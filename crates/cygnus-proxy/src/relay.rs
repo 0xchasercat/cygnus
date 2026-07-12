@@ -248,17 +248,12 @@ impl Proxy {
         action: DirectionAction,
     ) {
         match action {
-            DirectionAction::Read {
-                source,
-                pipe_write,
-            } => {
+            DirectionAction::Read { source, pipe_write } => {
                 let kind = match completed_kind {
-                    OperationKind::ClientToUpstreamRead
-                    | OperationKind::ClientToUpstreamWrite => {
+                    OperationKind::ClientToUpstreamRead | OperationKind::ClientToUpstreamWrite => {
                         OperationKind::ClientToUpstreamRead
                     }
-                    OperationKind::UpstreamToClientRead
-                    | OperationKind::UpstreamToClientWrite => {
+                    OperationKind::UpstreamToClientRead | OperationKind::UpstreamToClientWrite => {
                         OperationKind::UpstreamToClientRead
                     }
                 };
@@ -274,12 +269,10 @@ impl Proxy {
                 remaining,
             } => {
                 let kind = match completed_kind {
-                    OperationKind::ClientToUpstreamRead
-                    | OperationKind::ClientToUpstreamWrite => {
+                    OperationKind::ClientToUpstreamRead | OperationKind::ClientToUpstreamWrite => {
                         OperationKind::ClientToUpstreamWrite
                     }
-                    OperationKind::UpstreamToClientRead
-                    | OperationKind::UpstreamToClientWrite => {
+                    OperationKind::UpstreamToClientRead | OperationKind::UpstreamToClientWrite => {
                         OperationKind::UpstreamToClientWrite
                     }
                 };
@@ -374,18 +367,10 @@ impl Connection {
 
     fn complete(&mut self, kind: OperationKind, result: i32) -> DirectionAction {
         match kind {
-            OperationKind::ClientToUpstreamRead => {
-                self.client_to_upstream.complete_read(result)
-            }
-            OperationKind::ClientToUpstreamWrite => {
-                self.client_to_upstream.complete_write(result)
-            }
-            OperationKind::UpstreamToClientRead => {
-                self.upstream_to_client.complete_read(result)
-            }
-            OperationKind::UpstreamToClientWrite => {
-                self.upstream_to_client.complete_write(result)
-            }
+            OperationKind::ClientToUpstreamRead => self.client_to_upstream.complete_read(result),
+            OperationKind::ClientToUpstreamWrite => self.client_to_upstream.complete_write(result),
+            OperationKind::UpstreamToClientRead => self.upstream_to_client.complete_read(result),
+            OperationKind::UpstreamToClientWrite => self.upstream_to_client.complete_write(result),
         }
     }
 
@@ -545,22 +530,11 @@ fn splice_read_entry(source: RawFd, pipe_write: RawFd, token: u64) -> squeue::En
     .user_data(token)
 }
 
-fn splice_write_entry(
-    pipe_read: RawFd,
-    sink: RawFd,
-    remaining: u32,
-    token: u64,
-) -> squeue::Entry {
-    opcode::Splice::new(
-        types::Fd(pipe_read),
-        -1,
-        types::Fd(sink),
-        -1,
-        remaining,
-    )
-    .flags(libc::SPLICE_F_MOVE)
-    .build()
-    .user_data(token)
+fn splice_write_entry(pipe_read: RawFd, sink: RawFd, remaining: u32, token: u64) -> squeue::Entry {
+    opcode::Splice::new(types::Fd(pipe_read), -1, types::Fd(sink), -1, remaining)
+        .flags(libc::SPLICE_F_MOVE)
+        .build()
+        .user_data(token)
 }
 
 fn is_retryable(result: i32) -> bool {

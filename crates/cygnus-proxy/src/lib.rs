@@ -82,7 +82,10 @@ impl fmt::Display for ProxyError {
                     write!(formatter, "io_uring is not implemented by this kernel")
                 }
                 UnavailableReason::PermissionDenied => {
-                    write!(formatter, "io_uring setup was denied by the host security policy")
+                    write!(
+                        formatter,
+                        "io_uring setup was denied by the host security policy"
+                    )
                 }
                 UnavailableReason::MissingOpcode(opcode) => {
                     write!(formatter, "io_uring opcode {opcode} is not supported")

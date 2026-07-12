@@ -10,11 +10,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::sched::{clone, CloneFlags};
-use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{getegid, geteuid, pipe2, read, write, Pid};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::sched::{CloneFlags, clone};
+use nix::sys::signal::{Signal, kill};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 use thiserror::Error;
 
 use crate::spec::{BootTimings, CageSpec, CgroupLimits};
@@ -71,15 +71,8 @@ impl Cage {
         // SAFETY: `stack` remains alive in the parent until clone returns. The
         // child callback performs only async-signal-safe descriptor I/O before
         // replacing itself with the target process.
-        let pid = unsafe {
-            clone(
-                callback,
-                &mut stack,
-                flags,
-                Some(nix::libc::SIGCHLD),
-            )
-        }
-        .map_err(|source| CageError::NamespaceUnavailable { source })?;
+        let pid = unsafe { clone(callback, &mut stack, flags, Some(nix::libc::SIGCHLD)) }
+            .map_err(|source| CageError::NamespaceUnavailable { source })?;
 
         let mut guard = BootGuard::new(pid);
         if let Err(error) = write_identity_maps(pid) {
@@ -321,9 +314,7 @@ fn resolve_command(spec: &CageSpec) -> Result<OsString, CageError> {
         .get(OsStr::new("PATH"))
         .cloned()
         .or_else(|| std::env::var_os("PATH"))
-        .ok_or_else(|| {
-            CageError::InvalidSpec("command has no slash and PATH is not set".into())
-        })?;
+        .ok_or_else(|| CageError::InvalidSpec("command has no slash and PATH is not set".into()))?;
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join(&spec.command);
         let Ok(metadata) = fs::metadata(&candidate) else {
@@ -530,11 +521,7 @@ impl Cgroup {
                 self.removed = true;
                 Ok(())
             }
-            Err(source) => Err(CageError::io(
-                "remove cage cgroup",
-                &self.path,
-                source,
-            )),
+            Err(source) => Err(CageError::io("remove cage cgroup", &self.path, source)),
         }
     }
 }

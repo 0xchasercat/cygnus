@@ -250,16 +250,12 @@ mod tests {
     #[test]
     fn rejects_zero_runs_and_relative_sockets() {
         assert!(Options::parse(os_arguments(&["--runs", "0", "--", "true"])).is_err());
-        assert!(
-            Options::parse(os_arguments(&["--uds", "app.sock", "--", "true"])).is_err()
-        );
+        assert!(Options::parse(os_arguments(&["--uds", "app.sock", "--", "true"])).is_err());
     }
 
     #[test]
     fn percentile_uses_nearest_rank() {
-        let samples: Vec<_> = (1..=100)
-            .map(Duration::from_millis)
-            .collect();
+        let samples: Vec<_> = (1..=100).map(Duration::from_millis).collect();
 
         assert_eq!(percentile(&samples, 50), Duration::from_millis(50));
         assert_eq!(percentile(&samples, 95), Duration::from_millis(95));

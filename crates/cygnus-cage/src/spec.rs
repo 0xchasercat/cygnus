@@ -145,9 +145,9 @@ pub(crate) fn validate_name(name: &str) -> Result<(), CageError> {
             "name must begin with an ASCII letter or digit".into(),
         ));
     }
-    if !chars.all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-    }) {
+    if !chars
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
         return Err(CageError::InvalidSpec(
             "name contains unsupported characters".into(),
         ));
@@ -211,7 +211,8 @@ mod tests {
     #[test]
     fn validation_rejects_invalid_environment_keys() {
         let mut spec = CageSpec::new("example", "/bin/true");
-        spec.env.insert(OsString::from("BAD=KEY"), OsString::from("value"));
+        spec.env
+            .insert(OsString::from("BAD=KEY"), OsString::from("value"));
         assert!(spec.validate().is_err());
     }
 }

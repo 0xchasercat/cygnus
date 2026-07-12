@@ -27,10 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse()?;
     let socket_path = unique_socket_path("cygnus-g2");
     let upstream = UpstreamServer::start(&socket_path)?;
-    let proxy = match Proxy::bind(Config::new(
-        "127.0.0.1:0".parse()?,
-        socket_path.clone(),
-    )) {
+    let proxy = match Proxy::bind(Config::new("127.0.0.1:0".parse()?, socket_path.clone())) {
         Ok(proxy) => proxy,
         Err(error) if error.is_io_uring_unavailable() => {
             println!("G2 skipped: {error}");
@@ -161,12 +158,8 @@ fn parse_u64(name: &str, value: Option<String>) -> io::Result<u64> {
 }
 
 fn required_value(name: &str, value: Option<String>) -> io::Result<String> {
-    value.ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("missing value for {name}"),
-        )
-    })
+    value
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, format!("missing value for {name}")))
 }
 
 struct Latency {
