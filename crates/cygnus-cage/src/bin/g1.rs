@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -51,8 +51,7 @@ fn run() -> Result<(), String> {
             }
         };
         let timings = cage.timings();
-        cage
-            .teardown()
+        cage.teardown()
             .map_err(|error| format!("run {} failed to tear down: {error}", run_index + 1))?;
         if let Some(path) = &options.readiness_uds {
             remove_socket_after_run(path)?;
@@ -132,7 +131,7 @@ fn usage() -> String {
     "usage: g1 [--runs N] [--uds /absolute/path.sock] -- <cmd> [args...]".into()
 }
 
-fn ensure_socket_path_absent(path: &PathBuf) -> Result<(), String> {
+fn ensure_socket_path_absent(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(format!(
             "readiness path {path:?} already exists; remove it before running G1"
@@ -144,7 +143,7 @@ fn ensure_socket_path_absent(path: &PathBuf) -> Result<(), String> {
     }
 }
 
-fn remove_socket_after_run(path: &PathBuf) -> Result<(), String> {
+fn remove_socket_after_run(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -259,7 +258,7 @@ mod tests {
     #[test]
     fn percentile_uses_nearest_rank() {
         let samples: Vec<_> = (1..=100)
-            .map(|millis| Duration::from_millis(millis))
+            .map(Duration::from_millis)
             .collect();
 
         assert_eq!(percentile(&samples, 50), Duration::from_millis(50));
