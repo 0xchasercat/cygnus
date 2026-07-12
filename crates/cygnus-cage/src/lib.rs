@@ -4,9 +4,9 @@
 //! establishes the boot path with Linux namespaces and cgroups v2. Mounts,
 //! seccomp, networking, and long-lived supervision are added by later slices.
 //!
-//! On non-Linux hosts the same API boots the target as a plain child process
-//! with no isolation, so the platform runs identically on a development
-//! workstation. Production nodes are Linux.
+//! On non-Linux hosts the same API boots the target as a plain child
+//! process with no isolation; the platform runs identically, minus the cage
+//! walls.
 
 mod error;
 #[cfg(target_os = "linux")]
@@ -30,4 +30,4 @@ pub use spec::{
 pub const ISOLATION: &str = "kernel (namespaces + cgroups v2)";
 /// Isolation provided by the cage backend compiled for this platform.
 #[cfg(not(target_os = "linux"))]
-pub const ISOLATION: &str = "none (plain process; development only)";
+pub const ISOLATION: &str = "none (plain process)";

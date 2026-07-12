@@ -34,13 +34,10 @@ docs/spec.md          the technical specification, ground truth for design
 
 ## Requirements
 
-- Production nodes: Linux 5.15+ (cgroups v2, io_uring, core scheduling).
-  Cage isolation is built from Linux kernel primitives and exists nowhere
-  else.
-- Development: the same workspace builds, tests, and runs on macOS. Cages
-  degrade to plain processes -- no namespaces, no cgroups, no seccomp -- and
-  the tooling labels the mode plainly. Do not serve production traffic from
-  a non-Linux host.
+- Cage isolation is built from Linux kernel primitives; the full sandbox
+  needs Linux 5.15+ (cgroups v2, io_uring, core scheduling).
+- The same workspace builds, tests, and runs on macOS, with cages as plain
+  processes: no namespaces, no cgroups, no seccomp. Your machine, your call.
 - Rust (stable) to build.
 
 ## License

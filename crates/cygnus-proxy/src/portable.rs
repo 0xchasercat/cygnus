@@ -3,8 +3,8 @@
 //! Non-Linux hosts run the same public proxy API with a thread-per-direction
 //! copy loop instead of io_uring and `splice()`. Semantics match the Linux
 //! backend: bidirectional relay, half-close propagation, upstream connect
-//! failures drop the client, and shutdown drains active streams. Performance
-//! is not a goal here; production nodes are Linux.
+//! failures drop the client, and shutdown drains active streams. Raw
+//! throughput is the io_uring backend's job, not this one's.
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};

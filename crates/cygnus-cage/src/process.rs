@@ -1,10 +1,10 @@
 //! Portable process backend: the cage API without kernel isolation.
 //!
-//! Non-Linux hosts boot the target as a plain child process so the whole
-//! platform builds, tests, and runs on a development workstation. There are
-//! no namespaces, no cgroups, and no seccomp here: the resource limits in
-//! the cage specification are validated but not enforced. Production nodes
-//! run the Linux backend.
+//! Non-Linux hosts boot the target as a plain child process, so the whole
+//! platform builds, tests, and runs anywhere. There are no namespaces, no
+//! cgroups, and no seccomp here: the resource limits in the cage
+//! specification are validated but not enforced. The Linux backend is where
+//! the isolation lives.
 
 use std::io;
 use std::os::unix::net::UnixStream;
