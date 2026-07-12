@@ -4,11 +4,15 @@
 //! This crate deliberately does not parse HTTP or terminate TLS. Those layers
 //! sit above the mechanism-agnostic relay API added here.
 
+mod relay;
+
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+pub use relay::{Proxy, ProxyHandle};
 
 /// Configuration for a proxy listener.
 #[derive(Clone, Debug, Eq, PartialEq)]
