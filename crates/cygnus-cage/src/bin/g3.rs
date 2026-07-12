@@ -53,13 +53,13 @@ fn run() -> Result<RunOutcome, String> {
     };
 
     let mut cages = Vec::with_capacity(options.count);
-    let mut unloaded_boots = Vec::with_capacity(options.count);
+    let mut baseline_boots = Vec::with_capacity(options.count);
 
     for index in 0..options.count {
         let spec = cage_spec(&options, "baseline", index);
         match Cage::boot(spec) {
             Ok(cage) => {
-                unloaded_boots.push(cage.timings().total);
+                baseline_boots.push(cage.timings().total);
                 cages.push(cage);
             }
             Err(error) if index == 0 && environment_unavailable(&error) => {
@@ -135,7 +135,7 @@ fn run() -> Result<RunOutcome, String> {
         memory_before,
         memory_after,
         rss_samples: rss_samples.as_deref(),
-        unloaded_boots: &unloaded_boots,
+        baseline_boots: &baseline_boots,
         under_load_boots: &under_load_boots,
     });
 
@@ -390,7 +390,7 @@ struct Report<'a> {
     memory_before: Option<HostMemory>,
     memory_after: Option<HostMemory>,
     rss_samples: Option<&'a [u64]>,
-    unloaded_boots: &'a [Duration],
+    baseline_boots: &'a [Duration],
     under_load_boots: &'a [Duration],
 }
 
@@ -436,10 +436,10 @@ fn print_report(report: Report<'_>) {
     }
 
     println!(
-        "unloaded boot: mean {}, p50 {}, p99 {}",
-        format_duration(mean_duration(report.unloaded_boots)),
-        format_duration(percentile(report.unloaded_boots, 50)),
-        format_duration(percentile(report.unloaded_boots, 99))
+        "baseline boot (ramp to target): mean {}, p50 {}, p99 {}",
+        format_duration(mean_duration(report.baseline_boots)),
+        format_duration(percentile(report.baseline_boots, 50)),
+        format_duration(percentile(report.baseline_boots, 99))
     );
     println!(
         "boot under load (revival proxy; scale-to-zero not implemented): mean {}, p50 {}, p99 {} ({} probes)",
@@ -451,7 +451,7 @@ fn print_report(report: Report<'_>) {
 }
 
 fn print_memory_report(before: HostMemory, after: HostMemory) {
-    let total = after.total_bytes;
+    let total = before.total_bytes;
     let available_delta = i128::from(before.available_bytes) - i128::from(after.available_bytes);
     let delta_percent = percent(available_delta as f64, total);
     let used_after = total.saturating_sub(after.available_bytes.min(total));
