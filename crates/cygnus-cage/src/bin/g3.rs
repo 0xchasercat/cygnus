@@ -250,10 +250,7 @@ fn environment_unavailable(error: &CageError) -> bool {
     )
 }
 
-fn error_after_cleanup<const N: usize>(
-    message: String,
-    groups: [(&str, Vec<Cage>); N],
-) -> String {
+fn error_after_cleanup<const N: usize>(message: String, groups: [(&str, Vec<Cage>); N]) -> String {
     let mut errors = vec![message];
     for (label, cages) in groups {
         if let Err(error) = teardown_cages(label, cages) {
@@ -320,7 +317,11 @@ fn parse_meminfo_bytes(contents: &str, key: &str) -> Result<u64, String> {
         .map_err(|_| format!("{key} has an invalid value in /proc/meminfo"))?;
     match fields.next() {
         Some("kB") => {}
-        Some(unit) => return Err(format!("{key} uses unexpected unit {unit} in /proc/meminfo")),
+        Some(unit) => {
+            return Err(format!(
+                "{key} uses unexpected unit {unit} in /proc/meminfo"
+            ));
+        }
         None => return Err(format!("{key} has no unit in /proc/meminfo")),
     }
     kibibytes
@@ -417,10 +418,7 @@ fn print_report(report: Report<'_>) {
 
     match report.rss_samples {
         Some(samples) => {
-            let aggregate = samples
-                .iter()
-                .copied()
-                .fold(0_u64, u64::saturating_add);
+            let aggregate = samples.iter().copied().fold(0_u64, u64::saturating_add);
             println!("aggregate cage RSS: {}", format_bytes(aggregate));
             println!("per-cage RSS mean: {}", format_bytes(mean_u64(samples)));
             println!(
@@ -589,9 +587,7 @@ mod tests {
     #[test]
     fn rejects_zero_count_and_invalid_warmup() {
         assert!(Options::parse(os_arguments(&["--count", "0", "--", "true"])).is_err());
-        assert!(
-            Options::parse(os_arguments(&["--warmup-ms", "later", "--", "true"])).is_err()
-        );
+        assert!(Options::parse(os_arguments(&["--warmup-ms", "later", "--", "true"])).is_err());
     }
 
     #[test]
