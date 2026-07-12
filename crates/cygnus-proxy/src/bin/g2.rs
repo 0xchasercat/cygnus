@@ -279,6 +279,7 @@ fn print_report(
 
     println!("Cygnus G2 proxy overhead");
     println!("========================");
+    println!("backend: {}", cygnus_proxy::BACKEND);
     println!(
         "workload: {} round trips over {} connections; {} bulk bytes",
         options.round_trips, options.connections, options.bulk_bytes

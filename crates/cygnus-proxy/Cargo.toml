@@ -6,6 +6,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 libc = "0.2"
