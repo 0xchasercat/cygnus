@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cygnus-cage",
+    "crates/cygnus-proxy",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/0xchasercat/cygnus"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

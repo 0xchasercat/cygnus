@@ -1,0 +1,9 @@
+[package]
+name = "cygnus-proxy"
+description = "Data path: io_uring proxy loop between client TCP and per-app UDS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
