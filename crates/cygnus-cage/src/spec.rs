@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::CageError;
@@ -18,6 +18,8 @@ pub const DEFAULT_CPU_PERIOD: u64 = 100_000;
 pub const DEFAULT_PIDS_MAX: u32 = 128;
 /// Default time allowed for the target to exec and become ready.
 pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default size cap for the writable tmpfs layer of an overlay root: 64 MiB.
+pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Resource limits written to a cage's cgroup v2 controls.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +43,36 @@ impl Default for CgroupLimits {
     }
 }
 
+/// Overlay root filesystem for a cage.
+///
+/// The cage assembles an overlayfs from read-only lower directories (base
+/// files, engine, artifact) and a size-capped tmpfs upper layer, then pivots
+/// into it: the host tree is gone from the cage's view, and everything
+/// written at runtime lands in cage-private memory that vanishes at teardown.
+/// The Linux backend applies this; the plain-process backend runs on the host
+/// filesystem.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootfsSpec {
+    /// Read-only lower directories, top-most first (overlayfs order).
+    pub lowerdirs: Vec<PathBuf>,
+    /// Byte size cap for the writable tmpfs upper layer.
+    pub tmpfs_size: u64,
+    /// Host directory holding the per-cage staging mount point. Defaults to
+    /// the system temporary directory.
+    pub staging_dir: Option<PathBuf>,
+}
+
+impl RootfsSpec {
+    /// Describe an overlay root with the default tmpfs size cap.
+    pub fn new(lowerdirs: Vec<PathBuf>) -> Self {
+        Self {
+            lowerdirs,
+            tmpfs_size: DEFAULT_ROOTFS_TMPFS_SIZE,
+            staging_dir: None,
+        }
+    }
+}
+
 /// Complete description of one cage boot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CageSpec {
@@ -49,6 +81,7 @@ pub struct CageSpec {
     pub args: Vec<OsString>,
     pub env: BTreeMap<OsString, OsString>,
     pub limits: CgroupLimits,
+    pub rootfs: Option<RootfsSpec>,
     pub readiness_uds: Option<PathBuf>,
     pub readiness_timeout: Duration,
 }
@@ -62,6 +95,7 @@ impl CageSpec {
             args: Vec::new(),
             env: BTreeMap::new(),
             limits: CgroupLimits::default(),
+            rootfs: None,
             readiness_uds: None,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
@@ -105,6 +139,31 @@ impl CageSpec {
                 "readiness UDS path must be absolute".into(),
             ));
         }
+        if let Some(rootfs) = &self.rootfs {
+            if rootfs.lowerdirs.is_empty() {
+                return Err(CageError::InvalidSpec(
+                    "rootfs must list at least one lower directory".into(),
+                ));
+            }
+            for lower in &rootfs.lowerdirs {
+                validate_overlay_path(lower, "rootfs lower directory")?;
+            }
+            if rootfs.tmpfs_size == 0 {
+                return Err(CageError::InvalidSpec(
+                    "rootfs tmpfs_size must be greater than zero".into(),
+                ));
+            }
+            if let Some(staging) = &rootfs.staging_dir {
+                validate_overlay_path(staging, "rootfs staging directory")?;
+            }
+            if !Path::new(&self.command).is_absolute() {
+                return Err(CageError::InvalidSpec(
+                    "command must be an absolute path when a rootfs is set; it resolves inside \
+                     the overlay root"
+                        .into(),
+                ));
+            }
+        }
         for key in self.env.keys() {
             let bytes = key.as_os_str().as_bytes();
             if bytes.is_empty() || bytes.contains(&b'=') {
@@ -121,13 +180,27 @@ impl CageSpec {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BootTimings {
     pub namespaces_cgroup: Duration,
-    /// Placeholder until the mount stack is implemented.
+    /// Private propagation, the optional overlay root pivot, and `procfs`.
     pub mounts: Duration,
     /// Parent release through successful `execve` detection.
     pub exec_runtime_init: Duration,
     /// Successful `execve` through a readiness UDS accepting connections.
     pub socket_ready: Duration,
     pub total: Duration,
+}
+
+fn validate_overlay_path(path: &Path, label: &str) -> Result<(), CageError> {
+    if !path.is_absolute() {
+        return Err(CageError::InvalidSpec(format!("{label} must be absolute")));
+    }
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.iter().any(|&byte| matches!(byte, b':' | b',' | b'\\' | 0)) {
+        return Err(CageError::InvalidSpec(format!(
+            "{label} must not contain ':', ',', '\\', or NUL bytes; they cannot be expressed in \
+             overlay mount options"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<(), CageError> {
@@ -206,6 +279,42 @@ mod tests {
 
         spec.readiness_uds = Some(PathBuf::from("/tmp/app.sock"));
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_enforces_overlay_rootfs_constraints() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+
+        spec.rootfs = Some(RootfsSpec::new(Vec::new()));
+        assert!(spec.validate().is_err(), "accepted an empty lowerdir list");
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("relative")]));
+        assert!(spec.validate().is_err(), "accepted a relative lowerdir");
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower:dir")]));
+        assert!(spec.validate().is_err(), "accepted a lowerdir with ':'");
+
+        let mut rootfs = RootfsSpec::new(vec![PathBuf::from("/lower")]);
+        rootfs.tmpfs_size = 0;
+        spec.rootfs = Some(rootfs);
+        assert!(spec.validate().is_err(), "accepted a zero-size tmpfs");
+
+        let mut rootfs = RootfsSpec::new(vec![PathBuf::from("/lower")]);
+        rootfs.staging_dir = Some(PathBuf::from("staging"));
+        spec.rootfs = Some(rootfs);
+        assert!(spec.validate().is_err(), "accepted a relative staging dir");
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_requires_an_absolute_command_with_a_rootfs() {
+        let mut spec = CageSpec::new("example", "true");
+        assert!(spec.validate().is_ok(), "PATH lookup is fine without a rootfs");
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
+        assert!(spec.validate().is_err(), "PATH lookup cannot resolve inside the overlay root");
     }
 
     #[test]

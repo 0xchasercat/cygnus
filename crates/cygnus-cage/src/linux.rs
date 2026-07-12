@@ -17,7 +17,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
 use crate::error::CageError;
-use crate::mount::MountPlan;
+use crate::mount::{MountPlan, StagedRootfs};
 use crate::spec::{BootTimings, CageSpec, CgroupLimits};
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
@@ -35,16 +35,26 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub struct Cage {
     pid: Option<Pid>,
     cgroup: Option<Cgroup>,
+    staging: Option<StagedRootfs>,
     timings: BootTimings,
 }
 
 impl Cage {
     /// Boot a target in fresh user, mount, PID, UTS, IPC, and network
-    /// namespaces, with a private mount tree and a `procfs` bound to the
-    /// cage's own PID namespace.
+    /// namespaces, with a private mount tree, an optional overlay root the
+    /// cage pivots into, and a `procfs` bound to the cage's own PID
+    /// namespace.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
         spec.validate()?;
         let child_exec = ChildExec::new(&spec)?;
+        // Parent-side prework: the staging directory and every C string the
+        // child will touch are built before the clock starts and the clone
+        // happens. A failure past this point drops the staging directory.
+        let mut staging = match &spec.rootfs {
+            Some(rootfs) => Some(StagedRootfs::create(&spec.name, rootfs)?),
+            None => None,
+        };
+        let mount_plan = MountPlan::new(staging.as_ref())?;
         let boot_started = Instant::now();
 
         let (release_read, release_write) = pipe2(OFlag::O_CLOEXEC)
@@ -65,7 +75,7 @@ impl Cage {
         };
         let mut stack = vec![0_u8; CLONE_STACK_SIZE];
         let mut child_exec = Some(child_exec);
-        let mut mount_plan = Some(MountPlan::new());
+        let mut mount_plan = Some(mount_plan);
         let mut channels = Some(ChildChannels {
             release_read,
             exec_write,
@@ -155,7 +165,9 @@ impl Cage {
             socket_ready,
             total: boot_started.elapsed(),
         };
-        guard.finish(timings)
+        let mut cage = guard.finish(timings)?;
+        cage.staging = staging.take();
+        Ok(cage)
     }
 
     /// Return the completed cold-start phase timings.
@@ -173,7 +185,7 @@ impl Cage {
         self.cgroup.as_ref().map(|cgroup| cgroup.path.as_path())
     }
 
-    /// Kill the target, reap it, and remove its cgroup.
+    /// Kill the target, reap it, and remove its cgroup and rootfs staging.
     pub fn teardown(mut self) -> Result<(), CageError> {
         self.cleanup()
     }
@@ -205,6 +217,17 @@ impl Cage {
             }
             if cgroup.removed {
                 self.cgroup = None;
+            }
+        }
+
+        if let Some(staging) = &mut self.staging {
+            match staging.remove() {
+                Ok(()) => self.staging = None,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
@@ -712,6 +735,7 @@ impl BootGuard {
         Ok(Cage {
             pid: Some(pid),
             cgroup: Some(cgroup),
+            staging: None,
             timings,
         })
     }

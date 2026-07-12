@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cygnus_cage::{Cage, CageError, CageSpec};
+use cygnus_cage::{Cage, CageError, CageSpec, RootfsSpec};
 
 #[test]
 fn boots_and_tears_down_with_exec_readiness() {
@@ -35,6 +35,63 @@ fn boots_and_tears_down_with_exec_readiness() {
     assert_eq!(cage.timings().mounts, Duration::ZERO);
     assert!(cage.timings().total >= cage.timings().namespaces_cgroup);
 
+    if let Err(error) = cage.teardown() {
+        panic!("cage teardown failed: {error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn overlay_rootfs_contains_writes_and_pivots_proc() {
+    let name = unique_name("overlay");
+    let mut spec = CageSpec::new(&name, "/bin/sleep");
+    spec.args.push(OsString::from("30"));
+    spec.env = env::vars_os().collect();
+    // The host root as the single read-only lower layer: the merged tree
+    // looks like the host, but every write lands in the cage-private tmpfs.
+    spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/")]));
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error) if environment_unavailable(&error) => {
+            eprintln!("skipping privileged overlay rootfs test: {error}");
+            return;
+        }
+        Err(error) => panic!("cage boot failed: {error}"),
+    };
+
+    let pid = cage.host_pid().expect("cage has a host PID");
+    let cage_root = PathBuf::from(format!("/proc/{pid}/root"));
+    let probe_name = format!("cygnus-overlay-probe-{}", std::process::id());
+
+    // The pivoted root is writable through the upper layer...
+    fs::write(cage_root.join(&probe_name), b"upper")
+        .expect("write through the cage root into the upper layer");
+    // ...and the write stays out of the host tree.
+    let host_probe = PathBuf::from(format!("/{probe_name}"));
+    assert!(!host_probe.exists(), "cage write leaked into the host root");
+
+    // The fresh procfs reflects the cage's PID namespace: the target is PID 1.
+    let comm = fs::read_to_string(cage_root.join("proc/1/comm")).expect("read cage /proc/1/comm");
+    assert_eq!(comm.trim(), "sleep");
+
+    assert!(cage.timings().mounts > Duration::ZERO);
+    if let Err(error) = cage.teardown() {
+        panic!("cage teardown failed: {error}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn rootfs_is_inert_on_the_plain_process_backend() {
+    let name = unique_name("overlay");
+    let mut spec = CageSpec::new(&name, "/bin/sleep");
+    spec.args.push(OsString::from("30"));
+    spec.env = env::vars_os().collect();
+    spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/")]));
+
+    let cage = Cage::boot(spec).expect("plain process boot");
+    assert_eq!(cage.timings().mounts, Duration::ZERO);
     if let Err(error) = cage.teardown() {
         panic!("cage teardown failed: {error}");
     }
