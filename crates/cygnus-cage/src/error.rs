@@ -82,11 +82,7 @@ impl CageError {
         Self::Nix { operation, source }
     }
 
-    pub(crate) fn io(
-        operation: &'static str,
-        path: impl Into<PathBuf>,
-        source: io::Error,
-    ) -> Self {
+    pub(crate) fn io(operation: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             operation,
             path: path.into(),
