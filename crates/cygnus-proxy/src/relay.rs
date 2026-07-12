@@ -309,7 +309,9 @@ impl ProxyHandle {
             return Ok(());
         }
 
-        TcpStream::connect(self.listen_addr).map(drop)
+        let wake = TcpStream::connect(self.listen_addr)?;
+        drop(wake);
+        Ok(())
     }
 }
 
