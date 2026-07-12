@@ -1,0 +1,318 @@
+/* ————————————————————————————————————————————————————————————————
+   CYGNUS · porcelain instrument panel
+   Light, precise, expensive. Hairlines carry structure; mono carries
+   data; one cobalt accent; LEDs are the only glow permitted.
+   ———————————————————————————————————————————————————————————————— */
+
+:root {
+  /* canvas + surfaces */
+  --canvas: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #fafbfc;
+  --surface-3: #f6f7f9;
+  --line: #e6e8ee;
+  --line-2: #eef0f4;
+  --line-strong: #d8dbe3;
+
+  /* ink */
+  --ink: #0c0f14;
+  --ink-2: #555d6a;
+  --ink-3: #99a0ac;
+  --ink-4: #c3c8d1;
+
+  /* the accent — ultramarine, used sparingly */
+  --cobalt: #2c46f0;
+  --cobalt-deep: #1e34c4;
+  --cobalt-ghost: rgba(44, 70, 240, 0.07);
+  --cobalt-soft: rgba(44, 70, 240, 0.14);
+
+  /* signal hues (LEDs, status) */
+  --live: #0da55f;
+  --live-soft: rgba(13, 165, 95, 0.13);
+  --amber: #dd8f0b;
+  --amber-soft: rgba(221, 143, 11, 0.13);
+  --red: #dd3f34;
+  --red-soft: rgba(221, 63, 52, 0.11);
+  --violet: #7857f0;
+  --violet-soft: rgba(120, 87, 240, 0.12);
+
+  /* type */
+  --sans: 'Instrument Sans', system-ui, -apple-system, sans-serif;
+  --mono: 'Spline Sans Mono', ui-monospace, 'SF Mono', monospace;
+
+  /* elevation */
+  --shadow-card: 0 1px 2px rgba(13, 18, 28, 0.03), 0 10px 32px -18px rgba(13, 18, 28, 0.1);
+  --shadow-hover: 0 1px 2px rgba(13, 18, 28, 0.04), 0 18px 44px -20px rgba(13, 18, 28, 0.16);
+  --shadow-float: 0 2px 8px rgba(13, 18, 28, 0.05), 0 28px 60px -24px rgba(13, 18, 28, 0.25);
+  --shadow-pop: 0 1px 3px rgba(13, 18, 28, 0.07), 0 40px 90px -28px rgba(13, 18, 28, 0.32);
+
+  /* radii */
+  --r-s: 9px;
+  --r-m: 13px;
+  --r-l: 18px;
+  --r-xl: 24px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: 'ss01' on;
+  overflow-x: hidden;
+}
+
+/* drafting-table registration marks, barely there */
+.canvas-marks {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96'%3E%3Cpath d='M48 43.5v9M43.5 48h9' stroke='%230c0f14' stroke-opacity='.045' stroke-width='1'/%3E%3C/svg%3E");
+}
+
+::selection { background: var(--cobalt-soft); }
+
+:focus-visible {
+  outline: 2px solid var(--cobalt);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* scrollbars — thin, quiet */
+* { scrollbar-width: thin; scrollbar-color: var(--ink-4) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--ink-4); border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+h1, h2, h3, h4, p { margin: 0; }
+
+button {
+  font-family: inherit;
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+input, select {
+  font-family: inherit;
+  color: inherit;
+}
+
+a { color: inherit; text-decoration: none; }
+
+/* ————————————————————— shared utilities ————————————————————— */
+
+/* mono micro-label: the instrument voice */
+.label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* big instrument numeral with quiet unit */
+.readout {
+  font-family: var(--mono);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.035em;
+  color: var(--ink);
+}
+.readout .unit {
+  font-size: 0.52em;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--ink-3);
+  margin-left: 0.18em;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-l);
+  box-shadow: var(--shadow-card);
+}
+
+.hairline-v { width: 1px; align-self: stretch; background: var(--line); }
+.hairline-h { height: 1px; width: 100%; background: var(--line-2); }
+
+/* LED — the only glow in the system */
+.led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-block;
+}
+.led.live   { background: var(--live);   box-shadow: 0 0 0 3.5px var(--live-soft); }
+.led.build  { background: var(--amber);  box-shadow: 0 0 0 3.5px var(--amber-soft); animation: led-breathe 1.6s ease-in-out infinite; }
+.led.fail   { background: var(--red);    box-shadow: 0 0 0 3.5px var(--red-soft); }
+.led.preview{ background: var(--violet); box-shadow: 0 0 0 3.5px var(--violet-soft); }
+.led.cobalt { background: var(--cobalt); box-shadow: 0 0 0 3.5px var(--cobalt-soft); }
+.led.cold   { background: transparent;   box-shadow: inset 0 0 0 1.5px var(--ink-4); }
+.led.breathe{ animation: led-breathe 2.6s ease-in-out infinite; }
+
+@keyframes led-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+/* status text pill */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 7px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.pill.live    { color: #087a45; background: var(--live-soft); }
+.pill.build   { color: #a36a06; background: var(--amber-soft); }
+.pill.fail    { color: #b02c23; background: var(--red-soft); }
+.pill.preview { color: #5b3fd0; background: var(--violet-soft); }
+.pill.ghost   { color: var(--ink-3); background: var(--surface-3); }
+.pill.cobalt  { color: var(--cobalt-deep); background: var(--cobalt-ghost); }
+
+/* mono data chip */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.chip b { color: var(--ink); font-weight: 500; }
+
+/* buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 33px;
+  padding: 0 13px;
+  border-radius: var(--r-s);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  transition: background 0.13s ease, border-color 0.13s ease, transform 0.1s ease, box-shadow 0.13s ease;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--surface-3); border-color: var(--line-strong); }
+.btn:active { transform: scale(0.975); }
+.btn.primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+}
+.btn.primary:hover { background: #232833; border-color: #232833; }
+.btn.cobalt {
+  background: var(--cobalt);
+  border-color: var(--cobalt);
+  color: #fff;
+}
+.btn.cobalt:hover { background: var(--cobalt-deep); border-color: var(--cobalt-deep); }
+.btn.danger { color: var(--red); }
+.btn.danger:hover { background: var(--red-soft); border-color: rgba(221, 63, 52, 0.25); }
+.btn.sm { height: 28px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+.btn.icon { width: 33px; padding: 0; }
+
+/* segmented control — active item is a raised white pill */
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: #eceef2;
+  border-radius: 11px;
+}
+.seg button {
+  height: 27px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+  transition: color 0.12s ease;
+  position: relative;
+}
+.seg button:hover { color: var(--ink); }
+.seg button.on {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(13, 18, 28, 0.08), 0 4px 10px -4px rgba(13, 18, 28, 0.1);
+}
+
+/* table rows */
+.rows { display: flex; flex-direction: column; }
+.rows > * + * { border-top: 1px solid var(--line-2); }
+
+kbd {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 1.5px 5px;
+  line-height: 1;
+}
+
+/* identicon — deterministic duotone squircle */
+.identicon {
+  border-radius: 31%;
+  flex: none;
+  position: relative;
+  box-shadow: inset 0 0 0 1px rgba(13, 18, 28, 0.07);
+}
+
+/* page transition helper */
+.screen-enter {
+  animation: screen-in 0.24s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes screen-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes caret-blink {
+  0%, 55% { opacity: 1; }
+  56%, 100% { opacity: 0; }
+}
