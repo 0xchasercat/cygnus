@@ -166,6 +166,7 @@ fn environment_unavailable(error: &CageError) -> bool {
 fn print_report(samples: &[BootTimings]) {
     let totals: Vec<_> = samples.iter().map(|sample| sample.total).collect();
     println!("G1 cold-start results");
+    println!("isolation: {}", cygnus_cage::ISOLATION);
     println!("runs: {}", samples.len());
     println!("total p50: {}", format_duration(percentile(&totals, 50)));
     println!("total p95: {}", format_duration(percentile(&totals, 95)));
