@@ -27,6 +27,11 @@ fn boots_and_tears_down_with_exec_readiness() {
     assert!(cage.cgroup_path().is_some_and(|path| path.ends_with(&name)));
     #[cfg(not(target_os = "linux"))]
     assert!(cage.cgroup_path().is_none());
+    // The Linux backend mounts a private /proc; the plain-process backend does
+    // no mounting.
+    #[cfg(target_os = "linux")]
+    assert!(cage.timings().mounts > Duration::ZERO);
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(cage.timings().mounts, Duration::ZERO);
     assert!(cage.timings().total >= cage.timings().namespaces_cgroup);
 

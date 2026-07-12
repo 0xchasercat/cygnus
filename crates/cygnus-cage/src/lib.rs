@@ -1,8 +1,10 @@
 //! The cage: Cygnus's per-app isolation stack.
 //!
 //! A cage is a warm, reusable sandbox built from kernel primitives. This slice
-//! establishes the boot path with Linux namespaces and cgroups v2. Mounts,
-//! seccomp, networking, and long-lived supervision are added by later slices.
+//! establishes the boot path with Linux namespaces and cgroups v2, a private
+//! mount tree, and a `procfs` bound to the cage's own PID namespace. The
+//! overlay root, seccomp, networking, and long-lived supervision are added by
+//! later slices.
 //!
 //! On non-Linux hosts the same API boots the target as a plain child
 //! process with no isolation; the platform runs identically, minus the cage
@@ -11,6 +13,8 @@
 mod error;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod mount;
 #[cfg(not(target_os = "linux"))]
 mod process;
 mod spec;
