@@ -23,7 +23,10 @@ fn boots_and_tears_down_with_exec_readiness() {
     };
 
     assert!(cage.host_pid().is_some_and(|pid| pid > 0));
+    #[cfg(target_os = "linux")]
     assert!(cage.cgroup_path().is_some_and(|path| path.ends_with(&name)));
+    #[cfg(not(target_os = "linux"))]
+    assert!(cage.cgroup_path().is_none());
     assert_eq!(cage.timings().mounts, Duration::ZERO);
     assert!(cage.timings().total >= cage.timings().namespaces_cgroup);
 

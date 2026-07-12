@@ -34,8 +34,10 @@ docs/spec.md          the technical specification, ground truth for design
 
 ## Requirements
 
-- Linux 5.15+ (cgroups v2, io_uring, core scheduling). The platform is
-  Linux-only by design; `cygnus dev` will support macOS later.
+- Cage isolation is built from Linux kernel primitives; the full sandbox
+  needs Linux 5.15+ (cgroups v2, io_uring, core scheduling).
+- The same workspace builds, tests, and runs on macOS, with cages as plain
+  processes: no namespaces, no cgroups, no seccomp. Your machine, your call.
 - Rust (stable) to build.
 
 ## License

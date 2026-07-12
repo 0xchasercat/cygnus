@@ -25,7 +25,7 @@ const GATE_THROUGHPUT_GBPS: f64 = 5.0;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse()?;
-    let socket_path = unique_socket_path("cygnus-g2");
+    let socket_path = unique_socket_path("g2");
     let upstream = UpstreamServer::start(&socket_path)?;
     let proxy = match Proxy::bind(Config::new("127.0.0.1:0".parse()?, socket_path.clone())) {
         Ok(proxy) => proxy,
@@ -279,6 +279,7 @@ fn print_report(
 
     println!("Cygnus G2 proxy overhead");
     println!("========================");
+    println!("backend: {}", cygnus_proxy::BACKEND);
     println!(
         "workload: {} round trips over {} connections; {} bulk bytes",
         options.round_trips, options.connections, options.bulk_bytes
@@ -486,12 +487,14 @@ fn serve_bulk(mut stream: UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-fn unique_socket_path(prefix: &str) -> PathBuf {
+fn unique_socket_path(tag: &str) -> PathBuf {
+    // Unix socket paths have a tight length budget (about 104 bytes on macOS,
+    // where the temporary directory alone is ~50), so the name stays short.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    env::temp_dir().join(format!("{prefix}-{}-{nonce}.sock", process::id()))
+        .subsec_nanos();
+    env::temp_dir().join(format!("cyg-{tag}-{:x}-{nonce:x}.sock", process::id()))
 }
 
 fn remove_socket(path: &Path) -> io::Result<()> {

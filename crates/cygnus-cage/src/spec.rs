@@ -4,7 +4,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::linux::CageError;
+use crate::error::CageError;
 
 /// Default hard memory limit: 256 MiB.
 pub const DEFAULT_MEMORY_MAX: u64 = 256 * 1024 * 1024;

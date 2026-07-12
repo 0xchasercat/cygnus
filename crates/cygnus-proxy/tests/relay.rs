@@ -18,7 +18,7 @@ const TRANSFER_CHUNK: usize = 64 * 1024;
 fn loopback_round_trip_preserves_bytes() -> Result<(), Box<dyn Error>> {
     let pattern = patterned_bytes(256 * 1024, 0);
     let expected = pattern.clone();
-    let Some(harness) = Harness::start("loopback round trip", move |mut upstream| {
+    let Some(harness) = Harness::start("loopback round trip", "lb", move |mut upstream| {
         configure_unix_stream(&upstream)?;
         let mut request = vec![0; expected.len()];
         upstream.read_exact(&mut request)?;
@@ -46,7 +46,7 @@ fn loopback_round_trip_preserves_bytes() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn large_transfer_preserves_stream_hash() -> Result<(), Box<dyn Error>> {
-    let Some(harness) = Harness::start("large transfer integrity", |mut upstream| {
+    let Some(harness) = Harness::start("large transfer integrity", "lt", |mut upstream| {
         configure_unix_stream(&upstream)?;
         let mut buffer = vec![0; TRANSFER_CHUNK];
         loop {
@@ -108,7 +108,7 @@ fn half_close_propagates_without_losing_response() -> Result<(), Box<dyn Error>>
     let expected_request = request.clone();
     let response = b"response emitted only after upstream observed EOF".to_vec();
     let expected_response = response.clone();
-    let Some(harness) = Harness::start("half-close behavior", move |mut upstream| {
+    let Some(harness) = Harness::start("half-close behavior", "hc", move |mut upstream| {
         configure_unix_stream(&upstream)?;
         let mut received = Vec::new();
         upstream.read_to_end(&mut received)?;
@@ -143,11 +143,11 @@ struct Harness {
 }
 
 impl Harness {
-    fn start<F>(name: &str, handler: F) -> Result<Option<Self>, Box<dyn Error>>
+    fn start<F>(name: &str, tag: &str, handler: F) -> Result<Option<Self>, Box<dyn Error>>
     where
         F: FnOnce(UnixStream) -> io::Result<()> + Send + 'static,
     {
-        let path = unique_socket_path(name);
+        let path = unique_socket_path(tag);
         remove_socket(&path)?;
         let upstream = UnixListener::bind(&path)?;
         let proxy = match Proxy::bind(Config::new("127.0.0.1:0".parse()?, path.clone())) {
@@ -260,16 +260,14 @@ fn fill_pattern(bytes: &mut [u8], offset: u64) {
     }
 }
 
-fn unique_socket_path(test_name: &str) -> PathBuf {
-    let sanitized = test_name.replace(' ', "-");
+fn unique_socket_path(tag: &str) -> PathBuf {
+    // Unix socket paths have a tight length budget (about 104 bytes on macOS,
+    // where the temporary directory alone is ~50), so the name stays short.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "cygnus-proxy-{sanitized}-{}-{nonce}.sock",
-        process::id()
-    ))
+        .subsec_nanos();
+    std::env::temp_dir().join(format!("cyg-{tag}-{:x}-{nonce:x}.sock", process::id()))
 }
 
 fn remove_socket(path: &Path) -> io::Result<()> {

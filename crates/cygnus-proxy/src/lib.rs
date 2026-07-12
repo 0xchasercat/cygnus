@@ -3,7 +3,14 @@
 //!
 //! This crate deliberately does not parse HTTP or terminate TLS. Those layers
 //! sit above the mechanism-agnostic relay API added here.
+//!
+//! Linux hosts drive the relay with io_uring and `splice()`. Other hosts
+//! use a portable threaded copy loop with the same public API and
+//! semantics.
 
+#[cfg(not(target_os = "linux"))]
+mod portable;
+#[cfg(target_os = "linux")]
 mod relay;
 
 use std::error::Error as StdError;
@@ -12,6 +19,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+#[cfg(not(target_os = "linux"))]
+pub use portable::{Proxy, ProxyHandle};
+#[cfg(target_os = "linux")]
 pub use relay::{Proxy, ProxyHandle};
 
 /// Configuration for a proxy listener.
@@ -115,3 +125,10 @@ impl From<io::Error> for ProxyError {
 
 /// Result type used by the proxy data path.
 pub type Result<T> = std::result::Result<T, ProxyError>;
+
+/// Name of the data-path backend compiled for this platform.
+#[cfg(target_os = "linux")]
+pub const BACKEND: &str = "io_uring";
+/// Name of the data-path backend compiled for this platform.
+#[cfg(not(target_os = "linux"))]
+pub const BACKEND: &str = "threaded";
