@@ -53,9 +53,13 @@ impl Cage {
         let release_write_raw = release_write.as_raw_fd();
         let exec_read_raw = exec_read.as_raw_fd();
         let mut stack = vec![0_u8; CLONE_STACK_SIZE];
+        let mut child_exec = Some(child_exec);
         let callback = Box::new(move || {
+            let child = child_exec
+                .take()
+                .expect("clone callback invoked more than once");
             child_main(
-                child_exec,
+                child,
                 release_read,
                 exec_write,
                 release_write_raw,
