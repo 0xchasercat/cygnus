@@ -351,8 +351,9 @@ fn child_main(
     release_write_raw: i32,
     exec_read_raw: i32,
 ) -> isize {
-    // `clone` copies every open descriptor even though these parent-owned ends
-    // are not captured by the callback closure.
+    // SAFETY: `clone` copies every open descriptor even though these
+    // parent-owned ends are not captured by the callback closure. The raw
+    // descriptors remain valid in the child until explicitly closed here.
     unsafe {
         nix::libc::close(release_write_raw);
         nix::libc::close(exec_read_raw);
@@ -388,6 +389,8 @@ fn child_main(
     let _storage = (&child.args, &child.env);
     // The target is PID 1 in this slice. A later static-init process will reap
     // descendants and forward signals before the production supervisor lands.
+    // SAFETY: both pointer arrays are null-terminated and point into the
+    // CString storage kept alive above. `execve` does not retain the pointers.
     unsafe {
         nix::libc::execve(
             child.command.as_ptr(),
@@ -743,5 +746,26 @@ impl Drop for BootGuard {
         if let Some(cgroup) = &mut self.cgroup {
             let _ = cgroup.remove();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_path_is_confined_to_the_cygnus_subtree() {
+        assert_eq!(
+            cgroup_path(Path::new("/sys/fs/cgroup"), "app-1"),
+            PathBuf::from("/sys/fs/cgroup/cygnus/app-1")
+        );
+    }
+
+    #[test]
+    fn mountinfo_fields_are_unescaped() {
+        assert_eq!(
+            unescape_mount_field("/sys/fs/cgroup\\040unified\\134slice"),
+            "/sys/fs/cgroup unified\\slice"
+        );
     }
 }

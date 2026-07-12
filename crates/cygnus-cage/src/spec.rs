@@ -154,3 +154,64 @@ pub(crate) fn validate_name(name: &str) -> Result<(), CageError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_specification() {
+        let spec = CageSpec::new("example", "/bin/true");
+
+        assert_eq!(spec.limits.memory_max, 256 * 1024 * 1024);
+        assert_eq!(spec.limits.memory_high, 224 * 1024 * 1024);
+        assert_eq!(spec.limits.cpu_quota, 100_000);
+        assert_eq!(spec.limits.cpu_period, 100_000);
+        assert_eq!(spec.limits.pids_max, 128);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_unsafe_cgroup_names() {
+        for name in ["", "../escape", "a/b", "-leading", "app space", "äpp"] {
+            let spec = CageSpec::new(name, "/bin/true");
+            assert!(spec.validate().is_err(), "accepted cage name {name:?}");
+        }
+    }
+
+    #[test]
+    fn validation_accepts_safe_cgroup_names() {
+        for name in ["app", "app-1", "App_2.blue"] {
+            let spec = CageSpec::new(name, "/bin/true");
+            assert!(spec.validate().is_ok(), "rejected cage name {name:?}");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_inconsistent_limits() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        spec.limits.memory_high = spec.limits.memory_max + 1;
+        assert!(spec.validate().is_err());
+
+        spec.limits.memory_high = spec.limits.memory_max;
+        spec.limits.cpu_quota = 0;
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn validation_requires_an_absolute_readiness_path() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        spec.readiness_uds = Some(PathBuf::from("app.sock"));
+        assert!(spec.validate().is_err());
+
+        spec.readiness_uds = Some(PathBuf::from("/tmp/app.sock"));
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_environment_keys() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        spec.env.insert(OsString::from("BAD=KEY"), OsString::from("value"));
+        assert!(spec.validate().is_err());
+    }
+}
