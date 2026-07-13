@@ -20,14 +20,7 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
-/// The action applied when a syscall does not match the allowlist.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FilterMode {
-    /// Terminate the process on the first non-matching syscall.
-    Enforce,
-    /// Log non-matching syscalls to the kernel audit log and allow them to continue.
-    Audit,
-}
+pub use crate::spec::FilterMode;
 
 /// A seccomp BPF program compiled in the parent for installation in the cage child.
 pub struct SeccompPlan {

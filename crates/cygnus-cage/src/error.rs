@@ -43,6 +43,8 @@ pub enum CageError {
     CgroupControllerUnavailable(&'static str),
     #[error("cgroup already exists at {0:?}")]
     CgroupExists(PathBuf),
+    #[error("failed to compile the seccomp filter: {0}")]
+    SeccompFilter(String),
     #[error("cage child failed during {stage} with errno {errno}")]
     ChildSetup { stage: &'static str, errno: i32 },
     #[error("cage child sent a malformed setup status")]

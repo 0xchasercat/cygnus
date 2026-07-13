@@ -21,6 +21,21 @@ pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default size cap for the writable tmpfs layer of an overlay root: 64 MiB.
 pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Action taken when a cage syscall does not match the seccomp allowlist.
+///
+/// Defined here, in the platform-neutral spec, so a `CageSpec` can carry the
+/// choice on every host; the filter it drives is compiled and installed only
+/// by the Linux backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterMode {
+    /// Terminate the process on the first non-matching syscall.
+    Enforce,
+    /// Log non-matching syscalls to the kernel audit log and allow them to
+    /// continue, so a filter can be validated against a corpus before it is
+    /// enforced.
+    Audit,
+}
+
 /// Resource limits written to a cage's cgroup v2 controls.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CgroupLimits {
@@ -82,6 +97,10 @@ pub struct CageSpec {
     pub env: BTreeMap<OsString, OsString>,
     pub limits: CgroupLimits,
     pub rootfs: Option<RootfsSpec>,
+    /// Seccomp filter to install in the cage child immediately before `execve`.
+    /// `None` boots without a filter. The Linux backend honors this; the
+    /// plain-process backend ignores it.
+    pub seccomp: Option<FilterMode>,
     pub readiness_uds: Option<PathBuf>,
     pub readiness_timeout: Duration,
 }
@@ -96,6 +115,7 @@ impl CageSpec {
             env: BTreeMap::new(),
             limits: CgroupLimits::default(),
             rootfs: None,
+            seccomp: None,
             readiness_uds: None,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
@@ -182,6 +202,9 @@ pub struct BootTimings {
     pub namespaces_cgroup: Duration,
     /// Private propagation, the optional overlay root pivot, and `procfs`.
     pub mounts: Duration,
+    /// Seccomp filter compilation is done in the parent; this covers the
+    /// child-side install. Zero when no filter is requested.
+    pub seccomp: Duration,
     /// Parent release through successful `execve` detection.
     pub exec_runtime_init: Duration,
     /// Successful `execve` through a readiness UDS accepting connections.
@@ -244,6 +267,7 @@ mod tests {
         assert_eq!(spec.limits.cpu_quota, 100_000);
         assert_eq!(spec.limits.cpu_period, 100_000);
         assert_eq!(spec.limits.pids_max, 128);
+        assert!(spec.seccomp.is_none());
         assert!(spec.validate().is_ok());
     }
 

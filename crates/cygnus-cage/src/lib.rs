@@ -2,9 +2,10 @@
 //!
 //! A cage is a warm, reusable sandbox built from kernel primitives. This slice
 //! establishes the boot path with Linux namespaces and cgroups v2, a private
-//! mount tree, an optional overlay root the cage pivots into, and a `procfs`
-//! bound to the cage's own PID namespace. Seccomp, networking, and long-lived
-//! supervision are added by later slices.
+//! mount tree, an optional overlay root the cage pivots into, a `procfs` bound
+//! to the cage's own PID namespace, and an optional seccomp filter installed
+//! immediately before `execve`. Networking and long-lived supervision are
+//! added by later slices.
 //!
 //! On non-Linux hosts the same API boots the target as a plain child
 //! process with no isolation; the platform runs identically, minus the cage
@@ -27,11 +28,11 @@ pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]
 pub use process::Cage;
 #[cfg(target_os = "linux")]
-pub use seccomp::{FilterMode, SeccompPlan, allowlisted_syscalls};
+pub use seccomp::{SeccompPlan, allowlisted_syscalls};
 pub use spec::{
     BootTimings, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
     DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,
-    DEFAULT_ROOTFS_TMPFS_SIZE, RootfsSpec,
+    DEFAULT_ROOTFS_TMPFS_SIZE, FilterMode, RootfsSpec,
 };
 
 /// Isolation provided by the cage backend compiled for this platform.

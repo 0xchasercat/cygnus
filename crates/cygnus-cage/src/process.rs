@@ -63,6 +63,7 @@ impl Cage {
             timings: BootTimings {
                 namespaces_cgroup: Duration::ZERO,
                 mounts: Duration::ZERO,
+                seccomp: Duration::ZERO,
                 exec_runtime_init,
                 socket_ready,
                 total: boot_started.elapsed(),
