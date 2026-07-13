@@ -4,6 +4,7 @@ members = [
     "crates/cygnus-cage",
     "crates/cygnus-init",
     "crates/cygnus-proxy",
+    "crates/cygnus-supervisor",
 ]
 
 [workspace.package]
