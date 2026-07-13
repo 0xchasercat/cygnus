@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 nix = { version = "0.30.1", features = ["fs", "process", "sched", "signal", "user"] }
 thiserror = "2.0.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5.0"

@@ -17,6 +17,8 @@ mod linux;
 mod mount;
 #[cfg(not(target_os = "linux"))]
 mod process;
+#[cfg(target_os = "linux")]
+pub mod seccomp;
 mod spec;
 
 pub use error::CageError;
@@ -24,6 +26,8 @@ pub use error::CageError;
 pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]
 pub use process::Cage;
+#[cfg(target_os = "linux")]
+pub use seccomp::{FilterMode, SeccompPlan, allowlisted_syscalls};
 pub use spec::{
     BootTimings, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
     DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,
