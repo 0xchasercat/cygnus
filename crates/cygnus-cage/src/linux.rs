@@ -344,12 +344,11 @@ struct ChildExec {
 
 impl ChildExec {
     fn new(spec: &CageSpec) -> Result<Self, CageError> {
-        let resolved_command = resolve_command(spec)?;
-        let command = cstring(&resolved_command, "command contains a NUL byte")?;
-        let mut args = Vec::with_capacity(spec.args.len() + 1);
-        args.push(command.clone());
-        for arg in &spec.args {
-            args.push(cstring(arg, "argument contains a NUL byte")?);
+        let (program, argv_os) = exec_plan(spec)?;
+        let command = cstring(&program, "cage command contains a NUL byte")?;
+        let mut args = Vec::with_capacity(argv_os.len());
+        for arg in &argv_os {
+            args.push(cstring(arg, "cage argument contains a NUL byte")?);
         }
 
         let mut env = Vec::with_capacity(spec.env.len());
@@ -373,6 +372,35 @@ impl ChildExec {
             argv,
             envp,
         })
+    }
+}
+
+/// Decide the program to exec as the cage's first process and its full argv.
+///
+/// With `spec.init` set, the cage execs that init binary as PID 1 and passes
+/// the target command and its arguments as the init's arguments; the init then
+/// execs the target itself, reaping descendants and forwarding signals. Without
+/// it, the cage execs the target directly (argv[0] is the resolved program
+/// path) and the target is PID 1. The init path is exec'd verbatim, so it must
+/// resolve inside the cage's filesystem view; the target is resolved by the
+/// init (via `PATH`) when an init is used, and here otherwise.
+fn exec_plan(spec: &CageSpec) -> Result<(OsString, Vec<OsString>), CageError> {
+    match &spec.init {
+        Some(init) => {
+            let program = init.as_os_str().to_os_string();
+            let mut argv = Vec::with_capacity(spec.args.len() + 2);
+            argv.push(program.clone());
+            argv.push(spec.command.clone());
+            argv.extend(spec.args.iter().cloned());
+            Ok((program, argv))
+        }
+        None => {
+            let program = resolve_command(spec)?;
+            let mut argv = Vec::with_capacity(spec.args.len() + 1);
+            argv.push(program.clone());
+            argv.extend(spec.args.iter().cloned());
+            Ok((program, argv))
+        }
     }
 }
 
@@ -484,8 +512,9 @@ fn child_main(
     // Keep the CString storage alive while the pointer arrays are passed to
     // libc. No allocation or lock acquisition occurs after clone.
     let _storage = (&child.args, &child.env);
-    // The target is PID 1 in this slice. A later static-init process will reap
-    // descendants and forward signals before the production supervisor lands.
+    // This exec makes the target (or the init shim, when the spec configures
+    // one) the cage's PID 1. With an init the shim reaps descendants and
+    // forwards signals; without one the target runs as PID 1 directly.
     // SAFETY: both pointer arrays are null-terminated and point into the
     // CString storage kept alive above. `execve` does not retain the pointers.
     unsafe {
@@ -880,5 +909,36 @@ mod tests {
         for (index, code) in codes.iter().enumerate() {
             assert!(!codes[index + 1..].contains(code));
         }
+    }
+
+    #[test]
+    fn exec_plan_without_init_runs_the_command_directly() {
+        let mut spec = CageSpec::new("app", "/bin/true");
+        spec.args.push(OsString::from("--flag"));
+
+        let (program, argv) = exec_plan(&spec).expect("exec plan");
+        assert_eq!(program, OsString::from("/bin/true"));
+        assert_eq!(
+            argv,
+            vec![OsString::from("/bin/true"), OsString::from("--flag")]
+        );
+    }
+
+    #[test]
+    fn exec_plan_with_init_wraps_the_command() {
+        let mut spec = CageSpec::new("app", "/bin/true");
+        spec.args.push(OsString::from("--flag"));
+        spec.init = Some(PathBuf::from("/usr/bin/cygnus-init"));
+
+        let (program, argv) = exec_plan(&spec).expect("exec plan");
+        assert_eq!(program, OsString::from("/usr/bin/cygnus-init"));
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/usr/bin/cygnus-init"),
+                OsString::from("/bin/true"),
+                OsString::from("--flag"),
+            ]
+        );
     }
 }
