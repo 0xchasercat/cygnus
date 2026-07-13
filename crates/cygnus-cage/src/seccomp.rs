@@ -72,11 +72,7 @@ impl SeccompPlan {
 
         let program = libc::sock_fprog {
             len: self.program_len,
-            filter: self
-                .program
-                .as_ptr()
-                .cast::<libc::sock_filter>()
-                .cast_mut(),
+            filter: self.program.as_ptr().cast::<libc::sock_filter>().cast_mut(),
         };
         let result = unsafe {
             libc::syscall(
