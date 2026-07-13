@@ -45,6 +45,8 @@ pub enum CageError {
     CgroupExists(PathBuf),
     #[error("failed to compile the seccomp filter: {0}")]
     SeccompFilter(String),
+    #[error("network setup failed during {operation}: {detail}")]
+    Network { operation: String, detail: String },
     #[error("cage child failed during {stage} with errno {errno}")]
     ChildSetup { stage: &'static str, errno: i32 },
     #[error("cage child sent a malformed setup status")]
