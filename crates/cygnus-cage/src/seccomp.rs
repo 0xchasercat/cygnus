@@ -176,16 +176,16 @@ fn ioctl_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
 }
 
 fn equality_rule(argument: u8, value: u64) -> Result<SeccompRule, seccompiler::Error> {
-    SeccompRule::new(vec![SeccompCondition::new(
+    Ok(SeccompRule::new(vec![SeccompCondition::new(
         argument,
         SeccompCmpArgLen::Dword,
         SeccompCmpOp::Eq,
         value,
-    )?])
+    )?])?)
 }
 
 fn masked_rule(argument: u8, mask: u64, value: u64) -> Result<SeccompRule, seccompiler::Error> {
-    SeccompRule::new(vec![masked_condition(argument, mask, value)?])
+    Ok(SeccompRule::new(vec![masked_condition(argument, mask, value)?])?)
 }
 
 fn masked_condition(
@@ -193,12 +193,12 @@ fn masked_condition(
     mask: u64,
     value: u64,
 ) -> Result<SeccompCondition, seccompiler::Error> {
-    SeccompCondition::new(
+    Ok(SeccompCondition::new(
         argument,
         SeccompCmpArgLen::Dword,
         SeccompCmpOp::MaskedEq(mask),
         value,
-    )
+    )?)
 }
 
 const ALLOWLISTED_SYSCALLS: &[i64] = &[
