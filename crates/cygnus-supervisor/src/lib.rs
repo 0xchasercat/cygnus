@@ -12,6 +12,10 @@
 //! backoff shrinks and a looping app can recover on its own, so there is no
 //! separate counter to reset.
 
+mod runtime;
+
+pub use runtime::{AcquireError, Instance, Supervisor};
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
