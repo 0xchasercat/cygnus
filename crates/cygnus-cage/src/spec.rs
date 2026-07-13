@@ -21,18 +21,17 @@ pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default size cap for the writable tmpfs layer of an overlay root: 64 MiB.
 pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Action taken when a cage syscall does not match the seccomp allowlist.
+/// Action taken when a cage syscall matches the seccomp denylist.
 ///
 /// Defined here, in the platform-neutral spec, so a `CageSpec` can carry the
 /// choice on every host; the filter it drives is compiled and installed only
 /// by the Linux backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterMode {
-    /// Terminate the process on the first non-matching syscall.
+    /// Fail a blocked syscall with `EPERM`, like Docker's default profile.
     Enforce,
-    /// Log non-matching syscalls to the kernel audit log and allow them to
-    /// continue, so a filter can be validated against a corpus before it is
-    /// enforced.
+    /// Log a blocked syscall to the kernel audit log and allow it to continue,
+    /// so a workload can be observed before enforcing.
     Audit,
 }
 
@@ -131,8 +130,10 @@ pub struct CageSpec {
     pub limits: CgroupLimits,
     pub rootfs: Option<RootfsSpec>,
     /// Seccomp filter to install in the cage child immediately before `execve`.
-    /// `None` boots without a filter. The Linux backend honors this; the
-    /// plain-process backend ignores it.
+    /// Defaults to `Some(FilterMode::Enforce)` (see [`CageSpec::new`]), so a
+    /// cage is sandboxed out of the box like a Docker container; `None` boots
+    /// without a filter. The Linux backend honors this; the plain-process
+    /// backend ignores it.
     pub seccomp: Option<FilterMode>,
     /// Egress network policy. The Linux backend wires the veth and nftables;
     /// the plain-process backend ignores it.
@@ -151,7 +152,7 @@ impl CageSpec {
             env: BTreeMap::new(),
             limits: CgroupLimits::default(),
             rootfs: None,
-            seccomp: None,
+            seccomp: Some(FilterMode::Enforce),
             egress: EgressMode::None,
             readiness_uds: None,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
@@ -332,7 +333,8 @@ mod tests {
         assert_eq!(spec.limits.cpu_quota, 100_000);
         assert_eq!(spec.limits.cpu_period, 100_000);
         assert_eq!(spec.limits.pids_max, 128);
-        assert!(spec.seccomp.is_none());
+        // Sandboxed out of the box, like a Docker container.
+        assert_eq!(spec.seccomp, Some(FilterMode::Enforce));
         assert_eq!(spec.egress, EgressMode::None);
         assert!(spec.validate().is_ok());
     }

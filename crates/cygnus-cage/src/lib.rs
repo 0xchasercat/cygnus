@@ -31,7 +31,7 @@ pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]
 pub use process::Cage;
 #[cfg(target_os = "linux")]
-pub use seccomp::{SeccompPlan, allowlisted_syscalls};
+pub use seccomp::{SeccompPlan, denied_syscalls};
 pub use spec::{
     BootTimings, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
     DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,

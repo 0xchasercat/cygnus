@@ -1,7 +1,6 @@
 #![cfg(target_os = "linux")]
 
 use std::env;
-use std::os::unix::process::ExitStatusExt;
 use std::process::{self, Command, ExitStatus};
 
 use cygnus_cage::seccomp::{FilterMode, SeccompPlan};
@@ -11,13 +10,16 @@ const CHILD_ENV: &str = "CYGNUS_SECCOMP_CHILD";
 const CHILD_ALLOWED: &str = "allowed";
 const CHILD_DENIED: &str = "denied";
 const SECCOMP_UNAVAILABLE: i32 = 96;
-const FILTER_DID_NOT_KILL: i32 = 97;
+const DENY_NOT_ENFORCED: i32 = 97;
 const ALLOWED_SYSCALL_FAILED: i32 = 98;
 const UNEXPECTED_APPLY_ERROR: i32 = 99;
-const TEST_NAME: &str = "seccomp_filter_enforces_policy";
+const TEST_NAME: &str = "seccomp_denylist_blocks_dangerous_syscalls";
 
+// The Docker-parity denylist blocks a dangerous syscall with EPERM (not a kill)
+// and leaves ordinary syscalls untouched. This re-executes the test binary as a
+// child, installs the Enforce filter, and checks both halves of that contract.
 #[test]
-fn seccomp_filter_enforces_policy() {
+fn seccomp_denylist_blocks_dangerous_syscalls() {
     if let Ok(mode) = env::var(CHILD_ENV) {
         run_child(&mode);
     }
@@ -30,7 +32,7 @@ fn seccomp_filter_enforces_policy() {
     assert_eq!(
         allowed.code(),
         Some(0),
-        "allowed syscall child failed with {allowed:?}"
+        "an allowed syscall failed under the filter: {allowed:?}"
     );
 
     let denied = spawn_child(CHILD_DENIED);
@@ -38,15 +40,10 @@ fn seccomp_filter_enforces_policy() {
         eprintln!("skipping seccomp integration test: seccomp is unavailable");
         return;
     }
-    assert_ne!(
-        denied.code(),
-        Some(FILTER_DID_NOT_KILL),
-        "denied mount syscall returned after filter installation"
-    );
     assert_eq!(
-        denied.signal(),
-        Some(libc::SIGSYS),
-        "denied syscall child was not terminated by SIGSYS: {denied:?}"
+        denied.code(),
+        Some(0),
+        "mount was not blocked with EPERM under the filter: {denied:?}"
     );
 }
 
@@ -64,8 +61,8 @@ fn run_child(mode: &str) -> ! {
     let plan =
         SeccompPlan::new(FilterMode::Enforce).expect("enforce seccomp filter should compile");
 
-    // SAFETY: This process was re-executed for the child path, and the test invokes apply
-    // immediately before exercising the filtered syscall surface.
+    // SAFETY: this process was re-executed for the child path, and apply is
+    // called immediately before exercising the filtered syscall surface.
     match unsafe { plan.apply() } {
         Ok(()) => {}
         Err(errno) if errno == libc::ENOSYS || errno == libc::EINVAL => {
@@ -80,24 +77,21 @@ fn run_child(mode: &str) -> ! {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-
-            // SAFETY: now points to writable storage for a timespec, and clock_gettime is
-            // invoked with a valid clock identifier.
+            // SAFETY: `now` is writable storage for a timespec and the clock id
+            // is valid. clock_gettime is not on the denylist, so it must work.
             let result = unsafe {
                 libc::syscall(libc::SYS_clock_gettime, libc::CLOCK_MONOTONIC, &raw mut now)
             };
             if result != 0 {
                 process::exit(ALLOWED_SYSCALL_FAILED);
             }
-
             process::exit(0);
         }
         CHILD_DENIED => {
             let null_arg: libc::c_ulong = 0;
-
-            // SAFETY: Null arguments are valid for probing mount. The syscall should be
-            // intercepted by seccomp before the kernel examines them.
-            unsafe {
+            // SAFETY: null arguments are valid for probing mount; the filter
+            // intercepts the call before the kernel inspects them.
+            let result = unsafe {
                 libc::syscall(
                     libc::SYS_mount,
                     null_arg,
@@ -105,10 +99,16 @@ fn run_child(mode: &str) -> ! {
                     null_arg,
                     null_arg,
                     null_arg,
-                );
+                )
+            };
+            // Enforce mode denies with EPERM: the call returns -1 and never
+            // reaches the kernel's mount implementation.
+            let denied_with_eperm = result == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if denied_with_eperm {
+                process::exit(0);
             }
-
-            process::exit(FILTER_DID_NOT_KILL);
+            process::exit(DENY_NOT_ENFORCED);
         }
         _ => process::exit(UNEXPECTED_APPLY_ERROR),
     }
