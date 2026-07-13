@@ -1,10 +1,9 @@
-//! Cage egress networking: addressing and per-cage nftables policy.
+//! Cage egress networking: addressing, per-cage nftables policy, and host NAT.
 //!
-//! This is the pure model behind spec §7 — deterministic per-app addressing on
-//! the node's CGNAT bridge, and the nftables ruleset that encodes each cage's
-//! egress policy. Creating the veth pair, attaching the bridge, configuring the
-//! host NAT, and loading the ruleset live in the boot path and land in a
-//! following slice; everything here is host-independent and unit-tested.
+//! Spec §7. Addressing and the per-cage policy ruleset are pure and
+//! unit-tested; the veth fabric, the host bridge, the host NAT masquerade, and
+//! loading the ruleset run during boot. The host-side DNS forwarder and
+//! `resolv.conf` wiring are the remaining deferred pieces.
 //!
 //! The policy is enforced in the cage's own network namespace as an output
 //! chain with a default-drop policy, so containment is by construction: a rule
@@ -26,6 +25,8 @@ pub const BRIDGE_NAME: &str = "cygnus0";
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 /// Prefix length of the cage subnet, `100.64.0.0/16`.
 pub const SUBNET_PREFIX: u8 = 16;
+/// Network address of the cage subnet.
+pub const SUBNET_BASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 /// Interface name the peer veth end takes inside the cage.
 pub const CAGE_INTERFACE: &str = "eth0";
 
@@ -129,6 +130,24 @@ pub fn nftables_ruleset(cage_ip: Ipv4Addr, mode: &EgressMode) -> Option<String> 
     Some(script)
 }
 
+/// The host NAT ruleset: masquerade cage-subnet traffic leaving the node so it
+/// can reach the internet, with return traffic tracked back to the cage.
+///
+/// Written as flush-and-recreate so repeated cage boots never stack duplicate
+/// rules: the table is ensured to exist, deleted, then defined fresh.
+fn nat_ruleset() -> String {
+    format!(
+        "table ip cygnus_nat {{}}\n\
+         delete table ip cygnus_nat\n\
+         table ip cygnus_nat {{\n\
+         \tchain postrouting {{\n\
+         \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
+         \t\tip saddr {SUBNET_BASE}/{SUBNET_PREFIX} masquerade\n\
+         \t}}\n\
+         }}\n"
+    )
+}
+
 /// Temporary host-side name of the cage-side veth end, before it is moved into
 /// the cage netns and renamed to [`CAGE_INTERFACE`]. Distinct from the bridge
 /// end so both can exist briefly in the host namespace.
@@ -137,9 +156,9 @@ fn peer_veth_name(name: &str) -> String {
 }
 
 /// Idempotent host bridge setup: the `cygnus0` bridge, the gateway address, and
-/// bringing it up. NAT masquerade and IP forwarding are node provisioning and
-/// land with the DNS slice; this establishes only the local L2/L3 fabric the
-/// cage veths attach to.
+/// bringing it up. IP forwarding and the NAT masquerade are handled by
+/// [`ensure_host_nat`]; this establishes only the local L2/L3 fabric the cage
+/// veths attach to.
 fn bridge_setup_commands() -> Vec<Vec<String>> {
     vec![
         argv(&["ip", "link", "add", "name", BRIDGE_NAME, "type", "bridge"]),
@@ -207,9 +226,21 @@ pub(crate) fn ensure_bridge() -> Result<(), CageError> {
     Ok(())
 }
 
-/// Attach a cage to the bridge, address its interface, and load its egress
-/// policy. Runs while the cage child is parked, so the network is ready before
-/// the app execs.
+/// Ensure the node forwards and masquerades cage traffic, so a cage with egress
+/// can reach the internet. Idempotent across boots.
+pub(crate) fn ensure_host_nat() -> Result<(), CageError> {
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").map_err(|source| {
+        CageError::Network {
+            operation: "enable IP forwarding".into(),
+            detail: source.to_string(),
+        }
+    })?;
+    nft_load(None, &nat_ruleset(), "load host NAT ruleset")
+}
+
+/// Attach a cage to the bridge, ensure host NAT, address its interface, and
+/// load its egress policy. Runs while the cage child is parked, so the network
+/// is ready before the app execs.
 pub(crate) fn configure_cage(
     name: &str,
     ip: Ipv4Addr,
@@ -217,11 +248,12 @@ pub(crate) fn configure_cage(
     mode: &EgressMode,
 ) -> Result<(), CageError> {
     ensure_bridge()?;
+    ensure_host_nat()?;
     for command in veth_setup_commands(name, ip, pid) {
         run(&command, "configure cage network")?;
     }
     if let Some(ruleset) = nftables_ruleset(ip, mode) {
-        load_ruleset(pid, &ruleset)?;
+        nft_load(Some(pid), &ruleset, "load cage nftables ruleset")?;
     }
     Ok(())
 }
@@ -234,34 +266,50 @@ pub(crate) fn delete_veth(interface: &str) -> Result<(), CageError> {
     })
 }
 
-fn load_ruleset(pid: i32, ruleset: &str) -> Result<(), CageError> {
-    let pid = pid.to_string();
-    let mut child = Command::new("nsenter")
-        .args(["-t", pid.as_str(), "-n", "--", "nft", "-f", "-"])
+/// Load an nftables script from stdin, either on the host (`netns_pid` is
+/// `None`) or inside a cage's network namespace (`Some(pid)`, via `nsenter`).
+fn nft_load(
+    netns_pid: Option<i32>,
+    script: &str,
+    operation: &'static str,
+) -> Result<(), CageError> {
+    let mut command = match netns_pid {
+        Some(pid) => {
+            let mut command = Command::new("nsenter");
+            command.args(["-t", &pid.to_string(), "-n", "--", "nft", "-f", "-"]);
+            command
+        }
+        None => {
+            let mut command = Command::new("nft");
+            command.args(["-f", "-"]);
+            command
+        }
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| CageError::Network {
-            operation: "spawn nft".into(),
-            detail: source.to_string(),
+            operation: operation.into(),
+            detail: format!("spawn nft: {source}"),
         })?;
     child
         .stdin
         .take()
         .expect("nft stdin was requested")
-        .write_all(ruleset.as_bytes())
+        .write_all(script.as_bytes())
         .map_err(|source| CageError::Network {
-            operation: "write nft ruleset".into(),
-            detail: source.to_string(),
+            operation: operation.into(),
+            detail: format!("write nft script: {source}"),
         })?;
     let output = child.wait_with_output().map_err(|source| CageError::Network {
-        operation: "run nft".into(),
-        detail: source.to_string(),
+        operation: operation.into(),
+        detail: format!("run nft: {source}"),
     })?;
     if !output.status.success() {
         return Err(CageError::Network {
-            operation: "load nftables ruleset".into(),
+            operation: operation.into(),
             detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
@@ -385,6 +433,15 @@ mod tests {
         assert!(joined.iter().any(|c| c == "ip link add name cygnus0 type bridge"));
         assert!(joined.iter().any(|c| c == "ip addr add 100.64.0.1/16 dev cygnus0"));
         assert!(joined.iter().any(|c| c == "ip link set cygnus0 up"));
+    }
+
+    #[test]
+    fn nat_masquerades_the_cage_subnet() {
+        let script = nat_ruleset();
+        assert!(script.contains("ip saddr 100.64.0.0/16 masquerade"));
+        assert!(script.contains("type nat hook postrouting"));
+        // Flush-and-recreate keeps repeated boots from stacking rules.
+        assert!(script.contains("delete table ip cygnus_nat"));
     }
 
     #[test]
