@@ -164,11 +164,11 @@ fn mmap_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
 
 fn ioctl_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
     [
-        libc::FIONBIO as u64,
-        libc::FIONREAD as u64,
-        libc::FIOCLEX as u64,
-        libc::FIONCLEX as u64,
-        libc::TCGETS as u64,
+        libc::FIONBIO,
+        libc::FIONREAD,
+        libc::FIOCLEX,
+        libc::FIONCLEX,
+        libc::TCGETS,
     ]
     .into_iter()
     .map(|request| equality_rule(1, request))
