@@ -4,8 +4,9 @@
 //! establishes the boot path with Linux namespaces and cgroups v2, a private
 //! mount tree, an optional overlay root the cage pivots into, a `procfs` bound
 //! to the cage's own PID namespace, and an optional seccomp filter installed
-//! immediately before `execve`. Networking and long-lived supervision are
-//! added by later slices.
+//! immediately before `execve`. Egress addressing and per-cage nftables policy
+//! are modelled in [`net`]; wiring the veth and loading the policy, plus
+//! long-lived supervision, are added by later slices.
 //!
 //! On non-Linux hosts the same API boots the target as a plain child
 //! process with no isolation; the platform runs identically, minus the cage
@@ -16,6 +17,8 @@ mod error;
 mod linux;
 #[cfg(target_os = "linux")]
 mod mount;
+#[cfg(target_os = "linux")]
+pub mod net;
 #[cfg(not(target_os = "linux"))]
 mod process;
 #[cfg(target_os = "linux")]
@@ -32,7 +35,7 @@ pub use seccomp::{SeccompPlan, allowlisted_syscalls};
 pub use spec::{
     BootTimings, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
     DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,
-    DEFAULT_ROOTFS_TMPFS_SIZE, FilterMode, RootfsSpec,
+    DEFAULT_ROOTFS_TMPFS_SIZE, EgressMode, EgressRule, FilterMode, RootfsSpec,
 };
 
 /// Isolation provided by the cage backend compiled for this platform.
