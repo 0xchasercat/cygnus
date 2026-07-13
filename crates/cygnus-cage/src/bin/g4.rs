@@ -199,7 +199,7 @@ mod linux_harness {
         ]
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct CommandResult {
         command: String,
         outcome: Outcome,
@@ -272,7 +272,9 @@ mod linux_harness {
                 if errno == libc::EINTR {
                     continue;
                 }
-                return Err(format!("waitpid failed for child {child_pid}: errno {errno}"));
+                return Err(format!(
+                    "waitpid failed for child {child_pid}: errno {errno}"
+                ));
             }
             if Instant::now() >= deadline {
                 kill_and_reap(child_pid)?;
@@ -402,14 +404,14 @@ mod linux_harness {
             Outcome::SeccompUnavailable => {
                 format!("INCONCLUSIVE (exit {CHILD_SECCOMP_UNAVAILABLE}; seccomp unavailable)")
             }
-            Outcome::HarnessError { exit_code: CHILD_EXEC_FAILED } => {
+            Outcome::HarnessError {
+                exit_code: CHILD_EXEC_FAILED,
+            } => {
                 format!("INCONCLUSIVE (exit {CHILD_EXEC_FAILED}; exec failed)")
             }
             Outcome::HarnessError {
                 exit_code: CHILD_FILTER_FAILED,
-            } => format!(
-                "INCONCLUSIVE (exit {CHILD_FILTER_FAILED}; filter installation failed)"
-            ),
+            } => format!("INCONCLUSIVE (exit {CHILD_FILTER_FAILED}; filter installation failed)"),
             Outcome::HarnessError { exit_code } => {
                 format!("INCONCLUSIVE (unrecognized wait status {exit_code})")
             }
@@ -468,8 +470,8 @@ mod linux_harness {
 
         #[test]
         fn builds_null_terminated_argv() {
-            let command = PreparedCommand::new(&OsString::from("/bin/echo hello"))
-                .expect("valid command");
+            let command =
+                PreparedCommand::new(&OsString::from("/bin/echo hello")).expect("valid command");
 
             assert_eq!(command.argument_pointers.len(), 3);
             assert!(command.argument_pointers[2].is_null());
@@ -490,7 +492,7 @@ mod linux_harness {
                 outcome: Outcome::SeccompUnavailable,
             };
 
-            assert_eq!(gate_exit_code(&[pass]), ExitCode::SUCCESS);
+            assert_eq!(gate_exit_code(std::slice::from_ref(&pass)), ExitCode::SUCCESS);
             assert_eq!(gate_exit_code(&[unavailable]), ExitCode::from(2));
             assert_eq!(gate_exit_code(&[pass, violation]), ExitCode::from(1));
         }
