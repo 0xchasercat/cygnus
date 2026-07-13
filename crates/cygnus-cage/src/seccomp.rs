@@ -185,7 +185,9 @@ fn equality_rule(argument: u8, value: u64) -> Result<SeccompRule, seccompiler::E
 }
 
 fn masked_rule(argument: u8, mask: u64, value: u64) -> Result<SeccompRule, seccompiler::Error> {
-    Ok(SeccompRule::new(vec![masked_condition(argument, mask, value)?])?)
+    Ok(SeccompRule::new(vec![masked_condition(
+        argument, mask, value,
+    )?])?)
 }
 
 fn masked_condition(
