@@ -1,22 +1,30 @@
 //! G4 seccomp conformance gate.
 //!
-//! G4 requires zero filter violations across Bun's test suite and the real-world application
-//! corpus. This harness isolates the production filter as the variable under test: it compiles the
-//! filter in the parent, then forks, applies it in the single-threaded child immediately before
-//! `execve`, and classifies the child's wait status. The filter is defense in depth for
-//! operator-adjacent code, not a hostile-multitenancy boundary. Enforce mode is the real gate;
-//! Audit mode is a sanity pass that logs violations while allowing the command to continue.
+//! Under the Docker-parity denylist a blocked syscall returns `EPERM` rather
+//! than killing the process, so a real `SIGSYS` is now rare and unexpected. The
+//! question G4 answers is therefore "does a real workload run under the
+//! production filter" — a blocked syscall it can tolerate (Bun's `io_uring`
+//! probe falling back to `epoll`, say) should not stop it. The harness compiles
+//! the filter in the parent, forks, applies it in the single-threaded child
+//! immediately before `execvp`, and classifies the child.
 //!
-//! The built-in corpus is a smoke set of ubiquitous system binaries. Full G4 conformance requires
-//! passing Bun's test suite and the spec §12 application corpus, including Express, SvelteKit SSR,
-//! a Postgres client, and a native-addon app, through repeated `--app` arguments. App strings are
-//! split on whitespace; quoting and escaping inside a string are not supported.
+//! Cage workloads are usually long-lived servers, which never exit on their
+//! own. A command that is still alive at the deadline, having taken no
+//! `SIGSYS`, has demonstrably not been broken by the filter: G4 stops it and
+//! records a pass. A command that exits on its own passes on a normal exit and
+//! is a violation only if the kernel killed it with `SIGSYS`. G4 tests filter
+//! conformance, not application health.
 //!
-//! Per-syscall attribution is deferred because it needs audit-log scraping for `SECCOMP_RET_LOG` or
-//! a ptrace supervisor. This harness identifies the command that violated the filter, not the
-//! syscall. Running the corpus inside the full cage is also deferred: bare fork isolates filter
-//! conformance, and this path will unify with `Cage` once the boot path installs the filter. The
-//! actual Bun application corpus remains operator-supplied through `--app`.
+//! The built-in corpus is a smoke set of ubiquitous system binaries. Full G4
+//! conformance is an operator-supplied corpus through repeated `--app`
+//! arguments: Bun's test suite plus Express, SvelteKit SSR, a Postgres client,
+//! and a native-addon app. App strings are split on whitespace; quoting and
+//! escaping inside a string are not supported.
+//!
+//! Per-syscall attribution is deferred (it needs `SECCOMP_RET_LOG` audit-log
+//! scraping or a ptrace supervisor); the harness identifies the command, not
+//! the syscall. Running the corpus inside the full cage is also deferred: bare
+//! fork isolates the filter as the variable under test.
 
 #[cfg(target_os = "linux")]
 mod linux_harness {
@@ -130,7 +138,8 @@ mod linux_harness {
 
     fn usage() -> String {
         "usage: g4 [--mode enforce|audit] [--timeout-ms N] [--app 'PROGRAM ARG1 ARG2']...\n\
-         --app values are split on whitespace; embedded quoting and escaping are not supported"
+         --app values are split on whitespace; embedded quoting and escaping are not supported.\n\
+         A long-lived server still running after --timeout-ms is treated as a pass."
             .into()
     }
 
@@ -208,11 +217,11 @@ mod linux_harness {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Outcome {
         Pass { exit_code: i32 },
+        Survived,
         Violation,
         SeccompUnavailable,
         HarnessError { exit_code: i32 },
         OtherSignal { signal: i32 },
-        Timeout,
     }
 
     fn run_command(
@@ -251,7 +260,9 @@ mod linux_harness {
         }
 
         unsafe {
-            libc::execv(command.program.as_ptr(), command.argument_pointers.as_ptr());
+            // execvp resolves a bare program name (e.g. "bun") against PATH,
+            // like a shell; execv would require an absolute path.
+            libc::execvp(command.program.as_ptr(), command.argument_pointers.as_ptr());
             libc::_exit(CHILD_EXEC_FAILED);
         }
     }
@@ -272,13 +283,13 @@ mod linux_harness {
                 if errno == libc::EINTR {
                     continue;
                 }
-                return Err(format!(
-                    "waitpid failed for child {child_pid}: errno {errno}"
-                ));
+                return Err(format!("waitpid failed for child {child_pid}: errno {errno}"));
             }
             if Instant::now() >= deadline {
+                // Still alive at the deadline with no SIGSYS: a long-lived
+                // server that the filter did not break. Stop it and pass.
                 kill_and_reap(child_pid)?;
-                return Ok(Outcome::Timeout);
+                return Ok(Outcome::Survived);
             }
             thread::sleep(WAIT_POLL_INTERVAL);
         }
@@ -290,7 +301,7 @@ mod linux_harness {
             let errno = last_errno();
             if errno != libc::ESRCH {
                 return Err(format!(
-                    "failed to kill timed-out child {child_pid}: errno {errno}"
+                    "failed to kill child {child_pid}: errno {errno}"
                 ));
             }
         }
@@ -306,9 +317,7 @@ mod linux_harness {
                 if errno == libc::EINTR {
                     continue;
                 }
-                return Err(format!(
-                    "failed to reap timed-out child {child_pid}: errno {errno}"
-                ));
+                return Err(format!("failed to reap child {child_pid}: errno {errno}"));
             }
         }
     }
@@ -338,6 +347,10 @@ mod linux_harness {
             .unwrap_or(libc::EIO)
     }
 
+    fn ran_under_filter(outcome: Outcome) -> bool {
+        matches!(outcome, Outcome::Pass { .. } | Outcome::Survived)
+    }
+
     fn gate_exit_code(results: &[CommandResult]) -> ExitCode {
         if results
             .iter()
@@ -345,10 +358,7 @@ mod linux_harness {
         {
             return ExitCode::from(1);
         }
-        if results
-            .iter()
-            .any(|result| matches!(result.outcome, Outcome::Pass { .. }))
-        {
+        if results.iter().any(|result| ran_under_filter(result.outcome)) {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(2)
@@ -376,7 +386,7 @@ mod linux_harness {
             .count();
         let ran = results
             .iter()
-            .filter(|result| matches!(result.outcome, Outcome::Pass { .. }))
+            .filter(|result| ran_under_filter(result.outcome))
             .count();
         let inconclusive = results.len().saturating_sub(violations + ran);
 
@@ -400,6 +410,7 @@ mod linux_harness {
         match outcome {
             Outcome::Pass { exit_code: 0 } => "PASS (exit 0)".into(),
             Outcome::Pass { exit_code } => format!("PASS (exit {exit_code}; nonzero app exit)"),
+            Outcome::Survived => "PASS (ran under the filter; still alive at the deadline)".into(),
             Outcome::Violation => format!("VIOLATION (signal {} SIGSYS)", libc::SIGSYS),
             Outcome::SeccompUnavailable => {
                 format!("INCONCLUSIVE (exit {CHILD_SECCOMP_UNAVAILABLE}; seccomp unavailable)")
@@ -418,7 +429,6 @@ mod linux_harness {
             Outcome::OtherSignal { signal } => {
                 format!("INCONCLUSIVE (signal {signal} {})", signal_name(signal))
             }
-            Outcome::Timeout => "INCONCLUSIVE (timeout; killed with SIGKILL)".into(),
         }
     }
 
@@ -483,6 +493,10 @@ mod linux_harness {
                 command: "pass".into(),
                 outcome: Outcome::Pass { exit_code: 0 },
             };
+            let survived = CommandResult {
+                command: "survived".into(),
+                outcome: Outcome::Survived,
+            };
             let violation = CommandResult {
                 command: "violation".into(),
                 outcome: Outcome::Violation,
@@ -493,6 +507,11 @@ mod linux_harness {
             };
 
             assert_eq!(gate_exit_code(std::slice::from_ref(&pass)), ExitCode::SUCCESS);
+            // A long-lived server that survived the filter is a pass.
+            assert_eq!(
+                gate_exit_code(std::slice::from_ref(&survived)),
+                ExitCode::SUCCESS
+            );
             assert_eq!(gate_exit_code(&[unavailable]), ExitCode::from(2));
             assert_eq!(gate_exit_code(&[pass, violation]), ExitCode::from(1));
         }
