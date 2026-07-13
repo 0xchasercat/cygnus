@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/cygnus-cage",
+    "crates/cygnus-init",
     "crates/cygnus-proxy",
 ]
 
