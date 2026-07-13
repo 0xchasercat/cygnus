@@ -36,6 +36,39 @@ pub enum FilterMode {
     Audit,
 }
 
+/// A single allowance in `EgressMode::Restricted`.
+///
+/// Traffic to `cidr` is permitted; an empty `ports` list allows every
+/// destination port, otherwise only the listed ports (TCP or UDP) are allowed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EgressRule {
+    /// Destination network in CIDR form, e.g. `203.0.113.0/24`.
+    pub cidr: String,
+    /// Allowed destination ports; empty means all ports.
+    pub ports: Vec<u16>,
+}
+
+/// Per-cage egress policy, enforced with nftables in the cage's network
+/// namespace (spec §7).
+///
+/// Ingress is independent and always available over the UDS, so a cage with
+/// `None` still serves traffic. `Public` is SSRF-contained by default:
+/// RFC1918, link-local (cloud metadata), the node's own addresses, and the
+/// bridge subnet (no cage-to-cage) are denied; the public internet and the
+/// host DNS forwarder are allowed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EgressMode {
+    /// No veth at all: pure compute, no outbound network.
+    None,
+    /// Deny by default; allow only the listed destinations, plus DNS.
+    Restricted { allow: Vec<EgressRule> },
+    /// The public internet, with private ranges and metadata denied.
+    Public,
+    /// Public plus RFC1918, for apps that reach LAN services. Explicit opt-in;
+    /// metadata and the bridge subnet stay denied.
+    Open,
+}
+
 /// Resource limits written to a cage's cgroup v2 controls.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CgroupLimits {
@@ -101,6 +134,9 @@ pub struct CageSpec {
     /// `None` boots without a filter. The Linux backend honors this; the
     /// plain-process backend ignores it.
     pub seccomp: Option<FilterMode>,
+    /// Egress network policy. The Linux backend wires the veth and nftables;
+    /// the plain-process backend ignores it.
+    pub egress: EgressMode,
     pub readiness_uds: Option<PathBuf>,
     pub readiness_timeout: Duration,
 }
@@ -116,6 +152,7 @@ impl CageSpec {
             limits: CgroupLimits::default(),
             rootfs: None,
             seccomp: None,
+            egress: EgressMode::None,
             readiness_uds: None,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
@@ -184,6 +221,11 @@ impl CageSpec {
                 ));
             }
         }
+        if let EgressMode::Restricted { allow } = &self.egress {
+            for rule in allow {
+                validate_cidr(&rule.cidr)?;
+            }
+        }
         for key in self.env.keys() {
             let bytes = key.as_os_str().as_bytes();
             if bytes.is_empty() || bytes.contains(&b'=') {
@@ -229,6 +271,26 @@ fn validate_overlay_path(path: &Path, label: &str) -> Result<(), CageError> {
     Ok(())
 }
 
+/// Validate an IPv4 CIDR of the form `A.B.C.D/P` with `0 <= P <= 32`.
+fn validate_cidr(cidr: &str) -> Result<(), CageError> {
+    let Some((address, prefix)) = cidr.split_once('/') else {
+        return Err(CageError::InvalidSpec(format!(
+            "egress CIDR {cidr:?} must be in A.B.C.D/prefix form"
+        )));
+    };
+    if address.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(CageError::InvalidSpec(format!(
+            "egress CIDR {cidr:?} has an invalid IPv4 address"
+        )));
+    }
+    match prefix.parse::<u8>() {
+        Ok(bits) if bits <= 32 => Ok(()),
+        _ => Err(CageError::InvalidSpec(format!(
+            "egress CIDR {cidr:?} prefix must be between 0 and 32"
+        ))),
+    }
+}
+
 pub(crate) fn validate_name(name: &str) -> Result<(), CageError> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -268,6 +330,40 @@ mod tests {
         assert_eq!(spec.limits.cpu_period, 100_000);
         assert_eq!(spec.limits.pids_max, 128);
         assert!(spec.seccomp.is_none());
+        assert_eq!(spec.egress, EgressMode::None);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_checks_restricted_egress_cidrs() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+
+        spec.egress = EgressMode::Restricted {
+            allow: vec![EgressRule {
+                cidr: "203.0.113.0/24".into(),
+                ports: vec![443],
+            }],
+        };
+        assert!(spec.validate().is_ok());
+
+        spec.egress = EgressMode::Restricted {
+            allow: vec![EgressRule {
+                cidr: "203.0.113.0".into(),
+                ports: Vec::new(),
+            }],
+        };
+        assert!(spec.validate().is_err(), "accepted a CIDR without a prefix");
+
+        spec.egress = EgressMode::Restricted {
+            allow: vec![EgressRule {
+                cidr: "203.0.113.0/33".into(),
+                ports: Vec::new(),
+            }],
+        };
+        assert!(spec.validate().is_err(), "accepted an out-of-range prefix");
+
+        // Public and Open carry no rules to validate.
+        spec.egress = EgressMode::Open;
         assert!(spec.validate().is_ok());
     }
 
