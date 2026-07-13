@@ -138,6 +138,13 @@ pub struct CageSpec {
     /// Egress network policy. The Linux backend wires the veth and nftables;
     /// the plain-process backend ignores it.
     pub egress: EgressMode,
+    /// Optional static PID-1 init to exec as the cage's first process, with the
+    /// command and its arguments passed through to it. The init reaps orphaned
+    /// descendants and forwards signals — the correct behaviour for PID 1.
+    /// `None` execs the command directly. The path is exec'd verbatim, so it
+    /// must resolve inside the cage's filesystem view. Honored by the Linux
+    /// backend; the plain-process backend ignores it.
+    pub init: Option<PathBuf>,
     pub readiness_uds: Option<PathBuf>,
     pub readiness_timeout: Duration,
 }
@@ -154,6 +161,7 @@ impl CageSpec {
             rootfs: None,
             seccomp: Some(FilterMode::Enforce),
             egress: EgressMode::None,
+            init: None,
             readiness_uds: None,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
@@ -226,6 +234,13 @@ impl CageSpec {
             for rule in allow {
                 validate_cidr(&rule.cidr)?;
             }
+        }
+        if let Some(init) = &self.init
+            && !init.is_absolute()
+        {
+            return Err(CageError::InvalidSpec(
+                "init path must be absolute; it is exec'd inside the cage".into(),
+            ));
         }
         for key in self.env.keys() {
             let bytes = key.as_os_str().as_bytes();
@@ -336,6 +351,17 @@ mod tests {
         // Sandboxed out of the box, like a Docker container.
         assert_eq!(spec.seccomp, Some(FilterMode::Enforce));
         assert_eq!(spec.egress, EgressMode::None);
+        assert!(spec.init.is_none());
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_requires_an_absolute_init_path() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        spec.init = Some(PathBuf::from("cygnus-init"));
+        assert!(spec.validate().is_err(), "accepted a relative init path");
+
+        spec.init = Some(PathBuf::from("/usr/bin/cygnus-init"));
         assert!(spec.validate().is_ok());
     }
 
