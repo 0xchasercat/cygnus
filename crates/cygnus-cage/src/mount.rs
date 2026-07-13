@@ -35,7 +35,10 @@ impl StagedRootfs {
         let base = rootfs.staging_dir.clone().unwrap_or_else(env::temp_dir);
         let staging = base.join(format!("cygnus-cage-{name}"));
         let staging_bytes = staging.as_os_str().as_bytes();
-        if staging_bytes.iter().any(|&byte| matches!(byte, b':' | b',' | b'\\' | 0)) {
+        if staging_bytes
+            .iter()
+            .any(|&byte| matches!(byte, b':' | b',' | b'\\' | 0))
+        {
             return Err(CageError::InvalidSpec(format!(
                 "rootfs staging path {staging:?} contains bytes that cannot appear in overlay \
                  mount options"
@@ -385,7 +388,10 @@ mod tests {
 
         let staging = base.join("cygnus-cage-app");
         let merged = staging.join("merged");
-        assert_eq!(overlay.tmpfs_target.to_bytes(), staging.as_os_str().as_bytes());
+        assert_eq!(
+            overlay.tmpfs_target.to_bytes(),
+            staging.as_os_str().as_bytes()
+        );
         assert_eq!(overlay.merged.to_bytes(), merged.as_os_str().as_bytes());
         assert_eq!(
             overlay.put_old.to_bytes(),

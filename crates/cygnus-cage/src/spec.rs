@@ -194,7 +194,10 @@ fn validate_overlay_path(path: &Path, label: &str) -> Result<(), CageError> {
         return Err(CageError::InvalidSpec(format!("{label} must be absolute")));
     }
     let bytes = path.as_os_str().as_bytes();
-    if bytes.iter().any(|&byte| matches!(byte, b':' | b',' | b'\\' | 0)) {
+    if bytes
+        .iter()
+        .any(|&byte| matches!(byte, b':' | b',' | b'\\' | 0))
+    {
         return Err(CageError::InvalidSpec(format!(
             "{label} must not contain ':', ',', '\\', or NUL bytes; they cannot be expressed in \
              overlay mount options"
@@ -311,10 +314,16 @@ mod tests {
     #[test]
     fn validation_requires_an_absolute_command_with_a_rootfs() {
         let mut spec = CageSpec::new("example", "true");
-        assert!(spec.validate().is_ok(), "PATH lookup is fine without a rootfs");
+        assert!(
+            spec.validate().is_ok(),
+            "PATH lookup is fine without a rootfs"
+        );
 
         spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
-        assert!(spec.validate().is_err(), "PATH lookup cannot resolve inside the overlay root");
+        assert!(
+            spec.validate().is_err(),
+            "PATH lookup cannot resolve inside the overlay root"
+        );
     }
 
     #[test]
