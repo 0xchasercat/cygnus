@@ -1,0 +1,9 @@
+[package]
+name = "cygnus-supervisor"
+description = "Cage lifecycle supervision: scale-to-zero, restart backoff, crash-loop detection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
