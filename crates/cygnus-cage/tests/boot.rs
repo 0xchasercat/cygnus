@@ -12,6 +12,9 @@ fn boots_and_tears_down_with_exec_readiness() {
     let mut spec = CageSpec::new(&name, "/bin/sleep");
     spec.args.push(OsString::from("30"));
     spec.env = env::vars_os().collect();
+    // This test exercises the no-filter path explicitly, independent of the
+    // default; the default (Enforce) filter has its own test below.
+    spec.seccomp = None;
 
     let cage = match Cage::boot(spec) {
         Ok(cage) => cage,
@@ -52,6 +55,7 @@ fn overlay_rootfs_contains_writes_and_pivots_proc() {
     // The host root as the single read-only lower layer: the merged tree
     // looks like the host, but every write lands in the cage-private tmpfs.
     spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/")]));
+    spec.seccomp = None;
 
     let cage = match Cage::boot(spec) {
         Ok(cage) => cage,
@@ -91,6 +95,7 @@ fn rootfs_is_inert_on_the_plain_process_backend() {
     spec.args.push(OsString::from("30"));
     spec.env = env::vars_os().collect();
     spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/")]));
+    spec.seccomp = None;
 
     let cage = Cage::boot(spec).expect("plain process boot");
     assert_eq!(cage.timings().mounts, Duration::ZERO);
@@ -99,10 +104,35 @@ fn rootfs_is_inert_on_the_plain_process_backend() {
     }
 }
 
-// The audit filter allows every syscall while installing the full BPF program,
-// so this exercises the boot-path wiring end to end without risking a SIGSYS
-// on a syscall the allowlist has yet to be validated against. Enforce-mode
-// killing is covered directly in tests/seccomp.rs.
+// The default cage installs the Enforce denylist. A normal target runs fine
+// under it (the denylist only blocks dangerous syscalls), so this confirms the
+// out-of-the-box sandbox does not break an ordinary boot.
+#[cfg(target_os = "linux")]
+#[test]
+fn boots_under_the_default_enforce_filter() {
+    let name = unique_name("seccomp-default");
+    let mut spec = CageSpec::new(&name, "/bin/sleep");
+    spec.args.push(OsString::from("30"));
+    spec.env = env::vars_os().collect();
+    // Leave spec.seccomp at its default of Some(FilterMode::Enforce).
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error) if environment_unavailable(&error) || seccomp_unavailable(&error) => {
+            eprintln!("skipping default seccomp boot test: {error}");
+            return;
+        }
+        Err(error) => panic!("cage boot failed: {error}"),
+    };
+
+    assert!(cage.host_pid().is_some_and(|pid| pid > 0));
+    if let Err(error) = cage.teardown() {
+        panic!("cage teardown failed: {error}");
+    }
+}
+
+// Audit mode installs the same denylist but logs blocked syscalls instead of
+// failing them, for observing a workload before enforcing.
 #[cfg(target_os = "linux")]
 #[test]
 fn boots_under_an_audit_seccomp_filter() {
@@ -166,6 +196,7 @@ time.sleep(30)
         socket_path.as_os_str().to_os_string(),
     );
     spec.readiness_uds = Some(socket_path.clone());
+    spec.seccomp = None;
 
     let cage = match Cage::boot(spec) {
         Ok(cage) => cage,
