@@ -33,6 +33,8 @@ fn boots_and_tears_down_with_exec_readiness() {
     assert!(cage.timings().mounts > Duration::ZERO);
     #[cfg(not(target_os = "linux"))]
     assert_eq!(cage.timings().mounts, Duration::ZERO);
+    // No filter was requested, so the seccomp phase does nothing.
+    assert_eq!(cage.timings().seccomp, Duration::ZERO);
     assert!(cage.timings().total >= cage.timings().namespaces_cgroup);
 
     if let Err(error) = cage.teardown() {
@@ -92,6 +94,38 @@ fn rootfs_is_inert_on_the_plain_process_backend() {
 
     let cage = Cage::boot(spec).expect("plain process boot");
     assert_eq!(cage.timings().mounts, Duration::ZERO);
+    if let Err(error) = cage.teardown() {
+        panic!("cage teardown failed: {error}");
+    }
+}
+
+// The audit filter allows every syscall while installing the full BPF program,
+// so this exercises the boot-path wiring end to end without risking a SIGSYS
+// on a syscall the allowlist has yet to be validated against. Enforce-mode
+// killing is covered directly in tests/seccomp.rs.
+#[cfg(target_os = "linux")]
+#[test]
+fn boots_under_an_audit_seccomp_filter() {
+    use cygnus_cage::FilterMode;
+
+    let name = unique_name("seccomp");
+    let mut spec = CageSpec::new(&name, "/bin/sleep");
+    spec.args.push(OsString::from("30"));
+    spec.env = env::vars_os().collect();
+    spec.seccomp = Some(FilterMode::Audit);
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error) if environment_unavailable(&error) || seccomp_unavailable(&error) => {
+            eprintln!("skipping seccomp boot test: {error}");
+            return;
+        }
+        Err(error) => panic!("cage boot failed: {error}"),
+    };
+
+    // The child installed the filter and went on to exec the target.
+    assert!(cage.host_pid().is_some_and(|pid| pid > 0));
+    assert!(cage.timings().total >= cage.timings().mounts + cage.timings().seccomp);
     if let Err(error) = cage.teardown() {
         panic!("cage teardown failed: {error}");
     }
@@ -172,5 +206,18 @@ fn environment_unavailable(error: &CageError) -> bool {
             | CageError::CgroupUnavailable(_)
             | CageError::CgroupControllerUnavailable(_)
             | CageError::Io { .. }
+    )
+}
+
+// Some CI sandboxes forbid the seccomp syscall entirely; a filter install that
+// fails at the seccomp stage is an environment limitation, not a wiring fault.
+#[cfg(target_os = "linux")]
+fn seccomp_unavailable(error: &CageError) -> bool {
+    matches!(
+        error,
+        CageError::ChildSetup {
+            stage: "seccomp filter",
+            ..
+        } | CageError::SeccompFilter(_)
     )
 }

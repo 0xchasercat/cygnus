@@ -18,6 +18,7 @@ use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
 use crate::error::CageError;
 use crate::mount::{MountPlan, StagedRootfs};
+use crate::seccomp::SeccompPlan;
 use crate::spec::{BootTimings, CageSpec, CgroupLimits};
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
@@ -27,7 +28,8 @@ const CHILD_ABORT: u8 = 2;
 const CHILD_ERROR_LEN: usize = 5;
 const CHILD_STAGE_RELEASE: u8 = 1;
 const CHILD_STAGE_MOUNT: u8 = 2;
-const CHILD_STAGE_EXEC: u8 = 3;
+const CHILD_STAGE_SECCOMP: u8 = 3;
+const CHILD_STAGE_EXEC: u8 = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A running cage and the measurements captured while it booted.
@@ -42,19 +44,27 @@ pub struct Cage {
 impl Cage {
     /// Boot a target in fresh user, mount, PID, UTS, IPC, and network
     /// namespaces, with a private mount tree, an optional overlay root the
-    /// cage pivots into, and a `procfs` bound to the cage's own PID
-    /// namespace.
+    /// cage pivots into, a `procfs` bound to the cage's own PID namespace, and
+    /// an optional seccomp filter installed immediately before `execve`.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
         spec.validate()?;
         let child_exec = ChildExec::new(&spec)?;
-        // Parent-side prework: the staging directory and every C string the
-        // child will touch are built before the clock starts and the clone
-        // happens. A failure past this point drops the staging directory.
+        // Parent-side prework: the staging directory, every mount C string, and
+        // the compiled seccomp program are built before the clock starts and
+        // the clone happens, so the child only fires raw syscalls on prebuilt
+        // data. A failure past this point drops the staging directory.
         let mut staging = match &spec.rootfs {
             Some(rootfs) => Some(StagedRootfs::create(&spec.name, rootfs)?),
             None => None,
         };
         let mount_plan = MountPlan::new(staging.as_ref())?;
+        let seccomp_plan = match spec.seccomp {
+            Some(mode) => Some(
+                SeccompPlan::new(mode)
+                    .map_err(|source| CageError::SeccompFilter(source.to_string()))?,
+            ),
+            None => None,
+        };
         let boot_started = Instant::now();
 
         let (release_read, release_write) = pipe2(OFlag::O_CLOEXEC)
@@ -63,29 +73,38 @@ impl Cage {
             .map_err(|source| CageError::nix("create exec status pipe", source))?;
         let (mount_read, mount_write) = pipe2(OFlag::O_CLOEXEC)
             .map_err(|source| CageError::nix("create mount status pipe", source))?;
+        let (seccomp_read, seccomp_write) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|source| CageError::nix("create seccomp status pipe", source))?;
         fcntl(&exec_read, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|source| CageError::nix("make exec status pipe nonblocking", source))?;
         fcntl(&mount_read, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|source| CageError::nix("make mount status pipe nonblocking", source))?;
+        fcntl(&seccomp_read, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            .map_err(|source| CageError::nix("make seccomp status pipe nonblocking", source))?;
 
         let parent_fds = ParentFds {
             release_write: release_write.as_raw_fd(),
             exec_read: exec_read.as_raw_fd(),
             mount_read: mount_read.as_raw_fd(),
+            seccomp_read: seccomp_read.as_raw_fd(),
         };
         let mut stack = vec![0_u8; CLONE_STACK_SIZE];
         let mut child_exec = Some(child_exec);
-        let mut mount_plan = Some(mount_plan);
+        let mut child_plan = Some(ChildPlan {
+            mounts: mount_plan,
+            seccomp: seccomp_plan,
+        });
         let mut channels = Some(ChildChannels {
             release_read,
             exec_write,
             mount_write,
+            seccomp_write,
         });
         let callback = Box::new(move || {
             let child = child_exec
                 .take()
                 .expect("clone callback invoked more than once");
-            let plan = mount_plan
+            let plan = child_plan
                 .take()
                 .expect("clone callback invoked more than once");
             let channels = channels
@@ -101,7 +120,8 @@ impl Cage {
             | CloneFlags::CLONE_NEWNET;
         // SAFETY: `stack` remains alive in the parent until clone returns. The
         // child callback performs only async-signal-safe descriptor I/O and
-        // raw mount syscalls before replacing itself with the target process.
+        // raw mount and seccomp syscalls before replacing itself with the
+        // target process.
         let pid = unsafe { clone(callback, &mut stack, flags, Some(nix::libc::SIGCHLD)) }
             .map_err(|source| CageError::NamespaceUnavailable { source })?;
 
@@ -140,6 +160,16 @@ impl Cage {
         )?;
         let mounts = mounts_started.elapsed();
 
+        let seccomp_started = Instant::now();
+        wait_for_child_stage(
+            &seccomp_read,
+            pid,
+            deadline,
+            spec.readiness_timeout,
+            "seccomp filter",
+        )?;
+        let seccomp = seccomp_started.elapsed();
+
         let exec_started = Instant::now();
         wait_for_child_stage(
             &exec_read,
@@ -161,6 +191,7 @@ impl Cage {
         let timings = BootTimings {
             namespaces_cgroup,
             mounts,
+            seccomp,
             exec_runtime_init,
             socket_ready,
             total: boot_started.elapsed(),
@@ -251,14 +282,22 @@ struct ParentFds {
     release_write: i32,
     exec_read: i32,
     mount_read: i32,
+    seccomp_read: i32,
 }
 
 /// Child-owned pipe ends used to receive the release signal and report the
-/// outcome of the mount and exec stages.
+/// outcome of the mount, seccomp, and exec stages.
 struct ChildChannels {
     release_read: OwnedFd,
     exec_write: OwnedFd,
     mount_write: OwnedFd,
+    seccomp_write: OwnedFd,
+}
+
+/// The prebuilt setup steps the child applies between clone and `execve`.
+struct ChildPlan {
+    mounts: MountPlan,
+    seccomp: Option<SeccompPlan>,
 }
 
 #[derive(Debug)]
@@ -337,7 +376,7 @@ fn cstring(value: &OsStr, message: &'static str) -> Result<CString, CageError> {
 
 fn child_main(
     child: ChildExec,
-    mounts: MountPlan,
+    plan: ChildPlan,
     channels: ChildChannels,
     parent_fds: ParentFds,
 ) -> isize {
@@ -348,12 +387,14 @@ fn child_main(
         nix::libc::close(parent_fds.release_write);
         nix::libc::close(parent_fds.exec_read);
         nix::libc::close(parent_fds.mount_read);
+        nix::libc::close(parent_fds.seccomp_read);
     }
 
     let ChildChannels {
         release_read,
         exec_write,
         mount_write,
+        seccomp_write,
     } = channels;
 
     // Release-stage failures are reported on the mount pipe, which the parent
@@ -385,12 +426,27 @@ fn child_main(
 
     // SAFETY: the maps are set, we hold CAP_SYS_ADMIN in the new user and mount
     // namespaces, and the plan touches only prebuilt pointers via raw syscalls.
-    if let Err(errno) = unsafe { mounts.apply() } {
+    if let Err(errno) = unsafe { plan.mounts.apply() } {
         write_child_error(&mount_write, CHILD_STAGE_MOUNT, errno);
         return 127;
     }
     // Closing the mount pipe signals the parent that mounts are ready.
     drop(mount_write);
+
+    // Seccomp installs after mounts and immediately before execve, so the
+    // mount family the filter denies is already spent. With no filter the
+    // stage is a no-op and the pipe closes at once.
+    if let Some(seccomp) = &plan.seccomp {
+        // SAFETY: the child is single-threaded here, mounts are complete, and
+        // apply issues only raw syscalls over the program compiled in the
+        // parent. No allocation or lock acquisition occurs.
+        if let Err(errno) = unsafe { seccomp.apply() } {
+            write_child_error(&seccomp_write, CHILD_STAGE_SECCOMP, errno);
+            return 127;
+        }
+    }
+    // Closing the seccomp pipe signals the parent that the filter is installed.
+    drop(seccomp_write);
 
     // Keep the CString storage alive while the pointer arrays are passed to
     // libc. No allocation or lock acquisition occurs after clone.
@@ -622,6 +678,7 @@ fn wait_for_child_stage(
                     let stage = match message[0] {
                         CHILD_STAGE_RELEASE => "parent release",
                         CHILD_STAGE_MOUNT => "filesystem setup",
+                        CHILD_STAGE_SECCOMP => "seccomp filter",
                         CHILD_STAGE_EXEC => "execve",
                         _ => return Err(CageError::MalformedChildStatus),
                     };
@@ -775,7 +832,12 @@ mod tests {
 
     #[test]
     fn child_stage_codes_are_distinct() {
-        let codes = [CHILD_STAGE_RELEASE, CHILD_STAGE_MOUNT, CHILD_STAGE_EXEC];
+        let codes = [
+            CHILD_STAGE_RELEASE,
+            CHILD_STAGE_MOUNT,
+            CHILD_STAGE_SECCOMP,
+            CHILD_STAGE_EXEC,
+        ];
         for (index, code) in codes.iter().enumerate() {
             assert!(!codes[index + 1..].contains(code));
         }
