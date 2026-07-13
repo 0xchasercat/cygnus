@@ -226,6 +226,11 @@ const ALLOWLISTED_SYSCALLS: &[i64] = &[
     libc::SYS_fsync,
     libc::SYS_fdatasync,
     libc::SYS_copy_file_range,
+    // sendfile stays x86_64-only for now: the aarch64 kernel provides it, but
+    // the libc crate does not expose SYS_sendfile there. Revisit with the raw
+    // number once the Bun corpus runs on aarch64 — Bun's static file
+    // responses use it.
+    #[cfg(target_arch = "x86_64")]
     libc::SYS_sendfile,
     libc::SYS_unlinkat,
     libc::SYS_mkdirat,
@@ -234,7 +239,9 @@ const ALLOWLISTED_SYSCALLS: &[i64] = &[
     libc::SYS_renameat2,
     libc::SYS_utimensat,
     libc::SYS_fchmod,
+    libc::SYS_fchmodat,
     libc::SYS_fchown,
+    libc::SYS_fchownat,
     libc::SYS_umask,
     libc::SYS_getcwd,
     libc::SYS_chdir,
@@ -246,6 +253,50 @@ const ALLOWLISTED_SYSCALLS: &[i64] = &[
     libc::SYS_inotify_rm_watch,
     libc::SYS_statfs,
     libc::SYS_fstatfs,
+    // Legacy x86_64 entry points. The asm-generic table aarch64 uses never had
+    // them, so glibc reaches the *at forms there; on x86_64 glibc prefers the
+    // legacy syscall wherever the kernel provides one — the dynamic loader's
+    // access("/etc/ld.so.preload", R_OK) probe is among the first syscalls of
+    // every exec. Each entry is the older spelling of an operation already
+    // allowlisted, so this adds entry points, not capability.
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_access,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_open,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_stat,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_lstat,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_readlink,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_unlink,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_rmdir,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_mkdir,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_rename,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_chmod,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_chown,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_lchown,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_utime,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_utimes,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_pipe,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_epoll_create,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_inotify_init,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_eventfd,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_time,
     // Memory. mprotect is intentionally unconditional because seccomp cannot inspect a mapping's
     // backing object. mmap constrains direct writable-executable mappings, and writable mounts are
     // noexec.
@@ -378,7 +429,16 @@ mod tests {
             libc::SYS_futex,
             libc::SYS_epoll_create1,
             libc::SYS_membarrier,
+            libc::SYS_fchmodat,
+            libc::SYS_fchownat,
         ] {
+            assert!(allowlisted_syscalls().contains(&syscall));
+        }
+
+        // The x86_64 legacy entry points ride along with their modern forms;
+        // the dynamic loader needs them before user code runs.
+        #[cfg(target_arch = "x86_64")]
+        for syscall in [libc::SYS_access, libc::SYS_open, libc::SYS_stat] {
             assert!(allowlisted_syscalls().contains(&syscall));
         }
 
