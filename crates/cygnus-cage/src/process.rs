@@ -62,6 +62,7 @@ impl Cage {
             child: Some(child),
             timings: BootTimings {
                 namespaces_cgroup: Duration::ZERO,
+                network: Duration::ZERO,
                 mounts: Duration::ZERO,
                 seccomp: Duration::ZERO,
                 exec_runtime_init,

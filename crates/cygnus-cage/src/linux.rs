@@ -19,7 +19,8 @@ use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 use crate::error::CageError;
 use crate::mount::{MountPlan, StagedRootfs};
 use crate::seccomp::SeccompPlan;
-use crate::spec::{BootTimings, CageSpec, CgroupLimits};
+use crate::net;
+use crate::spec::{BootTimings, CageSpec, CgroupLimits, EgressMode};
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
 const CYGNUS_CGROUP: &str = "cygnus";
@@ -38,6 +39,7 @@ pub struct Cage {
     pid: Option<Pid>,
     cgroup: Option<Cgroup>,
     staging: Option<StagedRootfs>,
+    veth: Option<String>,
     timings: BootTimings,
 }
 
@@ -139,13 +141,29 @@ impl Cage {
             }
         };
         guard.cgroup = Some(cgroup);
+        let namespaces_cgroup = boot_started.elapsed();
+
+        // Egress fabric: the veth onto the bridge and the per-cage nftables
+        // policy, configured while the child is parked so the network is ready
+        // before it execs. `guard.veth` is recorded first, so any failure past
+        // this point tears the interface down on the way out.
+        let network_started = Instant::now();
+        if !matches!(spec.egress, EgressMode::None) {
+            guard.veth = Some(net::host_veth_name(&spec.name));
+            let cage_ip = net::cage_ipv4(&spec.name);
+            let configured = net::configure_cage(&spec.name, cage_ip, pid.as_raw(), &spec.egress);
+            if let Err(error) = configured {
+                let _ = write_all_fd(&release_write, &[CHILD_ABORT]);
+                return Err(error);
+            }
+        }
+        let network = network_started.elapsed();
 
         if let Err(source) = write_all_fd(&release_write, &[CHILD_RELEASE]) {
             return Err(CageError::nix("release cage child", source));
         }
         drop(release_write);
 
-        let namespaces_cgroup = boot_started.elapsed();
         let deadline = Instant::now()
             .checked_add(spec.readiness_timeout)
             .ok_or_else(|| CageError::InvalidSpec("readiness_timeout is too large".into()))?;
@@ -190,6 +208,7 @@ impl Cage {
 
         let timings = BootTimings {
             namespaces_cgroup,
+            network,
             mounts,
             seccomp,
             exec_runtime_init,
@@ -254,6 +273,20 @@ impl Cage {
         if let Some(staging) = &mut self.staging {
             match staging.remove() {
                 Ok(()) => self.staging = None,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        // The cage netns is gone once the process is reaped, which usually
+        // takes the veth pair with it; deleting the host end is tolerant of an
+        // already-absent device.
+        if let Some(veth) = &self.veth {
+            match net::delete_veth(veth) {
+                Ok(()) => self.veth = None,
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -770,6 +803,7 @@ fn reap(pid: Pid) -> Result<(), Errno> {
 struct BootGuard {
     pid: Option<Pid>,
     cgroup: Option<Cgroup>,
+    veth: Option<String>,
 }
 
 impl BootGuard {
@@ -777,6 +811,7 @@ impl BootGuard {
         Self {
             pid: Some(pid),
             cgroup: None,
+            veth: None,
         }
     }
 
@@ -793,6 +828,7 @@ impl BootGuard {
             pid: Some(pid),
             cgroup: Some(cgroup),
             staging: None,
+            veth: self.veth.take(),
             timings,
         })
     }
@@ -806,6 +842,9 @@ impl Drop for BootGuard {
         }
         if let Some(cgroup) = &mut self.cgroup {
             let _ = cgroup.remove();
+        }
+        if let Some(veth) = &self.veth {
+            let _ = net::delete_veth(veth);
         }
     }
 }

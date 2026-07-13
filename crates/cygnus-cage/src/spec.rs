@@ -242,6 +242,9 @@ impl CageSpec {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BootTimings {
     pub namespaces_cgroup: Duration,
+    /// Veth creation, bridge attach, addressing, and loading the egress
+    /// policy. Zero when the cage has no egress network.
+    pub network: Duration,
     /// Private propagation, the optional overlay root pivot, and `procfs`.
     pub mounts: Duration,
     /// Seccomp filter compilation is done in the parent; this covers the
