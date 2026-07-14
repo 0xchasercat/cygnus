@@ -111,13 +111,9 @@ impl Frontend {
     /// only if accepting itself fails.
     pub fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
         for incoming in listener.incoming() {
-            match incoming {
-                Ok(client) => {
-                    let front = Arc::clone(&self);
-                    thread::spawn(move || front.handle(client));
-                }
-                Err(error) => return Err(error),
-            }
+            let client = incoming?;
+            let front = Arc::clone(&self);
+            thread::spawn(move || front.handle(client));
         }
         Ok(())
     }
