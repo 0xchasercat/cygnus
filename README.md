@@ -16,20 +16,48 @@ is a page-cache exec, not an image pull.
 
 ## Status
 
-Pre-alpha. Nothing here is usable yet.
-
-Current work is the proof-of-concept gates from the
-[technical spec](docs/spec.md) — cold-start latency, proxy overhead, idle
-density, and seccomp conformance — which decide whether the architecture
-premise holds before any platform code gets built on top of it.
+Pre-alpha. The single-node request path now runs end to end: SQLite state is
+projected into the router and supervisor, the first request cold-boots its cage,
+and the front relays HTTP/1.1 over the app's Unix socket. TLS, the deploy/admin
+control plane, artifact-root socket mounts, and live crash monitoring are still
+under construction.
 
 ## Layout
 
 ```
-crates/cygnus-cage    isolation stack: namespaces, cgroups v2, mounts, seccomp
-crates/cygnus-proxy   data path: io_uring proxy loop, UDS upstream, splice
-console/              dashboard concept (the future Tenant 0 app)
-docs/spec.md          the technical specification, ground truth for design
+crates/cygnus-cage        isolation stack: namespaces, cgroups, mounts, network, seccomp
+crates/cygnus-init        static PID 1 for signal forwarding and orphan reaping
+crates/cygnus-supervisor  cold boot coalescing, backoff, and scale-to-zero policy
+crates/cygnus-router      lock-free Host-to-app routing table
+crates/cygnus-daemon      SQLite state, runnable front, and UDS relay
+crates/cygnus-proxy       io_uring/splice data-path benchmark and primitives
+console/                  dashboard concept (the future Tenant 0 app)
+docs/spec.md              the technical specification, ground truth for design
+```
+
+## Run the request path
+
+The daemon imports one complete JSON node configuration into its SQLite state.
+The configured command must bind and accept HTTP on the absolute `upstream`
+Unix socket; its environment is explicit rather than inherited.
+
+```json
+{
+  "listen": "127.0.0.1:3000",
+  "apps": [{
+    "name": "api",
+    "domains": ["api.localhost"],
+    "upstream": "/tmp/cygnus/api.sock",
+    "command": "/absolute/path/to/server",
+    "env": { "CYGNUS_SOCKET": "/tmp/cygnus/api.sock" }
+  }]
+}
+```
+
+```sh
+cargo run -p cygnus-daemon -- --state ./state.db apply ./node.json
+cargo run -p cygnus-daemon -- --state ./state.db serve
+curl -H 'Host: api.localhost' http://127.0.0.1:3000/
 ```
 
 ## Requirements

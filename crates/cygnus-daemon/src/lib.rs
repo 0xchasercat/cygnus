@@ -12,6 +12,7 @@
 //! `cygnus-proxy` for the body phase is a later optimization behind the same
 //! request path. The request-handling core (head read, routing, error
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
+pub mod state;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -272,17 +273,17 @@ mod tests {
         };
         assert_eq!(route_request(&miss, &router), Err(Status::NotFound));
 
-        let no_host = RequestHead {
-            host: None,
-            ..head
-        };
+        let no_host = RequestHead { host: None, ..head };
         assert_eq!(route_request(&no_host, &router), Err(Status::BadRequest));
     }
 
     #[test]
     fn acquire_failures_map_to_client_statuses() {
         assert_eq!(acquire_status(&AcquireError::Unknown), Status::NotFound);
-        assert_eq!(acquire_status(&AcquireError::CrashLooping), Status::Unavailable);
+        assert_eq!(
+            acquire_status(&AcquireError::CrashLooping),
+            Status::Unavailable
+        );
         assert_eq!(
             acquire_status(&AcquireError::BackingOff {
                 retry_after: Duration::from_secs(1)
