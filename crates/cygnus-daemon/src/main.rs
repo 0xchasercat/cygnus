@@ -257,60 +257,35 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpStream};
 
-        use cygnus_cage::INGRESS_CAGE_DIR;
         use cygnus_daemon::state::{AppConfig, RootfsConfig};
 
         let directory = unique_dir("overlay-request");
         let host_io = directory.join("io");
         fs::create_dir_all(&host_io).expect("create host ingress directory");
+        let lower = build_fixture_root(&directory).expect("build fixture root");
         let upstream = host_io.join("app.sock");
         let state_path = directory.join("state.db");
         let app_name = format!("daemon-ingress-{}", std::process::id());
-        let script = r#"
-import os
-import socketserver
-from http.server import BaseHTTPRequestHandler
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"overlay request reached the cage\n"
-        self.send_response(200)
-        self.send_header("content-length", str(len(body)))
-        self.send_header("connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-        self.close_connection = True
-
-    def log_message(self, format, *args):
-        pass
-
-path = os.environ["CYGNUS_SOCKET"]
-try:
-    os.unlink(path)
-except FileNotFoundError:
-    pass
-with socketserver.UnixStreamServer(path, Handler) as server:
-    server.serve_forever()
-"#;
 
         let mut app = AppConfig {
             name: app_name.clone(),
             domains: vec!["overlay.localhost".into()],
             upstream: upstream.clone(),
-            command: "/usr/bin/python3".into(),
-            args: vec!["-c".into(), script.into()],
+            command: "/fixture".into(),
+            args: vec![
+                "--exact".into(),
+                "tests::cage_fixture_process".into(),
+                "--nocapture".into(),
+            ],
             rootfs: Some(RootfsConfig {
-                lowerdirs: vec![PathBuf::from("/")],
+                lowerdirs: vec![lower],
                 staging_dir: Some(directory.join("staging")),
                 ..RootfsConfig::default()
             }),
             seccomp: None,
             ..AppConfig::default()
         };
-        app.env.insert(
-            "CYGNUS_SOCKET".into(),
-            format!("{INGRESS_CAGE_DIR}/app.sock"),
-        );
+        app.env.insert("CYGNUS_FIXTURE_MODE".into(), "uds".into());
         let config = NodeConfig {
             listen: "127.0.0.1:0".parse().expect("listen address"),
             apps: vec![app],
@@ -356,16 +331,14 @@ with socketserver.UnixStreamServer(path, Handler) as server:
 
         let mut client = TcpStream::connect(address).expect("connect test front");
         client
-            .write_all(
-                b"GET / HTTP/1.1\r\nHost: overlay.localhost\r\nConnection: close\r\n\r\n",
-            )
+            .write_all(b"GET / HTTP/1.1\r\nHost: overlay.localhost\r\nConnection: close\r\n\r\n")
             .expect("write request");
         client.shutdown(Shutdown::Write).expect("finish request");
         let mut response = Vec::new();
         client.read_to_end(&mut response).expect("read response");
         worker.join().expect("join front worker");
 
-        assert!(response.starts_with(b"HTTP/1.0 200"));
+        assert!(response.starts_with(b"HTTP/1.1 200"));
         assert!(
             response
                 .windows(b"overlay request reached the cage".len())
@@ -375,6 +348,66 @@ with socketserver.UnixStreamServer(path, Handler) as server:
         drop(frontend);
         drop(supervisor);
         fs::remove_dir_all(directory).expect("remove integration fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cage_fixture_process() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        if std::env::var("CYGNUS_FIXTURE_MODE").as_deref() != Ok("uds") {
+            return;
+        }
+        let listener = UnixListener::bind("/cygnus/io/app.sock").expect("bind fixture UDS");
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("accept fixture UDS");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            if read > 0 {
+                let body = b"overlay request reached the cage\n";
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write fixture response head");
+                stream.write_all(body).expect("write fixture response body");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_fixture_root(base: &Path) -> std::io::Result<PathBuf> {
+        let root = base.join("root");
+        fs::create_dir_all(&root)?;
+        let executable = std::env::current_exe()?;
+        fs::copy(&executable, root.join("fixture"))?;
+
+        let output = std::process::Command::new("ldd")
+            .arg(&executable)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other("ldd failed for cage fixture"));
+        }
+        let dependencies = String::from_utf8(output.stdout)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        for line in dependencies.lines() {
+            let Some(source) = line
+                .split_whitespace()
+                .find(|field| field.starts_with('/'))
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            let relative = source.strip_prefix("/").expect("absolute ldd dependency");
+            let destination = root.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, destination)?;
+        }
+        Ok(root)
     }
 
     #[cfg(target_os = "linux")]

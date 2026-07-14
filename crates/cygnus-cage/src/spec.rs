@@ -23,7 +23,6 @@ pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 /// Fixed directory inside an artifact-rooted cage where the host exposes app ingress.
 pub const INGRESS_CAGE_DIR: &str = "/cygnus/io";
 
-
 /// Action taken when a cage syscall matches the seccomp denylist.
 ///
 /// Defined here, in the platform-neutral spec, so a `CageSpec` can carry the
@@ -533,25 +532,40 @@ mod tests {
         let readiness = host_dir.join("app.sock");
 
         spec.ingress = Some(IngressSpec::new(host_dir.clone()));
-        assert!(spec.validate().is_err(), "accepted ingress without a rootfs");
+        assert!(
+            spec.validate().is_err(),
+            "accepted ingress without a rootfs"
+        );
 
         spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
-        assert!(spec.validate().is_err(), "accepted ingress without readiness UDS");
+        assert!(
+            spec.validate().is_err(),
+            "accepted ingress without readiness UDS"
+        );
 
         spec.readiness_uds = Some(PathBuf::from("app.sock"));
         assert!(spec.validate().is_err(), "accepted relative readiness UDS");
 
         spec.readiness_uds = Some(PathBuf::from("/tmp/other/app.sock"));
-        assert!(spec.validate().is_err(), "accepted readiness UDS from another directory");
+        assert!(
+            spec.validate().is_err(),
+            "accepted readiness UDS from another directory"
+        );
 
         spec.readiness_uds = Some(readiness);
         assert!(spec.validate().is_ok());
 
         spec.ingress = Some(IngressSpec::new("relative"));
-        assert!(spec.validate().is_err(), "accepted relative ingress host directory");
+        assert!(
+            spec.validate().is_err(),
+            "accepted relative ingress host directory"
+        );
 
         spec.ingress = Some(IngressSpec::new("/"));
-        assert!(spec.validate().is_err(), "accepted host root as ingress directory");
+        assert!(
+            spec.validate().is_err(),
+            "accepted host root as ingress directory"
+        );
 
         let traversing = PathBuf::from("/tmp/../etc");
         spec.readiness_uds = Some(traversing.join("app.sock"));

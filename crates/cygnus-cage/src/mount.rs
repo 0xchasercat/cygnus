@@ -11,7 +11,7 @@ use std::ptr;
 use nix::errno::Errno;
 
 use crate::error::CageError;
-use crate::spec::{IngressSpec, RootfsSpec, INGRESS_CAGE_DIR};
+use crate::spec::{INGRESS_CAGE_DIR, IngressSpec, RootfsSpec};
 
 /// Directory name the old root is pivoted onto before it is detached.
 const OLD_ROOT_NAME: &str = ".cygnus-old-root";
@@ -148,11 +148,10 @@ impl MountPlan {
     /// Apply the plan in the current mount namespace.
     ///
     /// First the whole tree is made private so later changes never propagate
-    /// back to the host. With an overlay root configured, the cage then
-    /// assembles the overlay and pivots into it, leaving the host tree behind
-    /// entirely. Last, a fresh `procfs` is mounted so `/proc` reflects the
-    /// cage's own PID namespace rather than the host's. The writable surface
-    /// stays `nosuid,nodev,noexec`.
+    /// back to the host. With an overlay root configured, the cage assembles
+    /// the overlay, mounts a fresh `procfs` into the merged tree, and then
+    /// pivots; without an overlay, `procfs` is mounted directly at `/proc`.
+    /// The writable surface stays `nosuid,nodev,noexec`.
     ///
     /// Returns the raw `errno` of the first failing operation.
     ///
@@ -177,22 +176,16 @@ impl MountPlan {
         }
 
         if let Some(overlay) = &self.overlay {
-            unsafe { overlay.apply(&self.root, self.ingress.as_ref())? };
-        }
-
-        // Fresh procfs bound to this PID namespace. With an overlay root this
-        // lands inside the pivoted root; without one it covers the host view.
-        let proc = unsafe {
-            nix::libc::mount(
-                self.proc_source.as_ptr(),
-                self.proc_target.as_ptr(),
-                self.proc_fstype.as_ptr(),
-                nix::libc::MS_NOSUID | nix::libc::MS_NODEV | nix::libc::MS_NOEXEC,
-                ptr::null(),
-            )
-        };
-        if proc != 0 {
-            return Err(Errno::last_raw());
+            unsafe {
+                overlay.apply(
+                    &self.root,
+                    self.ingress.as_ref(),
+                    &self.proc_source,
+                    &self.proc_fstype,
+                )?
+            };
+        } else {
+            unsafe { mount_proc(&self.proc_source, &self.proc_target, &self.proc_fstype)? };
         }
 
         Ok(())
@@ -237,11 +230,7 @@ impl IngressPlan {
             ));
         }
         let metadata = fs::symlink_metadata(&ingress.host_dir).map_err(|source| {
-            CageError::io(
-                "verify ingress host directory",
-                &ingress.host_dir,
-                source,
-            )
+            CageError::io("verify ingress host directory", &ingress.host_dir, source)
         })?;
         if !metadata.file_type().is_dir() {
             return Err(CageError::InvalidSpec(format!(
@@ -352,7 +341,13 @@ impl OverlayPlan {
     ///
     /// Same contract as [`MountPlan::apply`]: cloned child only, prebuilt
     /// pointers and raw syscalls only.
-    unsafe fn apply(&self, root: &CString, ingress: Option<&IngressPlan>) -> Result<(), i32> {
+    unsafe fn apply(
+        &self,
+        root: &CString,
+        ingress: Option<&IngressPlan>,
+        proc_source: &CString,
+        proc_fstype: &CString,
+    ) -> Result<(), i32> {
         // The writable layer: a size-capped tmpfs visible only in this mount
         // namespace. Everything written at runtime lands here and is dropped
         // with the namespace at teardown.
@@ -398,6 +393,11 @@ impl OverlayPlan {
             mkdir_allow_exists(&self.put_old, 0o700)?;
         }
 
+        // Mount procfs while the merged root is still reachable from the old
+        // tree. The mount moves with the tree across pivot_root and reflects
+        // this child’s PID namespace.
+        unsafe { mount_proc(proc_source, &self.merged_proc, proc_fstype)? };
+
         let pivot = unsafe {
             nix::libc::syscall(
                 nix::libc::SYS_pivot_root,
@@ -429,6 +429,27 @@ impl OverlayPlan {
 
         Ok(())
     }
+}
+
+/// Mount a fresh procfs for the cage's PID namespace.
+///
+/// # Safety
+///
+/// Cloned-child contract: prebuilt pointers and raw syscall only.
+unsafe fn mount_proc(source: &CString, target: &CString, fstype: &CString) -> Result<(), i32> {
+    let mounted = unsafe {
+        nix::libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            nix::libc::MS_NOSUID | nix::libc::MS_NODEV | nix::libc::MS_NOEXEC,
+            ptr::null(),
+        )
+    };
+    if mounted != 0 {
+        return Err(Errno::last_raw());
+    }
+    Ok(())
 }
 
 /// # Safety

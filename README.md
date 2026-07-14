@@ -18,9 +18,9 @@ is a page-cache exec, not an image pull.
 
 Pre-alpha. The single-node request path now runs end to end: SQLite state is
 projected into the router and supervisor, the first request cold-boots its cage,
-and the front relays HTTP/1.1 over the app's Unix socket. TLS, the deploy/admin
-control plane, artifact-root socket mounts, and live crash monitoring are still
-under construction.
+and the front relays HTTP/1.1 over the app's Unix socket. Overlay-rooted apps
+receive their daemon-owned socket directory at `/cygnus/io`. TLS, the
+deploy/admin control plane, and live crash monitoring are still under construction.
 
 ## Layout
 
@@ -40,6 +40,9 @@ docs/spec.md              the technical specification, ground truth for design
 The daemon imports one complete JSON node configuration into its SQLite state.
 The configured command must bind and accept HTTP on the absolute `upstream`
 Unix socket; its environment is explicit rather than inherited.
+For an app with `rootfs` configured, the daemon mounts the host `upstream`
+parent at `/cygnus/io`; the app binds `/cygnus/io/<upstream filename>` while
+readiness and routing continue to use the host path.
 
 ```json
 {
