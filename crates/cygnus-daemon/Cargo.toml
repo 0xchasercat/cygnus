@@ -1,0 +1,12 @@
+[package]
+name = "cygnus-daemon"
+description = "Cygnus front: accept HTTP/1.1, route by host, ensure the cage is up, relay to its socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cygnus-cage = { path = "../cygnus-cage" }
+cygnus-router = { path = "../cygnus-router" }
+cygnus-supervisor = { path = "../cygnus-supervisor" }
