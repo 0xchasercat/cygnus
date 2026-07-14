@@ -1,9 +1,13 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use cygnus_cage::IngressSpec;
 use cygnus_cage::{Cage, CageError, CageSpec, RootfsSpec};
 
 #[test]
@@ -49,18 +53,31 @@ fn boots_and_tears_down_with_exec_readiness() {
 #[test]
 fn overlay_rootfs_contains_writes_and_pivots_proc() {
     let name = unique_name("overlay");
-    let mut spec = CageSpec::new(&name, "/bin/sleep");
-    spec.args.push(OsString::from("30"));
-    spec.env = env::vars_os().collect();
-    // The host root as the single read-only lower layer: the merged tree
-    // looks like the host, but every write lands in the cage-private tmpfs.
-    spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/")]));
+    let fixture = env::temp_dir().join(format!("cygnus-overlay-{name}"));
+    let _ = fs::remove_dir_all(&fixture);
+    let lower = build_fixture_root(&fixture).expect("build fixture root");
+
+    let mut spec = CageSpec::new(&name, "/fixture");
+    spec.args.extend([
+        OsString::from("--exact"),
+        OsString::from("cage_fixture_process"),
+        OsString::from("--nocapture"),
+    ]);
+    spec.env.insert(
+        OsString::from("CYGNUS_FIXTURE_MODE"),
+        OsString::from("sleep"),
+    );
+    spec.rootfs = Some(RootfsSpec::new(vec![lower]));
     spec.seccomp = None;
 
     let cage = match Cage::boot(spec) {
         Ok(cage) => cage,
-        Err(error) if environment_unavailable(&error) => {
+        Err(error)
+            if environment_unavailable(&error)
+                && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none() =>
+        {
             eprintln!("skipping privileged overlay rootfs test: {error}");
+            let _ = fs::remove_dir_all(&fixture);
             return;
         }
         Err(error) => panic!("cage boot failed: {error}"),
@@ -70,21 +87,64 @@ fn overlay_rootfs_contains_writes_and_pivots_proc() {
     let cage_root = PathBuf::from(format!("/proc/{pid}/root"));
     let probe_name = format!("cygnus-overlay-probe-{}", std::process::id());
 
-    // The pivoted root is writable through the upper layer...
     fs::write(cage_root.join(&probe_name), b"upper")
         .expect("write through the cage root into the upper layer");
-    // ...and the write stays out of the host tree.
     let host_probe = PathBuf::from(format!("/{probe_name}"));
     assert!(!host_probe.exists(), "cage write leaked into the host root");
 
-    // The fresh procfs reflects the cage's PID namespace: the target is PID 1.
     let comm = fs::read_to_string(cage_root.join("proc/1/comm")).expect("read cage /proc/1/comm");
-    assert_eq!(comm.trim(), "sleep");
+    assert!(comm.trim().starts_with("fixture"));
 
     assert!(cage.timings().mounts > Duration::ZERO);
-    if let Err(error) = cage.teardown() {
-        panic!("cage teardown failed: {error}");
-    }
+    cage.teardown().expect("tear down overlay cage");
+    fs::remove_dir_all(&fixture).expect("remove overlay fixture");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ingress_socket_created_in_pivoted_root_is_host_visible() {
+    let name = unique_name("ingress");
+    let fixture = env::temp_dir().join(format!("cygnus-ingress-{name}"));
+    let host_dir = fixture.join("io");
+    let socket_path = host_dir.join("app.sock");
+    let _ = fs::remove_dir_all(&fixture);
+    fs::create_dir_all(&host_dir).expect("create ingress host directory");
+    let lower = build_fixture_root(&fixture).expect("build fixture root");
+
+    let mut spec = CageSpec::new(&name, "/fixture");
+    spec.args.extend([
+        OsString::from("--exact"),
+        OsString::from("cage_fixture_process"),
+        OsString::from("--nocapture"),
+    ]);
+    spec.env
+        .insert(OsString::from("CYGNUS_FIXTURE_MODE"), OsString::from("uds"));
+    spec.rootfs = Some(RootfsSpec::new(vec![lower]));
+    spec.ingress = Some(IngressSpec::new(host_dir.clone()));
+    spec.readiness_uds = Some(socket_path.clone());
+    spec.seccomp = None;
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error)
+            if environment_unavailable(&error)
+                && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none() =>
+        {
+            eprintln!("skipping privileged ingress test: {error}");
+            let _ = fs::remove_dir_all(&fixture);
+            return;
+        }
+        Err(error) => panic!("cage boot failed: {error}"),
+    };
+
+    assert!(
+        socket_path.exists(),
+        "pivoted cage socket is not host-visible"
+    );
+    UnixStream::connect(&socket_path).expect("connect through host ingress path");
+
+    cage.teardown().expect("tear down ingress cage");
+    fs::remove_dir_all(&fixture).expect("remove ingress fixture");
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -217,6 +277,73 @@ time.sleep(30)
         panic!("cage teardown failed: {error}");
     }
     let _ = fs::remove_file(&socket_path);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cage_fixture_process() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    match env::var("CYGNUS_FIXTURE_MODE").as_deref() {
+        Err(_) => {}
+        Ok("sleep") => loop {
+            thread::sleep(Duration::from_secs(60));
+        },
+        Ok("uds") => {
+            let listener = UnixListener::bind("/cygnus/io/app.sock").expect("bind fixture UDS");
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("accept fixture UDS");
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                if read > 0 {
+                    let body = b"overlay request reached the cage\n";
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .expect("write fixture response head");
+                    stream.write_all(body).expect("write fixture response body");
+                }
+            }
+        }
+        Ok(mode) => panic!("unknown fixture mode {mode:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_fixture_root(base: &std::path::Path) -> std::io::Result<PathBuf> {
+    let root = base.join("root");
+    fs::create_dir_all(&root)?;
+    let executable = env::current_exe()?;
+    fs::copy(&executable, root.join("fixture"))?;
+
+    let output = std::process::Command::new("ldd")
+        .arg(&executable)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("ldd failed for cage fixture"));
+    }
+    let dependencies = String::from_utf8(output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    for line in dependencies.lines() {
+        let Some(source) = line
+            .split_whitespace()
+            .find(|field| field.starts_with('/'))
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        let relative = source.strip_prefix("/").expect("absolute ldd dependency");
+        let destination = root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+    }
+    Ok(root)
 }
 
 fn unique_name(kind: &str) -> String {

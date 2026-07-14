@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::CageError;
@@ -20,6 +20,8 @@ pub const DEFAULT_PIDS_MAX: u32 = 128;
 pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default size cap for the writable tmpfs layer of an overlay root: 64 MiB.
 pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
+/// Fixed directory inside an artifact-rooted cage where the host exposes app ingress.
+pub const INGRESS_CAGE_DIR: &str = "/cygnus/io";
 
 /// Action taken when a cage syscall matches the seccomp denylist.
 ///
@@ -120,6 +122,22 @@ impl RootfsSpec {
     }
 }
 
+/// Host-side directory mounted at [`INGRESS_CAGE_DIR`] inside a cage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IngressSpec {
+    /// Existing host directory containing this cage's readiness socket.
+    pub host_dir: PathBuf,
+}
+
+impl IngressSpec {
+    /// Describe the host directory to expose for this cage's ingress socket.
+    pub fn new(host_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            host_dir: host_dir.into(),
+        }
+    }
+}
+
 /// Complete description of one cage boot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CageSpec {
@@ -129,6 +147,9 @@ pub struct CageSpec {
     pub env: BTreeMap<OsString, OsString>,
     pub limits: CgroupLimits,
     pub rootfs: Option<RootfsSpec>,
+    /// Optional host ingress directory mounted at [`INGRESS_CAGE_DIR`] after
+    /// the cage pivots into its overlay root.
+    pub ingress: Option<IngressSpec>,
     /// Seccomp filter to install in the cage child immediately before `execve`.
     /// Defaults to `Some(FilterMode::Enforce)` (see [`CageSpec::new`]), so a
     /// cage is sandboxed out of the box like a Docker container; `None` boots
@@ -159,6 +180,7 @@ impl CageSpec {
             env: BTreeMap::new(),
             limits: CgroupLimits::default(),
             rootfs: None,
+            ingress: None,
             seccomp: Some(FilterMode::Enforce),
             egress: EgressMode::None,
             init: None,
@@ -204,6 +226,45 @@ impl CageSpec {
             return Err(CageError::InvalidSpec(
                 "readiness UDS path must be absolute".into(),
             ));
+        }
+        if let Some(ingress) = &self.ingress {
+            if self.rootfs.is_none() {
+                return Err(CageError::InvalidSpec("ingress requires a rootfs".into()));
+            }
+            if !ingress.host_dir.is_absolute() {
+                return Err(CageError::InvalidSpec(
+                    "ingress host directory must be absolute".into(),
+                ));
+            }
+            if ingress.host_dir == Path::new("/") {
+                return Err(CageError::InvalidSpec(
+                    "ingress host directory must not be the host root".into(),
+                ));
+            }
+            if ingress.host_dir.as_os_str().as_bytes().contains(&0) {
+                return Err(CageError::InvalidSpec(
+                    "ingress host directory must not contain a NUL byte".into(),
+                ));
+            }
+            if ingress
+                .host_dir
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            {
+                return Err(CageError::InvalidSpec(
+                    "ingress host directory must not contain '.' or '..' components".into(),
+                ));
+            }
+            let Some(readiness_uds) = &self.readiness_uds else {
+                return Err(CageError::InvalidSpec(
+                    "ingress requires a readiness UDS".into(),
+                ));
+            };
+            if readiness_uds.parent() != Some(ingress.host_dir.as_path()) {
+                return Err(CageError::InvalidSpec(
+                    "readiness UDS parent must equal ingress host directory".into(),
+                ));
+            }
         }
         if let Some(rootfs) = &self.rootfs {
             if rootfs.lowerdirs.is_empty() {
@@ -338,6 +399,7 @@ pub(crate) fn validate_name(name: &str) -> Result<(), CageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn defaults_match_the_specification() {
@@ -351,6 +413,7 @@ mod tests {
         // Sandboxed out of the box, like a Docker container.
         assert_eq!(spec.seccomp, Some(FilterMode::Enforce));
         assert_eq!(spec.egress, EgressMode::None);
+        assert!(spec.ingress.is_none());
         assert!(spec.init.is_none());
         assert!(spec.validate().is_ok());
     }
@@ -460,6 +523,65 @@ mod tests {
 
         spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_enforces_ingress_shape() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        let host_dir = PathBuf::from("/tmp/cygnus-ingress");
+        let readiness = host_dir.join("app.sock");
+
+        spec.ingress = Some(IngressSpec::new(host_dir.clone()));
+        assert!(
+            spec.validate().is_err(),
+            "accepted ingress without a rootfs"
+        );
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
+        assert!(
+            spec.validate().is_err(),
+            "accepted ingress without readiness UDS"
+        );
+
+        spec.readiness_uds = Some(PathBuf::from("app.sock"));
+        assert!(spec.validate().is_err(), "accepted relative readiness UDS");
+
+        spec.readiness_uds = Some(PathBuf::from("/tmp/other/app.sock"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted readiness UDS from another directory"
+        );
+
+        spec.readiness_uds = Some(readiness);
+        assert!(spec.validate().is_ok());
+
+        spec.ingress = Some(IngressSpec::new("relative"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted relative ingress host directory"
+        );
+
+        spec.ingress = Some(IngressSpec::new("/"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted host root as ingress directory"
+        );
+
+        let traversing = PathBuf::from("/tmp/../etc");
+        spec.readiness_uds = Some(traversing.join("app.sock"));
+        spec.ingress = Some(IngressSpec::new(traversing));
+        assert!(spec.validate().is_err(), "accepted ingress path traversal");
+    }
+
+    #[test]
+    fn validation_rejects_nul_in_ingress_host_directory() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
+        spec.readiness_uds = Some(PathBuf::from("/tmp/app.sock"));
+        spec.ingress = Some(IngressSpec::new(PathBuf::from(OsString::from_vec(
+            b"/tmp/with\0nul".to_vec(),
+        ))));
+        assert!(spec.validate().is_err());
     }
 
     #[test]

@@ -18,8 +18,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Privileged run: namespace/cgroup integration tests detect capabilities at
-  # runtime and only exercise the full cage stack when they have them.
+  # Sudo supplies the available host capabilities; integration tests still
+  # report and skip when the runner's cgroup subtree is read-only.
   cage-tests:
     runs-on: namespace-profile-cygnus-linux-x86
     steps:

@@ -18,8 +18,8 @@ use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
 use crate::error::CageError;
 use crate::mount::{MountPlan, StagedRootfs};
-use crate::seccomp::SeccompPlan;
 use crate::net;
+use crate::seccomp::SeccompPlan;
 use crate::spec::{BootTimings, CageSpec, CgroupLimits, EgressMode};
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
@@ -51,15 +51,16 @@ impl Cage {
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
         spec.validate()?;
         let child_exec = ChildExec::new(&spec)?;
-        // Parent-side prework: the staging directory, every mount C string, and
-        // the compiled seccomp program are built before the clock starts and
-        // the clone happens, so the child only fires raw syscalls on prebuilt
-        // data. A failure past this point drops the staging directory.
+        // Parent-side prework: the staging directory, every mount C string,
+        // the ingress source/target plan, and the compiled seccomp program are
+        // built before the clock starts and the clone happens, so the child
+        // only fires raw syscalls on prebuilt data. A failure past this point
+        // drops the staging directory.
         let mut staging = match &spec.rootfs {
             Some(rootfs) => Some(StagedRootfs::create(&spec.name, rootfs)?),
             None => None,
         };
-        let mount_plan = MountPlan::new(staging.as_ref())?;
+        let mount_plan = MountPlan::new(staging.as_ref(), spec.ingress.as_ref())?;
         let seccomp_plan = match spec.seccomp {
             Some(mode) => Some(
                 SeccompPlan::new(mode)
