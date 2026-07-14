@@ -1,0 +1,10 @@
+[package]
+name = "cygnus-router"
+description = "Ingress routing: Host/SNI to per-app upstream over a lock-free route table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap = "1"
