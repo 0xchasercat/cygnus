@@ -287,7 +287,7 @@ fn cage_fixture_process() {
     use std::thread;
 
     match env::var("CYGNUS_FIXTURE_MODE").as_deref() {
-        Err(_) => return,
+        Err(_) => {}
         Ok("sleep") => loop {
             thread::sleep(Duration::from_secs(60));
         },
