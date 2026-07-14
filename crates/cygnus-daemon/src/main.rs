@@ -257,7 +257,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpStream};
 
-        use cygnus_cage::{CageError, INGRESS_CAGE_DIR};
+        use cygnus_cage::INGRESS_CAGE_DIR;
         use cygnus_daemon::state::{AppConfig, RootfsConfig};
 
         let directory = unique_dir("overlay-request");
@@ -378,13 +378,13 @@ with socketserver.UnixStreamServer(path, Handler) as server:
     }
 
     #[cfg(target_os = "linux")]
-    fn cage_environment_unavailable(error: &CageError) -> bool {
+    fn cage_environment_unavailable(error: &cygnus_cage::CageError) -> bool {
         matches!(
             error,
-            CageError::NamespaceUnavailable { .. }
-                | CageError::CgroupUnavailable(_)
-                | CageError::CgroupControllerUnavailable(_)
-                | CageError::Io { .. }
+            cygnus_cage::CageError::NamespaceUnavailable { .. }
+                | cygnus_cage::CageError::CgroupUnavailable(_)
+                | cygnus_cage::CageError::CgroupControllerUnavailable(_)
+                | cygnus_cage::CageError::Io { .. }
         )
     }
 }
