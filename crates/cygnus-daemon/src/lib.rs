@@ -114,13 +114,14 @@ impl Frontend {
         for incoming in listener.incoming() {
             let client = incoming?;
             let front = Arc::clone(&self);
-            thread::spawn(move || front.handle(client));
+            thread::spawn(move || front.serve_connection(client));
         }
         Ok(())
     }
 
-    /// Serve one client connection end to end.
-    fn handle(&self, mut client: TcpStream) {
+    /// Serve one accepted client connection end to end on the current thread.
+    /// This is the same path [`Self::serve`] dispatches to its workers.
+    pub fn serve_connection(&self, mut client: TcpStream) {
         // Bound the head read so a slow client cannot hold the worker forever.
         let _ = client.set_read_timeout(Some(HEAD_READ_TIMEOUT));
         let (_head, buffered, route) = match self.route(&mut client) {

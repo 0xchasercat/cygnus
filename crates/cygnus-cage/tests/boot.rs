@@ -1,10 +1,11 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cygnus_cage::{Cage, CageError, CageSpec, RootfsSpec};
+use cygnus_cage::{Cage, CageError, CageSpec, IngressSpec, RootfsSpec};
 
 #[test]
 fn boots_and_tears_down_with_exec_readiness() {
@@ -85,6 +86,68 @@ fn overlay_rootfs_contains_writes_and_pivots_proc() {
     if let Err(error) = cage.teardown() {
         panic!("cage teardown failed: {error}");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ingress_socket_created_in_pivoted_root_is_host_visible() {
+    let Some(python) = python3_path() else {
+        eprintln!("skipping ingress test: python3 is unavailable");
+        return;
+    };
+    let name = unique_name("ingress");
+    let host_dir = env::temp_dir().join(format!("cygnus-ingress-{name}"));
+    let socket_path = host_dir.join("app.sock");
+    let _ = fs::remove_dir_all(&host_dir);
+    fs::create_dir_all(&host_dir).expect("create ingress host directory");
+
+    let script = r#"
+import os
+import socket
+import time
+
+path = "/cygnus/io/app.sock"
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(1)
+time.sleep(30)
+"#;
+    let mut spec = CageSpec::new(&name, python);
+    spec.args.push(OsString::from("-c"));
+    spec.args.push(OsString::from(script));
+    spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/")]));
+    spec.ingress = Some(IngressSpec::new(host_dir.clone()));
+    spec.readiness_uds = Some(socket_path.clone());
+    spec.seccomp = None;
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error)
+            if environment_unavailable(&error)
+                && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none() =>
+        {
+            eprintln!("skipping privileged ingress test: {error}");
+            let _ = fs::remove_dir_all(&host_dir);
+            return;
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&host_dir);
+            panic!("cage boot failed: {error}");
+        }
+    };
+
+    assert!(socket_path.exists(), "pivoted cage socket is not host-visible");
+    UnixStream::connect(&socket_path).expect("connect through host ingress path");
+
+    if let Err(error) = cage.teardown() {
+        let _ = fs::remove_dir_all(&host_dir);
+        panic!("cage teardown failed: {error}");
+    }
+    fs::remove_dir_all(&host_dir).expect("remove ingress host directory");
 }
 
 #[cfg(not(target_os = "linux"))]

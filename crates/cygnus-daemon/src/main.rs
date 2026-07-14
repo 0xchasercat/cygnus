@@ -251,4 +251,140 @@ mod tests {
         );
         fs::remove_dir_all(directory).expect("remove test directory");
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_rooted_request_reaches_the_cage() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        use cygnus_cage::{CageError, INGRESS_CAGE_DIR};
+        use cygnus_daemon::state::{AppConfig, RootfsConfig};
+
+        let directory = unique_dir("overlay-request");
+        let host_io = directory.join("io");
+        fs::create_dir_all(&host_io).expect("create host ingress directory");
+        let upstream = host_io.join("app.sock");
+        let state_path = directory.join("state.db");
+        let app_name = format!("daemon-ingress-{}", std::process::id());
+        let script = r#"
+import os
+import socketserver
+from http.server import BaseHTTPRequestHandler
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"overlay request reached the cage\n"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def log_message(self, format, *args):
+        pass
+
+path = os.environ["CYGNUS_SOCKET"]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+with socketserver.UnixStreamServer(path, Handler) as server:
+    server.serve_forever()
+"#;
+
+        let mut app = AppConfig {
+            name: app_name.clone(),
+            domains: vec!["overlay.localhost".into()],
+            upstream: upstream.clone(),
+            command: "/usr/bin/python3".into(),
+            args: vec!["-c".into(), script.into()],
+            rootfs: Some(RootfsConfig {
+                lowerdirs: vec![PathBuf::from("/")],
+                staging_dir: Some(directory.join("staging")),
+                ..RootfsConfig::default()
+            }),
+            seccomp: None,
+            ..AppConfig::default()
+        };
+        app.env.insert(
+            "CYGNUS_SOCKET".into(),
+            format!("{INGRESS_CAGE_DIR}/app.sock"),
+        );
+        let config = NodeConfig {
+            listen: "127.0.0.1:0".parse().expect("listen address"),
+            apps: vec![app],
+        };
+        let mut state = State::open(&state_path).expect("open state");
+        state.apply(&config).expect("apply state");
+        let snapshot = state.load().expect("load state");
+        drop(state);
+
+        // Probe the privileged environment with the exact projected spec so
+        // an unavailable namespace/cgroup host skips, while a mount failure is
+        // still a real test failure. The request path below cold-boots again.
+        match Cage::boot(snapshot.apps[0].spec.clone()) {
+            Ok(cage) => cage.teardown().expect("tear down environment probe"),
+            Err(error)
+                if cage_environment_unavailable(&error)
+                    && std::env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none() =>
+            {
+                eprintln!("skipping overlay request test: {error}");
+                let _ = fs::remove_dir_all(directory);
+                return;
+            }
+            Err(error) => panic!("overlay ingress probe failed: {error}"),
+        }
+
+        let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
+        let mut routes = RouteTable::new();
+        let mut pinned = Vec::new();
+        for app in snapshot.apps {
+            install_app(&supervisor, &mut routes, &mut pinned, app);
+        }
+        let frontend = Arc::new(Frontend::new(
+            Arc::new(Router::new(routes)),
+            Arc::clone(&supervisor),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test front");
+        let address = listener.local_addr().expect("front address");
+        let serving = Arc::clone(&frontend);
+        let worker = thread::spawn(move || {
+            let (client, _) = listener.accept().expect("accept test client");
+            serving.serve_connection(client);
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect test front");
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: overlay.localhost\r\nConnection: close\r\n\r\n",
+            )
+            .expect("write request");
+        client.shutdown(Shutdown::Write).expect("finish request");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        worker.join().expect("join front worker");
+
+        assert!(response.starts_with(b"HTTP/1.0 200"));
+        assert!(
+            response
+                .windows(b"overlay request reached the cage".len())
+                .any(|window| window == b"overlay request reached the cage")
+        );
+
+        drop(frontend);
+        drop(supervisor);
+        fs::remove_dir_all(directory).expect("remove integration fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cage_environment_unavailable(error: &CageError) -> bool {
+        matches!(
+            error,
+            CageError::NamespaceUnavailable { .. }
+                | CageError::CgroupUnavailable(_)
+                | CageError::CgroupControllerUnavailable(_)
+                | CageError::Io { .. }
+        )
+    }
 }

@@ -35,7 +35,8 @@ pub use seccomp::{SeccompPlan, denied_syscalls};
 pub use spec::{
     BootTimings, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
     DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,
-    DEFAULT_ROOTFS_TMPFS_SIZE, EgressMode, EgressRule, FilterMode, RootfsSpec,
+    DEFAULT_ROOTFS_TMPFS_SIZE, EgressMode, EgressRule, FilterMode, IngressSpec,
+    INGRESS_CAGE_DIR, RootfsSpec,
 };
 
 /// Isolation provided by the cage backend compiled for this platform.

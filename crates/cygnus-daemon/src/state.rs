@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cygnus_cage::{
     CageError, CageSpec, CgroupLimits, DEFAULT_READINESS_TIMEOUT, EgressMode,
-    EgressRule as CageEgressRule, FilterMode, RootfsSpec,
+    EgressRule as CageEgressRule, FilterMode, IngressSpec, RootfsSpec,
 };
 use cygnus_router::normalize_host;
 use cygnus_supervisor::{
@@ -718,6 +718,22 @@ impl StoredRuntime {
     }
 }
 
+fn ingress_for(
+    rootfs: Option<&RootfsSpec>,
+    upstream: &Path,
+) -> Result<Option<IngressSpec>, StateError> {
+    if rootfs.is_none() {
+        return Ok(None);
+    }
+    let host_dir = upstream.parent().ok_or_else(|| {
+        StateError::InvalidConfig(format!(
+            "overlay-rooted upstream {} has no parent directory",
+            upstream.display()
+        ))
+    })?;
+    Ok(Some(IngressSpec::new(host_dir)))
+}
+
 fn loaded_from_stored(
     name: &str,
     upstream: &str,
@@ -744,6 +760,7 @@ fn loaded_from_stored(
         tmpfs_size: rootfs.tmpfs_size,
         staging_dir: rootfs.staging_dir.map(PathBuf::from),
     });
+    spec.ingress = ingress_for(spec.rootfs.as_ref(), &upstream_path)?;
     spec.seccomp = runtime.seccomp.map(FilterMode::from);
     spec.egress = runtime.egress.into();
     spec.init = runtime.init.map(PathBuf::from);
@@ -812,6 +829,7 @@ fn snapshot_from_config(config: &NodeConfig) -> Result<Snapshot, StateError> {
             .collect();
         spec.limits = input.limits.clone().into();
         spec.rootfs = input.rootfs.clone().map(Into::into);
+        spec.ingress = ingress_for(spec.rootfs.as_ref(), &input.upstream)?;
         spec.seccomp = input.seccomp.map(Into::into);
         spec.egress = input.egress.clone().into();
         spec.init = input.init.clone();
@@ -1039,6 +1057,10 @@ mod tests {
         input.apps[0].args = vec!["--serve".into()];
         input.apps[0].env.insert("MODE".into(), "test".into());
         input.apps[0].seccomp = None;
+        input.apps[0].rootfs = Some(RootfsConfig {
+            lowerdirs: vec![PathBuf::from("/lower")],
+            ..RootfsConfig::default()
+        });
         input.apps[0].egress = EgressConfig::Restricted {
             allow: vec![EgressRuleConfig {
                 cidr: "203.0.113.0/24".into(),
@@ -1056,6 +1078,14 @@ mod tests {
         );
         assert_eq!(loaded.apps[0].spec.args, [OsString::from("--serve")]);
         assert_eq!(loaded.apps[0].spec.seccomp, None);
+        assert_eq!(
+            loaded.apps[0]
+                .spec
+                .ingress
+                .as_ref()
+                .map(|ingress| ingress.host_dir.as_path()),
+            Some(Path::new("/run/cygnus"))
+        );
         assert_eq!(loaded.apps[0].lifecycle.min_instances, 1);
         drop(state);
         let _ = fs::remove_file(path);
