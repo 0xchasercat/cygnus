@@ -11,6 +11,7 @@ use std::ptr;
 use nix::errno::Errno;
 
 use crate::error::CageError;
+use crate::net;
 use crate::spec::{
     BUILD_OUTPUT_CAGE_DIR, BuildOutputSpec, INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
 };
@@ -448,6 +449,9 @@ struct OverlayPlan {
     tmpfs_data: CString,
     upper: CString,
     upper_dev: CString,
+    upper_etc: CString,
+    upper_resolv_conf: CString,
+    resolv_conf: Vec<u8>,
     work: CString,
     merged: CString,
     merged_dev: CString,
@@ -474,6 +478,9 @@ impl OverlayPlan {
                 .expect("tmpfs data has no NUL byte"),
             upper: path_cstring(&upper)?,
             upper_dev: path_cstring(&upper_dev)?,
+            upper_etc: path_cstring(&upper.join("etc"))?,
+            upper_resolv_conf: path_cstring(&upper.join("etc/resolv.conf"))?,
+            resolv_conf: format!("nameserver {}\noptions edns0\n", net::GATEWAY).into_bytes(),
             work: path_cstring(&staged.staging.join("work"))?,
             merged: path_cstring(&merged)?,
             merged_dev: path_cstring(&merged_dev)?,
@@ -522,6 +529,8 @@ impl OverlayPlan {
         unsafe {
             mkdir(&self.upper, 0o700)?;
             mkdir(&self.upper_dev, 0o755)?;
+            mkdir(&self.upper_etc, 0o755)?;
+            write_new_file(&self.upper_resolv_conf, &self.resolv_conf, 0o644)?;
             mkdir(&self.work, 0o700)?;
             mkdir(&self.merged, 0o700)?;
             for device in &self.devices {
@@ -671,6 +680,61 @@ unsafe fn create_device_placeholder(path: &CString) -> Result<(), i32> {
     Ok(())
 }
 
+/// Create and populate a private regular file in the overlay upper layer.
+///
+/// # Safety
+///
+/// Cloned-child contract: prebuilt path/content buffers and raw syscalls only.
+unsafe fn write_new_file(
+    path: &CString,
+    contents: &[u8],
+    mode: nix::libc::mode_t,
+) -> Result<(), i32> {
+    let fd = unsafe {
+        nix::libc::open(
+            path.as_ptr(),
+            nix::libc::O_WRONLY
+                | nix::libc::O_CREAT
+                | nix::libc::O_EXCL
+                | nix::libc::O_CLOEXEC
+                | nix::libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::last_raw());
+    }
+
+    let mut offset = 0;
+    while offset < contents.len() {
+        let written = unsafe {
+            nix::libc::write(
+                fd,
+                contents.as_ptr().add(offset).cast(),
+                contents.len() - offset,
+            )
+        };
+        if written < 0 {
+            let error = Errno::last_raw();
+            if error == nix::libc::EINTR {
+                continue;
+            }
+            let _ = unsafe { nix::libc::close(fd) };
+            return Err(error);
+        }
+        if written == 0 {
+            let _ = unsafe { nix::libc::close(fd) };
+            return Err(nix::libc::EIO);
+        }
+        offset += written as usize;
+    }
+
+    if unsafe { nix::libc::close(fd) } != 0 {
+        return Err(Errno::last_raw());
+    }
+    Ok(())
+}
+
 /// Verify that a source is still the expected character device after clone.
 /// This closes the pre-clone validation race without allocating in the child.
 ///
@@ -782,6 +846,15 @@ mod tests {
             merged.join(OLD_ROOT_NAME).as_os_str().as_bytes()
         );
         assert_eq!(overlay.old_root.to_bytes(), b"/.cygnus-old-root");
+        assert_eq!(
+            overlay.upper_resolv_conf.to_bytes(),
+            staging.join("upper/etc/resolv.conf").as_os_str().as_bytes()
+        );
+        assert_eq!(
+            overlay.resolv_conf,
+            format!("nameserver {}\noptions edns0\n", net::GATEWAY).as_bytes()
+        );
+
 
         drop(staged);
         assert!(!staging.exists());

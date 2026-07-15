@@ -1234,13 +1234,15 @@ impl From<StoredSeccomp> for FilterMode {
     }
 }
 
-impl From<&EgressMode> for StoredEgress {
-    fn from(mode: &EgressMode) -> Self {
+impl TryFrom<&EgressMode> for StoredEgress {
+    type Error = StateError;
+
+    fn try_from(mode: &EgressMode) -> Result<Self, Self::Error> {
         match mode {
-            EgressMode::None => Self::None,
-            EgressMode::Public => Self::Public,
-            EgressMode::Open => Self::Open,
-            EgressMode::Restricted { allow } => Self::Restricted {
+            EgressMode::None => Ok(Self::None),
+            EgressMode::Public => Ok(Self::Public),
+            EgressMode::Open => Ok(Self::Open),
+            EgressMode::Restricted { allow } => Ok(Self::Restricted {
                 allow: allow
                     .iter()
                     .map(|rule| StoredEgressRule {
@@ -1248,7 +1250,10 @@ impl From<&EgressMode> for StoredEgress {
                         ports: rule.ports.clone(),
                     })
                     .collect(),
-            },
+            }),
+            EgressMode::BuildDomains { .. } => Err(StateError::InvalidConfig(
+                "build-only domain egress cannot be persisted as an app policy".into(),
+            )),
         }
     }
 }
@@ -1337,7 +1342,7 @@ impl StoredRuntime {
             },
             rootfs,
             seccomp: app.spec.seccomp.map(StoredSeccomp::from),
-            egress: StoredEgress::from(&app.spec.egress),
+            egress: StoredEgress::try_from(&app.spec.egress)?,
             init: app
                 .spec
                 .init

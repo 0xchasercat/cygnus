@@ -5,6 +5,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
 use cygnus_daemon::state::{DEFAULT_STATE_PATH, LoadedApp, NodeConfig, State};
 use cygnus_router::{Route, RouteTable, Router};
 use cygnus_supervisor::Supervisor;
+use signal_hook::consts::{SIGINT, SIGTERM};
 
 const REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -157,6 +159,9 @@ fn apply(state_path: &Path, config_path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn serve(state_path: &Path) -> Result<(), Box<dyn Error>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let state = State::open(state_path)?;
     let snapshot = state.load()?;
     let listener = TcpListener::bind(snapshot.listen)?;
@@ -176,9 +181,17 @@ fn serve(state_path: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     spawn_reaper(Arc::downgrade(&supervisor));
-    let frontend = Arc::new(Frontend::new(Arc::new(Router::new(routes)), supervisor));
+    let frontend = Arc::new(Frontend::new(
+        Arc::new(Router::new(routes)),
+        Arc::clone(&supervisor),
+    ));
     eprintln!("cygnus-daemon: listening on {}", local_addr(&listener));
-    frontend.serve(listener)?;
+    let serve_result = frontend.serve_until(listener, &shutdown);
+    for (app, error) in supervisor.shutdown_all() {
+        eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
+    }
+    serve_result?;
+
     Ok(())
 }
 

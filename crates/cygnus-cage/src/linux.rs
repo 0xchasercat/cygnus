@@ -17,6 +17,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
 use crate::InstanceStatus;
+use crate::dns::{DnsForwarder, DnsLease};
 use crate::error::CageError;
 use crate::jobs::JobExitOutcome;
 use crate::mount::{MountPlan, StagedRootfs};
@@ -46,6 +47,7 @@ pub struct Cage {
     cgroup: Option<Cgroup>,
     staging: Option<StagedRootfs>,
     veth: Option<String>,
+    dns_lease: Option<DnsLease>,
     timings: BootTimings,
 }
 
@@ -55,7 +57,7 @@ impl Cage {
     /// cage pivots into, a `procfs` bound to the cage's own PID namespace, and
     /// an optional seccomp filter installed immediately before `execve`.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
-        Self::boot_inner(spec, None)
+        Self::boot_inner(spec, None, None)
     }
 
     pub(crate) fn boot_with_capture(
@@ -63,11 +65,29 @@ impl Cage {
         stdout: OwnedFd,
         stderr: OwnedFd,
     ) -> Result<Self, CageError> {
-        Self::boot_inner(spec, Some((stdout, stderr)))
+        Self::boot_inner(spec, Some((stdout, stderr)), None)
     }
 
-    fn boot_inner(spec: CageSpec, capture: Option<(OwnedFd, OwnedFd)>) -> Result<Self, CageError> {
+    pub(crate) fn boot_with_capture_and_dns(
+        spec: CageSpec,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+        dns: &DnsForwarder,
+    ) -> Result<Self, CageError> {
+        Self::boot_inner(spec, Some((stdout, stderr)), Some(dns))
+    }
+
+    fn boot_inner(
+        spec: CageSpec,
+        capture: Option<(OwnedFd, OwnedFd)>,
+        dns: Option<&DnsForwarder>,
+    ) -> Result<Self, CageError> {
         spec.validate()?;
+        if matches!(spec.egress, EgressMode::BuildDomains { .. }) && dns.is_none() {
+            return Err(CageError::InvalidSpec(
+                "build-domain egress requires a host DNS forwarder".into(),
+            ));
+        }
         let child_exec = ChildExec::new(&spec)?;
         // Parent-side prework: the staging directory, every mount C string,
         // the ingress source/target plan, the kernel capability range, and
@@ -183,6 +203,16 @@ impl Cage {
             if let Err(error) = configured {
                 let _ = write_all_fd(&release_write, &[CHILD_ABORT]);
                 return Err(error);
+            }
+        }
+        if let EgressMode::BuildDomains { allow } = &spec.egress {
+            let forwarder = dns.ok_or(CageError::Internal("missing host DNS forwarder"))?;
+            match forwarder.register(&spec.name, pid.as_raw(), allow) {
+                Ok(lease) => guard.dns_lease = Some(lease),
+                Err(error) => {
+                    let _ = write_all_fd(&release_write, &[CHILD_ABORT]);
+                    return Err(error);
+                }
             }
         }
         let network = network_started.elapsed();
@@ -303,6 +333,9 @@ impl Cage {
     fn cleanup(&mut self) -> Result<(), CageError> {
         let mut first_error = None;
 
+        // Stop authorizing DNS and wait for any in-flight nft mutation while
+        // the registered network namespace still exists.
+        self.dns_lease = None;
         if let Some(pid) = self.pid {
             if let Err(source) = kill(pid, Signal::SIGKILL)
                 && source != Errno::ESRCH
@@ -475,20 +508,13 @@ impl CapabilityPlan {
             version: LINUX_CAPABILITY_VERSION_3,
             pid: 0,
         };
-        let mut data = [
-            CapData {
-                effective: 0,
-                permitted: 0,
-                inheritable: 0,
-            };
-            LINUX_CAPABILITY_U32S_3
-        ];
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; LINUX_CAPABILITY_U32S_3];
         let result = unsafe {
-            nix::libc::syscall(
-                nix::libc::SYS_capset,
-                &raw mut header,
-                data.as_mut_ptr(),
-            )
+            nix::libc::syscall(nix::libc::SYS_capset, &raw mut header, data.as_mut_ptr())
         };
         if result != 0 {
             return Err(Errno::last_raw());
@@ -1068,6 +1094,7 @@ struct BootGuard {
     pid: Option<Pid>,
     cgroup: Option<Cgroup>,
     veth: Option<String>,
+    dns_lease: Option<DnsLease>,
 }
 
 impl BootGuard {
@@ -1076,6 +1103,7 @@ impl BootGuard {
             pid: Some(pid),
             cgroup: None,
             veth: None,
+            dns_lease: None,
         }
     }
 
@@ -1093,6 +1121,7 @@ impl BootGuard {
             cgroup: Some(cgroup),
             staging: None,
             veth: self.veth.take(),
+            dns_lease: self.dns_lease.take(),
             timings,
         })
     }
@@ -1100,6 +1129,7 @@ impl BootGuard {
 
 impl Drop for BootGuard {
     fn drop(&mut self) {
+        self.dns_lease = None;
         if let Some(pid) = self.pid.take() {
             let _ = kill(pid, Signal::SIGKILL);
             let _ = reap(pid);
@@ -1116,6 +1146,7 @@ impl Drop for BootGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DomainEgressRule;
 
     #[test]
     fn cgroup_path_is_confined_to_the_cygnus_subtree() {
@@ -1145,6 +1176,21 @@ mod tests {
         for (index, code) in codes.iter().enumerate() {
             assert!(!codes[index + 1..].contains(code));
         }
+    }
+
+    #[test]
+    fn build_domain_egress_requires_a_forwarder_before_clone() {
+        let mut spec = CageSpec::new("builder", "/bin/true");
+        spec.egress = EgressMode::BuildDomains {
+            allow: vec![DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
+        };
+
+        let error = Cage::boot(spec).expect_err("forwarder must be supplied");
+        assert!(matches!(error, CageError::InvalidSpec(_)));
+        assert!(error.to_string().contains("host DNS forwarder"));
     }
 
     #[test]

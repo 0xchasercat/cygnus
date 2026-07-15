@@ -21,8 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use cygnus_cage::{
-    BuildOutputSpec, EgressMode, FilterMode, JobConfig, JobExitOutcome, RootfsSpec, run_job,
+    BuildOutputSpec, CageError, DomainEgressRule, EgressMode, FilterMode, JobConfig,
+    JobExitOutcome, JobResult, RootfsSpec, run_job,
 };
+#[cfg(target_os = "linux")]
+use cygnus_cage::{DnsForwarder, run_job_with_dns};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -36,11 +39,32 @@ const WORKSPACE_REL: &str = ".work";
 const BUILD_OUTPUT_PREFIX: &str = ".building-";
 const FAILED_REL: &str = "failed";
 const SHIM_REL: &str = "cygnus/shim.js";
+const BUILD_RUNNER_REL: &str = "cygnus/build-runner.js";
+const BUILD_CONFIG_REL: &str = "cygnus/build.bunfig.toml";
+const BUILD_RUNNER_CAGE_PATH: &str = "/cygnus/build-runner.js";
+const BUILD_CONFIG_CAGE_PATH: &str = "/cygnus/build.bunfig.toml";
+const BUILD_WORKDIR_CAGE_PATH: &str = "/cygnus";
+const BUILD_CACHE_CAGE_PATH: &str = "/workspace/.cygnus-cache";
+const BUILD_HOME_CAGE_PATH: &str = "/cygnus/home";
+const BUILD_TMPDIR_CAGE_PATH: &str = "/cygnus/tmp";
+const BUILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const BUILD_REGISTRY: &str = "https://registry.npmjs.org";
+const BUILD_REGISTRY_DOMAIN: &str = "registry.npmjs.org";
+const BUILD_ROOTFS_TMPFS_SIZE: u64 = 512 * 1024 * 1024;
+const BUILD_INSTALL_MEMORY_MAX: u64 = 512 * 1024 * 1024;
+const BUILD_INSTALL_MEMORY_HIGH: u64 = 448 * 1024 * 1024;
+const BUILD_INSTALL_PIDS_MAX: u32 = 512;
+const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
+const MAX_BUN_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BUILD_OUTPUT: usize = 4 * 1024 * 1024;
-
 const LOG_STAGING_REL: &str = ".logs";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARTIFACT_INODES: u64 = 8_192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuildPlan {
+    install: bool,
+}
 /// Inputs to one source deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeployRequest {
@@ -223,6 +247,19 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
             return Err(error);
         }
     };
+    let build_plan = match preflight_workspace(&workspace) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = remove_work(&artifact_root, &deployment_id);
+            return Err(error);
+        }
+    };
+    let rootfs = workspace.parent().unwrap_or(&workspace);
+    if let Err(error) = stage_build_controls(rootfs) {
+        let _ = remove_work(&artifact_root, &deployment_id);
+        return Err(error);
+    };
+
 
     let input = DeploymentInput {
         id: deployment_id.clone(),
@@ -261,8 +298,15 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
             MAX_ARTIFACT_BYTES,
             MAX_ARTIFACT_INODES,
         )?;
-        let job = build_job(&engine, &workspace, publish.path(), &entry, &deployment_id);
-        let job_result = match run_job(job) {
+        let job = build_job(
+            &engine,
+            &workspace,
+            publish.path(),
+            &entry,
+            &deployment_id,
+            build_plan,
+        );
+        let job_result = match run_build_job(job, build_plan.install) {
             Ok(result) => result,
             Err(error) => {
                 write_logs(&log_staging, &[], error.to_string().as_bytes())?;
@@ -273,19 +317,23 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
                     &building,
                     &log_staging,
                     &deployment_id,
-                    format!("build cage could not start: {error}"),
+                    format!("Bun build pipeline cage could not start: {error}"),
                 ));
             }
         };
         write_logs(&log_staging, &job_result.stdout, &job_result.stderr)?;
         if !job_result.success() {
             let detail = match job_result.outcome {
-                JobExitOutcome::Exited(code) => format!("bun build exited with status {code}"),
-                JobExitOutcome::Signaled(signal) => {
-                    format!("bun build was terminated by signal {signal}")
+                JobExitOutcome::Exited(code) => {
+                    format!("Bun build pipeline exited with status {code}")
                 }
-                JobExitOutcome::TimedOut => "bun build exceeded its deadline".into(),
-                JobExitOutcome::OutputLimitExceeded => "bun build exceeded its output limit".into(),
+                JobExitOutcome::Signaled(signal) => {
+                    format!("Bun build pipeline was terminated by signal {signal}")
+                }
+                JobExitOutcome::TimedOut => "Bun build pipeline exceeded its deadline".into(),
+                JobExitOutcome::OutputLimitExceeded => {
+                    "Bun build pipeline exceeded its output limit".into()
+                }
             };
             publish.close()?;
             return Err(fail_build(
@@ -417,12 +465,25 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
     }
 }
 
+fn run_build_job(job: JobConfig, needs_dns: bool) -> Result<JobResult, CageError> {
+    #[cfg(target_os = "linux")]
+    if needs_dns {
+        let dns = DnsForwarder::start()?;
+        return run_job_with_dns(job, &dns);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = needs_dns;
+    run_job(job)
+}
+
 fn build_job(
     engine: &EngineRecord,
     workspace: &Path,
     publish: &Path,
     entry: &Path,
     deployment_id: &str,
+    plan: BuildPlan,
 ) -> JobConfig {
     let linux = cfg!(target_os = "linux");
     let relative = engine
@@ -434,41 +495,56 @@ fn build_job(
     } else {
         engine.host_root.join(relative)
     };
-    let output = if linux {
-        PathBuf::from(cygnus_cage::BUILD_OUTPUT_CAGE_DIR).join("app")
-    } else {
-        publish.join("app")
-    };
-    let source_entry = if linux {
-        PathBuf::from("/workspace").join(entry)
-    } else {
-        workspace.join(entry)
-    };
     let mut job = JobConfig::new(format!("cygnus-build-{deployment_id}"), command);
     job.args = vec![
-        OsString::from("build"),
-        source_entry.into_os_string(),
-        OsString::from("--target=bun"),
-        OsString::from("--production"),
-        OsString::from(format!("--outdir={}", output.display())),
-        OsString::from("--bytecode"),
+        OsString::from("--no-env-file"),
+        OsString::from(format!("--config={BUILD_CONFIG_CAGE_PATH}")),
+        OsString::from(BUILD_RUNNER_CAGE_PATH),
     ];
-    job.egress = EgressMode::None;
+    if plan.install {
+        job.args.push(OsString::from("--install"));
+    }
+    job.args.push(entry.as_os_str().to_owned());
+    job.env.insert("HOME".into(), BUILD_HOME_CAGE_PATH.into());
+    job.env
+        .insert("TMPDIR".into(), BUILD_TMPDIR_CAGE_PATH.into());
+    job.env.insert("PATH".into(), BUILD_PATH.into());
+    job.env
+        .insert("BUN_INSTALL_CACHE_DIR".into(), BUILD_CACHE_CAGE_PATH.into());
+    job.env
+        .insert("NPM_CONFIG_REGISTRY".into(), BUILD_REGISTRY.into());
+    job.egress = if plan.install {
+        EgressMode::BuildDomains {
+            allow: vec![DomainEgressRule {
+                domain: BUILD_REGISTRY_DOMAIN.into(),
+                ports: vec![443],
+            }],
+        }
+    } else {
+        EgressMode::None
+    };
     job.seccomp = Some(FilterMode::Enforce);
     job.timeout = JobConfig::DEFAULT_TIMEOUT;
     job.stdout_limit = MAX_BUILD_OUTPUT;
     job.stderr_limit = MAX_BUILD_OUTPUT;
     job.total_output_limit = Some(MAX_BUILD_OUTPUT * 2);
     job.working_dir = Some(if linux {
-        PathBuf::from("/workspace")
+        PathBuf::from(BUILD_WORKDIR_CAGE_PATH)
     } else {
-        workspace.to_path_buf()
+        workspace.parent().unwrap_or(workspace).to_path_buf()
     });
+    if plan.install {
+        job.limits.memory_max = BUILD_INSTALL_MEMORY_MAX;
+        job.limits.memory_high = BUILD_INSTALL_MEMORY_HIGH;
+        job.limits.pids_max = BUILD_INSTALL_PIDS_MAX;
+    }
     if linux {
-        job.rootfs = Some(RootfsSpec::new(vec![
+        let mut rootfs = RootfsSpec::new(vec![
             workspace.parent().unwrap_or(workspace).to_path_buf(),
             engine.host_root.clone(),
-        ]));
+        ]);
+        rootfs.tmpfs_size = BUILD_ROOTFS_TMPFS_SIZE;
+        job.rootfs = Some(rootfs);
         job.build_output = Some(BuildOutputSpec::new(publish));
     }
     job
@@ -544,6 +620,242 @@ fn runtime_config(
         egress: crate::state::EgressConfig::None,
         ..AppConfig::default()
     })
+}
+
+fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
+    reject_workspace_path(workspace, "node_modules", true)?;
+    reject_workspace_path(workspace, ".npmrc", false)?;
+    reject_workspace_path(workspace, "bunfig.toml", false)?;
+    reject_workspace_path(workspace, "bun.lockb", false)?;
+
+    let package_path = workspace.join("package.json");
+    let has_dependencies = match fs::symlink_metadata(&package_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(DeployError::InvalidInput(
+                    "package.json must be a regular file".into(),
+                ));
+            }
+            let bytes = read_control_file(&package_path, MAX_PACKAGE_JSON_BYTES, "package.json")?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                DeployError::InvalidInput(format!("package.json is malformed: {error}"))
+            })?;
+            let package = value.as_object().ok_or_else(|| {
+                DeployError::InvalidInput("package.json must contain a JSON object".into())
+            })?;
+            dependency_section_nonempty(package, "dependencies")?
+                || dependency_section_nonempty(package, "devDependencies")?
+                || dependency_section_nonempty(package, "optionalDependencies")?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return preflight_lock_only(workspace)
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let lock_path = workspace.join("bun.lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(DeployError::InvalidInput(
+                    "bun.lock must be a regular text file".into(),
+                ));
+            }
+            let bytes = read_control_file(&lock_path, MAX_BUN_LOCK_BYTES, "bun.lock")?;
+            validate_bun_lock(&bytes)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && has_dependencies => {
+            return Err(DeployError::InvalidInput(
+                "package dependencies require a regular text bun.lock".into(),
+            ));
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+
+    if has_dependencies {
+        for name in [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "pnpm-lock.yml",
+        ] {
+            reject_workspace_path(workspace, name, false)?;
+        }
+    }
+    Ok(BuildPlan {
+        install: has_dependencies,
+    })
+}
+
+fn preflight_lock_only(workspace: &Path) -> Result<BuildPlan, DeployError> {
+    let lock_path = workspace.join("bun.lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(DeployError::InvalidInput(
+                    "bun.lock must be a regular text file".into(),
+                ));
+            }
+            let bytes = read_control_file(&lock_path, MAX_BUN_LOCK_BYTES, "bun.lock")?;
+            validate_bun_lock(&bytes)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(BuildPlan { install: false })
+}
+
+fn reject_workspace_path(
+    workspace: &Path,
+    name: &str,
+    directory: bool,
+) -> Result<(), DeployError> {
+    let path = workspace.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(_) if directory => Err(DeployError::InvalidInput(format!(
+            "workspace contains forbidden root directory {name}"
+        ))),
+        Ok(_) => Err(DeployError::InvalidInput(format!(
+            "workspace contains forbidden control file {name}"
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn dependency_section_nonempty(
+    package: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<bool, DeployError> {
+    let Some(value) = package.get(name) else {
+        return Ok(false);
+    };
+    let Some(dependencies) = value.as_object() else {
+        return Err(DeployError::InvalidInput(format!(
+            "package.json {name} must be a JSON object"
+        )));
+    };
+    if dependencies
+        .iter()
+        .any(|(dependency, version)| dependency.is_empty() || !version.is_string())
+    {
+        return Err(DeployError::InvalidInput(format!(
+            "package.json {name} must map names to version strings"
+        )));
+    }
+    Ok(!dependencies.is_empty())
+}
+
+fn read_control_file(path: &Path, max_bytes: u64, name: &str) -> Result<Vec<u8>, DeployError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.len() > max_bytes {
+        return Err(DeployError::InvalidInput(format!(
+            "{name} exceeds the {} byte preflight limit",
+            max_bytes
+        )));
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(DeployError::InvalidInput(format!(
+            "{name} exceeds the {} byte preflight limit",
+            max_bytes
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_bun_lock(bytes: &[u8]) -> Result<(), DeployError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        DeployError::InvalidInput("bun.lock must be regular UTF-8 text".into())
+    })?;
+    if text.is_empty() || text.as_bytes().contains(&0) {
+        return Err(DeployError::InvalidInput(
+            "bun.lock must be regular UTF-8 text".into(),
+        ));
+    }
+    let normalized = strip_trailing_json_commas(text)?;
+    let value: serde_json::Value = serde_json::from_str(&normalized).map_err(|error| {
+        DeployError::InvalidInput(format!("bun.lock is malformed: {error}"))
+    })?;
+    if !value.is_object() || value.get("lockfileVersion").is_none() {
+        return Err(DeployError::InvalidInput(
+            "bun.lock is not a Bun text lockfile".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn strip_trailing_json_commas(text: &str) -> Result<String, DeployError> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+        } else if ch == ',' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_whitespace() {
+                next += 1;
+            }
+            if next == chars.len() || matches!(chars[next], '}' | ']') {
+                continue;
+            }
+            output.push(ch);
+        } else {
+            output.push(ch);
+        }
+    }
+    if in_string || escaped {
+        return Err(DeployError::InvalidInput(
+            "bun.lock is malformed: unterminated string".into(),
+        ));
+    }
+    Ok(output)
+}
+
+fn stage_build_controls(rootfs: &Path) -> Result<(), DeployError> {
+    let control_dir = rootfs.join("cygnus");
+    fs::create_dir_all(&control_dir)?;
+    let metadata = fs::symlink_metadata(&control_dir)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(DeployError::InvalidInput(
+            "build control directory must be daemon-owned".into(),
+        ));
+    }
+    write_control_asset(
+        &control_dir.join(BUILD_RUNNER_REL.strip_prefix("cygnus/").unwrap()),
+        include_bytes!("../../../assets/build-runner.js"),
+    )?;
+    write_control_asset(
+        &control_dir.join(BUILD_CONFIG_REL.strip_prefix("cygnus/").unwrap()),
+        include_bytes!("../../../assets/build.bunfig.toml"),
+    )?;
+    Ok(())
+}
+
+fn write_control_asset(path: &Path, bytes: &[u8]) -> Result<(), DeployError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
+    Ok(())
 }
 
 fn canonical_source_root(path: &Path) -> Result<PathBuf, DeployError> {
@@ -1074,6 +1386,7 @@ mod tests {
     use super::*;
     use crate::state::DeploymentStatus;
     use std::os::unix::fs::symlink;
+    use std::ffi::OsStr;
 
     fn temp_dir(label: &str) -> PathBuf {
         let path =
@@ -1123,6 +1436,115 @@ mod tests {
         assert!(validate_entry(Path::new("../file")).is_err());
         assert!(validate_entry(Path::new("/tmp/file")).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_preflight_matrix_is_strict_and_offline_without_deps() {
+        let root = temp_dir("preflight");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(preflight_workspace(&workspace).unwrap(), BuildPlan { install: false });
+
+        fs::write(workspace.join("package.json"), br#"{"name":"app","dependencies":{}}"#)
+            .unwrap();
+        assert_eq!(preflight_workspace(&workspace).unwrap(), BuildPlan { install: false });
+        fs::write(
+            workspace.join("package.json"),
+            br#"{"name":"app","dependencies":{"left-pad":"1.3.0"}}"#,
+        )
+        .unwrap();
+        assert!(preflight_workspace(&workspace).is_err());
+        fs::write(workspace.join("bun.lock"), br#"{"lockfileVersion":1,"workspaces":{},}"#)
+            .unwrap();
+        assert_eq!(preflight_workspace(&workspace).unwrap(), BuildPlan { install: true });
+        fs::write(workspace.join("package-lock.json"), b"{}\n").unwrap();
+        assert!(preflight_workspace(&workspace).is_err());
+        fs::remove_file(workspace.join("package-lock.json")).unwrap();
+        fs::write(workspace.join("bun.lock"), b"not a lock\n").unwrap();
+        assert!(preflight_workspace(&workspace).is_err());
+        fs::remove_file(workspace.join("bun.lock")).unwrap();
+        fs::create_dir(workspace.join("node_modules")).unwrap();
+        assert!(preflight_workspace(&workspace).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_preflight_rejects_oversized_and_control_files() {
+        let root = temp_dir("preflight-limits");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join("package.json"),
+            vec![b'a'; (MAX_PACKAGE_JSON_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(preflight_workspace(&workspace).is_err());
+        fs::remove_file(workspace.join("package.json")).unwrap();
+        fs::write(workspace.join(".npmrc"), b"registry=https://evil.invalid\n").unwrap();
+        assert!(preflight_workspace(&workspace).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn daemon_stages_runner_controls_outside_workspace() {
+        let root = temp_dir("control-assets");
+        let rootfs = root.join("rootfs");
+        let workspace = rootfs.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        stage_build_controls(&rootfs).unwrap();
+        assert!(rootfs.join(BUILD_RUNNER_REL).is_file());
+        assert!(rootfs.join(BUILD_CONFIG_REL).is_file());
+        assert!(!workspace.join("build-runner.js").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_job_has_closed_runner_argv_and_transient_domain_egress() {
+        let workspace = temp_dir("job").join("rootfs/workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let publish = workspace.parent().unwrap().join("publish");
+        fs::create_dir_all(&publish).unwrap();
+        let engine = EngineRecord {
+            version: "bun".into(),
+            host_root: PathBuf::from("/engine"),
+            cage_executable: PathBuf::from("/usr/local/bin/bun"),
+            sha256: "0".repeat(64),
+        };
+        let job = build_job(
+            &engine,
+            &workspace,
+            &publish,
+            Path::new("index.ts"),
+            "id",
+            BuildPlan { install: true },
+        );
+        assert_eq!(
+            job.args,
+            vec![
+                OsString::from("--no-env-file"),
+                OsString::from("--config=/cygnus/build.bunfig.toml"),
+                OsString::from("/cygnus/build-runner.js"),
+                OsString::from("--install"),
+                OsString::from("index.ts"),
+            ]
+        );
+        assert_eq!(job.working_dir, Some(if cfg!(target_os = "linux") {
+            PathBuf::from("/cygnus")
+        } else {
+            workspace.parent().unwrap().to_path_buf()
+        }));
+        assert_eq!(job.limits.memory_max, BUILD_INSTALL_MEMORY_MAX);
+        assert_eq!(job.limits.pids_max, BUILD_INSTALL_PIDS_MAX);
+        assert!(!job.env.contains_key(OsStr::new("BUN_OPTIONS")));
+        assert_eq!(
+            job.env.get(OsStr::new("NPM_CONFIG_REGISTRY")),
+            Some(&OsString::from(BUILD_REGISTRY)),
+        );
+        assert!(matches!(job.egress, EgressMode::BuildDomains { .. }));
+        if cfg!(target_os = "linux") {
+            assert_eq!(job.rootfs.as_ref().unwrap().tmpfs_size, BUILD_ROOTFS_TMPFS_SIZE);
+        }
+        fs::remove_dir_all(workspace.ancestors().nth(2).unwrap()).unwrap();
     }
 
     #[test]
