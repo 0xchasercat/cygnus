@@ -194,7 +194,7 @@ fn bridge_setup_commands() -> Vec<Vec<String>> {
         argv(&[
             "ip",
             "addr",
-            "add",
+            "replace",
             &format!("{GATEWAY}/{SUBNET_PREFIX}"),
             "dev",
             BRIDGE_NAME,
@@ -486,7 +486,7 @@ mod tests {
         assert!(
             joined
                 .iter()
-                .any(|c| c == "ip addr add 100.64.0.1/16 dev cygnus0")
+                .any(|c| c == "ip addr replace 100.64.0.1/16 dev cygnus0")
         );
         assert!(joined.iter().any(|c| c == "ip link set cygnus0 up"));
     }
