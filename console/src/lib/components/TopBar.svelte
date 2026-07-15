@@ -1,6 +1,6 @@
 <script>
   import { ui, go } from '../stores.svelte.js';
-  import { apps } from '../data.js';
+  import { apps, tenant0 } from '../data.js';
   import Icon from './Icon.svelte';
   import SwanMark from './SwanMark.svelte';
 
@@ -48,6 +48,13 @@
       <span class="avatar" title="chase · owner">C</span>
     </div>
   </div>
+  <div class="tenant-status" role="status" aria-label="Tenant 0 preview dataset; daemon bridge offline">
+    <span class="led preview" aria-hidden="true"></span>
+    <span class="tenant-id num">{tenant0.id}</span>
+    <span>{tenant0.dataSourceLabel}</span>
+    <span class="divider" aria-hidden="true">·</span>
+    <span>daemon bridge {tenant0.daemonBridge}</span>
+  </div>
 </header>
 
 <style>
@@ -65,6 +72,21 @@
     justify-content: space-between;
     gap: 20px;
   }
+  .tenant-status {
+    max-width: 1264px;
+    margin: 7px auto 0;
+    padding: 0 44px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--ink-3);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.025em;
+  }
+  .tenant-status .led { width: 6px; height: 6px; }
+  .tenant-id { color: var(--ink-2); font-weight: 500; }
+  .divider { color: var(--ink-4); }
   .left {
     display: flex;
     align-items: center;

@@ -15,7 +15,7 @@
       <section class="card">
         <div class="cardhead">
           <span class="label">Team</span>
-          <button class="btn sm"><Icon name="plus" size={12} />Invite</button>
+          <button class="btn sm" disabled title="Unavailable: daemon admin bridge offline"><Icon name="plus" size={12} />Invite</button>
         </div>
         <div class="rows pad0">
           {#each team as m}
@@ -34,7 +34,7 @@
       <section class="card">
         <div class="cardhead">
           <span class="label">API tokens</span>
-          <button class="btn sm"><Icon name="key" size={12} />New token</button>
+          <button class="btn sm" disabled title="Unavailable: daemon admin bridge offline"><Icon name="key" size={12} />New token</button>
         </div>
         <div class="rows pad0">
           {#each tokens as t}
@@ -45,7 +45,7 @@
                 <span class="tmeta num">{t.prefix} · {t.scope} · used {t.last}</span>
               </div>
               <span class="grow"></span>
-              <button class="btn sm danger">Revoke</button>
+              <button class="btn sm danger" disabled title="Unavailable: daemon admin bridge offline">Revoke</button>
             </div>
           {/each}
         </div>
@@ -74,7 +74,7 @@
       <section class="card">
         <div class="cardhead">
           <span class="label">Domains</span>
-          <button class="btn sm"><Icon name="plus" size={12} />Add domain</button>
+          <button class="btn sm" disabled title="Unavailable: daemon admin bridge offline"><Icon name="plus" size={12} />Add domain</button>
         </div>
         <div class="rows pad0">
           <div class="row">
@@ -98,14 +98,14 @@
               <span class="mname">Drain node</span>
               <span class="tmeta">Finish in-flight requests, park every cage.</span>
             </div>
-            <button class="btn sm danger">Drain</button>
+            <button class="btn sm danger" disabled title="Unavailable: daemon admin bridge offline">Drain</button>
           </div>
           <div class="setrow">
             <div class="settext">
               <span class="mname">Rotate node key</span>
               <span class="tmeta">Re-seal env secrets under a fresh key.</span>
             </div>
-            <button class="btn sm danger">Rotate</button>
+            <button class="btn sm danger" disabled title="Unavailable: daemon admin bridge offline">Rotate</button>
           </div>
         </div>
       </section>

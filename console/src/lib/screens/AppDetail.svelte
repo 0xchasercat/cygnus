@@ -77,9 +77,9 @@
           </div>
           <div class="grow"></div>
           {#if app.env === 'preview'}
-            <button class="btn cobalt"><Icon name="ship" size={13} />Promote</button>
+            <button class="btn cobalt" disabled title="Unavailable: daemon admin bridge offline"><Icon name="ship" size={13} />Promote</button>
           {:else}
-            <button class="btn"><Icon name="rollback" size={14} />Roll back</button>
+            <button class="btn" disabled title="Unavailable: daemon admin bridge offline"><Icon name="rollback" size={14} />Roll back</button>
           {/if}
           <button class="btn" onclick={() => openDeploy(app.id, current.id)}>Build log</button>
         </div>
@@ -124,7 +124,7 @@
           <div class="coldbox">
             <p>No process. The artifact sleeps on disk — {app.envVars} env vars sealed, route armed.</p>
             <div class="coldstat num">next request revives in ≈{app.revival} ms</div>
-            <button class="btn sm"><Icon name="zap" size={12} />Warm up now</button>
+            <button class="btn sm" disabled title="Unavailable: daemon admin bridge offline"><Icon name="zap" size={12} />Warm up now</button>
           </div>
         {:else}
           <div class="kv">

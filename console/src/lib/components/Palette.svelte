@@ -53,7 +53,7 @@
     if (ui.paletteOpen) {
       q = '';
       sel = 0;
-      setTimeout(() => inputEl?.focus(), 10);
+      queueMicrotask(() => inputEl?.focus());
     }
   });
 

@@ -3,6 +3,16 @@
 // Vocabulary is spec-faithful: apps run in cages (warm per-app servers),
 // cold apps are revived, deploys are blue-green artifact swaps.
 // ————————————————————————————————————————————————————————————————
+// Tenant 0 is intentionally read-only until a typed daemon admin bridge exists.
+export const tenant0 = Object.freeze({
+  id: 'tenant-0',
+  mode: 'preview',
+  dataSource: 'fixture',
+  dataSourceLabel: 'preview dataset',
+  connection: 'offline',
+  daemonBridge: 'offline',
+  mutating: false,
+});
 
 export const node = {
   name: 'swan-01',

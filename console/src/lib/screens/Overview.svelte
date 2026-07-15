@@ -13,17 +13,9 @@
     )
   );
 
-  // live request pulse
+  // static preview request pulse from the fixture dataset
   let rps = $state(1284);
   let sparkData = $state([48, 52, 50, 55, 61, 58, 54, 57, 63, 60, 56, 59, 66, 62, 58, 61, 55, 57, 64, 60, 62, 59, 61, 65]);
-  $effect(() => {
-    const t = setInterval(() => {
-      const next = Math.max(900, Math.round(rps + (Math.random() - 0.48) * 60));
-      rps = next;
-      sparkData = [...sparkData.slice(1), 40 + (next - 900) / 12];
-    }, 1100);
-    return () => clearInterval(t);
-  });
 
   const EVENT_ICON = {
     deploy: 'ship',
