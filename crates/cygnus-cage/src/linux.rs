@@ -25,14 +25,18 @@ use crate::seccomp::SeccompPlan;
 use crate::spec::{BootTimings, CageSpec, CgroupLimits, EgressMode};
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
+const CAP_LAST_CAP_PATH: &str = "/proc/sys/kernel/cap_last_cap";
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const LINUX_CAPABILITY_U32S_3: usize = 2;
 const CYGNUS_CGROUP: &str = "cygnus";
 const CHILD_RELEASE: u8 = 1;
 const CHILD_ABORT: u8 = 2;
 const CHILD_ERROR_LEN: usize = 5;
 const CHILD_STAGE_RELEASE: u8 = 1;
 const CHILD_STAGE_MOUNT: u8 = 2;
-const CHILD_STAGE_SECCOMP: u8 = 3;
-const CHILD_STAGE_EXEC: u8 = 4;
+const CHILD_STAGE_CAPABILITIES: u8 = 3;
+const CHILD_STAGE_SECCOMP: u8 = 4;
+const CHILD_STAGE_EXEC: u8 = 5;
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A running cage and the measurements captured while it booted.
@@ -66,9 +70,10 @@ impl Cage {
         spec.validate()?;
         let child_exec = ChildExec::new(&spec)?;
         // Parent-side prework: the staging directory, every mount C string,
-        // the ingress source/target plan, and the compiled seccomp program are
-        // built before the clock starts and the clone happens, so the child
-        // only fires raw syscalls on prebuilt data. A failure past this point
+        // the ingress source/target plan, the kernel capability range, and
+        // the compiled seccomp program are built before the clock starts and
+        // the clone happens, so the child only fires raw syscalls on prebuilt
+        // data. A failure past this point
         // drops the staging directory.
         let mut staging = match &spec.rootfs {
             Some(rootfs) => Some(StagedRootfs::create(&spec.name, rootfs)?),
@@ -79,6 +84,7 @@ impl Cage {
             spec.ingress.as_ref(),
             spec.build_output.as_ref(),
         )?;
+        let capabilities = CapabilityPlan::new()?;
         let seccomp_plan = match spec.seccomp {
             Some(mode) => Some(
                 SeccompPlan::new(mode)
@@ -113,6 +119,7 @@ impl Cage {
         let mut stack = vec![0_u8; CLONE_STACK_SIZE];
         let mut child_exec = Some(child_exec);
         let mut child_plan = Some(ChildPlan {
+            capabilities,
             mounts: mount_plan,
             seccomp: seccomp_plan,
         });
@@ -143,8 +150,8 @@ impl Cage {
             | CloneFlags::CLONE_NEWNET;
         // SAFETY: `stack` remains alive in the parent until clone returns. The
         // child callback performs only async-signal-safe descriptor I/O and
-        // raw mount and seccomp syscalls before replacing itself with the
-        // target process.
+        // raw capability, mount, and seccomp syscalls before replacing itself
+        // with the target process.
         let pid = unsafe { clone(callback, &mut stack, flags, Some(nix::libc::SIGCHLD)) }
             .map_err(|source| CageError::NamespaceUnavailable { source })?;
 
@@ -372,7 +379,7 @@ struct ParentFds {
 }
 
 /// Child-owned pipe ends used to receive the release signal and report the
-/// outcome of the mount, seccomp, and exec stages.
+/// outcome of the mount, capability, seccomp, and exec stages.
 struct ChildChannels {
     release_read: OwnedFd,
     exec_write: OwnedFd,
@@ -383,8 +390,116 @@ struct ChildChannels {
 
 /// The prebuilt setup steps the child applies between clone and `execve`.
 struct ChildPlan {
+    capabilities: CapabilityPlan,
     mounts: MountPlan,
     seccomp: Option<SeccompPlan>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CapabilityPlan {
+    last_cap: u32,
+}
+
+impl CapabilityPlan {
+    fn new() -> Result<Self, CageError> {
+        let path = Path::new(CAP_LAST_CAP_PATH);
+        let value = fs::read_to_string(path)
+            .map_err(|source| CageError::io("read kernel capability range", path, source))?;
+        let last_cap = value.trim().parse::<u32>().map_err(|source| {
+            CageError::io(
+                "parse kernel capability range",
+                path,
+                io::Error::new(io::ErrorKind::InvalidData, source),
+            )
+        })?;
+        Ok(Self { last_cap })
+    }
+
+    /// Drop every capability before handing control to the target process.
+    ///
+    /// # Safety
+    ///
+    /// The caller must invoke this in the single-threaded cloned child after
+    /// namespace and mount setup. Every operation below is a raw syscall over
+    /// stack data and performs no allocation or lock acquisition.
+    unsafe fn apply(self) -> Result<(), i32> {
+        for capability in 0..=self.last_cap {
+            let result = unsafe {
+                nix::libc::prctl(
+                    nix::libc::PR_CAPBSET_DROP,
+                    capability as nix::libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if result != 0 {
+                return Err(Errno::last_raw());
+            }
+        }
+
+        let result = unsafe {
+            nix::libc::prctl(
+                nix::libc::PR_CAP_AMBIENT,
+                nix::libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        };
+        if result != 0 {
+            let errno = Errno::last_raw();
+            // Ambient capabilities were added in Linux 4.3. EINVAL means the
+            // old kernel does not know this prctl operation; there is no
+            // ambient set to clear there. All other failures are fatal.
+            if errno != Errno::EINVAL as i32 {
+                return Err(errno);
+            }
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+
+        let mut header = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            };
+            LINUX_CAPABILITY_U32S_3
+        ];
+        let result = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_capset,
+                &raw mut header,
+                data.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(Errno::last_raw());
+        }
+
+        let result = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if result != 0 {
+            return Err(Errno::last_raw());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -569,13 +684,19 @@ fn child_main(
     // Closing the mount pipe signals the parent that mounts are ready.
     drop(mount_write);
 
-    // Seccomp installs after mounts and immediately before execve, so the
-    // mount family the filter denies is already spent. With no filter the
-    // stage is a no-op and the pipe closes at once.
+    if let Err(errno) = unsafe { plan.capabilities.apply() } {
+        write_child_error(&seccomp_write, CHILD_STAGE_CAPABILITIES, errno);
+        return 127;
+    }
+
+    // Seccomp installs after capability dropping, immediately before execve,
+    // so the mount family the filter denies is already spent. With no filter
+    // the stage is a no-op and the pipe closes at once.
     if let Some(seccomp) = &plan.seccomp {
-        // SAFETY: the child is single-threaded here, mounts are complete, and
-        // apply issues only raw syscalls over the program compiled in the
-        // parent. No allocation or lock acquisition occurs.
+        // SAFETY: the child is single-threaded here, mounts and capability
+        // setup are complete, and apply issues only raw syscalls over the
+        // program compiled in the parent. No allocation or lock acquisition
+        // occurs.
         if let Err(errno) = unsafe { seccomp.apply() } {
             write_child_error(&seccomp_write, CHILD_STAGE_SECCOMP, errno);
             return 127;
@@ -845,6 +966,7 @@ fn wait_for_child_stage(
                     let stage = match message[0] {
                         CHILD_STAGE_RELEASE => "parent release",
                         CHILD_STAGE_MOUNT => "filesystem setup",
+                        CHILD_STAGE_CAPABILITIES => "capability drop",
                         CHILD_STAGE_SECCOMP => "seccomp filter",
                         CHILD_STAGE_EXEC => "execve",
                         _ => return Err(CageError::MalformedChildStatus),
@@ -1016,6 +1138,7 @@ mod tests {
         let codes = [
             CHILD_STAGE_RELEASE,
             CHILD_STAGE_MOUNT,
+            CHILD_STAGE_CAPABILITIES,
             CHILD_STAGE_SECCOMP,
             CHILD_STAGE_EXEC,
         ];
