@@ -71,6 +71,12 @@ pub fn nftables_ruleset(cage_ip: Ipv4Addr, mode: &EgressMode) -> Option<String> 
     let mut script = String::new();
     let _ = writeln!(script, "# cage {cage_ip}");
     let _ = writeln!(script, "table inet cygnus {{");
+    if matches!(mode, EgressMode::BuildDomains { .. }) {
+        let _ = writeln!(script, "\tset dns_v4 {{");
+        let _ = writeln!(script, "\t\ttype ipv4_addr;");
+        let _ = writeln!(script, "\t\tflags timeout;");
+        let _ = writeln!(script, "\t}}");
+    }
     let _ = writeln!(script, "\tchain egress {{");
     let _ = writeln!(
         script,
@@ -121,6 +127,28 @@ pub fn nftables_ruleset(cage_ip: Ipv4Addr, mode: &EgressMode) -> Option<String> 
                         );
                     }
                 }
+            }
+        }
+        EgressMode::BuildDomains { allow } => {
+            for private in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+                let _ = writeln!(script, "\t\tip daddr {private} drop");
+            }
+            let ports = allow
+                .iter()
+                .flat_map(|rule| rule.ports.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !ports.is_empty() {
+                let ports = ports
+                    .iter()
+                    .map(|port| port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    script,
+                    "\t\tip daddr @dns_v4 tcp dport {{ {ports} }} accept"
+                );
             }
         }
     }
@@ -261,9 +289,11 @@ pub(crate) fn configure_cage(
 /// Best-effort removal of a cage's host-side veth at teardown, by interface
 /// name (the value returned by [`host_veth_name`]).
 pub(crate) fn delete_veth(interface: &str) -> Result<(), CageError> {
-    run_tolerant(&veth_delete_command(interface), "tear down cage network", |stderr| {
-        stderr.contains("Cannot find") || stderr.contains("does not exist")
-    })
+    run_tolerant(
+        &veth_delete_command(interface),
+        "tear down cage network",
+        |stderr| stderr.contains("Cannot find") || stderr.contains("does not exist"),
+    )
 }
 
 /// Load an nftables script from stdin, either on the host (`netns_pid` is
@@ -303,10 +333,12 @@ fn nft_load(
             operation: operation.into(),
             detail: format!("write nft script: {source}"),
         })?;
-    let output = child.wait_with_output().map_err(|source| CageError::Network {
-        operation: operation.into(),
-        detail: format!("run nft: {source}"),
-    })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|source| CageError::Network {
+            operation: operation.into(),
+            detail: format!("run nft: {source}"),
+        })?;
     if !output.status.success() {
         return Err(CageError::Network {
             operation: operation.into(),
@@ -362,7 +394,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::EgressRule;
+    use crate::spec::{DomainEgressRule, EgressRule};
 
     #[test]
     fn addresses_are_deterministic() {
@@ -372,11 +404,22 @@ mod tests {
 
     #[test]
     fn addresses_stay_in_the_assignable_range() {
-        for name in ["a", "web", "api", "preview-123", "tenant-0", "x".repeat(64).as_str()] {
+        for name in [
+            "a",
+            "web",
+            "api",
+            "preview-123",
+            "tenant-0",
+            "x".repeat(64).as_str(),
+        ] {
             let ip = cage_ipv4(name);
             let octets = ip.octets();
             assert_eq!([octets[0], octets[1]], [100, 64], "{name} left the subnet");
-            assert_ne!(ip, Ipv4Addr::new(100, 64, 0, 0), "{name} hit the network address");
+            assert_ne!(
+                ip,
+                Ipv4Addr::new(100, 64, 0, 0),
+                "{name} hit the network address"
+            );
             assert_ne!(ip, GATEWAY, "{name} hit the gateway");
             assert_ne!(
                 ip,
@@ -421,7 +464,11 @@ mod tests {
         assert!(addr.starts_with("nsenter -t 4321 -n --"));
         assert!(addr.contains(&format!("{ip}/16")));
         assert!(addr.contains("dev eth0"));
-        assert!(joined.iter().any(|c| c.contains("route add default via 100.64.0.1")));
+        assert!(
+            joined
+                .iter()
+                .any(|c| c.contains("route add default via 100.64.0.1"))
+        );
     }
 
     #[test]
@@ -430,8 +477,16 @@ mod tests {
             .iter()
             .map(|c| c.join(" "))
             .collect();
-        assert!(joined.iter().any(|c| c == "ip link add name cygnus0 type bridge"));
-        assert!(joined.iter().any(|c| c == "ip addr add 100.64.0.1/16 dev cygnus0"));
+        assert!(
+            joined
+                .iter()
+                .any(|c| c == "ip link add name cygnus0 type bridge")
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|c| c == "ip addr add 100.64.0.1/16 dev cygnus0")
+        );
         assert!(joined.iter().any(|c| c == "ip link set cygnus0 up"));
     }
 
@@ -469,8 +524,12 @@ mod tests {
 
         // DNS to the gateway must be accepted before the bridge subnet is
         // dropped, or name resolution would break.
-        let dns = script.find("ip daddr 100.64.0.1 udp dport 53").expect("dns rule");
-        let bridge_drop = script.find("ip daddr 100.64.0.0/16 drop").expect("bridge drop");
+        let dns = script
+            .find("ip daddr 100.64.0.1 udp dport 53")
+            .expect("dns rule");
+        let bridge_drop = script
+            .find("ip daddr 100.64.0.0/16 drop")
+            .expect("bridge drop");
         assert!(dns < bridge_drop, "DNS accept must precede the bridge drop");
     }
 
@@ -502,5 +561,76 @@ mod tests {
         assert!(script.contains("ip daddr 198.51.100.7/32 accept"));
         // Deny-by-default: no blanket internet allow in restricted mode.
         assert!(!script.contains("meta l4proto { tcp, udp } accept"));
+    }
+
+    #[test]
+    fn build_domains_use_a_timed_ipv4_set_and_the_union_of_tcp_ports() {
+        let mode = EgressMode::BuildDomains {
+            allow: vec![
+                DomainEgressRule {
+                    domain: "registry.npmjs.org".into(),
+                    ports: vec![443],
+                },
+                DomainEgressRule {
+                    domain: "git.example.com".into(),
+                    ports: vec![22, 443],
+                },
+            ],
+        };
+        let script = nftables_ruleset(cage_ipv4("builder"), &mode).expect("ruleset");
+
+        assert!(script.contains("set dns_v4 {"));
+        assert!(script.contains("type ipv4_addr;"));
+        assert!(script.contains("flags timeout;"));
+        assert!(script.contains("ip daddr @dns_v4 tcp dport { 22, 443 } accept"));
+        assert!(!script.contains("ip daddr @dns_v4 udp"));
+        assert!(!script.contains("meta l4proto { tcp, udp } accept"));
+    }
+
+    #[test]
+    fn build_domain_denials_precede_dynamic_set_allow() {
+        let mode = EgressMode::BuildDomains {
+            allow: vec![DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
+        };
+        let script = nftables_ruleset(cage_ipv4("builder"), &mode).expect("ruleset");
+        let dynamic_allow = script.find("ip daddr @dns_v4").expect("dynamic allow");
+
+        for denial in [
+            "ip daddr 169.254.0.0/16 drop",
+            "ip daddr 100.64.0.0/16 drop",
+            "ip daddr 10.0.0.0/8 drop",
+            "ip daddr 172.16.0.0/12 drop",
+            "ip daddr 192.168.0.0/16 drop",
+            "ip daddr 224.0.0.0/4 drop",
+        ] {
+            assert!(
+                script.find(denial).expect("required denial") < dynamic_allow,
+                "{denial} must precede the dynamic allow"
+            );
+        }
+
+        let dns = script
+            .find("ip daddr 100.64.0.1 udp dport 53 accept")
+            .expect("gateway DNS allow");
+        let bridge = script
+            .find("ip daddr 100.64.0.0/16 drop")
+            .expect("bridge denial");
+        assert!(dns < bridge);
+    }
+
+    #[test]
+    fn empty_build_domain_policy_remains_valid_default_drop() {
+        let script = nftables_ruleset(
+            cage_ipv4("builder"),
+            &EgressMode::BuildDomains { allow: Vec::new() },
+        )
+        .expect("ruleset");
+
+        assert!(script.contains("set dns_v4 {"));
+        assert!(script.contains("policy drop;"));
+        assert!(!script.contains("tcp dport {  }"));
     }
 }

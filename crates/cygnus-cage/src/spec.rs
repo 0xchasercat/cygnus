@@ -51,6 +51,19 @@ pub struct EgressRule {
     pub ports: Vec<u16>,
 }
 
+/// One exact DNS-name allowance used by [`EgressMode::BuildDomains`].
+///
+/// Domain egress is intentionally limited to build jobs. A successful A
+/// lookup populates a short-lived nftables set in that build cage, and only
+/// TCP traffic to the listed destination ports may use the resolved address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainEgressRule {
+    /// Canonical lowercase DNS name without a trailing root dot or wildcard.
+    pub domain: String,
+    /// Non-empty, unique TCP destination ports.
+    pub ports: Vec<u16>,
+}
+
 /// Per-cage egress policy, enforced with nftables in the cage's network
 /// namespace (spec §7).
 ///
@@ -65,6 +78,8 @@ pub enum EgressMode {
     None,
     /// Deny by default; allow only the listed destinations, plus DNS.
     Restricted { allow: Vec<EgressRule> },
+    /// Build-only exact-domain policy populated dynamically by DNS answers.
+    BuildDomains { allow: Vec<DomainEgressRule> },
     /// The public internet, with private ranges and metadata denied.
     Public,
     /// Public plus RFC1918, for apps that reach LAN services. Explicit opt-in;
@@ -345,10 +360,35 @@ impl CageSpec {
                 ));
             }
         }
-        if let EgressMode::Restricted { allow } = &self.egress {
-            for rule in allow {
-                validate_cidr(&rule.cidr)?;
+        match &self.egress {
+            EgressMode::Restricted { allow } => {
+                for rule in allow {
+                    validate_cidr(&rule.cidr)?;
+                }
             }
+            EgressMode::BuildDomains { allow } => {
+                for rule in allow {
+                    validate_domain(&rule.domain)?;
+                    if rule.ports.is_empty() {
+                        return Err(CageError::InvalidSpec(format!(
+                            "domain egress rule for {:?} must list at least one port",
+                            rule.domain
+                        )));
+                    }
+                    let mut unique = std::collections::BTreeSet::new();
+                    if rule
+                        .ports
+                        .iter()
+                        .any(|port| *port == 0 || !unique.insert(*port))
+                    {
+                        return Err(CageError::InvalidSpec(format!(
+                            "domain egress ports for {:?} must be nonzero and unique",
+                            rule.domain
+                        )));
+                    }
+                }
+            }
+            EgressMode::None | EgressMode::Public | EgressMode::Open => {}
         }
         if let Some(init) = &self.init
             && !init.is_absolute()
@@ -450,6 +490,35 @@ fn validate_cidr(cidr: &str) -> Result<(), CageError> {
     }
 }
 
+/// Validate a canonical exact host name as stored in a domain egress rule.
+fn validate_domain(domain: &str) -> Result<(), CageError> {
+    if domain.is_empty() || domain.len() > 253 {
+        return Err(CageError::InvalidSpec(format!(
+            "domain egress name {domain:?} must contain 1 to 253 bytes"
+        )));
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(CageError::InvalidSpec(format!(
+                "domain egress name {domain:?} contains an empty or overlong label"
+            )));
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit()
+            || !bytes[label.len() - 1].is_ascii_lowercase()
+                && !bytes[label.len() - 1].is_ascii_digit()
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return Err(CageError::InvalidSpec(format!(
+                "domain egress name {domain:?} is not a canonical lowercase host name"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_name(name: &str) -> Result<(), CageError> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -538,6 +607,88 @@ mod tests {
         // Public and Open carry no rules to validate.
         spec.egress = EgressMode::Open;
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_accepts_canonical_build_domains_with_unique_ports() {
+        let mut spec = CageSpec::new("builder", "/bin/true");
+        spec.egress = EgressMode::BuildDomains {
+            allow: vec![
+                DomainEgressRule {
+                    domain: "registry.npmjs.org".into(),
+                    ports: vec![443],
+                },
+                DomainEgressRule {
+                    domain: "cache-1.example.com".into(),
+                    ports: vec![80, 443],
+                },
+            ],
+        };
+
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_noncanonical_or_wildcard_build_domains() {
+        for domain in [
+            "Registry.npmjs.org",
+            "registry.npmjs.org.",
+            "*.npmjs.org",
+            ".npmjs.org",
+            "npmjs..org",
+            "-registry.npmjs.org",
+            "registry-.npmjs.org",
+            "registry_npmjs.org",
+            "éxample.org",
+        ] {
+            let mut spec = CageSpec::new("builder", "/bin/true");
+            spec.egress = EgressMode::BuildDomains {
+                allow: vec![DomainEgressRule {
+                    domain: domain.into(),
+                    ports: vec![443],
+                }],
+            };
+            assert!(
+                spec.validate().is_err(),
+                "accepted noncanonical build domain {domain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_empty_duplicate_or_zero_build_ports() {
+        for ports in [vec![], vec![443, 443], vec![0, 443]] {
+            let mut spec = CageSpec::new("builder", "/bin/true");
+            spec.egress = EgressMode::BuildDomains {
+                allow: vec![DomainEgressRule {
+                    domain: "registry.npmjs.org".into(),
+                    ports,
+                }],
+            };
+            assert!(spec.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn validation_rejects_overlong_domain_labels_and_names() {
+        let label = "a".repeat(64);
+        let name = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62),
+        ]
+        .join(".");
+        for domain in [format!("{label}.example"), name] {
+            let mut spec = CageSpec::new("builder", "/bin/true");
+            spec.egress = EgressMode::BuildDomains {
+                allow: vec![DomainEgressRule {
+                    domain,
+                    ports: vec![443],
+                }],
+            };
+            assert!(spec.validate().is_err());
+        }
     }
 
     #[test]
