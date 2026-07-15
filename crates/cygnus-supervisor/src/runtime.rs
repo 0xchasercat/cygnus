@@ -15,6 +15,7 @@
 //! trigger exactly one boot. No lock is ever held across a boot or a shutdown.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,8 @@ impl Instance for cygnus_cage::Cage {
 pub enum AcquireError {
     /// No app is registered under this name.
     Unknown,
+    /// The daemon is shutting down and will not start or retain a cage.
+    ShuttingDown,
     /// The app is crash-looping and parked; do not retry until it is cleared.
     CrashLooping,
     /// A boot is backing off after a recent failure; retry after this delay.
@@ -78,6 +81,7 @@ struct Slot<I> {
 pub struct Supervisor<I> {
     boot: Box<BootFn<I>>,
     apps: Mutex<HashMap<String, Arc<Slot<I>>>>,
+    shutting_down: AtomicBool,
 }
 
 impl<I: Instance> Supervisor<I> {
@@ -86,6 +90,7 @@ impl<I: Instance> Supervisor<I> {
         Self {
             boot: Box::new(boot),
             apps: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -108,6 +113,9 @@ impl<I: Instance> Supervisor<I> {
     /// Ensure the named app is booted and ready, booting it on demand. Callers
     /// racing on a cold app coalesce onto a single boot.
     pub fn acquire(&self, name: &str) -> Result<(), AcquireError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(AcquireError::ShuttingDown);
+        }
         let slot = {
             let apps = recover(self.apps.lock());
             apps.get(name).cloned().ok_or(AcquireError::Unknown)?
@@ -115,6 +123,9 @@ impl<I: Instance> Supervisor<I> {
 
         let mut state = recover(slot.state.lock());
         loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(AcquireError::ShuttingDown);
+            }
             match state.lifecycle.state() {
                 LifecycleState::Ready => {
                     state.lifecycle.note_request(Instant::now());
@@ -142,6 +153,17 @@ impl<I: Instance> Supervisor<I> {
                     drop(state);
                     let result = (self.boot)(&slot.spec);
                     state = recover(slot.state.lock());
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        let instance = result.ok();
+                        state.lifecycle.mark_cold();
+                        state.retry_after = None;
+                        slot.progress.notify_all();
+                        drop(state);
+                        if let Some(instance) = instance {
+                            let _ = instance.shutdown();
+                        }
+                        return Err(AcquireError::ShuttingDown);
+                    }
                     match result {
                         Ok(instance) => {
                             state.instance = Some(instance);
@@ -250,6 +272,47 @@ impl<I: Instance> Supervisor<I> {
         reaped
     }
 
+    /// Stop admitting boots, wait for in-flight lifecycle transitions, and
+    /// release every ready instance. Returns per-app teardown failures.
+    pub fn shutdown_all(&self) -> Vec<(String, String)> {
+        self.shutting_down.store(true, Ordering::Release);
+        let candidates: Vec<(String, Arc<Slot<I>>)> = {
+            let apps = recover(self.apps.lock());
+            apps.iter()
+                .map(|(name, slot)| (name.clone(), Arc::clone(slot)))
+                .collect()
+        };
+
+        let mut failures = Vec::new();
+        for (name, slot) in candidates {
+            let mut state = recover(slot.state.lock());
+            while matches!(
+                state.lifecycle.state(),
+                LifecycleState::Booting | LifecycleState::Draining
+            ) {
+                state = recover(slot.progress.wait(state));
+            }
+            if state.lifecycle.state() != LifecycleState::Ready {
+                continue;
+            }
+            state.lifecycle.begin_drain();
+            let instance = state.instance.take();
+            drop(state);
+
+            if let Some(instance) = instance
+                && let Err(error) = instance.shutdown()
+            {
+                failures.push((name, error));
+            }
+
+            let mut state = recover(slot.state.lock());
+            state.lifecycle.mark_cold();
+            state.retry_after = None;
+            slot.progress.notify_all();
+        }
+        failures
+    }
+
     /// Current lifecycle state of an app, if registered.
     pub fn state(&self, name: &str) -> Option<LifecycleState> {
         let slot = recover(self.apps.lock()).get(name).cloned()?;
@@ -271,6 +334,7 @@ impl<I: Instance> Supervisor<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
@@ -371,6 +435,64 @@ mod tests {
         assert!(supervisor.reconcile(Instant::now()).is_empty());
         assert_eq!(supervisor.state("app"), Some(LifecycleState::Ready));
         assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn shutdown_releases_ready_instances_and_rejects_new_acquires() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_counter = Arc::clone(&shutdowns);
+        let supervisor = Supervisor::new(move |_spec| {
+            Ok(StatusInstance {
+                status: InstanceStatus::Running,
+                shutdowns: Arc::clone(&shutdown_counter),
+            })
+        });
+        supervisor.register("app", spec(), LifecycleConfig::default());
+
+        assert_eq!(supervisor.acquire("app"), Ok(()));
+        assert!(supervisor.shutdown_all().is_empty());
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.state("app"), Some(LifecycleState::Cold));
+        assert_eq!(supervisor.acquire("app"), Err(AcquireError::ShuttingDown));
+    }
+
+    #[test]
+    fn shutdown_does_not_retain_a_boot_that_finishes_in_flight() {
+        let boot_started = Arc::new(Barrier::new(2));
+        let release_boot = Arc::new(Barrier::new(2));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let supervisor = Arc::new(Supervisor::new({
+            let boot_started = Arc::clone(&boot_started);
+            let release_boot = Arc::clone(&release_boot);
+            let shutdowns = Arc::clone(&shutdowns);
+            move |_spec| {
+                boot_started.wait();
+                release_boot.wait();
+                Ok(StatusInstance {
+                    status: InstanceStatus::Running,
+                    shutdowns: Arc::clone(&shutdowns),
+                })
+            }
+        }));
+        supervisor.register("app", spec(), LifecycleConfig::default());
+
+        let acquire = {
+            let supervisor = Arc::clone(&supervisor);
+            thread::spawn(move || supervisor.acquire("app"))
+        };
+        boot_started.wait();
+        let shutdown = {
+            let supervisor = Arc::clone(&supervisor);
+            thread::spawn(move || supervisor.shutdown_all())
+        };
+        while !supervisor.shutting_down.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        release_boot.wait();
+
+        assert_eq!(acquire.join().unwrap(), Err(AcquireError::ShuttingDown));
+        assert!(shutdown.join().unwrap().is_empty());
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.state("app"), Some(LifecycleState::Cold));
     }
 
     #[test]

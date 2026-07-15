@@ -12,13 +12,14 @@
 //! `cygnus-proxy` for the body phase is a later optimization behind the same
 //! request path. The request-handling core (head read, routing, error
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
-pub mod state;
 pub mod deploy;
+pub mod state;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -92,7 +93,9 @@ pub fn route_request(head: &RequestHead, router: &Router) -> Result<Arc<Route>, 
 fn acquire_status(error: &AcquireError) -> Status {
     match error {
         AcquireError::Unknown => Status::NotFound,
-        AcquireError::CrashLooping | AcquireError::BackingOff { .. } => Status::Unavailable,
+        AcquireError::CrashLooping
+        | AcquireError::BackingOff { .. }
+        | AcquireError::ShuttingDown => Status::Unavailable,
         AcquireError::BootFailed(_) => Status::BadGateway,
     }
 }
@@ -116,6 +119,30 @@ impl Frontend {
             let client = incoming?;
             let front = Arc::clone(&self);
             thread::spawn(move || front.serve_connection(client));
+        }
+        Ok(())
+    }
+    /// Accept connections until `shutdown` is set. The listener is polled in
+    /// nonblocking mode so signal-driven daemon shutdown cannot strand it in
+    /// `accept` while cages remain alive.
+    pub fn serve_until(
+        self: Arc<Self>,
+        listener: TcpListener,
+        shutdown: &AtomicBool,
+    ) -> io::Result<()> {
+        listener.set_nonblocking(true)?;
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    let front = Arc::clone(&self);
+                    thread::spawn(move || front.serve_connection(client));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -283,6 +310,10 @@ mod tests {
     fn acquire_failures_map_to_client_statuses() {
         assert_eq!(acquire_status(&AcquireError::Unknown), Status::NotFound);
         assert_eq!(
+            acquire_status(&AcquireError::ShuttingDown),
+            Status::Unavailable
+        );
+        assert_eq!(
             acquire_status(&AcquireError::CrashLooping),
             Status::Unavailable
         );
@@ -296,6 +327,17 @@ mod tests {
             acquire_status(&AcquireError::BootFailed("boom".into())),
             Status::BadGateway
         );
+    }
+
+    #[test]
+    fn interruptible_serve_returns_without_accepting_after_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let supervisor = Arc::new(Supervisor::new(|_| Err("must not boot".into())));
+        let frontend = Arc::new(Frontend::new(router, supervisor));
+        let shutdown = AtomicBool::new(true);
+
+        frontend.serve_until(listener, &shutdown).unwrap();
     }
 
     #[test]
