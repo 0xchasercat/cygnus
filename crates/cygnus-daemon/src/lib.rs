@@ -161,6 +161,7 @@ impl Frontend {
         };
 
         if let Err(error) = self.supervisor.acquire(&route.app) {
+            eprintln!("cygnus-daemon: app {:?} acquire failed: {error:?}", route.app);
             let _ = client.write_all(error_response(acquire_status(&error)));
             return;
         }
