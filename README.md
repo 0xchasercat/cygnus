@@ -16,14 +16,14 @@ is a page-cache exec, not an image pull.
 
 ## Status
 
-Pre-alpha. The single-node request path now runs end to end: SQLite state is
-projected into the router and supervisor, the first request cold-boots its cage,
-and the front relays HTTP/1.1 over the app's Unix socket. Overlay-rooted apps
-receive their daemon-owned socket directory at `/cygnus/io`; exited ready cages
-are reconciled into backoff/crash-loop policy. TLS and the source
-build/deploy/admin control plane are still under construction. Tenant 0 is a
-standard Bun UDS app today, explicitly read-only over a preview dataset until
-its typed daemon bridge exists.
+Pre-alpha. The single-node source path now runs end to end: the daemon copies a
+source directory into owned staging, builds Bun bytecode in a finite offline
+cage, seals a read-only content-addressed artifact, atomically activates its
+route in SQLite, and cold-boots the rooted app on the first request. Build
+publication is quota-backed; logs, manifests, engine hashes, crash recovery,
+and scale-to-zero state are daemon-owned. TLS, replacement/rollback, the typed
+Tenant 0 bridge, and the public setup/deploy experience are still under
+construction; the commands below are control-plane primitives, not the final UX.
 
 ## Layout
 
@@ -32,20 +32,40 @@ crates/cygnus-cage        isolation stack: namespaces, cgroups, mounts, network,
 crates/cygnus-init        static PID 1 for signal forwarding and orphan reaping
 crates/cygnus-supervisor  cold boot, exit reconciliation, backoff, and scale-to-zero
 crates/cygnus-router      lock-free Host-to-app routing table
-crates/cygnus-daemon      SQLite state, runnable front, and UDS relay
+crates/cygnus-daemon      source builds, artifact/SQLite state, runnable front, and UDS relay
 crates/cygnus-proxy       io_uring/splice data-path benchmark and primitives
 console/                  self-contained Tenant 0 Bun app (offline/read-only bridge mode)
 docs/spec.md              the technical specification, ground truth for design
 ```
 
-## Run the request path
+## Run the source path
 
-The daemon imports one complete JSON node configuration into its SQLite state.
-The configured command must bind and accept HTTP on the absolute `upstream`
-Unix socket; its environment is explicit rather than inherited.
-For an app with `rootfs` configured, the daemon mounts the host `upstream`
-parent at `/cygnus/io`; the app binds `/cygnus/io/<upstream filename>` while
-readiness and routing continue to use the host path.
+Register a prepared, read-only Bun engine root, then deploy a self-contained
+source directory. `--cage-executable` is the absolute path *inside* that root;
+the daemon hashes the corresponding host file before trusting it.
+
+```sh
+cargo run -p cygnus-daemon -- --state ./state.db engine register \
+  --version 1.3.14 \
+  --host-root /opt/cygnus/engines/bun-1.3.14 \
+  --cage-executable /usr/local/bin/bun
+
+cargo run -p cygnus-daemon -- --state ./state.db deploy \
+  --source-dir ./my-app \
+  --app my-app \
+  --domain my-app.localhost \
+  --engine-version 1.3.14 \
+  --artifact-root /var/lib/cygnus/artifacts \
+  --upstream /run/cygnus/my-app.sock
+
+cargo run -p cygnus-daemon -- --state ./state.db serve
+curl -H 'Host: my-app.localhost' http://127.0.0.1:3000/
+```
+
+The lower-level `apply` command remains available for manually provisioned
+apps and request-path development. Its command must bind and accept HTTP on
+the absolute `upstream` Unix socket; rooted apps receive the socket parent at
+`/cygnus/io`.
 
 ```json
 {
