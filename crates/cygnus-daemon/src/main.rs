@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use cygnus_cage::{Cage, CageSpec};
 use cygnus_daemon::Frontend;
+use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
 use cygnus_daemon::state::{DEFAULT_STATE_PATH, LoadedApp, NodeConfig, State};
 use cygnus_router::{Route, RouteTable, Router};
 use cygnus_supervisor::Supervisor;
@@ -28,7 +29,6 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
-
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Serve the apps and domains currently stored in the state database.
@@ -37,6 +37,48 @@ enum Command {
     Apply {
         /// JSON configuration to import into the state database.
         config: PathBuf,
+    },
+    /// Register an operator-trusted Bun engine.
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
+    },
+    /// Build source and activate the first app.
+    Deploy {
+        /// Source directory (canonicalized and copied before building).
+        #[arg(long = "source-dir", alias = "source")]
+        source_dir: PathBuf,
+        /// App name.
+        #[arg(long)]
+        app: String,
+        /// Hostname route.
+        #[arg(long)]
+        domain: String,
+        /// Registered engine version.
+        #[arg(long)]
+        engine_version: String,
+        /// Relative source entry point.
+        #[arg(long, default_value = "index.ts")]
+        entry: PathBuf,
+        /// Content-addressed artifact root.
+        #[arg(long)]
+        artifact_root: PathBuf,
+        /// Host upstream Unix socket.
+        #[arg(long)]
+        upstream: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineCommand {
+    /// Register one Bun executable and its content hash.
+    Register {
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        host_root: PathBuf,
+        #[arg(long)]
+        cage_executable: PathBuf,
     },
 }
 
@@ -54,7 +96,50 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(&cli.state),
         Command::Apply { config } => apply(&cli.state, &config),
+        Command::Engine { command } => engine_command(&cli.state, command),
+        Command::Deploy {
+            source_dir,
+            app,
+            domain,
+            engine_version,
+            entry,
+            artifact_root,
+            upstream,
+        } => deploy_command(
+            &cli.state,
+            DeployRequest::new(
+                source_dir,
+                app,
+                domain,
+                engine_version,
+                entry,
+                artifact_root,
+                upstream,
+            ),
+        ),
     }
+}
+
+fn engine_command(state_path: &Path, command: EngineCommand) -> Result<(), Box<dyn Error>> {
+    let EngineCommand::Register {
+        version,
+        host_root,
+        cage_executable,
+    } = command;
+    let mut state = State::open(state_path)?;
+    let engine = register_engine(&mut state, version, host_root, cage_executable)?;
+    println!("registered engine {} ({})", engine.version, engine.sha256);
+    Ok(())
+}
+
+fn deploy_command(state_path: &Path, request: DeployRequest) -> Result<(), Box<dyn Error>> {
+    let mut state = State::open(state_path)?;
+    let result = deploy(&mut state, request)?;
+    println!(
+        "activated deployment {} artifact {}",
+        result.deployment_id, result.artifact_hash
+    );
+    Ok(())
 }
 
 fn apply(state_path: &Path, config_path: &Path) -> Result<(), Box<dyn Error>> {

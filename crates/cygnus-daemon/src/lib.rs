@@ -13,6 +13,7 @@
 //! request path. The request-handling core (head read, routing, error
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
 pub mod state;
+pub mod deploy;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};

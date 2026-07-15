@@ -865,16 +865,24 @@ fn validate_engine(engine: &EngineRecord) -> Result<(), StateError> {
                 detail: "engine cage executable must be absolute".into(),
             })?;
     let host_executable = engine.host_root.join(relative);
-    if !host_executable.starts_with(&engine.host_root) {
+    let canonical_executable =
+        fs::canonicalize(&host_executable).map_err(|error| StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("engine executable is unavailable: {error}"),
+        })?;
+    if canonical_executable != host_executable
+        || !canonical_executable.starts_with(&engine.host_root)
+    {
         return Err(StateError::InvalidRecord {
             kind: "path",
-            detail: "engine executable escapes host root".into(),
+            detail: "engine executable must not traverse a symlink or escape host root".into(),
         });
     }
-    let metadata = fs::metadata(&host_executable).map_err(|error| StateError::InvalidRecord {
-        kind: "path",
-        detail: format!("engine executable is unavailable: {error}"),
-    })?;
+    let metadata =
+        fs::symlink_metadata(&host_executable).map_err(|error| StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("engine executable is unavailable: {error}"),
+        })?;
     if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
         return Err(StateError::InvalidRecord {
             kind: "path",
