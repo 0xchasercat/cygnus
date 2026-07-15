@@ -1164,9 +1164,9 @@ mod tests {
         let root = temp_dir("engine");
         let db = root.join("state.db");
         let mut state = State::open(&db).unwrap();
-        let executable = Path::new("/bin/sh");
-        let record = register_engine(&mut state, "test", "/", executable).unwrap();
-        assert_eq!(record.sha256, sha256_file(executable).unwrap());
+        let executable = fs::canonicalize("/bin/sh").unwrap();
+        let record = register_engine(&mut state, "test", "/", &executable).unwrap();
+        assert_eq!(record.sha256, sha256_file(&executable).unwrap());
         assert_eq!(state.engine("test").unwrap().unwrap(), record);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1222,7 +1222,8 @@ mod tests {
         fs::write(source.join("index.ts"), b"export default {};").unwrap();
         let db = root.join("state.db");
         let mut state = State::open(&db).unwrap();
-        register_engine(&mut state, "shell", "/", "/bin/sh").unwrap();
+        let shell = fs::canonicalize("/bin/sh").unwrap();
+        register_engine(&mut state, "shell", "/", shell).unwrap();
         let error = deploy(
             &mut state,
             DeployRequest::new(
