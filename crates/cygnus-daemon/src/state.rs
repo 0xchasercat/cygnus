@@ -684,12 +684,13 @@ impl State {
     pub fn deployments(
         &self,
         app: Option<&str>,
+        cursor: Option<&str>,
         limit: u16,
     ) -> Result<Vec<DeploymentRecord>, StateError> {
-        if limit == 0 || limit > 100 {
+        if limit == 0 || limit > 50 {
             return Err(StateError::InvalidRecord {
                 kind: "deployment query",
-                detail: "limit must be between 1 and 100".into(),
+                detail: "limit must be between 1 and 50".into(),
             });
         }
         if app.is_some_and(|name| name.trim().is_empty()) {
@@ -698,24 +699,71 @@ impl State {
                 detail: "app filter must be nonempty".into(),
             });
         }
+        let before = if let Some(cursor) = cursor {
+            let rowid = self
+                .connection
+                .query_row(
+                    "SELECT rowid FROM deployments WHERE id = ?1",
+                    [cursor],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| StateError::InvalidRecord {
+                    kind: "deployment cursor",
+                    detail: format!("deployment cursor {cursor:?} does not exist"),
+                })?;
+            Some(rowid)
+        } else {
+            None
+        };
 
         let columns = "id, app, source_hash, engine_version, artifact_hash, status, error";
         let mut deployments = Vec::new();
-        if let Some(app) = app {
-            let sql = format!(
-                "SELECT {columns} FROM deployments WHERE app = ?1 ORDER BY rowid DESC LIMIT ?2"
-            );
-            let mut statement = self.connection.prepare(&sql)?;
-            let rows = statement.query_map(params![app, i64::from(limit)], deployment_from_row)?;
-            for row in rows {
-                deployments.push(row?);
+        match (app, before) {
+            (Some(app), Some(before)) => {
+                let sql = format!(
+                    "SELECT {columns} FROM deployments WHERE app = ?1 AND rowid < ?2 ORDER BY rowid DESC LIMIT ?3"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map(
+                    params![app, before, i64::from(limit)],
+                    deployment_from_row,
+                )?;
+                for row in rows {
+                    deployments.push(row?);
+                }
             }
-        } else {
-            let sql = format!("SELECT {columns} FROM deployments ORDER BY rowid DESC LIMIT ?1");
-            let mut statement = self.connection.prepare(&sql)?;
-            let rows = statement.query_map([i64::from(limit)], deployment_from_row)?;
-            for row in rows {
-                deployments.push(row?);
+            (Some(app), None) => {
+                let sql = format!(
+                    "SELECT {columns} FROM deployments WHERE app = ?1 ORDER BY rowid DESC LIMIT ?2"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows =
+                    statement.query_map(params![app, i64::from(limit)], deployment_from_row)?;
+                for row in rows {
+                    deployments.push(row?);
+                }
+            }
+            (None, Some(before)) => {
+                let sql = format!(
+                    "SELECT {columns} FROM deployments WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map(
+                    params![before, i64::from(limit)],
+                    deployment_from_row,
+                )?;
+                for row in rows {
+                    deployments.push(row?);
+                }
+            }
+            (None, None) => {
+                let sql = format!("SELECT {columns} FROM deployments ORDER BY rowid DESC LIMIT ?1");
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map([i64::from(limit)], deployment_from_row)?;
+                for row in rows {
+                    deployments.push(row?);
+                }
             }
         }
         Ok(deployments)
@@ -2008,10 +2056,10 @@ mod tests {
             Some(PathBuf::from("/var/lib/cygnus/apps/api/c/logs"))
         );
         assert_eq!(
-            state.deployments(Some("api"), 10).unwrap(),
+            state.deployments(Some("api"), None, 10).unwrap(),
             vec![state.deployment("dep-1").unwrap().unwrap()]
         );
-        assert!(state.deployments(None, 0).is_err());
+        assert!(state.deployments(None, None, 0).is_err());
         let second_source_hash = "d".repeat(64);
         let second_artifact_hash = "e".repeat(64);
         state
@@ -2056,13 +2104,23 @@ mod tests {
         );
         assert_eq!(
             state
-                .deployments(None, 10)
+                .deployments(None, None, 10)
                 .unwrap()
                 .into_iter()
                 .map(|deployment| deployment.id)
                 .collect::<Vec<_>>(),
             ["dep-2", "dep-1"]
         );
+        assert_eq!(
+            state
+                .deployments(None, Some("dep-2"), 10)
+                .unwrap()
+                .into_iter()
+                .map(|deployment| deployment.id)
+                .collect::<Vec<_>>(),
+            ["dep-1"]
+        );
+        assert!(state.deployments(None, Some("missing"), 10).is_err());
         assert!(matches!(
             state.apply(&NodeConfig::default()),
             Err(StateError::DestructiveApply)
