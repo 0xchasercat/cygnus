@@ -3,19 +3,21 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
-pub const MAX_ADMIN_FRAME_BYTES: usize = 1024 * 1024;
-pub const MAX_LOG_CHUNK_BYTES: u32 = 64 * 1024;
+pub const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_LOG_CHUNK_BYTES: u32 = 48 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminRequest {
     pub version: u16,
+    pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
     pub command: AdminCommand,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
     Health,
     Snapshot,
@@ -60,29 +62,37 @@ impl LogStream {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminResponse {
     Ok {
         version: u16,
+        request_id: String,
         data: AdminData,
     },
     Error {
         version: u16,
+        request_id: String,
         error: AdminFault,
     },
 }
 
 impl AdminResponse {
-    pub fn ok(data: AdminData) -> Self {
+    pub fn ok(request_id: impl Into<String>, data: AdminData) -> Self {
         Self::Ok {
             version: ADMIN_PROTOCOL_VERSION,
+            request_id: request_id.into(),
             data,
         }
     }
 
-    pub fn error(code: AdminErrorCode, message: impl Into<String>) -> Self {
+    pub fn error(
+        request_id: impl Into<String>,
+        code: AdminErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Error {
             version: ADMIN_PROTOCOL_VERSION,
+            request_id: request_id.into(),
             error: AdminFault {
                 code,
                 message: message.into(),
@@ -92,7 +102,7 @@ impl AdminResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminData {
     Health {
         service: String,
@@ -172,6 +182,13 @@ pub enum AdminErrorCode {
     Internal,
 }
 
+pub fn valid_request_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T> {
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length)?;
@@ -213,6 +230,7 @@ mod tests {
         let request = AdminRequest {
             version: ADMIN_PROTOCOL_VERSION,
             actor: Some("operator@example.test".into()),
+            request_id: "0123456789abcdef0123456789abcdef".into(),
             command: AdminCommand::ReadLog {
                 deployment: "deploy-1".into(),
                 stream: LogStream::Stderr,
@@ -246,6 +264,7 @@ mod tests {
     fn defaults_bound_lists_and_log_chunks() {
         let request: AdminRequest = serde_json::from_value(serde_json::json!({
             "version": 1,
+            "request_id": "0123456789abcdef0123456789abcdef",
             "command": { "type": "list_deployments" }
         }))
         .unwrap();
@@ -257,5 +276,7 @@ mod tests {
             }
         );
         assert!(default_log_limit() <= MAX_LOG_CHUNK_BYTES);
+        assert!(valid_request_id(&request.request_id));
+        assert!(!valid_request_id("ABCDEF0123456789ABCDEF0123456789"));
     }
 }
