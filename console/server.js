@@ -4,6 +4,10 @@ const socketPath = process.env.CYGNUS_SOCKET?.trim();
 const requestedPort = process.env.PORT?.trim() || '3000';
 const port = Number(requestedPort);
 
+if (socketPath && !socketPath.startsWith('/')) {
+  throw new Error(`CYGNUS_SOCKET must be an absolute path (received ${socketPath})`);
+}
+
 if (!socketPath && (!Number.isInteger(port) || port < 0 || port > 65535)) {
   throw new Error(`PORT must be an integer between 0 and 65535 (received ${requestedPort})`);
 }
