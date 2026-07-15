@@ -10,15 +10,16 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::{DNSClass, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
+use parking_lot::Mutex;
 
 use crate::error::CageError;
 use crate::net::{self, GATEWAY, cage_ipv4};
@@ -31,9 +32,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
-/// Lower TTL bound keeps an address present until the current request's
-/// connection can be established.
-pub const MIN_TTL_SECS: u32 = 1;
+/// Minimum lease lifetime gives clients time to use cached DNS answers for
+/// follow-up parallel connections after a low-TTL response.
+pub const MIN_TTL_SECS: u32 = 60;
 /// Upper TTL bound keeps this transient build policy from becoming permanent.
 pub const MAX_TTL_SECS: u32 = 3_600;
 
@@ -188,7 +189,7 @@ impl DnsLease {
 
 impl Drop for DnsLease {
     fn drop(&mut self) {
-        let mut state = lock(&self.registry.state);
+        let mut state = self.registry.state.lock();
         if state
             .registrations
             .get(&self.cage_ip)
@@ -234,7 +235,7 @@ impl Registry {
     ) -> DnsLease {
         let cage_ip = cage_ipv4(cage_name);
         let domains = rules.iter().map(|rule| rule.domain.clone()).collect();
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock();
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
         let generation = state.next_generation;
         state.registrations.insert(
@@ -254,7 +255,7 @@ impl Registry {
     }
 
     fn authorize(&self, cage_ip: Ipv4Addr, domain: &str) -> Option<RegistrationToken> {
-        let state = lock(&self.state);
+        let state = self.state.lock();
         let registration = state.registrations.get(&cage_ip)?;
         registration
             .domains
@@ -275,7 +276,7 @@ impl Registry {
         // The lock covers generation validation and every synchronous nft
         // mutation. Lease Drop and replacement registration therefore cannot
         // race an old PID into an update.
-        let state = lock(&self.state);
+        let state = self.state.lock();
         let current = state.registrations.get(&token.cage_ip);
         if !current.is_some_and(|registration| {
             registration.generation == token.generation && registration.pid == token.pid
@@ -488,7 +489,7 @@ fn tcp_listener(listener: TcpListener, sender: SyncSender<Work>, stop: Arc<Atomi
 
 fn worker(receiver: Arc<Mutex<Receiver<Work>>>, runtime: Arc<Runtime>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
-        let work = lock(&receiver).recv_timeout(POLL_INTERVAL);
+        let work = receiver.lock().recv_timeout(POLL_INTERVAL);
         match work {
             Ok(Work::Udp { request, peer }) => handle_udp(&runtime, peer, &request),
             Ok(Work::Tcp { stream, peer }) => handle_tcp(&runtime, peer, stream),
@@ -664,12 +665,6 @@ fn network_error(operation: &'static str, source: io::Error) -> CageError {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,7 +720,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let update_order = Arc::clone(&order);
         let update = move |pid, address, ttl| {
-            update_order.lock().unwrap().push((pid, address, ttl));
+            update_order.lock().push((pid, address, ttl));
             Ok(())
         };
         let response = process_request(
@@ -740,9 +735,35 @@ mod tests {
         );
         assert_eq!(response, upstream);
         assert_eq!(
-            order.lock().unwrap().as_slice(),
+            order.lock().as_slice(),
             &[(4242, Ipv4Addr::new(203, 0, 113, 7), MAX_TTL_SECS)]
         );
+    }
+    #[test]
+    fn low_ttl_keeps_addresses_available_for_follow_up_connections() {
+        let registry = Arc::new(Registry::default());
+        let rule = DomainEgressRule {
+            domain: "registry.npmjs.org".into(),
+            ports: vec![443],
+        };
+        let lease = registry.register("builder", 4242, &[rule]);
+        let request = query_bytes(70, "registry.npmjs.org", RecordType::A);
+        let upstream = answer_bytes(&request, Ipv4Addr::new(203, 0, 113, 7), 5);
+        let observed_ttl = Mutex::new(None);
+
+        let response = process_request(
+            &registry,
+            lease.cage_ip(),
+            &request,
+            |_| Ok(upstream.clone()),
+            &|_, _, ttl| {
+                *observed_ttl.lock() = Some(ttl);
+                Ok(())
+            },
+        );
+
+        assert_eq!(response, upstream);
+        assert_eq!(*observed_ttl.lock(), Some(MIN_TTL_SECS));
     }
 
     #[test]
