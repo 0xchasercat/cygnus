@@ -886,6 +886,12 @@ fn fail_build(
         let _ = fs::create_dir(&failed_logs);
         failed_logs
     };
+    for name in ["build.stdout.log", "build.stderr.log"] {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(logs.join(name));
+    }
     let _ = OpenOptions::new()
         .write(true)
         .create_new(true)
