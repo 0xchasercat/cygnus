@@ -1,9 +1,8 @@
 //! Cage egress networking: addressing, per-cage nftables policy, and host NAT.
 //!
 //! Spec §7. Addressing and the per-cage policy ruleset are pure and
-//! unit-tested; the veth fabric, the host bridge, the host NAT masquerade, and
-//! loading the ruleset run during boot. The host-side DNS forwarder and
-//! `resolv.conf` wiring are the remaining deferred pieces.
+//! unit-tested; the veth fabric, host bridge, NAT masquerade, DNS forwarder,
+//! cage resolver injection, and policy loading run during boot.
 //!
 //! The policy is enforced in the cage's own network namespace as an output
 //! chain with a default-drop policy, so containment is by construction: a rule
