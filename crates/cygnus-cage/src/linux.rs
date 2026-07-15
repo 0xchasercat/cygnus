@@ -86,6 +86,7 @@ impl Cage {
             ),
             None => None,
         };
+        let has_seccomp = seccomp_plan.is_some();
         let boot_started = Instant::now();
 
         let (release_read, release_write) = pipe2(OFlag::O_CLOEXEC)
@@ -206,7 +207,11 @@ impl Cage {
             spec.readiness_timeout,
             "seccomp filter",
         )?;
-        let seccomp = seccomp_started.elapsed();
+        let seccomp = if has_seccomp {
+            seccomp_started.elapsed()
+        } else {
+            Duration::ZERO
+        };
 
         let exec_started = Instant::now();
         wait_for_child_stage(

@@ -16,6 +16,7 @@ use cygnus_supervisor::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use thiserror::Error;
 
@@ -712,10 +713,14 @@ impl State {
                 deployment: artifact.app,
             });
         }
-        if query_app_id_tx(&transaction, &app.name)?.is_some() {
+        let existing_app = transaction
+            .query_row("SELECT name FROM apps ORDER BY id LIMIT 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if let Some(existing) = existing_app {
             return Err(StateError::InvalidConfig(format!(
-                "app {:?} is already registered",
-                app.name
+                "first activation requires an empty node (existing app {existing:?})"
             )));
         }
         let deployment =
@@ -855,6 +860,18 @@ fn validate_engine(engine: &EngineRecord) -> Result<(), StateError> {
         });
     }
     validate_absolute_path(&engine.host_root, "engine host root")?;
+    if engine
+        .host_root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b':' | b',' | b'\\' | 0))
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: "engine host root contains bytes unsupported by overlayfs options".into(),
+        });
+    }
     validate_cage_path(&engine.cage_executable, "engine cage executable")?;
     let relative =
         engine
@@ -865,16 +882,24 @@ fn validate_engine(engine: &EngineRecord) -> Result<(), StateError> {
                 detail: "engine cage executable must be absolute".into(),
             })?;
     let host_executable = engine.host_root.join(relative);
-    if !host_executable.starts_with(&engine.host_root) {
+    let canonical_executable =
+        fs::canonicalize(&host_executable).map_err(|error| StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("engine executable is unavailable: {error}"),
+        })?;
+    if canonical_executable != host_executable
+        || !canonical_executable.starts_with(&engine.host_root)
+    {
         return Err(StateError::InvalidRecord {
             kind: "path",
-            detail: "engine executable escapes host root".into(),
+            detail: "engine executable must not traverse a symlink or escape host root".into(),
         });
     }
-    let metadata = fs::metadata(&host_executable).map_err(|error| StateError::InvalidRecord {
-        kind: "path",
-        detail: format!("engine executable is unavailable: {error}"),
-    })?;
+    let metadata =
+        fs::symlink_metadata(&host_executable).map_err(|error| StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("engine executable is unavailable: {error}"),
+        })?;
     if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
         return Err(StateError::InvalidRecord {
             kind: "path",
@@ -1098,17 +1123,6 @@ fn query_deployment_by_artifact_tx(
         let status: String = row.get(5)?;
         Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
     }).optional().map_err(StateError::from)
-}
-
-fn query_app_id_tx(
-    transaction: &Transaction<'_>,
-    app: &str,
-) -> Result<Option<i64>, rusqlite::Error> {
-    transaction
-        .query_row("SELECT id FROM apps WHERE name = ?1", [app], |row| {
-            row.get(0)
-        })
-        .optional()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1859,6 +1873,48 @@ mod tests {
         assert_eq!(
             state.deployment("dep-1").unwrap().unwrap().status,
             DeploymentStatus::Active
+        );
+        let second_source_hash = "d".repeat(64);
+        let second_artifact_hash = "e".repeat(64);
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "dep-2".into(),
+                app: "worker".into(),
+                source_hash: second_source_hash.clone(),
+                engine_version: engine.version.clone(),
+            })
+            .unwrap();
+        state
+            .seal_deployment(
+                "dep-2",
+                &ArtifactInput {
+                    app: "worker".into(),
+                    source_hash: second_source_hash.clone(),
+                    artifact_hash: second_artifact_hash.clone(),
+                    engine_version: engine.version.clone(),
+                    host_path: "/var/lib/cygnus/apps/worker/e".into(),
+                    metadata_json: format!(
+                        "{{\"bunVersion\":\"{}\",\"sourceHash\":\"{}\"}}",
+                        engine.version, second_source_hash
+                    ),
+                },
+            )
+            .unwrap();
+        let worker = AppConfig {
+            name: "worker".into(),
+            domains: vec!["worker.example.com".into()],
+            upstream: "/run/worker.sock".into(),
+            command: "/bin/true".into(),
+            ..AppConfig::default()
+        };
+        assert!(
+            state
+                .activate_first(&worker, &second_artifact_hash)
+                .is_err()
+        );
+        assert_eq!(
+            state.deployment("dep-2").unwrap().unwrap().status,
+            DeploymentStatus::Sealed
         );
         assert!(matches!(
             state.apply(&NodeConfig::default()),

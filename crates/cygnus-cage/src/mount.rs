@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
@@ -335,6 +335,108 @@ impl BuildOutputPlan {
     }
 }
 
+/// Host character devices intentionally exposed inside an overlay cage.
+///
+/// Keep this list closed: adding a path here changes the cage's device
+/// surface and must be an explicit security decision.
+const APPROVED_DEVICE_PATHS: [(&str, &str); 4] = [
+    ("null", "/dev/null"),
+    ("zero", "/dev/zero"),
+    ("random", "/dev/random"),
+    ("urandom", "/dev/urandom"),
+];
+
+/// Device bind mounts must clear `nodev` while retaining the other hardening
+/// flags. The overlay and writable tmpfs remain globally `nodev`.
+const DEVICE_REMOUNT_FLAGS: nix::libc::c_ulong = nix::libc::MS_BIND
+    | nix::libc::MS_REMOUNT
+    | nix::libc::MS_NOSUID
+    | nix::libc::MS_NOEXEC;
+
+#[derive(Debug)]
+struct DevicePlan {
+    source: CString,
+    placeholder: CString,
+    target: CString,
+    expected_rdev: nix::libc::dev_t,
+}
+
+impl DevicePlan {
+    fn all(upper_dev: &Path, merged_dev: &Path) -> Result<Vec<Self>, CageError> {
+        APPROVED_DEVICE_PATHS
+            .iter()
+            .map(|(name, source)| Self::new(name, source, upper_dev, merged_dev))
+            .collect()
+    }
+
+    fn new(
+        name: &str,
+        source: &str,
+        upper_dev: &Path,
+        merged_dev: &Path,
+    ) -> Result<Self, CageError> {
+        let source_path = Path::new(source);
+        let expected_rdev = validate_character_device_source(source_path, name)?;
+        Ok(Self {
+            source: CString::new(source).expect("approved device path has no NUL byte"),
+            placeholder: path_cstring(&upper_dev.join(name))?,
+            target: path_cstring(&merged_dev.join(name))?,
+            expected_rdev,
+        })
+    }
+
+    /// Bind one validated host character device into the merged root.
+    ///
+    /// # Safety
+    ///
+    /// Cloned-child contract: all pointers are prebuilt and this uses raw
+    /// syscalls only; no allocation or lock acquisition occurs here.
+    unsafe fn apply(&self) -> Result<(), i32> {
+        unsafe { require_character_device(&self.source, self.expected_rdev)? };
+        let bind = unsafe {
+            nix::libc::mount(
+                self.source.as_ptr(),
+                self.target.as_ptr(),
+                ptr::null(),
+                nix::libc::MS_BIND,
+                ptr::null(),
+            )
+        };
+        if bind != 0 {
+            return Err(Errno::last_raw());
+        }
+        let remount = unsafe {
+            nix::libc::mount(
+                ptr::null(),
+                self.target.as_ptr(),
+                ptr::null(),
+                DEVICE_REMOUNT_FLAGS,
+                ptr::null(),
+            )
+        };
+        if remount != 0 {
+            return Err(Errno::last_raw());
+        }
+        Ok(())
+    }
+}
+
+/// Validate a host source before cloning. Symlinks and non-character files
+/// are rejected rather than silently broadening the cage's device surface.
+fn validate_character_device_source(
+    path: &Path,
+    name: &str,
+) -> Result<nix::libc::dev_t, CageError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| CageError::io("verify cage device", path, source))?;
+    if metadata.mode() & nix::libc::S_IFMT != nix::libc::S_IFCHR {
+        return Err(CageError::InvalidSpec(format!(
+            "cage device {name} at {path:?} must be a character device"
+        )));
+    }
+    Ok(metadata.rdev() as nix::libc::dev_t)
+}
+
 /// Overlay root assembly: a size-capped tmpfs holding the writable layer, an
 /// overlayfs mount stacking it over the read-only lower directories, and a
 /// `pivot_root` that makes the merged tree the cage's root.
@@ -345,11 +447,14 @@ struct OverlayPlan {
     tmpfs_fstype: CString,
     tmpfs_data: CString,
     upper: CString,
+    upper_dev: CString,
     work: CString,
     merged: CString,
+    merged_dev: CString,
     overlay_source: CString,
     overlay_fstype: CString,
     overlay_data: CString,
+    devices: Vec<DevicePlan>,
     merged_proc: CString,
     put_old: CString,
     old_root: CString,
@@ -358,19 +463,25 @@ struct OverlayPlan {
 impl OverlayPlan {
     fn new(staged: &StagedRootfs) -> Result<Self, CageError> {
         let merged = staged.staging.join("merged");
+        let upper = staged.staging.join("upper");
+        let upper_dev = upper.join("dev");
+        let merged_dev = merged.join("dev");
         Ok(Self {
             tmpfs_source: CString::new("tmpfs").expect("tmpfs source has no NUL byte"),
             tmpfs_target: path_cstring(&staged.staging)?,
             tmpfs_fstype: CString::new("tmpfs").expect("tmpfs fstype has no NUL byte"),
             tmpfs_data: CString::new(staged.tmpfs_data.as_str())
                 .expect("tmpfs data has no NUL byte"),
-            upper: path_cstring(&staged.staging.join("upper"))?,
+            upper: path_cstring(&upper)?,
+            upper_dev: path_cstring(&upper_dev)?,
             work: path_cstring(&staged.staging.join("work"))?,
             merged: path_cstring(&merged)?,
+            merged_dev: path_cstring(&merged_dev)?,
             overlay_source: CString::new("overlay").expect("overlay source has no NUL byte"),
             overlay_fstype: CString::new("overlay").expect("overlay fstype has no NUL byte"),
             overlay_data: CString::new(staged.overlay_data.clone())
                 .map_err(|_| CageError::InvalidSpec("overlay options contain a NUL byte".into()))?,
+            devices: DevicePlan::all(&upper_dev, &merged_dev)?,
             merged_proc: path_cstring(&merged.join("proc"))?,
             put_old: path_cstring(&merged.join(OLD_ROOT_NAME))?,
             old_root: CString::new(format!("/{OLD_ROOT_NAME}"))
@@ -410,8 +521,12 @@ impl OverlayPlan {
 
         unsafe {
             mkdir(&self.upper, 0o700)?;
+            mkdir(&self.upper_dev, 0o755)?;
             mkdir(&self.work, 0o700)?;
             mkdir(&self.merged, 0o700)?;
+            for device in &self.devices {
+                create_device_placeholder(&device.placeholder)?;
+            }
         }
 
         // The merged root keeps exec: the engine and artifact live in the
@@ -431,7 +546,15 @@ impl OverlayPlan {
         }
 
         // Mount points the pivoted root needs. The lower layers may already
-        // provide them, so existing directories are fine.
+        // provide them, so existing directories are fine. `/dev` is supplied
+        // by our explicit device binds below, never by a host-wide dev mount.
+        unsafe {
+            mkdir_allow_exists(&self.merged_dev, 0o755)?;
+            require_directory(&self.merged_dev)?;
+        }
+        for device in &self.devices {
+            unsafe { device.apply()? };
+        }
         unsafe {
             mkdir_allow_exists(&self.merged_proc, 0o555)?;
             mkdir_allow_exists(&self.put_old, 0o700)?;
@@ -518,6 +641,58 @@ unsafe fn mkdir_allow_exists(path: &CString, mode: nix::libc::mode_t) -> Result<
         Err(errno) if errno == nix::libc::EEXIST => Ok(()),
         Err(errno) => Err(errno),
     }
+}
+
+/// Create a private regular placeholder for a file bind mount. The host
+/// character device is checked immediately before the bind and supplies the
+/// actual device semantics after the mount.
+///
+/// # Safety
+///
+/// Cloned-child contract: prebuilt pointer and raw syscalls only.
+unsafe fn create_device_placeholder(path: &CString) -> Result<(), i32> {
+    let fd = unsafe {
+        nix::libc::open(
+            path.as_ptr(),
+            nix::libc::O_WRONLY
+                | nix::libc::O_CREAT
+                | nix::libc::O_EXCL
+                | nix::libc::O_CLOEXEC
+                | nix::libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::last_raw());
+    }
+    if unsafe { nix::libc::close(fd) } != 0 {
+        return Err(Errno::last_raw());
+    }
+    Ok(())
+}
+
+/// Verify that a source is still the expected character device after clone.
+/// This closes the pre-clone validation race without allocating in the child.
+///
+/// # Safety
+///
+/// Cloned-child contract: prebuilt pointer, stack storage, and raw syscall
+/// only.
+unsafe fn require_character_device(
+    path: &CString,
+    expected_rdev: nix::libc::dev_t,
+) -> Result<(), i32> {
+    let mut metadata = MaybeUninit::<nix::libc::stat>::uninit();
+    if unsafe { nix::libc::lstat(path.as_ptr(), metadata.as_mut_ptr()) } != 0 {
+        return Err(Errno::last_raw());
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFCHR
+        || metadata.st_rdev != expected_rdev
+    {
+        return Err(nix::libc::ENODEV);
+    }
+    Ok(())
 }
 
 /// Reject a pre-existing symlink or non-directory mount target.
@@ -610,6 +785,49 @@ mod tests {
 
         drop(staged);
         assert!(!staging.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overlay_plan_contains_only_approved_device_binds() {
+        let base = unique_staging_base("device-plan");
+        let mut rootfs = RootfsSpec::new(vec![PathBuf::from("/lower")]);
+        rootfs.staging_dir = Some(base.clone());
+
+        let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
+        let plan = MountPlan::new(Some(&staged), None, None).expect("plan with devices");
+        let overlay = plan.overlay.as_ref().expect("overlay plan present");
+        assert_eq!(overlay.merged_dev.to_bytes(),
+            base.join("cygnus-cage-app/merged/dev").as_os_str().as_bytes());
+        assert_eq!(overlay.devices.len(), APPROVED_DEVICE_PATHS.len());
+        for ((name, source), device) in APPROVED_DEVICE_PATHS.iter().zip(&overlay.devices) {
+            assert_eq!(device.source.to_bytes(), source.as_bytes());
+            assert_eq!(device.target.to_bytes(),
+                base.join(format!("cygnus-cage-app/merged/dev/{name}")).as_os_str().as_bytes());
+            assert_eq!(device.placeholder.to_bytes(),
+                base.join(format!("cygnus-cage-app/upper/dev/{name}")).as_os_str().as_bytes());
+        }
+        assert_eq!(DEVICE_REMOUNT_FLAGS & nix::libc::MS_NODEV, 0);
+
+        drop(staged);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn device_source_validation_rejects_a_substituted_regular_file() {
+        let base = unique_staging_base("device-source");
+        fs::create_dir_all(&base).expect("create device test directory");
+        let substituted = base.join("null");
+        fs::write(&substituted, b"not a device").expect("create substituted source");
+
+        let error = validate_character_device_source(&substituted, "null")
+            .expect_err("regular file must not be accepted as a device");
+        match error {
+            CageError::InvalidSpec(message) => {
+                assert!(message.contains("must be a character device"));
+            }
+            other => panic!("unexpected validation error: {other:?}"),
+        }
         let _ = fs::remove_dir_all(&base);
     }
 
