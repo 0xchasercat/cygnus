@@ -4,11 +4,16 @@
 //! beginning any durable deployment. The build cage never receives a caller
 //! path, and the only host path it can publish is the bounded output mount.
 
+mod publish;
+
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +30,7 @@ use crate::state::{
     AppConfig, ArtifactInput, DeploymentInput, DeploymentRecord, EngineRecord, RootfsConfig,
     SeccompMode, State, StateError,
 };
+use publish::PublishDir;
 
 const WORKSPACE_REL: &str = ".work";
 const BUILD_OUTPUT_PREFIX: &str = ".building-";
@@ -32,6 +38,9 @@ const FAILED_REL: &str = "failed";
 const SHIM_REL: &str = "cygnus/shim.js";
 const MAX_BUILD_OUTPUT: usize = 4 * 1024 * 1024;
 
+const LOG_STAGING_REL: &str = ".logs";
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ARTIFACT_INODES: u64 = 8_192;
 /// Inputs to one source deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeployRequest {
@@ -227,25 +236,48 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
     }
 
     let building = artifact_root.join(format!("{BUILD_OUTPUT_PREFIX}{deployment_id}"));
+    let log_staging = match prepare_log_staging(&artifact_root, &deployment_id) {
+        Ok(path) => path,
+        Err(error) => {
+            let detail = error.to_string();
+            let terminal = match state.mark_deployment_failed(&deployment_id, &detail) {
+                Ok(_) => detail,
+                Err(state_error) => {
+                    format!("{detail}; unable to persist failed state: {state_error}")
+                }
+            };
+            let _ = remove_work(&artifact_root, &deployment_id);
+            return Err(DeployError::BuildFailed {
+                id: deployment_id,
+                detail: terminal,
+                logs: artifact_root.join(LOG_STAGING_REL),
+            });
+        }
+    };
     let result = (|| {
-        fs::create_dir(&building)?;
-        fs::create_dir_all(building.join("app"))?;
-        let job = build_job(&engine, &workspace, &building, &entry, &deployment_id);
+        let publish = PublishDir::create(
+            &artifact_root,
+            &deployment_id,
+            MAX_ARTIFACT_BYTES,
+            MAX_ARTIFACT_INODES,
+        )?;
+        let job = build_job(&engine, &workspace, publish.path(), &entry, &deployment_id);
         let job_result = match run_job(job) {
             Ok(result) => result,
             Err(error) => {
+                write_logs(&log_staging, &[], error.to_string().as_bytes())?;
+                publish.close()?;
                 return Err(fail_build(
                     state,
                     &artifact_root,
                     &building,
+                    &log_staging,
                     &deployment_id,
                     format!("build cage could not start: {error}"),
-                    Vec::new(),
-                    error.to_string().into_bytes(),
                 ));
             }
         };
-        write_logs(&building, &job_result.stdout, &job_result.stderr)?;
+        write_logs(&log_staging, &job_result.stdout, &job_result.stderr)?;
         if !job_result.success() {
             let detail = match job_result.outcome {
                 JobExitOutcome::Exited(code) => format!("bun build exited with status {code}"),
@@ -255,17 +287,27 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
                 JobExitOutcome::TimedOut => "bun build exceeded its deadline".into(),
                 JobExitOutcome::OutputLimitExceeded => "bun build exceeded its output limit".into(),
             };
+            publish.close()?;
             return Err(fail_build(
                 state,
                 &artifact_root,
                 &building,
+                &log_staging,
                 &deployment_id,
                 detail,
-                job_result.stdout,
-                job_result.stderr,
             ));
         }
-        validate_tree(&building)?;
+
+        let staging_result = (|| {
+            validate_build_payload(publish.path())?;
+            copy_output_tree(publish.path(), &building)
+        })();
+        let close_result = publish.close();
+        close_result?;
+        staging_result?;
+        fs::rename(&log_staging, building.join("logs"))?;
+        let _ = fs::remove_dir(artifact_root.join(LOG_STAGING_REL));
+
         let generated = expected_generated_entry(&building.join("app"), &entry)?;
         let sidecar = generated.with_extension("js.jsc");
         let sidecar_meta = fs::symlink_metadata(&sidecar).map_err(|error| {
@@ -336,10 +378,9 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
                 state,
                 &artifact_root,
                 &final_path,
+                &log_staging,
                 &deployment_id,
                 format!("artifact could not be sealed: {error}"),
-                job_result.stdout,
-                job_result.stderr,
             ));
         }
         let deployment = state
@@ -368,10 +409,9 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
                 state,
                 &artifact_root,
                 &building,
+                &log_staging,
                 &deployment_id,
-                detail.clone(),
-                Vec::new(),
-                detail.into_bytes(),
+                detail,
             ))
         }
     }
@@ -380,7 +420,7 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
 fn build_job(
     engine: &EngineRecord,
     workspace: &Path,
-    building: &Path,
+    publish: &Path,
     entry: &Path,
     deployment_id: &str,
 ) -> JobConfig {
@@ -397,7 +437,7 @@ fn build_job(
     let output = if linux {
         PathBuf::from(cygnus_cage::BUILD_OUTPUT_CAGE_DIR).join("app")
     } else {
-        building.join("app")
+        publish.join("app")
     };
     let source_entry = if linux {
         PathBuf::from("/workspace").join(entry)
@@ -429,7 +469,7 @@ fn build_job(
             workspace.parent().unwrap_or(workspace).to_path_buf(),
             engine.host_root.clone(),
         ]));
-        job.build_output = Some(BuildOutputSpec::new(building));
+        job.build_output = Some(BuildOutputSpec::new(publish));
     }
     job
 }
@@ -497,7 +537,7 @@ fn runtime_config(
         ],
         env,
         rootfs: Some(RootfsConfig {
-            lowerdirs: vec![artifact_path.to_path_buf(), engine.host_root.clone()],
+            lowerdirs: vec![engine.host_root.clone(), artifact_path.to_path_buf()],
             ..RootfsConfig::default()
         }),
         seccomp: Some(SeccompMode::Enforce),
@@ -580,13 +620,14 @@ fn validate_upstream(path: &Path) -> Result<(), DeployError> {
 }
 
 fn copy_source(source: &Path, destination: &Path) -> Result<String, DeployError> {
+    let source = fs::canonicalize(source)?;
     let mut files = Vec::new();
-    collect_source_files(source, Path::new(""), &mut files)?;
+    collect_source_files(&source, Path::new(""), &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = Sha256::new();
     for (relative, path) in files {
         let relative = slash_path(&relative);
-        let bytes = fs::read(&path)?;
+        let bytes = read_source_file(&source, &path)?;
         hash_path_length_bytes(&mut hasher, &relative, bytes.len() as u64, &bytes);
         let target = destination.join(&relative);
         if let Some(parent) = target.parent() {
@@ -599,6 +640,32 @@ fn copy_source(source: &Path, destination: &Path) -> Result<String, DeployError>
         output.write_all(&bytes)?;
     }
     Ok(hex_digest(hasher))
+}
+
+fn read_source_file(source_root: &Path, path: &Path) -> Result<Vec<u8>, DeployError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(DeployError::InvalidInput(format!(
+            "source path {} changed type during intake",
+            path.display()
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    let opened_path = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    #[cfg(not(target_os = "linux"))]
+    let opened_path = fs::canonicalize(path)?;
+    if !opened_path.starts_with(source_root) {
+        return Err(DeployError::InvalidInput(format!(
+            "source path {} escaped its source root during intake",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn collect_source_files(
@@ -632,11 +699,71 @@ fn collect_source_files(
                     "source path is not valid UTF-8".into(),
                 ));
             }
+
             files.push((child_relative, path));
         } else {
             return Err(DeployError::InvalidInput(format!(
                 "source contains non-regular file {}",
                 child_relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_payload(root: &Path) -> Result<(), DeployError> {
+    validate_tree(root)?;
+    let entries = fs::read_dir(root)?.collect::<Result<Vec<_>, io::Error>>()?;
+    if entries.len() != 1 || entries[0].file_name() != OsStr::new("app") {
+        return Err(DeployError::InvalidInput(
+            "build output may publish only the reserved app directory".into(),
+        ));
+    }
+    if !fs::symlink_metadata(entries[0].path())?
+        .file_type()
+        .is_dir()
+    {
+        return Err(DeployError::InvalidInput(
+            "build output app path must be a directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn copy_output_tree(source: &Path, destination: &Path) -> Result<(), DeployError> {
+    fs::create_dir(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by(|left, right| {
+        left.file_name()
+            .as_bytes()
+            .cmp(right.file_name().as_bytes())
+    });
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_dir() {
+            copy_output_tree(&source_path, &destination_path)?;
+        } else if metadata.file_type().is_file() {
+            let mut input = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&source_path)?;
+            if !input.metadata()?.file_type().is_file() {
+                return Err(DeployError::InvalidInput(format!(
+                    "build output changed type at {}",
+                    source_path.display()
+                )));
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination_path)?;
+            io::copy(&mut input, &mut output)?;
+        } else {
+            return Err(DeployError::InvalidInput(format!(
+                "build output contains unsupported file {}",
+                source_path.display()
             )));
         }
     }
@@ -706,33 +833,70 @@ fn validate_tree(root: &Path) -> Result<(), DeployError> {
     Ok(())
 }
 
-fn write_logs(building: &Path, stdout: &[u8], stderr: &[u8]) -> Result<(), io::Error> {
-    let logs = building.join("logs");
-    fs::create_dir_all(&logs)?;
-    fs::write(logs.join("build.stdout.log"), stdout)?;
-    fs::write(logs.join("build.stderr.log"), stderr)
+fn prepare_log_staging(artifact_root: &Path, id: &str) -> Result<PathBuf, DeployError> {
+    let parent = artifact_root.join(LOG_STAGING_REL);
+    fs::create_dir_all(&parent)?;
+    let metadata = fs::symlink_metadata(&parent)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(DeployError::InvalidInput(
+            "deployment log staging path must be a directory".into(),
+        ));
+    }
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+    let logs = parent.join(id);
+    fs::create_dir(&logs)?;
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700))?;
+    Ok(logs)
+}
+
+fn write_logs(logs: &Path, stdout: &[u8], stderr: &[u8]) -> Result<(), io::Error> {
+    for (name, bytes) in [("build.stdout.log", stdout), ("build.stderr.log", stderr)] {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(logs.join(name))?;
+        file.write_all(bytes)?;
+    }
+    Ok(())
 }
 
 fn fail_build(
     state: &mut State,
     artifact_root: &Path,
-    building: &Path,
+    output: &Path,
+    log_staging: &Path,
     id: &str,
     detail: String,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
 ) -> DeployError {
-    let _ = write_logs(building, &stdout, &stderr);
     let failed = artifact_root.join(FAILED_REL).join(id);
+    let failed_output = failed.join("output");
+    let failed_logs = failed.join("logs");
     let _ = fs::create_dir_all(artifact_root.join(FAILED_REL));
     let _ = fs::remove_dir_all(&failed);
-    let _ = fs::rename(building, &failed);
-    let logs = failed.join("logs");
+    let _ = fs::create_dir(&failed);
+    if output.exists() {
+        let _ = fs::rename(output, &failed_output);
+    }
+    let logs = if log_staging.exists() {
+        let _ = fs::rename(log_staging, &failed_logs);
+        failed_logs
+    } else if failed_output.join("logs").is_dir() {
+        failed_output.join("logs")
+    } else {
+        let _ = fs::create_dir(&failed_logs);
+        failed_logs
+    };
+    let _ = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(logs.join("pipeline.error.log"))
+        .and_then(|mut file| file.write_all(detail.as_bytes()));
     let terminal = match state.mark_deployment_failed(id, &detail) {
         Ok(_) => detail,
         Err(error) => format!("{detail}; unable to persist failed state: {error}"),
     };
     let _ = remove_work(artifact_root, id);
+    let _ = fs::remove_dir(artifact_root.join(LOG_STAGING_REL));
     DeployError::BuildFailed {
         id: id.to_owned(),
         detail: terminal,
@@ -745,6 +909,7 @@ fn remove_work(artifact_root: &Path, id: &str) -> Result<(), io::Error> {
     if work.exists() {
         fs::remove_dir_all(work)?;
     }
+    let _ = fs::remove_dir(artifact_root.join(WORKSPACE_REL));
     Ok(())
 }
 
@@ -951,6 +1116,19 @@ mod tests {
         assert!(copy_source(&root, &destination).is_err());
         assert!(validate_entry(Path::new("../file")).is_err());
         assert!(validate_entry(Path::new("/tmp/file")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_payload_rejects_build_controlled_namespaces() {
+        let root = temp_dir("published-namespace");
+        fs::create_dir(root.join("app")).unwrap();
+        let sentinel = root.join("sentinel");
+        fs::write(&sentinel, b"preserved").unwrap();
+        symlink(&sentinel, root.join("logs")).unwrap();
+        assert!(validate_build_payload(&root).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserved");
+        fs::remove_file(root.join("logs")).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -76,11 +76,11 @@ impl PublishDir {
                 return Err(error);
             }
 
-            return Ok(Self {
+            Ok(Self {
                 path,
                 path_c,
                 mounted: true,
-            });
+            })
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -100,11 +100,11 @@ impl PublishDir {
     pub(super) fn close(self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            return self.close_linux();
+            self.close_linux()
         }
 
         #[cfg(not(target_os = "linux"))]
-        fs::remove_dir(&self.path)
+        fs::remove_dir_all(&self.path)
     }
 
     #[cfg(target_os = "linux")]
@@ -128,7 +128,10 @@ impl Drop for PublishDir {
             self.mounted = false;
         }
 
+        #[cfg(target_os = "linux")]
         let _ = fs::remove_dir(&self.path);
+        #[cfg(not(target_os = "linux"))]
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -205,8 +208,8 @@ mod tests {
     #[test]
     fn rejects_interior_nul_before_filesystem_work() {
         let missing_root = Path::new("/definitely/missing/cygnus-publish-tests");
-        let error = PublishDir::create(missing_root, "bad\0id", 1, 1)
-            .expect_err("interior NUL must fail");
+        let error =
+            PublishDir::create(missing_root, "bad\0id", 1, 1).expect_err("interior NUL must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -247,10 +250,8 @@ mod tests {
     }
 
     fn test_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "cygnus-publish-{label}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cygnus-publish-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         root
