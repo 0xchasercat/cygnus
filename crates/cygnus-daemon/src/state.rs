@@ -90,6 +90,14 @@ pub struct DeploymentRecord {
     pub error: Option<String>,
 }
 
+/// The deployment currently selected by an app's active artifact pointer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveDeploymentRecord {
+    pub deployment_id: String,
+    pub artifact_hash: String,
+    pub engine_version: String,
+}
+
 /// The JSON document accepted by the daemon's apply operation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct NodeConfig {
@@ -668,11 +676,91 @@ impl State {
         self.connection.query_row(
             "SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE id = ?1",
             [id],
-            |row| {
-                let status: String = row.get(5)?;
-                Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
-            },
+            deployment_from_row,
         ).optional().map_err(StateError::from)
+    }
+
+    /// List newest deployments, optionally scoped to one app.
+    pub fn deployments(
+        &self,
+        app: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<DeploymentRecord>, StateError> {
+        if limit == 0 || limit > 100 {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment query",
+                detail: "limit must be between 1 and 100".into(),
+            });
+        }
+        if app.is_some_and(|name| name.trim().is_empty()) {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment query",
+                detail: "app filter must be nonempty".into(),
+            });
+        }
+
+        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error";
+        let mut deployments = Vec::new();
+        if let Some(app) = app {
+            let sql = format!(
+                "SELECT {columns} FROM deployments WHERE app = ?1 ORDER BY rowid DESC LIMIT ?2"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let rows = statement.query_map(params![app, i64::from(limit)], deployment_from_row)?;
+            for row in rows {
+                deployments.push(row?);
+            }
+        } else {
+            let sql = format!("SELECT {columns} FROM deployments ORDER BY rowid DESC LIMIT ?1");
+            let mut statement = self.connection.prepare(&sql)?;
+            let rows = statement.query_map([i64::from(limit)], deployment_from_row)?;
+            for row in rows {
+                deployments.push(row?);
+            }
+        }
+        Ok(deployments)
+    }
+
+    /// Resolve the deployment selected by an app's active artifact pointer.
+    pub fn active_deployment(
+        &self,
+        app: &str,
+    ) -> Result<Option<ActiveDeploymentRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT d.id, ar.artifact_hash, ar.engine_version
+                 FROM apps a
+                 JOIN app_artifacts aa ON aa.app_id = a.id
+                 JOIN artifacts ar ON ar.id = aa.artifact_id
+                 JOIN deployments d ON d.artifact_hash = ar.artifact_hash
+                 WHERE a.name = ?1 AND d.status = 'active'",
+                [app],
+                |row| {
+                    Ok(ActiveDeploymentRecord {
+                        deployment_id: row.get(0)?,
+                        artifact_hash: row.get(1)?,
+                        engine_version: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    /// Return the daemon-owned log directory for a sealed or active deployment.
+    pub fn deployment_logs_dir(&self, id: &str) -> Result<Option<PathBuf>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT ar.host_path
+                 FROM deployments d
+                 JOIN artifacts ar ON ar.artifact_hash = d.artifact_hash
+                 WHERE d.id = ?1 AND d.status IN ('sealed', 'active')",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|path| path.map(PathBuf::from).map(|path| path.join("logs")))
+            .map_err(StateError::from)
     }
 
     pub fn artifact(&self, hash: &str) -> Result<Option<ArtifactRecord>, StateError> {
@@ -1090,10 +1178,34 @@ fn query_deployment_tx(
     transaction: &Transaction<'_>,
     id: &str,
 ) -> Result<Option<DeploymentRecord>, StateError> {
-    transaction.query_row("SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE id = ?1", [id], |row| {
-        let status: String = row.get(5)?;
-        Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
-    }).optional().map_err(StateError::from)
+    transaction
+        .query_row(
+            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE id = ?1",
+            [id],
+            deployment_from_row,
+        )
+        .optional()
+        .map_err(StateError::from)
+}
+
+fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusqlite::Error> {
+    let status: String = row.get(5)?;
+    let status = parse_status(&status).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error)),
+        )
+    })?;
+    Ok(DeploymentRecord {
+        id: row.get(0)?,
+        app: row.get(1)?,
+        source_hash: row.get(2)?,
+        engine_version: row.get(3)?,
+        artifact_hash: row.get(4)?,
+        status,
+        error: row.get(6)?,
+    })
 }
 
 fn query_artifact_tx(
@@ -1119,10 +1231,14 @@ fn query_deployment_by_artifact_tx(
     transaction: &Transaction<'_>,
     hash: &str,
 ) -> Result<Option<DeploymentRecord>, StateError> {
-    transaction.query_row("SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE artifact_hash = ?1", [hash], |row| {
-        let status: String = row.get(5)?;
-        Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
-    }).optional().map_err(StateError::from)
+    transaction
+        .query_row(
+            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE artifact_hash = ?1",
+            [hash],
+            deployment_from_row,
+        )
+        .optional()
+        .map_err(StateError::from)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1879,6 +1995,23 @@ mod tests {
             state.deployment("dep-1").unwrap().unwrap().status,
             DeploymentStatus::Active
         );
+        assert_eq!(
+            state.active_deployment("api").unwrap(),
+            Some(ActiveDeploymentRecord {
+                deployment_id: "dep-1".into(),
+                artifact_hash: artifact_hash.clone(),
+                engine_version: engine.version.clone(),
+            })
+        );
+        assert_eq!(
+            state.deployment_logs_dir("dep-1").unwrap(),
+            Some(PathBuf::from("/var/lib/cygnus/apps/api/c/logs"))
+        );
+        assert_eq!(
+            state.deployments(Some("api"), 10).unwrap(),
+            vec![state.deployment("dep-1").unwrap().unwrap()]
+        );
+        assert!(state.deployments(None, 0).is_err());
         let second_source_hash = "d".repeat(64);
         let second_artifact_hash = "e".repeat(64);
         state
@@ -1920,6 +2053,15 @@ mod tests {
         assert_eq!(
             state.deployment("dep-2").unwrap().unwrap().status,
             DeploymentStatus::Sealed
+        );
+        assert_eq!(
+            state
+                .deployments(None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|deployment| deployment.id)
+                .collect::<Vec<_>>(),
+            ["dep-2", "dep-1"]
         );
         assert!(matches!(
             state.apply(&NodeConfig::default()),
