@@ -156,6 +156,7 @@ impl JobConfig {
             limits: self.limits.clone(),
             rootfs: self.rootfs.clone(),
             ingress: None,
+            admin_socket: None,
             build_output: self.build_output.clone(),
             working_dir: self.working_dir.clone(),
             seccomp: self.seccomp,
@@ -190,10 +191,7 @@ pub fn run_job(config: JobConfig) -> Result<JobResult, CageError> {
 
 /// Run a domain-restricted finite job through the host DNS forwarder.
 #[cfg(target_os = "linux")]
-pub fn run_job_with_dns(
-    config: JobConfig,
-    dns: &DnsForwarder,
-) -> Result<JobResult, CageError> {
+pub fn run_job_with_dns(config: JobConfig, dns: &DnsForwarder) -> Result<JobResult, CageError> {
     run_job_with_boot(config, |spec, stdout, stderr| {
         Cage::boot_with_capture_and_dns(spec, stdout, stderr, dns)
     })

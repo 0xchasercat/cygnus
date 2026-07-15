@@ -22,6 +22,10 @@ pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 /// Fixed directory inside an artifact-rooted cage where the host exposes app ingress.
 pub const INGRESS_CAGE_DIR: &str = "/cygnus/io";
+/// Fixed read-only directory containing Tenant Zero's typed admin socket.
+pub const ADMIN_CAGE_DIR: &str = "/cygnus/admin";
+/// Fixed socket name inside [`ADMIN_CAGE_DIR`].
+pub const ADMIN_SOCKET_FILENAME: &str = "admin.sock";
 /// Fixed writable build-artifact directory exposed inside a rooted job.
 pub const BUILD_OUTPUT_CAGE_DIR: &str = "/cygnus/output";
 
@@ -155,6 +159,23 @@ impl IngressSpec {
     }
 }
 
+/// Daemon-owned directory mounted read-only at [`ADMIN_CAGE_DIR`].
+///
+/// This capability is purpose-specific to Tenant Zero. It is deliberately
+/// separate from writable ingress and is not a generic host volume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminSocketSpec {
+    pub host_dir: PathBuf,
+}
+
+impl AdminSocketSpec {
+    pub fn new(host_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            host_dir: host_dir.into(),
+        }
+    }
+}
+
 /// Host-side directory mounted writable at [`BUILD_OUTPUT_CAGE_DIR`] for a
 /// finite build job. The mount is intentionally purpose-specific rather than
 /// a generic volume: it is the only host path a build can publish to.
@@ -183,6 +204,8 @@ pub struct CageSpec {
     /// Optional host ingress directory mounted at [`INGRESS_CAGE_DIR`] after
     /// the cage pivots into its overlay root.
     pub ingress: Option<IngressSpec>,
+    /// Optional daemon admin directory mounted read-only at [`ADMIN_CAGE_DIR`].
+    pub admin_socket: Option<AdminSocketSpec>,
     /// Optional host build output directory mounted at the fixed
     /// [`BUILD_OUTPUT_CAGE_DIR`] path. This requires a rootfs.
     pub build_output: Option<BuildOutputSpec>,
@@ -220,6 +243,7 @@ impl CageSpec {
             limits: CgroupLimits::default(),
             rootfs: None,
             ingress: None,
+            admin_socket: None,
             build_output: None,
             working_dir: None,
             seccomp: Some(FilterMode::Enforce),
@@ -306,6 +330,14 @@ impl CageSpec {
                     "readiness UDS parent must equal ingress host directory".into(),
                 ));
             }
+        }
+        if let Some(admin) = &self.admin_socket {
+            if self.rootfs.is_none() {
+                return Err(CageError::InvalidSpec(
+                    "Tenant admin socket requires a rootfs".into(),
+                ));
+            }
+            validate_host_directory_shape(&admin.host_dir, "Tenant admin host directory")?;
         }
         if let Some(output) = &self.build_output {
             if self.rootfs.is_none() {
@@ -562,6 +594,7 @@ mod tests {
         assert_eq!(spec.seccomp, Some(FilterMode::Enforce));
         assert_eq!(spec.egress, EgressMode::None);
         assert!(spec.ingress.is_none());
+        assert!(spec.admin_socket.is_none());
         assert!(spec.init.is_none());
         assert!(spec.validate().is_ok());
     }
@@ -811,6 +844,23 @@ mod tests {
         spec.ingress = Some(IngressSpec::new(PathBuf::from(OsString::from_vec(
             b"/tmp/with\0nul".to_vec(),
         ))));
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn validation_enforces_tenant_admin_mount_shape() {
+        let mut spec = CageSpec::new("tenant-0", "/bin/true");
+        spec.admin_socket = Some(AdminSocketSpec::new("/run/cygnus/tenant0-admin"));
+        assert!(spec.validate().is_err(), "admin socket requires a rootfs");
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
+        assert!(spec.validate().is_ok());
+
+        spec.admin_socket = Some(AdminSocketSpec::new("relative"));
+        assert!(spec.validate().is_err());
+        spec.admin_socket = Some(AdminSocketSpec::new("/"));
+        assert!(spec.validate().is_err());
+        spec.admin_socket = Some(AdminSocketSpec::new("/tmp/../etc"));
         assert!(spec.validate().is_err());
     }
 
