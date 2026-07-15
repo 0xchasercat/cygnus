@@ -19,7 +19,6 @@ const CONTROL_ENV = Object.freeze({
   HOME,
   TMPDIR,
   PATH,
-  NODE_ENV: "production",
   BUN_INSTALL_CACHE_DIR: CACHE,
   NPM_CONFIG_REGISTRY: REGISTRY,
 });
@@ -106,6 +105,7 @@ async function buildBundle(entry) {
     sourcemap: "none",
     packages: "bundle",
     splitting: false,
+    define: { "process.env.NODE_ENV": JSON.stringify("production") },
     env: "disable",
   });
   if (!result.success) {

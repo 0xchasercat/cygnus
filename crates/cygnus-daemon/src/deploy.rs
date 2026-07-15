@@ -495,7 +495,6 @@ fn build_job(
     job.env
         .insert("TMPDIR".into(), BUILD_TMPDIR_CAGE_PATH.into());
     job.env.insert("PATH".into(), BUILD_PATH.into());
-    job.env.insert("NODE_ENV".into(), "production".into());
     job.env
         .insert("BUN_INSTALL_CACHE_DIR".into(), BUILD_CACHE_CAGE_PATH.into());
     job.env
