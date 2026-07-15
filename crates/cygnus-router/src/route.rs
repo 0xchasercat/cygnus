@@ -68,6 +68,14 @@ impl RouteTable {
         }
         None
     }
+
+    /// Whether no request still holds a route cloned from this table.
+    pub fn is_quiescent(&self) -> bool {
+        self.exact
+            .values()
+            .chain(self.wildcards.iter().map(|(_, route)| route))
+            .all(|route| Arc::strong_count(route) == 1)
+    }
 }
 
 /// The live routing table: lock-free reads, atomic swap on deploy.
@@ -88,9 +96,10 @@ impl Router {
         self.table.load().resolve(host)
     }
 
-    /// Atomically replace the routing table (a deploy or config reload).
-    pub fn install(&self, table: RouteTable) {
-        self.table.store(Arc::new(table));
+    /// Atomically replace the routing table and return the retired table.
+    /// Its route reference counts provide a drain barrier for in-flight users.
+    pub fn install(&self, table: RouteTable) -> Arc<RouteTable> {
+        self.table.swap(Arc::new(table))
     }
 }
 
@@ -169,14 +178,18 @@ mod tests {
     #[test]
     fn install_swaps_the_table_atomically() {
         let router = Router::new(table());
-        assert_eq!(router.resolve("api.example.com").unwrap().app, "api");
+        let before = router.resolve("api.example.com").unwrap();
+        assert_eq!(before.app, "api");
 
         let mut next = RouteTable::new();
         next.insert("api.example.com", route("api-v2"));
-        router.install(next);
+        let retired = router.install(next);
         assert_eq!(router.resolve("api.example.com").unwrap().app, "api-v2");
         // The old wildcard is gone after the swap.
         assert!(router.resolve("blog.apps.example.com").is_none());
+        assert!(!retired.is_quiescent());
+        drop(before);
+        assert!(retired.is_quiescent());
     }
 
     #[test]
