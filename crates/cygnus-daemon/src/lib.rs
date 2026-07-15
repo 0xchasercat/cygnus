@@ -12,6 +12,7 @@
 //! `cygnus-proxy` for the body phase is a later optimization behind the same
 //! request path. The request-handling core (head read, routing, error
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
+pub mod admin;
 pub mod deploy;
 pub mod state;
 
