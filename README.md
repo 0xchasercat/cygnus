@@ -40,9 +40,12 @@ docs/spec.md              the technical specification, ground truth for design
 
 ## Run the source path
 
-Register a prepared, read-only Bun engine root, then deploy a self-contained
-source directory. `--cage-executable` is the absolute path *inside* that root;
-the daemon hashes the corresponding host file before trusting it.
+Register a prepared, read-only Bun engine root, then deploy a source directory.
+`--cage-executable` is the absolute path *inside* that root; the daemon hashes
+the corresponding host file before trusting it. Projects with `dependencies`,
+`devDependencies`, or `optionalDependencies` must include a text `bun.lock`.
+The build cage runs a frozen, script-free install with egress restricted to the
+npm registry, then bundles dependencies into the sealed runtime artifact.
 
 ```sh
 cargo run -p cygnus-daemon -- --state ./state.db engine register \
