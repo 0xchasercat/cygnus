@@ -11,7 +11,9 @@ use std::ptr;
 use nix::errno::Errno;
 
 use crate::error::CageError;
-use crate::spec::{INGRESS_CAGE_DIR, IngressSpec, RootfsSpec};
+use crate::spec::{
+    BUILD_OUTPUT_CAGE_DIR, BuildOutputSpec, INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
+};
 
 /// Directory name the old root is pivoted onto before it is detached.
 const OLD_ROOT_NAME: &str = ".cygnus-old-root";
@@ -114,6 +116,7 @@ pub(crate) struct MountPlan {
     root: CString,
     overlay: Option<OverlayPlan>,
     ingress: Option<IngressPlan>,
+    build_output: Option<BuildOutputPlan>,
     proc_source: CString,
     proc_target: CString,
     proc_fstype: CString,
@@ -125,11 +128,21 @@ impl MountPlan {
     pub(crate) fn new(
         rootfs: Option<&StagedRootfs>,
         ingress: Option<&IngressSpec>,
+        build_output: Option<&BuildOutputSpec>,
     ) -> Result<Self, CageError> {
         let ingress_plan = match (rootfs, ingress) {
             (Some(_), Some(ingress)) => Some(IngressPlan::new(ingress)?),
             (None, Some(_)) => {
                 return Err(CageError::InvalidSpec("ingress requires a rootfs".into()));
+            }
+            (Some(_), None) | (None, None) => None,
+        };
+        let build_output_plan = match (rootfs, build_output) {
+            (Some(_), Some(output)) => Some(BuildOutputPlan::new(output)?),
+            (None, Some(_)) => {
+                return Err(CageError::InvalidSpec(
+                    "build output requires a rootfs".into(),
+                ));
             }
             (Some(_), None) | (None, None) => None,
         };
@@ -139,6 +152,7 @@ impl MountPlan {
             root: CString::new("/").expect("root path has no NUL byte"),
             overlay,
             ingress: ingress_plan,
+            build_output: build_output_plan,
             proc_source: CString::new("proc").expect("proc source has no NUL byte"),
             proc_target: CString::new("/proc").expect("proc target has no NUL byte"),
             proc_fstype: CString::new("proc").expect("proc fstype has no NUL byte"),
@@ -180,6 +194,7 @@ impl MountPlan {
                 overlay.apply(
                     &self.root,
                     self.ingress.as_ref(),
+                    self.build_output.as_ref(),
                     &self.proc_source,
                     &self.proc_fstype,
                 )?
@@ -210,43 +225,54 @@ struct IngressPlan {
 impl IngressPlan {
     /// Verify the host source and prebuild every path used after `clone`.
     fn new(ingress: &IngressSpec) -> Result<Self, CageError> {
-        if !ingress.host_dir.is_absolute() {
-            return Err(CageError::InvalidSpec(
-                "ingress host directory must be absolute".into(),
-            ));
+        Self::from_host_dir(&ingress.host_dir, INGRESS_CAGE_DIR, "ingress")
+    }
+
+    fn from_host_dir(host_dir: &Path, target: &str, label: &str) -> Result<Self, CageError> {
+        if !host_dir.is_absolute() {
+            return Err(CageError::InvalidSpec(format!(
+                "{label} host directory must be absolute"
+            )));
         }
-        if ingress.host_dir == Path::new("/") {
-            return Err(CageError::InvalidSpec(
-                "ingress host directory must not be the host root".into(),
-            ));
+        if host_dir == Path::new("/") {
+            return Err(CageError::InvalidSpec(format!(
+                "{label} host directory must not be the host root"
+            )));
         }
-        if ingress
-            .host_dir
+        if host_dir.as_os_str().as_bytes().contains(&0) {
+            return Err(CageError::InvalidSpec(format!(
+                "{label} host directory must not contain a NUL byte"
+            )));
+        }
+        if host_dir
             .components()
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
         {
-            return Err(CageError::InvalidSpec(
-                "ingress host directory must not contain '.' or '..' components".into(),
-            ));
-        }
-        let metadata = fs::symlink_metadata(&ingress.host_dir).map_err(|source| {
-            CageError::io("verify ingress host directory", &ingress.host_dir, source)
-        })?;
-        if !metadata.file_type().is_dir() {
             return Err(CageError::InvalidSpec(format!(
-                "ingress host path {:?} must be a directory, not a symlink or file",
-                ingress.host_dir
+                "{label} host directory must not contain '.' or '..' components"
             )));
         }
-        let relative = ingress.host_dir.strip_prefix("/").map_err(|_| {
-            CageError::InvalidSpec("ingress host directory must be absolute".into())
+        let operation = if label == "build output" {
+            "verify build output host directory"
+        } else {
+            "verify ingress host directory"
+        };
+        let metadata = fs::symlink_metadata(host_dir)
+            .map_err(|source| CageError::io(operation, host_dir, source))?;
+        if !metadata.file_type().is_dir() {
+            return Err(CageError::InvalidSpec(format!(
+                "{label} host path {host_dir:?} must be a directory, not a symlink or file"
+            )));
+        }
+        let relative = host_dir.strip_prefix("/").map_err(|_| {
+            CageError::InvalidSpec(format!("{label} host directory must be absolute"))
         })?;
         let mut source_path = PathBuf::from(format!("/{OLD_ROOT_NAME}"));
         source_path.push(relative);
         Ok(Self {
             source: path_cstring(&source_path)?,
-            target_parent: CString::new("/cygnus").expect("ingress parent has no NUL byte"),
-            target: CString::new(INGRESS_CAGE_DIR).expect("ingress target has no NUL byte"),
+            target_parent: CString::new("/cygnus").expect("bind parent has no NUL byte"),
+            target: CString::new(target).expect("bind target has no NUL byte"),
             remount_flags: INGRESS_REMOUNT_FLAGS,
         })
     }
@@ -289,6 +315,23 @@ impl IngressPlan {
             return Err(Errno::last_raw());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BuildOutputPlan(IngressPlan);
+
+impl BuildOutputPlan {
+    fn new(output: &BuildOutputSpec) -> Result<Self, CageError> {
+        Ok(Self(IngressPlan::from_host_dir(
+            &output.host_dir,
+            BUILD_OUTPUT_CAGE_DIR,
+            "build output",
+        )?))
+    }
+
+    unsafe fn apply(&self) -> Result<(), i32> {
+        unsafe { self.0.apply() }
     }
 }
 
@@ -345,6 +388,7 @@ impl OverlayPlan {
         &self,
         root: &CString,
         ingress: Option<&IngressPlan>,
+        build_output: Option<&BuildOutputPlan>,
         proc_source: &CString,
         proc_fstype: &CString,
     ) -> Result<(), i32> {
@@ -416,6 +460,9 @@ impl OverlayPlan {
         // its source path resolves through the host tree at this point.
         if let Some(ingress) = ingress {
             unsafe { ingress.apply()? };
+        }
+        if let Some(output) = build_output {
+            unsafe { output.apply()? };
         }
 
         // Drop the old root. The overlay holds its own references to the
@@ -506,7 +553,7 @@ mod tests {
 
     #[test]
     fn plan_paths_are_valid_c_strings() {
-        let plan = MountPlan::new(None, None).expect("plan without a rootfs");
+        let plan = MountPlan::new(None, None, None).expect("plan without a rootfs");
         assert_eq!(plan.root.to_bytes(), b"/");
         assert_eq!(plan.proc_source.to_bytes(), b"proc");
         assert_eq!(plan.proc_target.to_bytes(), b"/proc");
@@ -545,7 +592,7 @@ mod tests {
         rootfs.staging_dir = Some(base.clone());
 
         let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
-        let plan = MountPlan::new(Some(&staged), None).expect("plan with a rootfs");
+        let plan = MountPlan::new(Some(&staged), None, None).expect("plan with a rootfs");
         let overlay = plan.overlay.as_ref().expect("overlay plan present");
 
         let staging = base.join("cygnus-cage-app");
@@ -576,7 +623,7 @@ mod tests {
 
         let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
         let ingress = IngressSpec::new(host_dir.clone());
-        let plan = MountPlan::new(Some(&staged), Some(&ingress)).expect("ingress plan");
+        let plan = MountPlan::new(Some(&staged), Some(&ingress), None).expect("ingress plan");
         let ingress_plan = plan.ingress.as_ref().expect("ingress plan present");
 
         assert_eq!(
@@ -594,6 +641,38 @@ mod tests {
                 | nix::libc::MS_NOEXEC
         );
 
+        drop(staged);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_output_plan_uses_the_fixed_hardened_mount() {
+        let base = unique_staging_base("output-plan");
+        let host_dir = base.join("host-output");
+        fs::create_dir_all(&host_dir).expect("create output host directory");
+        let mut rootfs = RootfsSpec::new(vec![PathBuf::from("/lower")]);
+        rootfs.staging_dir = Some(base.join("staging"));
+
+        let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
+        let output = BuildOutputSpec::new(host_dir.clone());
+        let plan = MountPlan::new(Some(&staged), None, Some(&output)).expect("output plan");
+        let output_plan = plan.build_output.as_ref().expect("output plan present");
+        assert_eq!(
+            output_plan.0.target.to_bytes(),
+            BUILD_OUTPUT_CAGE_DIR.as_bytes()
+        );
+        assert_eq!(
+            output_plan.0.source.to_bytes(),
+            format!("/{OLD_ROOT_NAME}{}", host_dir.display()).as_bytes()
+        );
+        assert_eq!(
+            output_plan.0.remount_flags,
+            nix::libc::MS_BIND
+                | nix::libc::MS_REMOUNT
+                | nix::libc::MS_NOSUID
+                | nix::libc::MS_NODEV
+                | nix::libc::MS_NOEXEC
+        );
         drop(staged);
         let _ = fs::remove_dir_all(&base);
     }

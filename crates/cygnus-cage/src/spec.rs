@@ -22,6 +22,8 @@ pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_ROOTFS_TMPFS_SIZE: u64 = 64 * 1024 * 1024;
 /// Fixed directory inside an artifact-rooted cage where the host exposes app ingress.
 pub const INGRESS_CAGE_DIR: &str = "/cygnus/io";
+/// Fixed writable build-artifact directory exposed inside a rooted job.
+pub const BUILD_OUTPUT_CAGE_DIR: &str = "/cygnus/output";
 
 /// Action taken when a cage syscall matches the seccomp denylist.
 ///
@@ -138,6 +140,22 @@ impl IngressSpec {
     }
 }
 
+/// Host-side directory mounted writable at [`BUILD_OUTPUT_CAGE_DIR`] for a
+/// finite build job. The mount is intentionally purpose-specific rather than
+/// a generic volume: it is the only host path a build can publish to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildOutputSpec {
+    pub host_dir: PathBuf,
+}
+
+impl BuildOutputSpec {
+    pub fn new(host_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            host_dir: host_dir.into(),
+        }
+    }
+}
+
 /// Complete description of one cage boot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CageSpec {
@@ -150,6 +168,12 @@ pub struct CageSpec {
     /// Optional host ingress directory mounted at [`INGRESS_CAGE_DIR`] after
     /// the cage pivots into its overlay root.
     pub ingress: Option<IngressSpec>,
+    /// Optional host build output directory mounted at the fixed
+    /// [`BUILD_OUTPUT_CAGE_DIR`] path. This requires a rootfs.
+    pub build_output: Option<BuildOutputSpec>,
+    /// Optional absolute directory to use as the target's current directory
+    /// after the rootfs is assembled. The path is interpreted inside the cage.
+    pub working_dir: Option<PathBuf>,
     /// Seccomp filter to install in the cage child immediately before `execve`.
     /// Defaults to `Some(FilterMode::Enforce)` (see [`CageSpec::new`]), so a
     /// cage is sandboxed out of the box like a Docker container; `None` boots
@@ -181,6 +205,8 @@ impl CageSpec {
             limits: CgroupLimits::default(),
             rootfs: None,
             ingress: None,
+            build_output: None,
+            working_dir: None,
             seccomp: Some(FilterMode::Enforce),
             egress: EgressMode::None,
             init: None,
@@ -266,6 +292,34 @@ impl CageSpec {
                 ));
             }
         }
+        if let Some(output) = &self.build_output {
+            if self.rootfs.is_none() {
+                return Err(CageError::InvalidSpec(
+                    "build output requires a rootfs".into(),
+                ));
+            }
+            validate_host_directory_shape(&output.host_dir, "build output host directory")?;
+        }
+        if let Some(working_dir) = &self.working_dir {
+            if !working_dir.is_absolute() {
+                return Err(CageError::InvalidSpec(
+                    "working directory must be absolute and inside the cage".into(),
+                ));
+            }
+            if working_dir
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            {
+                return Err(CageError::InvalidSpec(
+                    "working directory must not contain '.' or '..' components".into(),
+                ));
+            }
+            if working_dir.as_os_str().as_bytes().contains(&0) {
+                return Err(CageError::InvalidSpec(
+                    "working directory must not contain a NUL byte".into(),
+                ));
+            }
+        }
         if let Some(rootfs) = &self.rootfs {
             if rootfs.lowerdirs.is_empty() {
                 return Err(CageError::InvalidSpec(
@@ -313,6 +367,31 @@ impl CageSpec {
         }
         Ok(())
     }
+}
+
+fn validate_host_directory_shape(path: &Path, label: &str) -> Result<(), CageError> {
+    if !path.is_absolute() {
+        return Err(CageError::InvalidSpec(format!("{label} must be absolute")));
+    }
+    if path == Path::new("/") {
+        return Err(CageError::InvalidSpec(format!(
+            "{label} must not be the host root"
+        )));
+    }
+    if path.as_os_str().as_bytes().contains(&0) {
+        return Err(CageError::InvalidSpec(format!(
+            "{label} must not contain a NUL byte"
+        )));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(CageError::InvalidSpec(format!(
+            "{label} must not contain '.' or '..' components"
+        )));
+    }
+    Ok(())
 }
 
 /// Per-phase decomposition of a completed cold boot.
@@ -582,6 +661,43 @@ mod tests {
             b"/tmp/with\0nul".to_vec(),
         ))));
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn validation_enforces_build_output_and_working_directory_shape() {
+        let mut spec = CageSpec::new("example", "/bin/true");
+        spec.build_output = Some(BuildOutputSpec::new("/tmp/output"));
+        assert!(spec.validate().is_err(), "output requires a rootfs");
+
+        spec.rootfs = Some(RootfsSpec::new(vec![PathBuf::from("/lower")]));
+        assert!(spec.validate().is_ok());
+
+        spec.build_output = Some(BuildOutputSpec::new("relative"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted relative output directory"
+        );
+        spec.build_output = Some(BuildOutputSpec::new("/"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted host root as output directory"
+        );
+        spec.build_output = Some(BuildOutputSpec::new("/tmp/../output"));
+        assert!(spec.validate().is_err(), "accepted output path traversal");
+        spec.build_output = Some(BuildOutputSpec::new("/tmp/output"));
+
+        spec.working_dir = Some(PathBuf::from("relative"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted relative working directory"
+        );
+        spec.working_dir = Some(PathBuf::from("/tmp/../workspace"));
+        assert!(
+            spec.validate().is_err(),
+            "accepted working-directory traversal"
+        );
+        spec.working_dir = Some(PathBuf::from("/workspace"));
+        assert!(spec.validate().is_ok());
     }
 
     #[test]
