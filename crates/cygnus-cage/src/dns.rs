@@ -21,7 +21,7 @@ use hickory_proto::rr::{DNSClass, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 
 use crate::error::CageError;
-use crate::net::{self, cage_ipv4, GATEWAY};
+use crate::net::{self, GATEWAY, cage_ipv4};
 use crate::spec::DomainEgressRule;
 
 const DNS_PORT: u16 = 53;
@@ -54,15 +54,13 @@ impl DnsForwarder {
     /// Ensure the cage bridge exists and start UDP and TCP DNS listeners.
     pub fn start() -> Result<Self, CageError> {
         net::ensure_bridge()?;
-        let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").map_err(|source| {
-            network_error("read host resolv.conf", source)
-        })?;
-        let upstream_ip = nameserver_from_resolv_conf(&resolv_conf).ok_or_else(|| {
-            CageError::Network {
+        let resolv_conf = std::fs::read_to_string("/etc/resolv.conf")
+            .map_err(|source| network_error("read host resolv.conf", source))?;
+        let upstream_ip =
+            nameserver_from_resolv_conf(&resolv_conf).ok_or_else(|| CageError::Network {
                 operation: "select host DNS upstream".into(),
                 detail: "no valid non-gateway nameserver in /etc/resolv.conf".into(),
-            }
-        })?;
+            })?;
         let upstream = SocketAddr::new(upstream_ip, DNS_PORT);
         let listen = SocketAddrV4::new(GATEWAY, DNS_PORT);
         let udp = Arc::new(
@@ -258,11 +256,14 @@ impl Registry {
     fn authorize(&self, cage_ip: Ipv4Addr, domain: &str) -> Option<RegistrationToken> {
         let state = lock(&self.state);
         let registration = state.registrations.get(&cage_ip)?;
-        registration.domains.contains(domain).then_some(RegistrationToken {
-            cage_ip,
-            pid: registration.pid,
-            generation: registration.generation,
-        })
+        registration
+            .domains
+            .contains(domain)
+            .then_some(RegistrationToken {
+                cage_ip,
+                pid: registration.pid,
+                generation: registration.generation,
+            })
     }
 
     fn install_answers(
@@ -382,7 +383,9 @@ fn error_response(raw: &[u8], request: Option<&Message>, code: ResponseCode) -> 
         }
     }
     response.metadata.response_code = code;
-    response.to_vec().unwrap_or_else(|_| minimal_error(id, code))
+    response
+        .to_vec()
+        .unwrap_or_else(|_| minimal_error(id, code))
 }
 
 fn minimal_error(id: u16, code: ResponseCode) -> Vec<u8> {
@@ -425,8 +428,8 @@ fn nft_add(pid: i32, address: Ipv4Addr, ttl: u32) -> io::Result<()> {
     let ttl = format!("{}s", ttl.clamp(MIN_TTL_SECS, MAX_TTL_SECS));
     let output = Command::new("nsenter")
         .args([
-            "-t", &pid, "-n", "--", "nft", "add", "element", "inet", "cygnus", "dns_v4",
-            "{", &address, "timeout", &ttl, "}",
+            "-t", &pid, "-n", "--", "nft", "add", "element", "inet", "cygnus", "dns_v4", "{",
+            &address, "timeout", &ttl, "}",
         ])
         .output()?;
     if output.status.success() {
@@ -552,7 +555,10 @@ fn forward_tcp(upstream: SocketAddr, request: &[u8]) -> io::Result<Vec<u8>> {
     stream.set_write_timeout(Some(UPSTREAM_TIMEOUT))?;
     stream.write_all(&tcp_frame(request)?)?;
     read_tcp_message(&mut stream)?.ok_or_else(|| {
-        io::Error::new(ErrorKind::UnexpectedEof, "upstream closed before DNS response")
+        io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "upstream closed before DNS response",
+        )
     })
 }
 
@@ -567,7 +573,10 @@ fn read_tcp_message(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     stream.read_exact(&mut length[1..])?;
     let length = usize::from(u16::from_be_bytes(length));
     if length == 0 {
-        return Err(io::Error::new(ErrorKind::InvalidData, "empty DNS TCP frame"));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "empty DNS TCP frame",
+        ));
     }
     let mut payload = vec![0_u8; length];
     stream.read_exact(&mut payload)?;
@@ -590,7 +599,10 @@ fn tcp_frame(payload: &[u8]) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 fn tcp_payload(frame: &[u8]) -> io::Result<&[u8]> {
     let [high, low, payload @ ..] = frame else {
-        return Err(io::Error::new(ErrorKind::InvalidData, "missing DNS TCP length"));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "missing DNS TCP length",
+        ));
     };
     let expected = usize::from(u16::from_be_bytes([*high, *low]));
     if payload.len() != expected {
@@ -612,7 +624,10 @@ fn validate_domain_rule(rule: &DomainEgressRule) -> Result<(), CageError> {
     for label in rule.domain.split('.') {
         let bytes = label.as_bytes();
         if bytes.is_empty() || bytes.len() > 63 {
-            return Err(CageError::InvalidSpec(format!("invalid DNS domain {:?}", rule.domain)));
+            return Err(CageError::InvalidSpec(format!(
+                "invalid DNS domain {:?}",
+                rule.domain
+            )));
         }
         if (!bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit())
             || (!bytes[bytes.len() - 1].is_ascii_lowercase()
@@ -621,12 +636,18 @@ fn validate_domain_rule(rule: &DomainEgressRule) -> Result<(), CageError> {
                 .iter()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
         {
-            return Err(CageError::InvalidSpec(format!("invalid DNS domain {:?}", rule.domain)));
+            return Err(CageError::InvalidSpec(format!(
+                "invalid DNS domain {:?}",
+                rule.domain
+            )));
         }
     }
     let mut unique = HashSet::new();
     if rule.ports.is_empty()
-        || rule.ports.iter().any(|port| *port == 0 || !unique.insert(*port))
+        || rule
+            .ports
+            .iter()
+            .any(|port| *port == 0 || !unique.insert(*port))
     {
         return Err(CageError::InvalidSpec(format!(
             "DNS domain ports for {:?} must be nonzero and unique",
@@ -644,7 +665,9 @@ fn network_error(operation: &'static str, source: io::Error) -> CageError {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -702,25 +725,28 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let update_order = Arc::clone(&order);
         let update = move |pid, address, ttl| {
-            update_order
-                .lock()
-                .unwrap()
-                .push((pid, address, ttl));
+            update_order.lock().unwrap().push((pid, address, ttl));
             Ok(())
         };
         let response = process_request(
             &registry,
             lease.cage_ip(),
             &request,
-            |_| Ok(upstream.clone()),
+            |raw| {
+                assert_eq!(raw, request);
+                Ok(upstream.clone())
+            },
             &update,
         );
         assert_eq!(response, upstream);
-        assert_eq!(order.lock().unwrap().as_slice(), &[(4242, Ipv4Addr::new(203, 0, 113, 7), MAX_TTL_SECS)]);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            &[(4242, Ipv4Addr::new(203, 0, 113, 7), MAX_TTL_SECS)]
+        );
     }
 
     #[test]
-    fn private_answer_becomes_servfail_and_unregistered_becomes_refused() {
+    fn forbidden_answers_become_servfail_and_unregistered_becomes_refused() {
         let registry = Arc::new(Registry::default());
         let rule = DomainEgressRule {
             domain: "registry.npmjs.org".into(),
@@ -728,15 +754,31 @@ mod tests {
         };
         let lease = registry.register("builder", 4242, &[rule]);
         let request = query_bytes(8, "registry.npmjs.org", RecordType::A);
-        let private = answer_bytes(&request, Ipv4Addr::new(10, 0, 0, 1), 30);
-        let response = process_request(
-            &registry,
-            lease.cage_ip(),
-            &request,
-            |_| Ok(private),
-            &|_, _, _| Ok(()),
-        );
-        assert_eq!(Message::from_vec(&response).unwrap().metadata.response_code, ResponseCode::ServFail);
+        let updates = AtomicUsize::new(0);
+        for address in [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(100, 64, 1, 10),
+        ] {
+            let rejected = answer_bytes(&request, address, 30);
+            let response = process_request(
+                &registry,
+                lease.cage_ip(),
+                &request,
+                |_| Ok(rejected),
+                &|_, _, _| {
+                    updates.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                Message::from_vec(&response).unwrap().metadata.response_code,
+                ResponseCode::ServFail
+            );
+        }
+        assert_eq!(updates.load(Ordering::Relaxed), 0);
         drop(lease);
         let response = process_request(
             &registry,
@@ -745,7 +787,10 @@ mod tests {
             |_| panic!("unregistered request must not forward"),
             &|_, _, _| Ok(()),
         );
-        assert_eq!(Message::from_vec(&response).unwrap().metadata.response_code, ResponseCode::Refused);
+        assert_eq!(
+            Message::from_vec(&response).unwrap().metadata.response_code,
+            ResponseCode::Refused
+        );
     }
 
     #[test]
@@ -754,12 +799,18 @@ mod tests {
         let first = registry.register(
             "builder",
             4242,
-            &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443] }],
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
         );
         let second = registry.register(
             "builder",
             4343,
-            &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443] }],
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
         );
         let ip = second.cage_ip();
         drop(first);
@@ -774,7 +825,10 @@ mod tests {
         let lease = registry.register(
             "builder",
             4242,
-            &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443] }],
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
         );
         let called = AtomicBool::new(false);
         let request = query_bytes(9, "registry.npmjs.org", RecordType::AAAA);
@@ -789,7 +843,10 @@ mod tests {
             &|_, _, _| Ok(()),
         );
         assert!(!called.load(Ordering::Relaxed));
-        assert_eq!(Message::from_vec(&response).unwrap().metadata.response_code, ResponseCode::Refused);
+        assert_eq!(
+            Message::from_vec(&response).unwrap().metadata.response_code,
+            ResponseCode::Refused
+        );
     }
 
     #[test]
@@ -801,12 +858,30 @@ mod tests {
             sender: None,
             threads: Vec::new(),
         };
-        assert!(forwarder
-            .register("builder", 1, &[DomainEgressRule { domain: "Registry.npmjs.org".into(), ports: vec![443] }])
-            .is_err());
-        assert!(forwarder
-            .register("builder", 1, &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443, 443] }])
-            .is_err());
+        assert!(
+            forwarder
+                .register(
+                    "builder",
+                    1,
+                    &[DomainEgressRule {
+                        domain: "Registry.npmjs.org".into(),
+                        ports: vec![443]
+                    }]
+                )
+                .is_err()
+        );
+        assert!(
+            forwarder
+                .register(
+                    "builder",
+                    1,
+                    &[DomainEgressRule {
+                        domain: "registry.npmjs.org".into(),
+                        ports: vec![443, 443]
+                    }]
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -815,10 +890,16 @@ mod tests {
         let lease = registry.register(
             "builder",
             4242,
-            &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443] }],
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
         );
         let request = query_bytes(10, "registry.npmjs.org", RecordType::A);
-        let mismatched = query_bytes(10, "other.example", RecordType::A);
+        let mut mismatched =
+            Message::from_vec(&query_bytes(10, "other.example", RecordType::A)).unwrap();
+        mismatched.metadata.message_type = MessageType::Response;
+        let mismatched = mismatched.to_vec().unwrap();
         let response = process_request(
             &registry,
             lease.cage_ip(),
@@ -826,7 +907,38 @@ mod tests {
             |_| Ok(mismatched),
             &|_, _, _| Ok(()),
         );
-        assert_eq!(Message::from_vec(&response).unwrap().metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            Message::from_vec(&response).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+    }
+
+    #[test]
+    fn response_transaction_mismatch_servfails_without_update() {
+        let registry = Arc::new(Registry::default());
+        let lease = registry.register(
+            "builder",
+            4242,
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
+        );
+        let request = query_bytes(13, "registry.npmjs.org", RecordType::A);
+        let mut mismatched =
+            Message::from_vec(&answer_bytes(&request, Ipv4Addr::new(203, 0, 113, 9), 30)).unwrap();
+        mismatched.metadata.id = 14;
+        let response = process_request(
+            &registry,
+            lease.cage_ip(),
+            &request,
+            |_| Ok(mismatched.to_vec().unwrap()),
+            &|_, _, _| panic!("mismatched transaction must not update nft"),
+        );
+        assert_eq!(
+            Message::from_vec(&response).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
     }
 
     #[test]
@@ -835,7 +947,10 @@ mod tests {
         let lease = registry.register(
             "builder",
             4242,
-            &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443] }],
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
         );
         let request = query_bytes(11, "registry.npmjs.org", RecordType::A);
         let answer = answer_bytes(&request, Ipv4Addr::new(203, 0, 113, 8), 30);
@@ -846,7 +961,10 @@ mod tests {
             |_| Ok(answer),
             &|_, _, _| Err(io::Error::other("nft unavailable")),
         );
-        assert_eq!(Message::from_vec(&response).unwrap().metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            Message::from_vec(&response).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
     }
 
     #[test]
@@ -855,10 +973,15 @@ mod tests {
         let lease = registry.register(
             "builder",
             4242,
-            &[DomainEgressRule { domain: "registry.npmjs.org".into(), ports: vec![443] }],
+            &[DomainEgressRule {
+                domain: "registry.npmjs.org".into(),
+                ports: vec![443],
+            }],
         );
         let request = query_bytes(12, "registry.npmjs.org", RecordType::A);
-        let upstream = Message::from_vec(&request).unwrap().to_vec().unwrap();
+        let mut upstream_message = Message::from_vec(&request).unwrap();
+        upstream_message.metadata.message_type = MessageType::Response;
+        let upstream = upstream_message.to_vec().unwrap();
         let updates = AtomicUsize::new(0);
         let response = process_request(
             &registry,
