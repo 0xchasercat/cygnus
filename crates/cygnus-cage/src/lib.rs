@@ -39,6 +39,15 @@ pub use spec::{
     RootfsSpec,
 };
 
+/// Nonblocking status reported by a cage process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceStatus {
+    /// The cage process has not exited.
+    Running,
+    /// The cage process exited and its status was reaped by the poll.
+    Exited,
+}
+
 /// Isolation provided by the cage backend compiled for this platform.
 #[cfg(target_os = "linux")]
 pub const ISOLATION: &str = "kernel (namespaces + cgroups v2)";

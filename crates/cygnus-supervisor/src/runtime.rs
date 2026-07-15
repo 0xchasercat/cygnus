@@ -20,16 +20,27 @@ use std::time::{Duration, Instant};
 
 use cygnus_cage::CageSpec;
 
-use crate::{AppLifecycle, CrashOutcome, LifecycleConfig, LifecycleState};
+use crate::{AppLifecycle, CrashOutcome, InstanceStatus, LifecycleConfig, LifecycleState};
 
-/// An app instance the supervisor owns and can shut down. `cygnus_cage::Cage`
+fn recover<T>(result: std::sync::LockResult<T>) -> T {
+    result.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// An app instance the supervisor owns and can poll or shut down. `cygnus_cage::Cage`
 /// implements this; tests substitute a fake.
 pub trait Instance: Send {
+    /// Nonblocking process liveness poll. An exited process must be reaped by
+    /// this call so a later shutdown only releases remaining resources.
+    fn try_status(&mut self) -> Result<InstanceStatus, String>;
     /// Release the instance's resources (kill, reap, tear down).
     fn shutdown(self) -> Result<(), String>;
 }
 
 impl Instance for cygnus_cage::Cage {
+    fn try_status(&mut self) -> Result<InstanceStatus, String> {
+        cygnus_cage::Cage::try_status(self).map_err(|error| error.to_string())
+    }
+
     fn shutdown(self) -> Result<(), String> {
         self.teardown().map_err(|error| error.to_string())
     }
@@ -91,18 +102,18 @@ impl<I: Instance> Supervisor<I> {
             }),
             progress: Condvar::new(),
         });
-        self.apps.lock().unwrap().insert(name.into(), slot);
+        recover(self.apps.lock()).insert(name.into(), slot);
     }
 
     /// Ensure the named app is booted and ready, booting it on demand. Callers
     /// racing on a cold app coalesce onto a single boot.
     pub fn acquire(&self, name: &str) -> Result<(), AcquireError> {
         let slot = {
-            let apps = self.apps.lock().unwrap();
+            let apps = recover(self.apps.lock());
             apps.get(name).cloned().ok_or(AcquireError::Unknown)?
         };
 
-        let mut state = slot.state.lock().unwrap();
+        let mut state = recover(slot.state.lock());
         loop {
             match state.lifecycle.state() {
                 LifecycleState::Ready => {
@@ -113,7 +124,7 @@ impl<I: Instance> Supervisor<I> {
                 LifecycleState::Booting | LifecycleState::Draining => {
                     // Another caller is booting this app, or it is draining;
                     // wait for that to finish, then re-evaluate.
-                    state = slot.progress.wait(state).unwrap();
+                    state = recover(slot.progress.wait(state));
                 }
                 LifecycleState::Cold => {
                     if let Some(retry_after) = state.retry_after {
@@ -130,7 +141,7 @@ impl<I: Instance> Supervisor<I> {
                     state.lifecycle.begin_boot(Instant::now());
                     drop(state);
                     let result = (self.boot)(&slot.spec);
-                    state = slot.state.lock().unwrap();
+                    state = recover(slot.state.lock());
                     match result {
                         Ok(instance) => {
                             state.instance = Some(instance);
@@ -155,12 +166,62 @@ impl<I: Instance> Supervisor<I> {
             }
         }
     }
+    /// Poll every ready instance and reconcile exits through the lifecycle
+    /// crash policy. Exited instances are detached before shutdown so callers
+    /// racing an asynchronous maintenance pass wait on `Draining` rather than
+    /// observing a stale `Ready` slot. Returns the names that crashed.
+    pub fn reconcile(&self, now: Instant) -> Vec<String> {
+        let candidates: Vec<(String, Arc<Slot<I>>)> = {
+            let apps = recover(self.apps.lock());
+            apps.iter()
+                .map(|(name, slot)| (name.clone(), Arc::clone(slot)))
+                .collect()
+        };
+
+        let mut crashed = Vec::new();
+        for (name, slot) in candidates {
+            let mut state = recover(slot.state.lock());
+            if state.lifecycle.state() != LifecycleState::Ready {
+                continue;
+            }
+
+            let status = match state.instance.as_mut() {
+                Some(instance) => instance.try_status(),
+                None => Err("ready slot has no instance".to_owned()),
+            };
+            if matches!(status, Ok(InstanceStatus::Running)) {
+                continue;
+            }
+
+            state.lifecycle.begin_drain();
+            let instance = state.instance.take();
+            drop(state);
+
+            if let Some(instance) = instance {
+                let _ = instance.shutdown();
+            }
+
+            let mut state = recover(slot.state.lock());
+            match state.lifecycle.note_crash(now) {
+                CrashOutcome::Restart { after } => {
+                    state.retry_after = Some(now + after);
+                }
+                CrashOutcome::CrashLooping => {
+                    state.retry_after = None;
+                }
+            }
+            slot.progress.notify_all();
+            crashed.push(name);
+        }
+        crashed
+    }
+
 
     /// Reap every ready app that has been idle past its TTL (and is not
     /// pinned). Returns the names reaped. `now` is passed for testability.
     pub fn reap_idle(&self, now: Instant) -> Vec<String> {
         let candidates: Vec<(String, Arc<Slot<I>>)> = {
-            let apps = self.apps.lock().unwrap();
+            let apps = recover(self.apps.lock());
             apps.iter()
                 .map(|(name, slot)| (name.clone(), Arc::clone(slot)))
                 .collect()
@@ -168,7 +229,7 @@ impl<I: Instance> Supervisor<I> {
 
         let mut reaped = Vec::new();
         for (name, slot) in candidates {
-            let mut state = slot.state.lock().unwrap();
+            let mut state = recover(slot.state.lock());
             if !state.lifecycle.should_reap_idle(now) {
                 continue;
             }
@@ -182,7 +243,7 @@ impl<I: Instance> Supervisor<I> {
                 let _ = instance.shutdown();
             }
 
-            let mut state = slot.state.lock().unwrap();
+            let mut state = recover(slot.state.lock());
             state.lifecycle.mark_cold();
             slot.progress.notify_all();
             reaped.push(name);
@@ -192,15 +253,15 @@ impl<I: Instance> Supervisor<I> {
 
     /// Current lifecycle state of an app, if registered.
     pub fn state(&self, name: &str) -> Option<LifecycleState> {
-        let slot = self.apps.lock().unwrap().get(name).cloned()?;
-        let state = slot.state.lock().unwrap();
+        let slot = recover(self.apps.lock()).get(name).cloned()?;
+        let state = recover(slot.state.lock());
         Some(state.lifecycle.state())
     }
 
     /// Clear a crash-looping app so it can boot again on the next acquire.
     pub fn clear_failure(&self, name: &str) {
-        if let Some(slot) = self.apps.lock().unwrap().get(name).cloned() {
-            let mut state = slot.state.lock().unwrap();
+        if let Some(slot) = recover(self.apps.lock()).get(name).cloned() {
+            let mut state = recover(slot.state.lock());
             state.lifecycle.clear_failure(Instant::now());
             state.retry_after = None;
             slot.progress.notify_all();
@@ -217,6 +278,10 @@ mod tests {
     struct FakeInstance;
 
     impl Instance for FakeInstance {
+        fn try_status(&mut self) -> Result<InstanceStatus, String> {
+            Ok(InstanceStatus::Running)
+        }
+
         fn shutdown(self) -> Result<(), String> {
             Ok(())
         }
@@ -273,6 +338,107 @@ mod tests {
             1,
             "eight racing callers should trigger exactly one boot"
         );
+    }
+
+    struct StatusInstance {
+        status: InstanceStatus,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl Instance for StatusInstance {
+        fn try_status(&mut self) -> Result<InstanceStatus, String> {
+            Ok(self.status)
+        }
+
+        fn shutdown(self) -> Result<(), String> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reconcile_leaves_running_instances_untouched() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_counter = Arc::clone(&shutdowns);
+        let supervisor = Supervisor::new(move |_spec| {
+            Ok(StatusInstance {
+                status: InstanceStatus::Running,
+                shutdowns: Arc::clone(&shutdown_counter),
+            })
+        });
+        supervisor.register("app", spec(), LifecycleConfig::default());
+
+        assert_eq!(supervisor.acquire("app"), Ok(()));
+        assert!(supervisor.reconcile(Instant::now()).is_empty());
+        assert_eq!(supervisor.state("app"), Some(LifecycleState::Ready));
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reconcile_records_one_exit_and_recovers_after_backoff() {
+        let boots = Arc::new(AtomicUsize::new(0));
+        let boot_counter = Arc::clone(&boots);
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_counter = Arc::clone(&shutdowns);
+        let supervisor = Supervisor::new(move |_spec| {
+            let status = if boot_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                InstanceStatus::Exited
+            } else {
+                InstanceStatus::Running
+            };
+            Ok(StatusInstance {
+                status,
+                shutdowns: Arc::clone(&shutdown_counter),
+            })
+        });
+        let config = LifecycleConfig {
+            backoff_base: Duration::from_millis(20),
+            ..LifecycleConfig::default()
+        };
+        supervisor.register("app", spec(), config);
+
+        assert_eq!(supervisor.acquire("app"), Ok(()));
+        assert_eq!(supervisor.reconcile(Instant::now()), vec!["app".to_owned()]);
+        assert_eq!(supervisor.state("app"), Some(LifecycleState::Cold));
+        assert!(supervisor.reconcile(Instant::now()).is_empty());
+        assert!(matches!(
+            supervisor.acquire("app"),
+            Err(AcquireError::BackingOff { .. })
+        ));
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(supervisor.acquire("app"), Ok(()));
+        assert_eq!(supervisor.state("app"), Some(LifecycleState::Ready));
+        assert!(supervisor.reconcile(Instant::now()).is_empty());
+        assert_eq!(boots.load(Ordering::SeqCst), 2);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_exits_park_a_crash_looping_app() {
+        let boots = Arc::new(AtomicUsize::new(0));
+        let boot_counter = Arc::clone(&boots);
+        let supervisor = Supervisor::new(move |_spec| {
+            boot_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusInstance {
+                status: InstanceStatus::Exited,
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+            })
+        });
+        let config = LifecycleConfig {
+            backoff_base: Duration::ZERO,
+            backoff_max: Duration::ZERO,
+            crash_loop_threshold: 3,
+            ..LifecycleConfig::default()
+        };
+        supervisor.register("app", spec(), config);
+
+        for _ in 0..3 {
+            assert_eq!(supervisor.acquire("app"), Ok(()));
+            supervisor.reconcile(Instant::now());
+        }
+        assert_eq!(supervisor.state("app"), Some(LifecycleState::Failed));
+        assert_eq!(supervisor.acquire("app"), Err(AcquireError::CrashLooping));
+        assert_eq!(boots.load(Ordering::SeqCst), 3);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::mount::{MountPlan, StagedRootfs};
 use crate::net;
 use crate::seccomp::SeccompPlan;
 use crate::spec::{BootTimings, CageSpec, CgroupLimits, EgressMode};
+use crate::InstanceStatus;
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
 const CYGNUS_CGROUP: &str = "cygnus";
@@ -229,6 +230,22 @@ impl Cage {
     /// Return the target's PID as seen by the host.
     pub fn host_pid(&self) -> Option<i32> {
         self.pid.map(Pid::as_raw)
+    }
+
+    /// Poll the cage init without blocking; an exited child is reaped exactly once.
+    pub fn try_status(&mut self) -> Result<InstanceStatus, CageError> {
+        let Some(pid) = self.pid else {
+            return Ok(InstanceStatus::Exited);
+        };
+        match child_status(pid)? {
+            Some(_) => {
+                // WNOHANG returned and reaped the child. Clear the PID before
+                // handing the cage to teardown so it never waits or kills twice.
+                self.pid = None;
+                Ok(InstanceStatus::Exited)
+            }
+            None => Ok(InstanceStatus::Running),
+        }
     }
 
     /// Return the cage's cgroup v2 path.

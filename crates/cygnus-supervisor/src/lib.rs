@@ -14,6 +14,7 @@
 
 mod runtime;
 
+pub use cygnus_cage::InstanceStatus;
 pub use runtime::{AcquireError, Instance, Supervisor};
 
 use std::collections::VecDeque;
