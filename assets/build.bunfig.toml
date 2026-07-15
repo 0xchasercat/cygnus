@@ -1,0 +1,4 @@
+# Daemon-owned build configuration. Tenant configuration is never loaded.
+[install]
+frozenLockfile = true
+ignoreScripts = true
