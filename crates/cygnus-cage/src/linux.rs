@@ -16,12 +16,12 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
+use crate::InstanceStatus;
 use crate::error::CageError;
 use crate::mount::{MountPlan, StagedRootfs};
 use crate::net;
 use crate::seccomp::SeccompPlan;
 use crate::spec::{BootTimings, CageSpec, CgroupLimits, EgressMode};
-use crate::InstanceStatus;
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
 const CYGNUS_CGROUP: &str = "cygnus";

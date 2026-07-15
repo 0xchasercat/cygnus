@@ -294,10 +294,7 @@ mod tests {
         // The first threshold-1 crashes ask for a restart.
         for i in 0..DEFAULT_CRASH_LOOP_THRESHOLD - 1 {
             let now = start + Duration::from_millis(u64::from(i));
-            assert!(matches!(
-                app.note_crash(now),
-                CrashOutcome::Restart { .. }
-            ));
+            assert!(matches!(app.note_crash(now), CrashOutcome::Restart { .. }));
         }
         // The threshold-th crash within the window parks the app.
         let now = start + Duration::from_millis(u64::from(DEFAULT_CRASH_LOOP_THRESHOLD));

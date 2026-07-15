@@ -216,7 +216,6 @@ impl<I: Instance> Supervisor<I> {
         crashed
     }
 
-
     /// Reap every ready app that has been idle past its TTL (and is not
     /// pinned). Returns the names reaped. `now` is passed for testability.
     pub fn reap_idle(&self, now: Instant) -> Vec<String> {

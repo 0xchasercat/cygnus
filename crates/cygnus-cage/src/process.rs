@@ -13,9 +13,9 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::InstanceStatus;
 use crate::error::CageError;
 use crate::spec::{BootTimings, CageSpec};
-use crate::InstanceStatus;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -220,7 +220,10 @@ mod tests {
             thread::sleep(POLL_INTERVAL);
         }
         assert!(matches!(cage.try_status(), Ok(InstanceStatus::Exited)));
-        assert!(cage.host_pid().is_none(), "exit poll relinquishes the child");
+        assert!(
+            cage.host_pid().is_none(),
+            "exit poll relinquishes the child"
+        );
         cage.teardown().expect("teardown already-reaped child");
     }
 }
