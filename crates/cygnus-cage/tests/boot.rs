@@ -51,6 +51,38 @@ fn boots_and_tears_down_with_exec_readiness() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn unrooted_child_has_no_capabilities_and_no_new_privs() {
+    let name = unique_name("capabilities");
+    let mut spec = CageSpec::new(&name, env::current_exe().expect("test executable path"));
+    spec.args.extend([
+        OsString::from("--exact"),
+        OsString::from("cage_fixture_process"),
+        OsString::from("--nocapture"),
+    ]);
+    spec.env.insert(
+        OsString::from("CYGNUS_FIXTURE_MODE"),
+        OsString::from("capabilities"),
+    );
+    spec.seccomp = None;
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error) if environment_unavailable(&error) => {
+            eprintln!("skipping privileged capability test: {error}");
+            return;
+        }
+        Err(error) => panic!("cage boot failed: {error}"),
+    };
+
+    let pid = cage.host_pid().expect("cage has a host PID");
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))
+        .expect("read unrooted cage process status");
+    assert_capabilities_are_dropped(&status);
+    cage.teardown().expect("tear down capability cage");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn overlay_rootfs_contains_writes_and_pivots_proc() {
     let name = unique_name("overlay");
     let fixture = env::temp_dir().join(format!("cygnus-overlay-{name}"));
@@ -98,6 +130,48 @@ fn overlay_rootfs_contains_writes_and_pivots_proc() {
     assert!(cage.timings().mounts > Duration::ZERO);
     cage.teardown().expect("tear down overlay cage");
     fs::remove_dir_all(&fixture).expect("remove overlay fixture");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rooted_child_has_no_capabilities_and_no_new_privs() {
+    let name = unique_name("rootfs-capabilities");
+    let fixture = env::temp_dir().join(format!("cygnus-capabilities-{name}"));
+    let _ = fs::remove_dir_all(&fixture);
+    let lower = build_fixture_root(&fixture).expect("build fixture root");
+
+    let mut spec = CageSpec::new(&name, "/fixture");
+    spec.args.extend([
+        OsString::from("--exact"),
+        OsString::from("cage_fixture_process"),
+        OsString::from("--nocapture"),
+    ]);
+    spec.env.insert(
+        OsString::from("CYGNUS_FIXTURE_MODE"),
+        OsString::from("capabilities"),
+    );
+    spec.rootfs = Some(RootfsSpec::new(vec![lower]));
+    spec.seccomp = None;
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error)
+            if environment_unavailable(&error)
+                && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none() =>
+        {
+            eprintln!("skipping privileged rooted capability test: {error}");
+            let _ = fs::remove_dir_all(&fixture);
+            return;
+        }
+        Err(error) => panic!("cage boot failed: {error}"),
+    };
+
+    let pid = cage.host_pid().expect("cage has a host PID");
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))
+        .expect("read rooted cage process status");
+    assert_capabilities_are_dropped(&status);
+    cage.teardown().expect("tear down rooted capability cage");
+    fs::remove_dir_all(&fixture).expect("remove capability fixture");
 }
 
 #[cfg(target_os = "linux")]
@@ -288,6 +362,14 @@ fn cage_fixture_process() {
 
     match env::var("CYGNUS_FIXTURE_MODE").as_deref() {
         Err(_) => {}
+        Ok("capabilities") => {
+            let status = fs::read_to_string("/proc/self/status")
+                .expect("read fixture process capability status");
+            assert_capabilities_are_dropped(&status);
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
         Ok("sleep") => loop {
             thread::sleep(Duration::from_secs(60));
         },
@@ -311,6 +393,32 @@ fn cage_fixture_process() {
         }
         Ok(mode) => panic!("unknown fixture mode {mode:?}"),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_capabilities_are_dropped(status: &str) {
+    for field in ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"] {
+        let value = status
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some(field)).then(|| fields.next())
+            })
+            .flatten()
+            .unwrap_or_else(|| panic!("{field} missing from /proc/self/status"));
+        let value = u64::from_str_radix(value, 16).expect("capability field is hexadecimal");
+        assert_eq!(value, 0, "{field} should be zero");
+    }
+
+    let no_new_privs = status
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("NoNewPrivs:")).then(|| fields.next())
+        })
+        .flatten()
+        .unwrap_or_else(|| panic!("NoNewPrivs missing from /proc/self/status"));
+    assert_eq!(no_new_privs, "1", "NoNewPrivs should be enabled");
 }
 
 #[cfg(target_os = "linux")]
