@@ -16,6 +16,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
+use crate::InstanceStatus;
 use crate::error::CageError;
 use crate::mount::{MountPlan, StagedRootfs};
 use crate::net;
@@ -229,6 +230,22 @@ impl Cage {
     /// Return the target's PID as seen by the host.
     pub fn host_pid(&self) -> Option<i32> {
         self.pid.map(Pid::as_raw)
+    }
+
+    /// Poll the cage init without blocking; an exited child is reaped exactly once.
+    pub fn try_status(&mut self) -> Result<InstanceStatus, CageError> {
+        let Some(pid) = self.pid else {
+            return Ok(InstanceStatus::Exited);
+        };
+        match child_status(pid)? {
+            Some(_) => {
+                // WNOHANG returned and reaped the child. Clear the PID before
+                // handing the cage to teardown so it never waits or kills twice.
+                self.pid = None;
+                Ok(InstanceStatus::Exited)
+            }
+            None => Ok(InstanceStatus::Running),
+        }
     }
 
     /// Return the cage's cgroup v2 path.

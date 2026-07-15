@@ -13,6 +13,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::InstanceStatus;
 use crate::error::CageError;
 use crate::spec::{BootTimings, CageSpec};
 
@@ -80,6 +81,26 @@ impl Cage {
     /// Return the target's PID as seen by the host.
     pub fn host_pid(&self) -> Option<i32> {
         self.child.as_ref().map(|child| child.id() as i32)
+    }
+
+    /// Poll the child without blocking; an exited child is reaped exactly once.
+    pub fn try_status(&mut self) -> Result<InstanceStatus, CageError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(InstanceStatus::Exited);
+        };
+        match child.try_wait().map_err(|source| CageError::Spawn {
+            operation: "poll cage process",
+            source,
+        })? {
+            Some(_) => {
+                // std::process::Child::try_wait reaps the child when it reports
+                // an exit. Drop the handle so teardown never waits or kills it
+                // a second time.
+                self.child = None;
+                Ok(InstanceStatus::Exited)
+            }
+            None => Ok(InstanceStatus::Running),
+        }
     }
 
     /// Return the cage's cgroup v2 path. Always `None` on this platform.
@@ -165,4 +186,44 @@ fn retry_socket_error(error: &io::Error) -> bool {
             | io::ErrorKind::WouldBlock
             | io::ErrorKind::Interrupted
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::thread;
+
+    fn shell_spec(script: &str) -> CageSpec {
+        let mut spec = CageSpec::new("portable-test", "/bin/sh");
+        spec.args = vec![OsString::from("-c"), OsString::from(script)];
+        spec
+    }
+
+    #[test]
+    fn try_status_leaves_a_running_child_untouched() {
+        let mut cage = Cage::boot(shell_spec("exec sleep 1")).expect("boot portable cage");
+        assert!(matches!(cage.try_status(), Ok(InstanceStatus::Running)));
+        assert!(cage.host_pid().is_some(), "running child remains owned");
+        cage.teardown().expect("teardown running child");
+    }
+
+    #[test]
+    fn try_status_reaps_an_exit_once_and_teardown_is_idempotent() {
+        let mut cage = Cage::boot(shell_spec("exit 0")).expect("boot portable cage");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if cage.try_status().expect("poll portable cage") == InstanceStatus::Exited {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not exit");
+            thread::sleep(POLL_INTERVAL);
+        }
+        assert!(matches!(cage.try_status(), Ok(InstanceStatus::Exited)));
+        assert!(
+            cage.host_pid().is_none(),
+            "exit poll relinquishes the child"
+        );
+        cage.teardown().expect("teardown already-reaped child");
+    }
 }

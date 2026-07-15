@@ -133,7 +133,9 @@ fn spawn_reaper(supervisor: Weak<Supervisor<Cage>>) {
             let Some(supervisor) = supervisor.upgrade() else {
                 return;
             };
-            supervisor.reap_idle(Instant::now());
+            let now = Instant::now();
+            supervisor.reconcile(now);
+            supervisor.reap_idle(now);
         }
     });
 }
