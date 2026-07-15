@@ -48,9 +48,9 @@
     </div>
     <div class="actions">
       {#if deploy.status === 'live'}
-        <button class="btn"><Icon name="rollback" size={14} />Roll back</button>
+        <button class="btn" disabled title="Unavailable: daemon admin bridge offline"><Icon name="rollback" size={14} />Roll back</button>
       {:else if deploy.status !== 'failed' && deploy.status !== 'building'}
-        <button class="btn cobalt"><Icon name="ship" size={13} />Promote to production</button>
+        <button class="btn cobalt" disabled title="Unavailable: daemon admin bridge offline"><Icon name="ship" size={13} />Promote to production</button>
       {/if}
       <button class="btn"><Icon name="ext" size={13} />Open</button>
     </div>

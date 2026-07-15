@@ -8,12 +8,6 @@
 
   let reqs = $state(Array.from({ length: 14 }, () => nextRequest()).reverse());
 
-  $effect(() => {
-    const t = setInterval(() => {
-      reqs = [nextRequest(), ...reqs].slice(0, 22);
-    }, 1600);
-    return () => clearInterval(t);
-  });
 
   const EVENT_ICON = {
     deploy: 'ship',
@@ -73,7 +67,7 @@
         <button class:on={tab === 'events'} onclick={() => (tab = 'events')}>Events</button>
       </div>
       {#if tab === 'requests'}
-        <span class="livehint num"><span class="led live breathe"></span>streaming</span>
+        <span class="livehint num"><span class="led preview"></span>preview snapshot</span>
       {/if}
     </div>
 
