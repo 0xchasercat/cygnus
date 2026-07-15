@@ -1,25 +1,25 @@
+use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use parking_lot::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::protocol::{
-    read_frame, write_frame, AdminCommand, AdminErrorCode, AdminRequest, AdminResponse,
-    ADMIN_PROTOCOL_VERSION, MAX_LOG_CHUNK_BYTES,
+    ADMIN_PROTOCOL_VERSION, AdminCommand, AdminErrorCode, AdminRequest, AdminResponse,
+    MAX_LOG_CHUNK_BYTES, read_frame, write_frame,
 };
 
 /// The listener through which an admin request arrived.
 ///
-/// A request's `actor` field is descriptive input only. Authorization is based on
-/// this role, which is assigned by the listener and cannot be supplied by a client.
+/// The request actor is audit attribution only. Authorization is based on this
+/// listener-assigned role, which a client cannot supply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminRole {
     Host,
@@ -34,7 +34,7 @@ pub trait AdminHandler: Send + Sync + 'static {
 pub const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_ADMIN_WORKERS: usize = 4;
 pub const DEFAULT_ADMIN_QUEUE_CAPACITY: usize = 64;
-pub const MAX_ADMIN_ACTOR_BYTES: usize = 256;
+pub const MAX_ADMIN_ACTOR_BYTES: usize = 128;
 pub const MAX_ADMIN_APP_BYTES: usize = 128;
 pub const MAX_ADMIN_DEPLOYMENT_BYTES: usize = 128;
 pub const MAX_ADMIN_LIST_LIMIT: u16 = 50;
@@ -52,8 +52,7 @@ pub fn prepare_listener(path: impl AsRef<Path>) -> io::Result<UnixListener> {
             format!("admin socket path {} has no parent", path.display()),
         )
     })?;
-    fs::create_dir_all(parent)?;
-
+    prepare_private_parent(parent)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_socket() {
@@ -87,11 +86,44 @@ pub fn prepare_listener(path: impl AsRef<Path>) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+fn prepare_private_parent(parent: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "admin socket parent {} is not a directory",
+                parent.display()
+            ),
+        ));
+    }
+    let daemon_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != daemon_uid || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "admin socket parent {} must be owned by daemon uid {daemon_uid} with mode 0700",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// One role-bound admin listener. The role is never read from request JSON.
 pub struct AdminBinding {
     listener: UnixListener,
     role: AdminRole,
     path: PathBuf,
+    identity: Option<(u64, u64)>,
 }
 
 impl AdminBinding {
@@ -109,10 +141,16 @@ impl AdminBinding {
         path: impl Into<PathBuf>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
+        let path = path.into();
+        let identity = fs::symlink_metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_socket())
+            .map(|metadata| (metadata.dev(), metadata.ino()));
         Ok(Self {
             listener,
             role,
-            path: path.into(),
+            path,
+            identity,
         })
     }
 
@@ -127,7 +165,13 @@ impl AdminBinding {
 
 impl Drop for AdminBinding {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let current = fs::symlink_metadata(&self.path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_socket())
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        if current.is_some() && current == self.identity {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -343,14 +387,18 @@ fn serve_connection(stream: &mut UnixStream, role: AdminRole, handler: &dyn Admi
         return;
     }
 
+    if let Err(message) = authorize_actor(role, &request) {
+        let _ = write_frame(
+            stream,
+            &AdminResponse::error(request.request_id, AdminErrorCode::Unauthorized, message),
+        );
+        return;
+    }
+
     if let Err(message) = validate_request(&request) {
         let _ = write_frame(
             stream,
-            &AdminResponse::error(
-                request.request_id,
-                AdminErrorCode::Validation,
-                message,
-            ),
+            &AdminResponse::error(request.request_id, AdminErrorCode::Validation, message),
         );
         return;
     }
@@ -364,7 +412,7 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         return Err("request_id must be exactly 32 lowercase hexadecimal characters".into());
     }
     if let Some(actor) = request.actor.as_deref() {
-        validate_text(actor, MAX_ADMIN_ACTOR_BYTES, "actor")?;
+        validate_actor(actor)?;
     }
     match &request.command {
         AdminCommand::Health | AdminCommand::Status => {}
@@ -388,22 +436,50 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             validate_text(deployment, MAX_ADMIN_DEPLOYMENT_BYTES, "deployment")?;
         }
         AdminCommand::ReadLog {
-            deployment,
-            limit,
-            ..
+            deployment, limit, ..
         } => {
             validate_text(deployment, MAX_ADMIN_DEPLOYMENT_BYTES, "deployment")?;
             if !(1..=MAX_LOG_CHUNK_BYTES).contains(limit) {
-                return Err(format!("log limit must be between 1 and {MAX_LOG_CHUNK_BYTES}"));
+                return Err(format!(
+                    "log limit must be between 1 and {MAX_LOG_CHUNK_BYTES}"
+                ));
             }
         }
     }
     Ok(())
 }
 
+fn authorize_actor(role: AdminRole, request: &AdminRequest) -> Result<(), String> {
+    match (role, request.actor.as_deref()) {
+        (AdminRole::Host, None) => Ok(()),
+        (AdminRole::Host, Some(_)) => Err("host admin requests must not supply an actor".into()),
+        (AdminRole::TenantZero, Some(actor)) => validate_actor(actor),
+        (AdminRole::TenantZero, None) => {
+            Err("Tenant Zero admin requests require an authenticated actor".into())
+        }
+    }
+}
+
+fn validate_actor(actor: &str) -> Result<(), String> {
+    validate_text(actor, MAX_ADMIN_ACTOR_BYTES, "actor")?;
+    let mut bytes = actor.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b':' | b'-')
+        })
+    {
+        return Err("actor contains unsupported characters".into());
+    }
+    Ok(())
+}
+
 fn validate_list_limit(limit: u16) -> Result<(), String> {
     if !(1..=MAX_ADMIN_LIST_LIMIT).contains(&limit) {
-        return Err(format!("list limit must be between 1 and {MAX_ADMIN_LIST_LIMIT}"));
+        return Err(format!(
+            "list limit must be between 1 and {MAX_ADMIN_LIST_LIMIT}"
+        ));
     }
     Ok(())
 }
@@ -445,9 +521,10 @@ fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
             )
         };
         if result == 0 {
-            return Ok(credentials.uid == daemon_uid);
+            Ok(credentials.uid == daemon_uid)
+        } else {
+            Err(io::Error::last_os_error())
         }
-        return Err(io::Error::last_os_error());
     }
 
     #[cfg(any(
@@ -463,9 +540,10 @@ fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
         let mut gid = 0;
         let result = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
         if result == 0 {
-            return Ok(uid == daemon_uid);
+            Ok(uid == daemon_uid)
+        } else {
+            Err(io::Error::last_os_error())
         }
-        return Err(io::Error::last_os_error());
     }
 
     #[cfg(not(any(
@@ -515,7 +593,7 @@ mod tests {
         AdminRequest {
             version: ADMIN_PROTOCOL_VERSION,
             request_id: "0123456789abcdef0123456789abcdef".into(),
-            actor: Some("operator".into()),
+            actor: None,
             command: AdminCommand::Health,
         }
     }
@@ -524,6 +602,7 @@ mod tests {
     fn stale_socket_removed_and_non_socket_preserved() {
         let root = temp_path("prepare");
         fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let stale = root.join("stale.sock");
         let listener = UnixListener::bind(&stale).unwrap();
         drop(listener);
@@ -537,6 +616,34 @@ mod tests {
         let error = prepare_listener(&collision).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::AlreadyExists);
         assert!(collision.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn insecure_parent_is_rejected_without_changing_permissions() {
+        let root = temp_path("insecure-parent");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = prepare_listener(root.join("admin.sock")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binding_drop_preserves_a_replacement_socket() {
+        let root = temp_path("replacement");
+        let socket = root.join("admin.sock");
+        let binding = AdminBinding::bind(&socket, AdminRole::Host).unwrap();
+        fs::remove_file(&socket).unwrap();
+        let replacement = UnixListener::bind(&socket).unwrap();
+        drop(binding);
+        assert!(socket.exists());
+        drop(replacement);
+        fs::remove_file(&socket).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -560,15 +667,33 @@ mod tests {
         let join = thread::spawn(move || server.serve(flag).unwrap());
         let mut stream = UnixStream::connect(&socket).unwrap();
         let mut bad = request();
+
         bad.version = ADMIN_PROTOCOL_VERSION + 1;
         write_frame(&mut stream, &bad).unwrap();
         let response: AdminResponse = read_frame(&mut stream).unwrap();
-        assert!(matches!(response, AdminResponse::Error { error, .. } if error.code == AdminErrorCode::UnsupportedVersion));
+        assert!(
+            matches!(response, AdminResponse::Error { error, .. } if error.code == AdminErrorCode::UnsupportedVersion)
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         shutdown.store(true, Ordering::Release);
         join.join().unwrap();
         assert!(!socket.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn endpoint_roles_enforce_actor_provenance() {
+        let mut host = request();
+        assert!(authorize_actor(AdminRole::Host, &host).is_ok());
+        host.actor = Some("spoofed".into());
+        assert!(authorize_actor(AdminRole::Host, &host).is_err());
+
+        let mut tenant = request();
+        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
+        tenant.actor = Some("github:user-1".into());
+        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_ok());
+        tenant.actor = Some("bad actor".into());
+        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
     }
 
     #[test]
@@ -615,7 +740,9 @@ mod tests {
         let mut stream = UnixStream::connect(&socket).unwrap();
         stream.write_all(&[0, 0, 0, 3, b'{', b'}', b'!']).unwrap();
         let response: AdminResponse = read_frame(&mut stream).unwrap();
-        assert!(matches!(response, AdminResponse::Error { error, .. } if error.code == AdminErrorCode::InvalidRequest));
+        assert!(
+            matches!(response, AdminResponse::Error { error, .. } if error.code == AdminErrorCode::InvalidRequest)
+        );
         shutdown.store(true, Ordering::Release);
         join.join().unwrap();
         assert!(!socket.exists());

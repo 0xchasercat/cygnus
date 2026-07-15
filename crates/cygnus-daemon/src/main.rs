@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::fs;
+use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,10 +14,14 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use cygnus_cage::{Cage, CageSpec};
 use cygnus_daemon::Frontend;
+use cygnus_daemon::admin::{
+    AdminBinding, AdminHandler, AdminRole, AdminServer, DEFAULT_HOST_ADMIN_SOCKET,
+    StateAdminHandler,
+};
 use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
 use cygnus_daemon::state::{DEFAULT_STATE_PATH, LoadedApp, NodeConfig, State};
 use cygnus_router::{Route, RouteTable, Router};
-use cygnus_supervisor::Supervisor;
+use cygnus_supervisor::{LifecycleState, Supervisor};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 const REAPER_INTERVAL: Duration = Duration::from_secs(1);
@@ -27,6 +32,10 @@ struct Cli {
     /// SQLite state database.
     #[arg(long, global = true, default_value = DEFAULT_STATE_PATH)]
     state: PathBuf,
+
+    /// Root-only local administration socket.
+    #[arg(long, global = true, default_value = DEFAULT_HOST_ADMIN_SOCKET)]
+    admin_socket: PathBuf,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -96,7 +105,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve(&cli.state),
+        Command::Serve => serve(&cli.state, &cli.admin_socket),
         Command::Apply { config } => apply(&cli.state, &config),
         Command::Engine { command } => engine_command(&cli.state, command),
         Command::Deploy {
@@ -158,12 +167,13 @@ fn apply(state_path: &Path, config_path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn serve(state_path: &Path) -> Result<(), Box<dyn Error>> {
+fn serve(state_path: &Path, admin_socket: &Path) -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let state = State::open(state_path)?;
     let snapshot = state.load()?;
+    drop(state);
     let listener = TcpListener::bind(snapshot.listen)?;
 
     let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
@@ -185,13 +195,37 @@ fn serve(state_path: &Path) -> Result<(), Box<dyn Error>> {
         Arc::new(Router::new(routes)),
         Arc::clone(&supervisor),
     ));
-    eprintln!("cygnus-daemon: listening on {}", local_addr(&listener));
+    let lifecycle_supervisor = Arc::clone(&supervisor);
+    let admin_handler: Arc<dyn AdminHandler> =
+        Arc::new(StateAdminHandler::new(state_path, move |app| {
+            lifecycle_supervisor.state(app).map(lifecycle_state_name)
+        }));
+    let admin_binding = AdminBinding::bind(admin_socket, AdminRole::Host)?;
+    let admin_server = AdminServer::new(vec![admin_binding], admin_handler);
+    let admin_shutdown = Arc::clone(&shutdown);
+    let admin_failure = Arc::clone(&shutdown);
+    let admin_thread = thread::spawn(move || {
+        let result = admin_server.serve(admin_shutdown);
+        if result.is_err() {
+            admin_failure.store(true, Ordering::Release);
+        }
+        result
+    });
+    eprintln!(
+        "cygnus-daemon: listening on {} (admin {})",
+        local_addr(&listener),
+        admin_socket.display()
+    );
     let serve_result = frontend.serve_until(listener, &shutdown);
+    shutdown.store(true, Ordering::Release);
+    let admin_result = admin_thread
+        .join()
+        .map_err(|_| io::Error::other("admin server thread panicked"))?;
     for (app, error) in supervisor.shutdown_all() {
         eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
     }
     serve_result?;
-
+    admin_result?;
     Ok(())
 }
 
@@ -222,6 +256,17 @@ fn install_app(
             },
         );
     }
+}
+
+fn lifecycle_state_name(state: LifecycleState) -> String {
+    match state {
+        LifecycleState::Cold => "cold",
+        LifecycleState::Booting => "booting",
+        LifecycleState::Ready => "ready",
+        LifecycleState::Draining => "draining",
+        LifecycleState::Failed => "failed",
+    }
+    .into()
 }
 
 fn spawn_reaper(supervisor: Weak<Supervisor<Cage>>) {

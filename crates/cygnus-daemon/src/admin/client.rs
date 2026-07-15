@@ -3,7 +3,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::protocol::{read_frame, write_frame, AdminRequest, AdminResponse};
+use super::protocol::{AdminRequest, AdminResponse, read_frame, write_frame};
 use super::server::ADMIN_IO_TIMEOUT;
 
 const ZERO_REQUEST_ID: &str = "00000000000000000000000000000000";
@@ -70,7 +70,9 @@ pub fn request(path: impl AsRef<Path>, request: &AdminRequest) -> io::Result<Adm
 
 fn validate_response_id(response: &AdminResponse, expected: &str) -> io::Result<()> {
     let response_id = match response {
-        AdminResponse::Ok { request_id, .. } | AdminResponse::Error { request_id, .. } => request_id,
+        AdminResponse::Ok { request_id, .. } | AdminResponse::Error { request_id, .. } => {
+            request_id
+        }
     };
     validate_request_id(response_id)?;
     if response_id != expected {
@@ -103,12 +105,13 @@ pub fn invalid_request_id() -> String {
 mod tests {
     use super::*;
     use crate::admin::{
-        AdminBinding, AdminData, AdminErrorCode, AdminHandler, AdminRole, AdminServer,
-        ADMIN_PROTOCOL_VERSION,
+        ADMIN_PROTOCOL_VERSION, AdminBinding, AdminData, AdminErrorCode, AdminHandler, AdminRole,
+        AdminServer,
     };
     use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -136,6 +139,7 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("cygnus-admin-client-{nonce}"));
         fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         root.join("admin.sock")
     }
 
@@ -161,11 +165,13 @@ mod tests {
         let request = AdminRequest {
             request_id: "0123456789abcdef0123456789abcdef".into(),
             version: ADMIN_PROTOCOL_VERSION,
-            actor: Some("operator".into()),
+            actor: None,
             command: crate::admin::AdminCommand::Health,
         };
         let response = AdminClient::new(&socket).request(&request).unwrap();
-        assert!(matches!(response, AdminResponse::Ok { request_id, .. } if request_id == request.request_id));
+        assert!(
+            matches!(response, AdminResponse::Ok { request_id, .. } if request_id == request.request_id)
+        );
         assert_eq!(handler.calls.load(Ordering::Relaxed), 1);
 
         shutdown.store(true, Ordering::Release);
@@ -182,7 +188,9 @@ mod tests {
             actor: None,
             command: crate::admin::AdminCommand::Health,
         };
-        let error = AdminClient::new("/does/not/exist").request(&request).unwrap_err();
+        let error = AdminClient::new("/does/not/exist")
+            .request(&request)
+            .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 

@@ -271,7 +271,10 @@ mod tests {
         };
         let mut frame = Vec::new();
         write_frame(&mut frame, &request).unwrap();
-        assert_eq!(read_frame::<AdminRequest>(&mut frame.as_slice()).unwrap(), request);
+        assert_eq!(
+            read_frame::<AdminRequest>(&mut frame.as_slice()).unwrap(),
+            request
+        );
     }
 
     #[test]

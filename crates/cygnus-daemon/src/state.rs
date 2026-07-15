@@ -687,10 +687,10 @@ impl State {
         cursor: Option<&str>,
         limit: u16,
     ) -> Result<Vec<DeploymentRecord>, StateError> {
-        if limit == 0 || limit > 50 {
+        if limit == 0 || limit > 51 {
             return Err(StateError::InvalidRecord {
                 kind: "deployment query",
-                detail: "limit must be between 1 and 50".into(),
+                detail: "limit must be between 1 and 51".into(),
             });
         }
         if app.is_some_and(|name| name.trim().is_empty()) {
