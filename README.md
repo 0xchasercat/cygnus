@@ -19,19 +19,22 @@ is a page-cache exec, not an image pull.
 Pre-alpha. The single-node request path now runs end to end: SQLite state is
 projected into the router and supervisor, the first request cold-boots its cage,
 and the front relays HTTP/1.1 over the app's Unix socket. Overlay-rooted apps
-receive their daemon-owned socket directory at `/cygnus/io`. TLS, the
-deploy/admin control plane, and live crash monitoring are still under construction.
+receive their daemon-owned socket directory at `/cygnus/io`; exited ready cages
+are reconciled into backoff/crash-loop policy. TLS and the source
+build/deploy/admin control plane are still under construction. Tenant 0 is a
+standard Bun UDS app today, explicitly read-only over a preview dataset until
+its typed daemon bridge exists.
 
 ## Layout
 
 ```
 crates/cygnus-cage        isolation stack: namespaces, cgroups, mounts, network, seccomp
 crates/cygnus-init        static PID 1 for signal forwarding and orphan reaping
-crates/cygnus-supervisor  cold boot coalescing, backoff, and scale-to-zero policy
+crates/cygnus-supervisor  cold boot, exit reconciliation, backoff, and scale-to-zero
 crates/cygnus-router      lock-free Host-to-app routing table
 crates/cygnus-daemon      SQLite state, runnable front, and UDS relay
 crates/cygnus-proxy       io_uring/splice data-path benchmark and primitives
-console/                  dashboard concept (the future Tenant 0 app)
+console/                  self-contained Tenant 0 Bun app (offline/read-only bridge mode)
 docs/spec.md              the technical specification, ground truth for design
 ```
 
