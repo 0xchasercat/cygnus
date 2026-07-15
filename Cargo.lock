@@ -186,6 +186,7 @@ dependencies = [
  "cygnus-cage",
  "cygnus-router",
  "cygnus-supervisor",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

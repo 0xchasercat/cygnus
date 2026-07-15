@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+libc = "0.2"
 cygnus-cage = { path = "../cygnus-cage" }
 cygnus-router = { path = "../cygnus-router" }
 cygnus-supervisor = { path = "../cygnus-supervisor" }
