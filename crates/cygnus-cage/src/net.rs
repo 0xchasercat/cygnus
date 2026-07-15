@@ -75,6 +75,7 @@ pub fn nftables_ruleset(cage_ip: Ipv4Addr, mode: &EgressMode) -> Option<String> 
         let _ = writeln!(script, "\tset dns_v4 {{");
         let _ = writeln!(script, "\t\ttype ipv4_addr;");
         let _ = writeln!(script, "\t\tflags timeout;");
+        let _ = writeln!(script, "\t\tsize 1024;");
         let _ = writeln!(script, "\t}}");
     }
     let _ = writeln!(script, "\tchain egress {{");
@@ -582,6 +583,7 @@ mod tests {
         assert!(script.contains("set dns_v4 {"));
         assert!(script.contains("type ipv4_addr;"));
         assert!(script.contains("flags timeout;"));
+        assert!(script.contains("size 1024;"));
         assert!(script.contains("ip daddr @dns_v4 tcp dport { 22, 443 } accept"));
         assert!(!script.contains("ip daddr @dns_v4 udp"));
         assert!(!script.contains("meta l4proto { tcp, udp } accept"));

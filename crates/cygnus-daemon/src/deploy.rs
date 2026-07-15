@@ -21,9 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use cygnus_cage::{
-    BuildOutputSpec, DomainEgressRule, EgressMode, FilterMode, JobConfig, JobExitOutcome,
-    RootfsSpec, run_job,
+    BuildOutputSpec, CageError, DomainEgressRule, EgressMode, FilterMode, JobConfig,
+    JobExitOutcome, JobResult, RootfsSpec, run_job,
 };
+#[cfg(target_os = "linux")]
+use cygnus_cage::{DnsForwarder, run_job_with_dns};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -304,7 +306,7 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
             &deployment_id,
             build_plan,
         );
-        let job_result = match run_job(job) {
+        let job_result = match run_build_job(job, build_plan.install) {
             Ok(result) => result,
             Err(error) => {
                 write_logs(&log_staging, &[], error.to_string().as_bytes())?;
@@ -461,6 +463,18 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
             ))
         }
     }
+}
+
+fn run_build_job(job: JobConfig, needs_dns: bool) -> Result<JobResult, CageError> {
+    #[cfg(target_os = "linux")]
+    if needs_dns {
+        let dns = DnsForwarder::start()?;
+        return run_job_with_dns(job, &dns);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = needs_dns;
+    run_job(job)
 }
 
 fn build_job(

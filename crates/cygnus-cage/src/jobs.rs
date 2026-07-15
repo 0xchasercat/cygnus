@@ -5,6 +5,8 @@
 //! result is returned.
 
 use crate::Cage;
+#[cfg(target_os = "linux")]
+use crate::DnsForwarder;
 use crate::error::CageError;
 use crate::spec::{BuildOutputSpec, CageSpec, CgroupLimits, EgressMode, FilterMode, RootfsSpec};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -183,7 +185,24 @@ impl JobResult {
 /// Run one finite job, draining stdout and stderr concurrently and always
 /// releasing the cage resources before returning.
 pub fn run_job(config: JobConfig) -> Result<JobResult, CageError> {
-    config.validate()?;
+    run_job_with_boot(config, Cage::boot_with_capture)
+}
+
+/// Run a domain-restricted finite job through the host DNS forwarder.
+#[cfg(target_os = "linux")]
+pub fn run_job_with_dns(
+    config: JobConfig,
+    dns: &DnsForwarder,
+) -> Result<JobResult, CageError> {
+    run_job_with_boot(config, |spec, stdout, stderr| {
+        Cage::boot_with_capture_and_dns(spec, stdout, stderr, dns)
+    })
+}
+
+fn run_job_with_boot(
+    config: JobConfig,
+    boot: impl FnOnce(CageSpec, OwnedFd, OwnedFd) -> Result<Cage, CageError>,
+) -> Result<JobResult, CageError> {
     let started = Instant::now();
     let (stdout_read, stdout_write) = make_pipe("create job stdout pipe")?;
     let (stderr_read, stderr_write) = make_pipe("create job stderr pipe")?;
@@ -206,7 +225,7 @@ pub fn run_job(config: JobConfig) -> Result<JobResult, CageError> {
     );
 
     let spec = config.cage_spec();
-    let mut cage = match Cage::boot_with_capture(spec, stdout_write, stderr_write) {
+    let mut cage = match boot(spec, stdout_write, stderr_write) {
         Ok(cage) => cage,
         Err(error) => {
             let _ = stdout.join();

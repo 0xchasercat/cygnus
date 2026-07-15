@@ -33,6 +33,8 @@ pub use dns::{DnsForwarder, DnsLease};
 pub use error::CageError;
 pub use jobs::{JobConfig, JobExitOutcome, JobResult, run_job};
 #[cfg(target_os = "linux")]
+pub use jobs::run_job_with_dns;
+#[cfg(target_os = "linux")]
 pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]
 pub use process::Cage;
