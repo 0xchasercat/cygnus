@@ -14,9 +14,9 @@ use cygnus_supervisor::{
     DEFAULT_BACKOFF_BASE, DEFAULT_BACKOFF_MAX, DEFAULT_CRASH_LOOP_THRESHOLD, DEFAULT_CRASH_WINDOW,
     DEFAULT_IDLE_TTL, LifecycleConfig,
 };
-use std::os::unix::fs::PermissionsExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::PermissionsExt;
 use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
@@ -416,11 +416,18 @@ pub enum StateError {
     #[error("invalid {kind}: {detail}")]
     InvalidRecord { kind: &'static str, detail: String },
     #[error("deployment {id:?} has illegal transition from {from:?} to {to:?}")]
-    InvalidDeploymentTransition { id: String, from: DeploymentStatus, to: DeploymentStatus },
+    InvalidDeploymentTransition {
+        id: String,
+        from: DeploymentStatus,
+        to: DeploymentStatus,
+    },
     #[error("complete-config apply would destroy artifact/deployment state")]
     DestructiveApply,
     #[error("artifact {artifact:?} is not owned by deployment {deployment:?}")]
-    ArtifactOwnership { artifact: String, deployment: String },
+    ArtifactOwnership {
+        artifact: String,
+        deployment: String,
+    },
     #[error("artifact metadata does not agree with its deployment")]
     MetadataMismatch,
 }
@@ -439,13 +446,14 @@ impl State {
         {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
 
-        let mut version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let mut version: i32 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if !(0..=SCHEMA_VERSION).contains(&version) {
             return Err(StateError::UnknownSchemaVersion {
                 found: version,
@@ -453,17 +461,22 @@ impl State {
             });
         }
         if version == 0 {
-            create_schema(&connection)?;
+            let transaction = connection.transaction()?;
+            create_schema(&transaction)?;
+            transaction.pragma_update(None, "user_version", 1_i32)?;
+            transaction.commit()?;
             version = 1;
-            connection.pragma_update(None, "user_version", version)?;
         }
         while version < SCHEMA_VERSION {
+            let transaction = connection.transaction()?;
             match version {
-                1 => migrate_v1_to_v2(&connection)?,
+                1 => migrate_v1_to_v2(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
-            version += 1;
-            connection.pragma_update(None, "user_version", version)?;
+            let next = version + 1;
+            transaction.pragma_update(None, "user_version", next)?;
+            transaction.commit()?;
+            version = next;
         }
         Ok(Self { connection })
     }
@@ -556,40 +569,85 @@ impl State {
     }
 
     /// Start a caller-identified build against a registered engine.
-    pub fn begin_deployment(&mut self, input: &DeploymentInput) -> Result<DeploymentRecord, StateError> {
+    pub fn begin_deployment(
+        &mut self,
+        input: &DeploymentInput,
+    ) -> Result<DeploymentRecord, StateError> {
         validate_deployment_input(input)?;
         if self.engine(&input.engine_version)?.is_none() {
-            return Err(StateError::InvalidRecord { kind: "deployment", detail: format!("engine {:?} is not registered", input.engine_version) });
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("engine {:?} is not registered", input.engine_version),
+            });
         }
         self.connection.execute(
             "INSERT INTO deployments (id, app, source_hash, engine_version, status, error) VALUES (?1, ?2, ?3, ?4, 'building', NULL)",
             params![input.id, input.app, input.source_hash, input.engine_version],
         )?;
-        self.deployment(&input.id)?.ok_or_else(|| StateError::IncompleteState(format!("deployment {:?} disappeared after insert", input.id)))
+        self.deployment(&input.id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "deployment {:?} disappeared after insert",
+                input.id
+            ))
+        })
     }
 
-    pub fn mark_deployment_failed(&mut self, id: &str, error: &str) -> Result<DeploymentRecord, StateError> {
+    pub fn mark_deployment_failed(
+        &mut self,
+        id: &str,
+        error: &str,
+    ) -> Result<DeploymentRecord, StateError> {
         if id.trim().is_empty() || error.trim().is_empty() {
-            return Err(StateError::InvalidRecord { kind: "deployment", detail: "id and failure error must be nonempty".into() });
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: "id and failure error must be nonempty".into(),
+            });
         }
-        let current = self.deployment(id)?.ok_or_else(|| StateError::InvalidRecord { kind: "deployment", detail: format!("deployment {id:?} does not exist") })?;
+        let current = self
+            .deployment(id)?
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("deployment {id:?} does not exist"),
+            })?;
         ensure_transition(id, current.status, DeploymentStatus::Failed)?;
-        self.connection.execute("UPDATE deployments SET status = 'failed', error = ?2 WHERE id = ?1", params![id, error])?;
-        self.deployment(id)?.ok_or_else(|| StateError::IncompleteState(format!("deployment {id:?} disappeared after failure")))
+        self.connection.execute(
+            "UPDATE deployments SET status = 'failed', error = ?2 WHERE id = ?1",
+            params![id, error],
+        )?;
+        self.deployment(id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!("deployment {id:?} disappeared after failure"))
+        })
     }
 
     /// Seal the server-computed artifact and advance its deployment.
-    pub fn seal_deployment(&mut self, id: &str, artifact: &ArtifactInput) -> Result<ArtifactRecord, StateError> {
+    pub fn seal_deployment(
+        &mut self,
+        id: &str,
+        artifact: &ArtifactInput,
+    ) -> Result<ArtifactRecord, StateError> {
         validate_artifact_input(artifact)?;
         let transaction = self.connection.transaction()?;
-        let deployment = query_deployment_tx(&transaction, id)?.ok_or_else(|| StateError::InvalidRecord { kind: "deployment", detail: format!("deployment {id:?} does not exist") })?;
+        let deployment =
+            query_deployment_tx(&transaction, id)?.ok_or_else(|| StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("deployment {id:?} does not exist"),
+            })?;
         ensure_transition(id, deployment.status, DeploymentStatus::Sealed)?;
-        if deployment.app != artifact.app || deployment.source_hash != artifact.source_hash || deployment.engine_version != artifact.engine_version {
-            return Err(StateError::ArtifactOwnership { artifact: artifact.artifact_hash.clone(), deployment: id.to_owned() });
+        if deployment.app != artifact.app
+            || deployment.source_hash != artifact.source_hash
+            || deployment.engine_version != artifact.engine_version
+        {
+            return Err(StateError::ArtifactOwnership {
+                artifact: artifact.artifact_hash.clone(),
+                deployment: id.to_owned(),
+            });
         }
         validate_metadata(artifact)?;
         if !query_engine_tx(&transaction, &artifact.engine_version)? {
-            return Err(StateError::InvalidRecord { kind: "artifact", detail: format!("engine {:?} is not registered", artifact.engine_version) });
+            return Err(StateError::InvalidRecord {
+                kind: "artifact",
+                detail: format!("engine {:?} is not registered", artifact.engine_version),
+            });
         }
         transaction.execute(
             "INSERT INTO artifacts (app, source_hash, artifact_hash, engine_version, host_path, metadata_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sealed')",
@@ -597,7 +655,12 @@ impl State {
         )?;
         transaction.execute("UPDATE deployments SET artifact_hash = ?2, status = 'sealed', error = NULL WHERE id = ?1", params![id, artifact.artifact_hash])?;
         transaction.commit()?;
-        self.artifact(&artifact.artifact_hash)?.ok_or_else(|| StateError::IncompleteState(format!("artifact {:?} disappeared after sealing", artifact.artifact_hash)))
+        self.artifact(&artifact.artifact_hash)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "artifact {:?} disappeared after sealing",
+                artifact.artifact_hash
+            ))
+        })
     }
 
     pub fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>, StateError> {
@@ -620,33 +683,82 @@ impl State {
     }
 
     /// Atomically register the first runtime app and activate its sealed artifact.
-    pub fn activate_first(&mut self, app: &AppConfig, artifact_hash: &str) -> Result<DeploymentRecord, StateError> {
-        let snapshot = snapshot_from_config(&NodeConfig { listen: SocketAddr::from(([127, 0, 0, 1], 3000)), apps: vec![app.clone()] })?;
+    pub fn activate_first(
+        &mut self,
+        app: &AppConfig,
+        artifact_hash: &str,
+    ) -> Result<DeploymentRecord, StateError> {
+        let snapshot = snapshot_from_config(&NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            apps: vec![app.clone()],
+        })?;
         let stored = snapshot_to_stored(&snapshot)?;
-        let stored_app = stored.apps.first().ok_or_else(|| StateError::InvalidConfig("activation app is empty".into()))?;
+        let stored_app = stored
+            .apps
+            .first()
+            .ok_or_else(|| StateError::InvalidConfig("activation app is empty".into()))?;
         validate_absolute_path(&app.upstream, "app upstream")?;
         validate_hash(artifact_hash, "artifact hash")?;
         let transaction = self.connection.transaction()?;
-        let artifact = query_artifact_tx(&transaction, artifact_hash)?.ok_or_else(|| StateError::InvalidRecord { kind: "artifact", detail: format!("sealed artifact {artifact_hash:?} does not exist") })?;
+        let artifact = query_artifact_tx(&transaction, artifact_hash)?.ok_or_else(|| {
+            StateError::InvalidRecord {
+                kind: "artifact",
+                detail: format!("sealed artifact {artifact_hash:?} does not exist"),
+            }
+        })?;
         if artifact.app != app.name {
-            return Err(StateError::ArtifactOwnership { artifact: artifact_hash.to_owned(), deployment: artifact.app });
+            return Err(StateError::ArtifactOwnership {
+                artifact: artifact_hash.to_owned(),
+                deployment: artifact.app,
+            });
         }
         if query_app_id_tx(&transaction, &app.name)?.is_some() {
-            return Err(StateError::InvalidConfig(format!("app {:?} is already registered", app.name)));
+            return Err(StateError::InvalidConfig(format!(
+                "app {:?} is already registered",
+                app.name
+            )));
         }
-        let deployment = query_deployment_by_artifact_tx(&transaction, artifact_hash)?.ok_or_else(|| StateError::IncompleteState("artifact deployment relation is missing".into()))?;
+        let deployment =
+            query_deployment_by_artifact_tx(&transaction, artifact_hash)?.ok_or_else(|| {
+                StateError::IncompleteState("artifact deployment relation is missing".into())
+            })?;
         ensure_transition(&deployment.id, deployment.status, DeploymentStatus::Active)?;
-        let runtime_json = serde_json::to_string(&StoredApp { name: &stored_app.name, upstream: &stored_app.upstream, domains: &[], runtime: &stored_app.runtime }).map_err(|error| StateError::InvalidConfig(format!("serialize app {:?}: {error}", app.name)))?;
-        let app_id = transaction.query_row("INSERT INTO apps (name, upstream, runtime_json) VALUES (?1, ?2, ?3) RETURNING id", params![stored_app.name, stored_app.upstream, runtime_json], |row| row.get::<_, i64>(0))?;
+        let runtime_json = serde_json::to_string(&StoredApp {
+            name: &stored_app.name,
+            upstream: &stored_app.upstream,
+            domains: &[],
+            runtime: &stored_app.runtime,
+        })
+        .map_err(|error| {
+            StateError::InvalidConfig(format!("serialize app {:?}: {error}", app.name))
+        })?;
+        let app_id = transaction.query_row(
+            "INSERT INTO apps (name, upstream, runtime_json) VALUES (?1, ?2, ?3) RETURNING id",
+            params![stored_app.name, stored_app.upstream, runtime_json],
+            |row| row.get::<_, i64>(0),
+        )?;
         for domain in &stored_app.domains {
-            transaction.execute("INSERT INTO domains (app_id, domain) VALUES (?1, ?2)", params![app_id, domain])?;
+            transaction.execute(
+                "INSERT INTO domains (app_id, domain) VALUES (?1, ?2)",
+                params![app_id, domain],
+            )?;
         }
-        transaction.execute("INSERT INTO app_artifacts (app_id, artifact_id) VALUES (?1, ?2)", params![app_id, artifact.id])?;
-        transaction.execute("UPDATE deployments SET status = 'active' WHERE id = ?1", [deployment.id.as_str()])?;
+        transaction.execute(
+            "INSERT INTO app_artifacts (app_id, artifact_id) VALUES (?1, ?2)",
+            params![app_id, artifact.id],
+        )?;
+        transaction.execute(
+            "UPDATE deployments SET status = 'active' WHERE id = ?1",
+            [deployment.id.as_str()],
+        )?;
         transaction.commit()?;
-        self.deployment(&deployment.id)?.ok_or_else(|| StateError::IncompleteState(format!("deployment {:?} disappeared after activation", deployment.id)))
+        self.deployment(&deployment.id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "deployment {:?} disappeared after activation",
+                deployment.id
+            ))
+        })
     }
-
 
     fn load_domains(&self, app_id: i64, app: &str) -> Result<Vec<String>, StateError> {
         let mut statement = self.connection.prepare(
@@ -737,89 +849,170 @@ struct ArtifactRow {
 
 fn validate_engine(engine: &EngineRecord) -> Result<(), StateError> {
     if engine.version.trim().is_empty() || engine.version.chars().any(char::is_control) {
-        return Err(StateError::InvalidRecord { kind: "engine", detail: "version must be nonempty and printable".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "engine",
+            detail: "version must be nonempty and printable".into(),
+        });
     }
     validate_absolute_path(&engine.host_root, "engine host root")?;
     validate_cage_path(&engine.cage_executable, "engine cage executable")?;
-    let relative = engine.cage_executable.strip_prefix("/").map_err(|_| StateError::InvalidRecord { kind: "path", detail: "engine cage executable must be absolute".into() })?;
+    let relative =
+        engine
+            .cage_executable
+            .strip_prefix("/")
+            .map_err(|_| StateError::InvalidRecord {
+                kind: "path",
+                detail: "engine cage executable must be absolute".into(),
+            })?;
     let host_executable = engine.host_root.join(relative);
     if !host_executable.starts_with(&engine.host_root) {
-        return Err(StateError::InvalidRecord { kind: "path", detail: "engine executable escapes host root".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: "engine executable escapes host root".into(),
+        });
     }
-    let metadata = fs::metadata(&host_executable).map_err(|error| StateError::InvalidRecord { kind: "path", detail: format!("engine executable is unavailable: {error}") })?;
+    let metadata = fs::metadata(&host_executable).map_err(|error| StateError::InvalidRecord {
+        kind: "path",
+        detail: format!("engine executable is unavailable: {error}"),
+    })?;
     if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(StateError::InvalidRecord { kind: "path", detail: "engine executable must be a regular executable file".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: "engine executable must be a regular executable file".into(),
+        });
     }
     validate_hash(&engine.sha256, "engine SHA-256")
 }
 
 fn validate_cage_path(path: &Path, kind: &str) -> Result<(), StateError> {
-    if !path.is_absolute() || path.components().any(|component| matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir | std::path::Component::Prefix(_))) {
-        return Err(StateError::InvalidRecord { kind: "path", detail: format!("{kind} must be an absolute canonical path") });
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("{kind} must be an absolute canonical path"),
+        });
     }
     Ok(())
 }
 
 fn validate_deployment_input(input: &DeploymentInput) -> Result<(), StateError> {
     if input.id.trim().is_empty() || input.id.chars().any(char::is_control) {
-        return Err(StateError::InvalidRecord { kind: "deployment", detail: "id must be nonempty and printable".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "deployment",
+            detail: "id must be nonempty and printable".into(),
+        });
     }
     if input.app.trim().is_empty() || input.app.chars().any(char::is_control) {
-        return Err(StateError::InvalidRecord { kind: "deployment", detail: "app must be nonempty and printable".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "deployment",
+            detail: "app must be nonempty and printable".into(),
+        });
     }
     validate_hash(&input.source_hash, "source hash")?;
     if input.engine_version.trim().is_empty() {
-        return Err(StateError::InvalidRecord { kind: "deployment", detail: "engine version must be nonempty".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "deployment",
+            detail: "engine version must be nonempty".into(),
+        });
     }
     Ok(())
 }
 
 fn validate_artifact_input(input: &ArtifactInput) -> Result<(), StateError> {
     if input.app.trim().is_empty() || input.app.chars().any(char::is_control) {
-        return Err(StateError::InvalidRecord { kind: "artifact", detail: "app must be nonempty and printable".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "artifact",
+            detail: "app must be nonempty and printable".into(),
+        });
     }
     validate_hash(&input.source_hash, "source hash")?;
     validate_hash(&input.artifact_hash, "artifact hash")?;
     if input.engine_version.trim().is_empty() {
-        return Err(StateError::InvalidRecord { kind: "artifact", detail: "engine version must be nonempty".into() });
+        return Err(StateError::InvalidRecord {
+            kind: "artifact",
+            detail: "engine version must be nonempty".into(),
+        });
     }
     validate_absolute_path(&input.host_path, "artifact host path")
 }
 
 fn validate_absolute_path(path: &Path, kind: &str) -> Result<(), StateError> {
     if !path.is_absolute() {
-        return Err(StateError::InvalidRecord { kind: "path", detail: format!("{kind} must be absolute") });
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("{kind} must be absolute"),
+        });
     }
-    if path.components().any(|component| matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir | std::path::Component::Prefix(_))) {
-        return Err(StateError::InvalidRecord { kind: "path", detail: format!("{kind} must be canonical") });
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir
+                | std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("{kind} must be canonical"),
+        });
     }
     if path.exists() && fs::canonicalize(path)? != path {
-        return Err(StateError::InvalidRecord { kind: "path", detail: format!("{kind} is not canonical") });
+        return Err(StateError::InvalidRecord {
+            kind: "path",
+            detail: format!("{kind} is not canonical"),
+        });
     }
     Ok(())
 }
 
 fn validate_hash(hash: &str, kind: &str) -> Result<(), StateError> {
-    if hash.len() != SHA256_HEX_LEN || !hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
-        return Err(StateError::InvalidRecord { kind: "hash", detail: format!("{kind} must be lowercase 64-character SHA-256 hex") });
+    if hash.len() != SHA256_HEX_LEN
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "hash",
+            detail: format!("{kind} must be lowercase 64-character SHA-256 hex"),
+        });
     }
     Ok(())
 }
 
-fn metadata_value<'a>(object: &'a serde_json::Map<String, serde_json::Value>, a: &str, b: &str) -> Option<&'a str> {
-    object.get(a).or_else(|| object.get(b)).and_then(serde_json::Value::as_str)
+fn metadata_value<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    a: &str,
+    b: &str,
+) -> Option<&'a str> {
+    object
+        .get(a)
+        .or_else(|| object.get(b))
+        .and_then(serde_json::Value::as_str)
 }
 
 fn validate_metadata(artifact: &ArtifactInput) -> Result<(), StateError> {
-    let value: serde_json::Value = serde_json::from_str(&artifact.metadata_json).map_err(|_| StateError::MetadataMismatch)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&artifact.metadata_json).map_err(|_| StateError::MetadataMismatch)?;
     let object = value.as_object().ok_or(StateError::MetadataMismatch)?;
-    let source = metadata_value(object, "sourceHash", "source_hash").ok_or(StateError::MetadataMismatch)?;
-    let bun = metadata_value(object, "bunVersion", "bun_version").ok_or(StateError::MetadataMismatch)?;
+    let source =
+        metadata_value(object, "sourceHash", "source_hash").ok_or(StateError::MetadataMismatch)?;
+    let bun =
+        metadata_value(object, "bunVersion", "bun_version").ok_or(StateError::MetadataMismatch)?;
     if source != artifact.source_hash || bun != artifact.engine_version {
         return Err(StateError::MetadataMismatch);
     }
-    if let Some(hash) = metadata_value(object, "artifactHash", "artifact_hash") {
-        if hash != artifact.artifact_hash { return Err(StateError::MetadataMismatch); }
+    if let Some(hash) = metadata_value(object, "artifactHash", "artifact_hash")
+        && hash != artifact.artifact_hash
+    {
+        return Err(StateError::MetadataMismatch);
     }
     Ok(())
 }
@@ -834,37 +1027,88 @@ fn parse_status(status: &str) -> Result<DeploymentStatus, String> {
     }
 }
 
-fn ensure_transition(id: &str, from: DeploymentStatus, to: DeploymentStatus) -> Result<(), StateError> {
-    let legal = matches!((from, to), (DeploymentStatus::Building, DeploymentStatus::Failed | DeploymentStatus::Sealed) | (DeploymentStatus::Sealed, DeploymentStatus::Active));
-    if legal { Ok(()) } else { Err(StateError::InvalidDeploymentTransition { id: id.to_owned(), from, to }) }
+fn ensure_transition(
+    id: &str,
+    from: DeploymentStatus,
+    to: DeploymentStatus,
+) -> Result<(), StateError> {
+    let legal = matches!(
+        (from, to),
+        (
+            DeploymentStatus::Building,
+            DeploymentStatus::Failed | DeploymentStatus::Sealed
+        ) | (DeploymentStatus::Sealed, DeploymentStatus::Active)
+    );
+    if legal {
+        Ok(())
+    } else {
+        Err(StateError::InvalidDeploymentTransition {
+            id: id.to_owned(),
+            from,
+            to,
+        })
+    }
 }
 
 fn query_engine_tx(transaction: &Transaction<'_>, version: &str) -> Result<bool, rusqlite::Error> {
-    transaction.query_row("SELECT 1 FROM engines WHERE version = ?1", [version], |_| Ok(())).optional().map(|value| value.is_some())
+    transaction
+        .query_row(
+            "SELECT 1 FROM engines WHERE version = ?1",
+            [version],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
 }
 
-fn query_deployment_tx(transaction: &Transaction<'_>, id: &str) -> Result<Option<DeploymentRecord>, StateError> {
+fn query_deployment_tx(
+    transaction: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<DeploymentRecord>, StateError> {
     transaction.query_row("SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE id = ?1", [id], |row| {
         let status: String = row.get(5)?;
         Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
     }).optional().map_err(StateError::from)
 }
 
-fn query_artifact_tx(transaction: &Transaction<'_>, hash: &str) -> Result<Option<ArtifactRow>, StateError> {
-    transaction.query_row("SELECT id, app FROM artifacts WHERE artifact_hash = ?1 AND status = 'sealed'", [hash], |row| {
-        Ok(ArtifactRow { id: row.get(0)?, app: row.get(1)? })
-    }).optional().map_err(StateError::from)
+fn query_artifact_tx(
+    transaction: &Transaction<'_>,
+    hash: &str,
+) -> Result<Option<ArtifactRow>, StateError> {
+    transaction
+        .query_row(
+            "SELECT id, app FROM artifacts WHERE artifact_hash = ?1 AND status = 'sealed'",
+            [hash],
+            |row| {
+                Ok(ArtifactRow {
+                    id: row.get(0)?,
+                    app: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StateError::from)
 }
 
-fn query_deployment_by_artifact_tx(transaction: &Transaction<'_>, hash: &str) -> Result<Option<DeploymentRecord>, StateError> {
+fn query_deployment_by_artifact_tx(
+    transaction: &Transaction<'_>,
+    hash: &str,
+) -> Result<Option<DeploymentRecord>, StateError> {
     transaction.query_row("SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE artifact_hash = ?1", [hash], |row| {
         let status: String = row.get(5)?;
         Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
     }).optional().map_err(StateError::from)
 }
 
-fn query_app_id_tx(transaction: &Transaction<'_>, app: &str) -> Result<Option<i64>, rusqlite::Error> {
-    transaction.query_row("SELECT id FROM apps WHERE name = ?1", [app], |row| row.get(0)).optional()
+fn query_app_id_tx(
+    transaction: &Transaction<'_>,
+    app: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    transaction
+        .query_row("SELECT id FROM apps WHERE name = ?1", [app], |row| {
+            row.get(0)
+        })
+        .optional()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1549,7 +1793,10 @@ mod tests {
         assert_eq!(loaded.listen, "127.0.0.1:8181".parse().unwrap());
         assert_eq!(loaded.apps[0].name, "legacy");
         assert_eq!(loaded.apps[0].domains, ["legacy.example.com"]);
-        let version: i32 = state.connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 2);
         drop(state);
         let _ = fs::remove_file(path);
@@ -1559,20 +1806,64 @@ mod tests {
     fn artifact_deployment_round_trip_and_first_activation_are_atomic() {
         let path = temp_db("activation");
         let mut state = State::open(&path).expect("open state");
-        let engine = EngineRecord { version: "1.2.3".into(), host_root: "/".into(), cage_executable: "/usr/bin/true".into(), sha256: "a".repeat(64) };
+        let engine = EngineRecord {
+            version: "1.2.3".into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "a".repeat(64),
+        };
         assert_eq!(state.register_engine(&engine).unwrap(), engine);
         let source_hash = "b".repeat(64);
         let artifact_hash = "c".repeat(64);
-        let input = DeploymentInput { id: "dep-1".into(), app: "api".into(), source_hash: source_hash.clone(), engine_version: engine.version.clone() };
-        assert_eq!(state.begin_deployment(&input).unwrap().status, DeploymentStatus::Building);
-        let artifact = ArtifactInput { app: "api".into(), source_hash: source_hash.clone(), artifact_hash: artifact_hash.clone(), engine_version: engine.version.clone(), host_path: "/var/lib/cygnus/apps/api/c".into(), metadata_json: format!("{{\"bunVersion\":\"{}\",\"sourceHash\":\"{}\"}}", engine.version, source_hash) };
-        assert_eq!(state.seal_deployment("dep-1", &artifact).unwrap().artifact_hash, artifact_hash);
-        let app = AppConfig { name: "api".into(), domains: vec!["API.Example.com".into()], upstream: "/run/api.sock".into(), command: "/bin/true".into(), ..AppConfig::default() };
-        assert_eq!(state.activate_first(&app, &artifact_hash).unwrap().status, DeploymentStatus::Active);
+        let input = DeploymentInput {
+            id: "dep-1".into(),
+            app: "api".into(),
+            source_hash: source_hash.clone(),
+            engine_version: engine.version.clone(),
+        };
+        assert_eq!(
+            state.begin_deployment(&input).unwrap().status,
+            DeploymentStatus::Building
+        );
+        let artifact = ArtifactInput {
+            app: "api".into(),
+            source_hash: source_hash.clone(),
+            artifact_hash: artifact_hash.clone(),
+            engine_version: engine.version.clone(),
+            host_path: "/var/lib/cygnus/apps/api/c".into(),
+            metadata_json: format!(
+                "{{\"bunVersion\":\"{}\",\"sourceHash\":\"{}\"}}",
+                engine.version, source_hash
+            ),
+        };
+        assert_eq!(
+            state
+                .seal_deployment("dep-1", &artifact)
+                .unwrap()
+                .artifact_hash,
+            artifact_hash
+        );
+        let app = AppConfig {
+            name: "api".into(),
+            domains: vec!["API.Example.com".into()],
+            upstream: "/run/api.sock".into(),
+            command: "/bin/true".into(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            state.activate_first(&app, &artifact_hash).unwrap().status,
+            DeploymentStatus::Active
+        );
         assert_eq!(state.load().unwrap().apps[0].name, "api");
         assert!(state.activate_first(&app, &artifact_hash).is_err());
-        assert_eq!(state.deployment("dep-1").unwrap().unwrap().status, DeploymentStatus::Active);
-        assert!(matches!(state.apply(&NodeConfig::default()), Err(StateError::DestructiveApply)));
+        assert_eq!(
+            state.deployment("dep-1").unwrap().unwrap().status,
+            DeploymentStatus::Active
+        );
+        assert!(matches!(
+            state.apply(&NodeConfig::default()),
+            Err(StateError::DestructiveApply)
+        ));
         drop(state);
         let _ = fs::remove_file(path);
     }
@@ -1581,11 +1872,41 @@ mod tests {
     fn invalid_hashes_paths_and_status_transitions_are_rejected() {
         let path = temp_db("validation");
         let mut state = State::open(&path).expect("open state");
-        assert!(state.register_engine(&EngineRecord { version: "bad".into(), host_root: "relative".into(), cage_executable: "/usr/bin/true".into(), sha256: "A".repeat(64) }).is_err());
-        let engine = EngineRecord { version: "1".into(), host_root: "/".into(), cage_executable: "/usr/bin/true".into(), sha256: "d".repeat(64) };
+        assert!(
+            state
+                .register_engine(&EngineRecord {
+                    version: "bad".into(),
+                    host_root: "relative".into(),
+                    cage_executable: "/usr/bin/true".into(),
+                    sha256: "A".repeat(64)
+                })
+                .is_err()
+        );
+        let engine = EngineRecord {
+            version: "1".into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "d".repeat(64),
+        };
         state.register_engine(&engine).unwrap();
-        assert!(state.begin_deployment(&DeploymentInput { id: "".into(), app: "api".into(), source_hash: "e".repeat(64), engine_version: "1".into() }).is_err());
-        state.begin_deployment(&DeploymentInput { id: "dep".into(), app: "api".into(), source_hash: "e".repeat(64), engine_version: "1".into() }).unwrap();
+        assert!(
+            state
+                .begin_deployment(&DeploymentInput {
+                    id: "".into(),
+                    app: "api".into(),
+                    source_hash: "e".repeat(64),
+                    engine_version: "1".into()
+                })
+                .is_err()
+        );
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "dep".into(),
+                app: "api".into(),
+                source_hash: "e".repeat(64),
+                engine_version: "1".into(),
+            })
+            .unwrap();
         state.mark_deployment_failed("dep", "build failed").unwrap();
         assert!(state.mark_deployment_failed("dep", "again").is_err());
         drop(state);
