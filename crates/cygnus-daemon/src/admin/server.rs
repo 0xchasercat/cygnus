@@ -6,7 +6,8 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use parking_lot::{Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -154,7 +155,7 @@ impl WorkQueue {
     }
 
     fn push(&self, stream: UnixStream, role: AdminRole) -> bool {
-        let mut state = self.state.lock().expect("admin queue mutex poisoned");
+        let mut state = self.state.lock();
         if state.closed || state.pending.len() >= self.capacity {
             return false;
         }
@@ -164,7 +165,7 @@ impl WorkQueue {
     }
 
     fn pop(&self) -> Option<(UnixStream, AdminRole)> {
-        let mut state = self.state.lock().expect("admin queue mutex poisoned");
+        let mut state = self.state.lock();
         loop {
             if let Some(item) = state.pending.pop_front() {
                 return Some(item);
@@ -172,12 +173,12 @@ impl WorkQueue {
             if state.closed {
                 return None;
             }
-            state = self.wake.wait(state).expect("admin queue mutex poisoned");
+            self.wake.wait(&mut state);
         }
     }
 
     fn close(&self) {
-        let mut state = self.state.lock().expect("admin queue mutex poisoned");
+        let mut state = self.state.lock();
         state.closed = true;
         state.pending.clear();
         self.wake.notify_all();
