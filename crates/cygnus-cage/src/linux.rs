@@ -1,7 +1,7 @@
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -18,6 +18,7 @@ use nix::unistd::{Pid, getegid, geteuid, pipe2, read, write};
 
 use crate::InstanceStatus;
 use crate::error::CageError;
+use crate::jobs::JobExitOutcome;
 use crate::mount::{MountPlan, StagedRootfs};
 use crate::net;
 use crate::seccomp::SeccompPlan;
@@ -50,6 +51,18 @@ impl Cage {
     /// cage pivots into, a `procfs` bound to the cage's own PID namespace, and
     /// an optional seccomp filter installed immediately before `execve`.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
+        Self::boot_inner(spec, None)
+    }
+
+    pub(crate) fn boot_with_capture(
+        spec: CageSpec,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    ) -> Result<Self, CageError> {
+        Self::boot_inner(spec, Some((stdout, stderr)))
+    }
+
+    fn boot_inner(spec: CageSpec, capture: Option<(OwnedFd, OwnedFd)>) -> Result<Self, CageError> {
         spec.validate()?;
         let child_exec = ChildExec::new(&spec)?;
         // Parent-side prework: the staging directory, every mount C string,
@@ -61,7 +74,11 @@ impl Cage {
             Some(rootfs) => Some(StagedRootfs::create(&spec.name, rootfs)?),
             None => None,
         };
-        let mount_plan = MountPlan::new(staging.as_ref(), spec.ingress.as_ref())?;
+        let mount_plan = MountPlan::new(
+            staging.as_ref(),
+            spec.ingress.as_ref(),
+            spec.build_output.as_ref(),
+        )?;
         let seccomp_plan = match spec.seccomp {
             Some(mode) => Some(
                 SeccompPlan::new(mode)
@@ -103,6 +120,7 @@ impl Cage {
             exec_write,
             mount_write,
             seccomp_write,
+            output: capture,
         });
         let callback = Box::new(move || {
             let child = child_exec
@@ -248,6 +266,18 @@ impl Cage {
         }
     }
 
+    /// Poll the finite job and return its terminal exit outcome when reaped.
+    pub(crate) fn try_job_status(&mut self) -> Result<Option<JobExitOutcome>, CageError> {
+        let Some(pid) = self.pid else {
+            return Ok(None);
+        };
+        let Some(status) = child_status(pid)? else {
+            return Ok(None);
+        };
+        self.pid = None;
+        Ok(Some(job_outcome(status)))
+    }
+
     /// Return the cage's cgroup v2 path.
     pub fn cgroup_path(&self) -> Option<&Path> {
         self.cgroup.as_ref().map(|cgroup| cgroup.path.as_path())
@@ -343,6 +373,7 @@ struct ChildChannels {
     exec_write: OwnedFd,
     mount_write: OwnedFd,
     seccomp_write: OwnedFd,
+    output: Option<(OwnedFd, OwnedFd)>,
 }
 
 /// The prebuilt setup steps the child applies between clone and `execve`.
@@ -356,6 +387,7 @@ struct ChildExec {
     command: CString,
     args: Vec<CString>,
     env: Vec<CString>,
+    working_dir: Option<CString>,
     argv: Vec<*const nix::libc::c_char>,
     envp: Vec<*const nix::libc::c_char>,
 }
@@ -364,6 +396,11 @@ impl ChildExec {
     fn new(spec: &CageSpec) -> Result<Self, CageError> {
         let (program, argv_os) = exec_plan(spec)?;
         let command = cstring(&program, "cage command contains a NUL byte")?;
+        let working_dir = spec
+            .working_dir
+            .as_deref()
+            .map(|path| cstring(path.as_os_str(), "working directory contains a NUL byte"))
+            .transpose()?;
         let mut args = Vec::with_capacity(argv_os.len());
         for arg in &argv_os {
             args.push(cstring(arg, "cage argument contains a NUL byte")?);
@@ -387,6 +424,7 @@ impl ChildExec {
             command,
             args,
             env,
+            working_dir,
             argv,
             envp,
         })
@@ -474,6 +512,7 @@ fn child_main(
         exec_write,
         mount_write,
         seccomp_write,
+        output,
     } = channels;
 
     // Release-stage failures are reported on the mount pipe, which the parent
@@ -506,6 +545,19 @@ fn child_main(
     // SAFETY: the maps are set, we hold CAP_SYS_ADMIN in the new user and mount
     // namespaces, and the plan touches only prebuilt pointers via raw syscalls.
     if let Err(errno) = unsafe { plan.mounts.apply() } {
+        write_child_error(&mount_write, CHILD_STAGE_MOUNT, errno);
+        return 127;
+    }
+    if let Some(working_dir) = &child.working_dir
+        && unsafe { nix::libc::chdir(working_dir.as_ptr()) } != 0
+    {
+        let errno = Errno::last_raw();
+        write_child_error(&mount_write, CHILD_STAGE_MOUNT, errno);
+        return 127;
+    }
+    if let Some((stdout, stderr)) = output
+        && let Err(errno) = unsafe { redirect_output(stdout, stderr) }
+    {
         write_child_error(&mount_write, CHILD_STAGE_MOUNT, errno);
         return 127;
     }
@@ -545,6 +597,36 @@ fn child_main(
     let source = Errno::last_raw();
     write_child_error(&exec_write, CHILD_STAGE_EXEC, source);
     127
+}
+
+unsafe fn redirect_output(stdout: OwnedFd, stderr: OwnedFd) -> Result<(), i32> {
+    let stdout_fd = stdout.into_raw_fd();
+    let stderr_fd = stderr.into_raw_fd();
+    if unsafe { nix::libc::dup2(stdout_fd, nix::libc::STDOUT_FILENO) } < 0 {
+        let errno = Errno::last_raw();
+        unsafe {
+            nix::libc::close(stdout_fd);
+            nix::libc::close(stderr_fd);
+        }
+        return Err(errno);
+    }
+    if unsafe { nix::libc::dup2(stderr_fd, nix::libc::STDERR_FILENO) } < 0 {
+        let errno = Errno::last_raw();
+        unsafe {
+            nix::libc::close(stdout_fd);
+            nix::libc::close(stderr_fd);
+        }
+        return Err(errno);
+    }
+    unsafe {
+        if stdout_fd != nix::libc::STDOUT_FILENO {
+            nix::libc::close(stdout_fd);
+        }
+        if stderr_fd != nix::libc::STDERR_FILENO {
+            nix::libc::close(stderr_fd);
+        }
+    }
+    Ok(())
 }
 
 fn write_child_error(fd: &OwnedFd, stage: u8, errno: i32) {
@@ -823,6 +905,14 @@ fn retry_socket_error(error: &io::Error) -> bool {
             | io::ErrorKind::WouldBlock
             | io::ErrorKind::Interrupted
     )
+}
+
+fn job_outcome(status: WaitStatus) -> JobExitOutcome {
+    match status {
+        WaitStatus::Exited(_, code) => JobExitOutcome::Exited(code),
+        WaitStatus::Signaled(_, signal, _) => JobExitOutcome::Signaled(signal as i32),
+        _ => JobExitOutcome::Signaled(-1),
+    }
 }
 
 fn child_status(pid: Pid) -> Result<Option<WaitStatus>, CageError> {

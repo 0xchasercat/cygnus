@@ -13,6 +13,7 @@
 //! walls.
 
 mod error;
+mod jobs;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -26,6 +27,7 @@ pub mod seccomp;
 mod spec;
 
 pub use error::CageError;
+pub use jobs::{JobConfig, JobExitOutcome, JobResult, run_job};
 #[cfg(target_os = "linux")]
 pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]
@@ -33,10 +35,10 @@ pub use process::Cage;
 #[cfg(target_os = "linux")]
 pub use seccomp::{SeccompPlan, denied_syscalls};
 pub use spec::{
-    BootTimings, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
-    DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,
-    DEFAULT_ROOTFS_TMPFS_SIZE, EgressMode, EgressRule, FilterMode, INGRESS_CAGE_DIR, IngressSpec,
-    RootfsSpec,
+    BUILD_OUTPUT_CAGE_DIR, BootTimings, BuildOutputSpec, CageSpec, CgroupLimits,
+    DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA, DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX,
+    DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT, DEFAULT_ROOTFS_TMPFS_SIZE, EgressMode, EgressRule,
+    FilterMode, INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
 };
 
 /// Nonblocking status reported by a cage process.

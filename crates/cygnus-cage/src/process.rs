@@ -7,14 +7,16 @@
 //! the isolation lives.
 
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::InstanceStatus;
 use crate::error::CageError;
+use crate::jobs::JobExitOutcome;
 use crate::spec::{BootTimings, CageSpec};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -31,6 +33,24 @@ pub struct Cage {
 impl Cage {
     /// Boot the target as an unisolated child process.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
+        Self::boot_inner(spec, None, None)
+    }
+
+    /// Boot the target with its standard streams connected to the supplied
+    /// pipe write ends. The descriptors are consumed by the spawned child.
+    pub(crate) fn boot_with_capture(
+        spec: CageSpec,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    ) -> Result<Self, CageError> {
+        Self::boot_inner(spec, Some(stdout), Some(stderr))
+    }
+
+    fn boot_inner(
+        spec: CageSpec,
+        stdout: Option<OwnedFd>,
+        stderr: Option<OwnedFd>,
+    ) -> Result<Self, CageError> {
         spec.validate()?;
         let boot_started = Instant::now();
         let deadline = boot_started
@@ -39,6 +59,15 @@ impl Cage {
 
         let mut command = Command::new(&spec.command);
         command.args(&spec.args).env_clear().envs(&spec.env);
+        if let Some(working_dir) = &spec.working_dir {
+            command.current_dir(working_dir);
+        }
+        if let Some(stdout) = stdout {
+            command.stdout(Stdio::from(stdout));
+        }
+        if let Some(stderr) = stderr {
+            command.stderr(Stdio::from(stderr));
+        }
         let exec_started = Instant::now();
         let mut child = command.spawn().map_err(|source| CageError::Spawn {
             operation: "spawn cage process",
@@ -101,6 +130,29 @@ impl Cage {
             }
             None => Ok(InstanceStatus::Running),
         }
+    }
+
+    /// Poll and return the finite job outcome when the child has exited.
+    pub(crate) fn try_job_status(&mut self) -> Result<Option<JobExitOutcome>, CageError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let Some(status) = child.try_wait().map_err(|source| CageError::Spawn {
+            operation: "poll cage process",
+            source,
+        })?
+        else {
+            return Ok(None);
+        };
+        self.child = None;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return Ok(Some(JobExitOutcome::Signaled(signal)));
+            }
+        }
+        Ok(Some(JobExitOutcome::Exited(status.code().unwrap_or(-1))))
     }
 
     /// Return the cage's cgroup v2 path. Always `None` on this platform.
