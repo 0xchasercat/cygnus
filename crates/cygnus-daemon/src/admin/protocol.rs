@@ -20,12 +20,26 @@ pub struct AdminRequest {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
     Health,
-    Snapshot,
+    Status,
+    ListApps {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default = "default_list_limit")]
+        limit: u16,
+    },
+    GetApp {
+        app: String,
+    },
     ListDeployments {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app: Option<String>,
-        #[serde(default = "default_deployment_limit")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default = "default_list_limit")]
         limit: u16,
+    },
+    GetDeployment {
+        deployment: String,
     },
     ReadLog {
         deployment: String,
@@ -37,7 +51,7 @@ pub enum AdminCommand {
     },
 }
 
-const fn default_deployment_limit() -> u16 {
+const fn default_list_limit() -> u16 {
     50
 }
 
@@ -108,11 +122,24 @@ pub enum AdminData {
         service: String,
         isolation: String,
     },
-    Snapshot {
+    Status {
         node: NodeView,
+    },
+    Apps {
+        apps: Vec<AppView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    App {
+        app: AppView,
     },
     Deployments {
         deployments: Vec<DeploymentView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    Deployment {
+        deployment: DeploymentView,
     },
     Log {
         deployment: String,
@@ -125,12 +152,14 @@ pub enum AdminData {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeView {
     pub listen: String,
-    pub apps: Vec<AppView>,
+    pub app_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppView {
     pub name: String,
     pub domains: Vec<String>,
@@ -145,6 +174,7 @@ pub struct AppView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveDeploymentView {
     pub deployment_id: String,
     pub artifact_hash: String,
@@ -152,6 +182,7 @@ pub struct ActiveDeploymentView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentView {
     pub id: String,
     pub app: String,
@@ -272,6 +303,7 @@ mod tests {
             request.command,
             AdminCommand::ListDeployments {
                 app: None,
+                cursor: None,
                 limit: 50
             }
         );
