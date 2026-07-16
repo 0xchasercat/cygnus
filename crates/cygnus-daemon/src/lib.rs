@@ -14,6 +14,7 @@
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
 pub mod admin;
 pub mod deploy;
+pub mod edge;
 pub mod state;
 
 use std::io::{self, Read, Write};
@@ -162,7 +163,10 @@ impl Frontend {
         };
 
         if let Err(error) = self.supervisor.acquire(&route.app) {
-            eprintln!("cygnus-daemon: app {:?} acquire failed: {error:?}", route.app);
+            eprintln!(
+                "cygnus-daemon: app {:?} acquire failed: {error:?}",
+                route.app
+            );
             let _ = client.write_all(error_response(acquire_status(&error)));
             return;
         }

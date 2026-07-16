@@ -5,6 +5,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::edge::{
+    AcmeConfig, CertificateInput, CertificateRecord, CertificateStore, CertificateStoreError,
+    EdgeConfig,
+};
 use cygnus_cage::{
     CageError, CageSpec, CgroupLimits, DEFAULT_READINESS_TIMEOUT, EgressMode,
     EgressRule as CageEgressRule, FilterMode, IngressSpec, RootfsSpec,
@@ -22,7 +26,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const SHA256_HEX_LEN: usize = 64;
 
@@ -172,9 +176,11 @@ pub struct ActivationRecord {
 }
 
 /// The JSON document accepted by the daemon's apply operation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeConfig {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub edge: EdgeConfig,
     #[serde(default)]
     pub apps: Vec<AppConfig>,
 }
@@ -183,6 +189,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            edge: EdgeConfig::default(),
             apps: Vec::new(),
         }
     }
@@ -458,6 +465,7 @@ fn default_crash_loop_threshold() -> u32 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub listen: SocketAddr,
+    pub edge: EdgeConfig,
     pub apps: Vec<LoadedApp>,
 }
 
@@ -528,17 +536,23 @@ pub enum StateError {
     AppNotFound(String),
     #[error("domain {domain:?} is already mapped to app {owner:?}")]
     DomainConflict { domain: String, owner: String },
+    #[error("certificate store error: {0}")]
+    CertificateStore(#[from] CertificateStoreError),
+    #[error("certificate domain {domain:?} is already owned by certificate {owner:?}")]
+    CertificateDomainConflict { domain: String, owner: String },
 }
 
 /// A SQLite-backed node configuration store.
 pub struct State {
     connection: Connection,
+    certificate_store: CertificateStore,
 }
 
 impl State {
     /// Open or create a state database and apply every ordered migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let path = path.as_ref();
+        let certificate_store = CertificateStore::for_state_database(path);
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -570,6 +584,7 @@ impl State {
             match version {
                 1 => migrate_v1_to_v2(&transaction)?,
                 2 => migrate_v2_to_v3(&transaction)?,
+                3 => migrate_v3_to_v4(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -577,7 +592,10 @@ impl State {
             transaction.commit()?;
             version = next;
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            certificate_store,
+        })
     }
 
     /// Validate and atomically replace the complete persisted configuration.
@@ -614,6 +632,59 @@ impl State {
                 app: "<node>".into(),
                 detail: format!("invalid listen address: {error}"),
             })?;
+
+        let edge = self
+            .connection
+            .query_row(
+                "SELECT https_listen, apps_domain, acme_email, acme_directory_url, dns_provider
+                 FROM edge_config WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StateError::IncompleteState("singleton edge config is missing".into())
+            })?;
+        let https_listen = edge
+            .0
+            .map(|value| {
+                value
+                    .parse::<SocketAddr>()
+                    .map_err(|error| StateError::InvalidPersisted {
+                        app: "<edge>".into(),
+                        detail: format!("invalid HTTPS listen address: {error}"),
+                    })
+            })
+            .transpose()?;
+        let acme = match (edge.2, edge.3) {
+            (None, None) => None,
+            (Some(email), Some(directory_url)) => Some(AcmeConfig {
+                email,
+                directory_url,
+                dns_provider: edge.4,
+            }),
+            _ => {
+                return Err(StateError::IncompleteState(
+                    "ACME email and directory must be stored together".into(),
+                ));
+            }
+        };
+        let edge = canonical_edge_config(
+            listen,
+            &EdgeConfig {
+                https_listen,
+                apps_domain: edge.1,
+                acme,
+            },
+        )?;
 
         let mut statement = self.connection.prepare(
             "SELECT id, name, upstream, runtime_json FROM apps ORDER BY name COLLATE BINARY ASC",
@@ -656,9 +727,167 @@ impl State {
             }
             apps.push(loaded);
         }
-        let snapshot = Snapshot { listen, apps };
+        let snapshot = Snapshot { listen, edge, apps };
         validate_snapshot(&snapshot)?;
         Ok(snapshot)
+    }
+
+    /// Replace public-edge configuration and append its audit event atomically.
+    pub fn update_edge_config(
+        &mut self,
+        edge: &EdgeConfig,
+        audit: &AuditContext,
+    ) -> Result<EdgeConfig, StateError> {
+        validate_audit_context(audit)?;
+        let listen = self.load()?.listen;
+        let edge = canonical_edge_config(listen, edge)?;
+        let transaction = self.connection.transaction()?;
+        store_edge_config_tx(&transaction, &edge)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(edge)
+    }
+
+    /// Publish immutable certificate files, then select that generation in SQLite.
+    pub fn install_certificate(
+        &mut self,
+        input: &CertificateInput,
+        audit: &AuditContext,
+    ) -> Result<CertificateRecord, StateError> {
+        validate_audit_context(audit)?;
+        if input.not_after_unix <= 0 {
+            return Err(StateError::InvalidRecord {
+                kind: "certificate",
+                detail: "not_after_unix must be positive".into(),
+            });
+        }
+        let domains = canonical_certificate_domains(&input.domains)?;
+        for domain in &domains {
+            let owner = self
+                .connection
+                .query_row(
+                    "SELECT certificate_id FROM certificate_domains WHERE domain = ?1",
+                    [domain],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(owner) = owner
+                && owner != input.id
+            {
+                return Err(StateError::CertificateDomainConflict {
+                    domain: domain.clone(),
+                    owner,
+                });
+            }
+        }
+        let published = self.certificate_store.publish(
+            &input.id,
+            &input.certificate_pem,
+            &input.private_key_pem,
+        )?;
+        let transaction = self.connection.transaction()?;
+        for domain in &domains {
+            let owner = transaction
+                .query_row(
+                    "SELECT certificate_id FROM certificate_domains WHERE domain = ?1",
+                    [domain],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(owner) = owner
+                && owner != input.id
+            {
+                return Err(StateError::CertificateDomainConflict {
+                    domain: domain.clone(),
+                    owner,
+                });
+            }
+        }
+        transaction.execute(
+            "INSERT INTO certificates (id, generation, not_after_unix, installed_at)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET generation = excluded.generation,
+                 not_after_unix = excluded.not_after_unix, installed_at = CURRENT_TIMESTAMP",
+            params![input.id, published.generation, input.not_after_unix],
+        )?;
+        transaction.execute(
+            "DELETE FROM certificate_domains WHERE certificate_id = ?1",
+            [&input.id],
+        )?;
+        for domain in &domains {
+            transaction.execute(
+                "INSERT INTO certificate_domains (certificate_id, domain) VALUES (?1, ?2)",
+                params![input.id, domain],
+            )?;
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.certificate(&input.id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "certificate {:?} disappeared after installation",
+                input.id
+            ))
+        })
+    }
+
+    pub fn certificate(&self, id: &str) -> Result<Option<CertificateRecord>, StateError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT generation, not_after_unix, installed_at FROM certificates WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((generation, not_after_unix, installed_at)) = stored else {
+            return Ok(None);
+        };
+        let domains = self.load_certificate_domains(id)?;
+        let published = self.certificate_store.resolve(id, &generation)?;
+        Ok(Some(CertificateRecord {
+            id: id.into(),
+            domains,
+            generation,
+            certificate_path: published.certificate_path,
+            private_key_path: published.private_key_path,
+            not_after_unix,
+            installed_at,
+        }))
+    }
+
+    pub fn certificates(&self) -> Result<Vec<CertificateRecord>, StateError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM certificates ORDER BY id COLLATE BINARY")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                self.certificate(&id)?.ok_or_else(|| {
+                    StateError::IncompleteState(format!(
+                        "certificate {id:?} disappeared while listing"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn load_certificate_domains(&self, id: &str) -> Result<Vec<String>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT domain FROM certificate_domains
+             WHERE certificate_id = ?1 ORDER BY domain COLLATE BINARY",
+        )?;
+        statement
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
     }
 
     /// Register an operator-trusted engine and return the validated record.
@@ -978,6 +1207,7 @@ impl State {
         }
         let snapshot = snapshot_from_config(&NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            edge: EdgeConfig::default(),
             apps: vec![candidate.clone()],
         })?;
         let mut loaded = snapshot
@@ -1048,6 +1278,7 @@ impl State {
         );
         validate_snapshot(&Snapshot {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            edge: EdgeConfig::default(),
             apps: vec![loaded.clone()],
         })?;
         Ok(ActivationPlan {
@@ -1091,6 +1322,7 @@ impl State {
         }
         validate_snapshot(&Snapshot {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            edge: EdgeConfig::default(),
             apps: vec![plan.candidate.clone()],
         })?;
         let stored_runtime = StoredRuntime::from_app(&plan.candidate)?;
@@ -1537,6 +1769,36 @@ fn migrate_v2_to_v3(connection: &Connection) -> Result<(), StateError> {
          CREATE TRIGGER audit_log_no_delete
              BEFORE DELETE ON audit_log
              BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE edge_config (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             https_listen TEXT,
+             apps_domain TEXT,
+             acme_email TEXT,
+             acme_directory_url TEXT,
+             dns_provider TEXT,
+             CHECK ((acme_email IS NULL AND acme_directory_url IS NULL AND dns_provider IS NULL)
+                 OR (acme_email IS NOT NULL AND acme_directory_url IS NOT NULL))
+         );
+         INSERT INTO edge_config (id) VALUES (1);
+         CREATE TABLE certificates (
+             id TEXT PRIMARY KEY,
+             generation TEXT NOT NULL,
+             not_after_unix INTEGER NOT NULL CHECK (not_after_unix > 0),
+             installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE certificate_domains (
+             certificate_id TEXT NOT NULL REFERENCES certificates(id) ON DELETE CASCADE,
+             domain TEXT NOT NULL COLLATE BINARY UNIQUE,
+             PRIMARY KEY (certificate_id, domain)
+         );
+         CREATE INDEX certificate_domains_certificate_id
+             ON certificate_domains(certificate_id);",
     )?;
     Ok(())
 }
@@ -2155,6 +2417,7 @@ struct StoredAppJson {
 #[derive(Clone, Debug)]
 struct StoredSnapshot {
     listen: SocketAddr,
+    edge: EdgeConfig,
     apps: Vec<StoredAppOwned>,
 }
 
@@ -2302,6 +2565,7 @@ fn snapshot_to_stored(snapshot: &Snapshot) -> Result<StoredSnapshot, StateError>
         .collect::<Result<Vec<_>, StateError>>()?;
     Ok(StoredSnapshot {
         listen: snapshot.listen,
+        edge: snapshot.edge.clone(),
         apps,
     })
 }
@@ -2434,6 +2698,41 @@ fn loaded_from_stored(
         lifecycle,
     })
 }
+
+fn store_edge_config_tx(
+    transaction: &Transaction<'_>,
+    edge: &EdgeConfig,
+) -> Result<(), StateError> {
+    let https_listen = edge.https_listen.map(|address| address.to_string());
+    let (acme_email, acme_directory_url, dns_provider) = edge
+        .acme
+        .as_ref()
+        .map(|acme| {
+            (
+                Some(acme.email.as_str()),
+                Some(acme.directory_url.as_str()),
+                acme.dns_provider.as_deref(),
+            )
+        })
+        .unwrap_or((None, None, None));
+    transaction.execute(
+        "INSERT INTO edge_config
+         (id, https_listen, apps_domain, acme_email, acme_directory_url, dns_provider)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET https_listen = excluded.https_listen,
+             apps_domain = excluded.apps_domain, acme_email = excluded.acme_email,
+             acme_directory_url = excluded.acme_directory_url,
+             dns_provider = excluded.dns_provider",
+        params![
+            https_listen,
+            edge.apps_domain,
+            acme_email,
+            acme_directory_url,
+            dns_provider,
+        ],
+    )?;
+    Ok(())
+}
 fn replace_database(
     transaction: &Transaction<'_>,
     snapshot: &StoredSnapshot,
@@ -2452,6 +2751,7 @@ fn replace_database(
         "INSERT INTO node_config (id, listen) VALUES (1, ?1)",
         [snapshot.listen.to_string()],
     )?;
+    store_edge_config_tx(transaction, &snapshot.edge)?;
     for app in &snapshot.apps {
         let runtime_json = serde_json::to_string(&StoredApp {
             name: &app.name,
@@ -2512,6 +2812,7 @@ fn snapshot_from_config(config: &NodeConfig) -> Result<Snapshot, StateError> {
     }
     let snapshot = Snapshot {
         listen: config.listen,
+        edge: canonical_edge_config(config.listen, &config.edge)?,
         apps,
     };
     validate_snapshot(&snapshot)?;
@@ -2522,6 +2823,11 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), StateError> {
     let mut names = BTreeSet::new();
     let mut upstreams = BTreeSet::new();
     let mut domains = BTreeSet::new();
+    if canonical_edge_config(snapshot.listen, &snapshot.edge)? != snapshot.edge {
+        return Err(StateError::InvalidConfig(
+            "edge configuration is not canonical".into(),
+        ));
+    }
     let mut tenant_admin_count = 0;
     for app in &snapshot.apps {
         if app.tenant_admin {
@@ -2606,6 +2912,100 @@ fn sort_snapshot(mut snapshot: Snapshot) -> Snapshot {
         app.domains.sort();
     }
     snapshot
+}
+
+fn canonical_edge_config(listen: SocketAddr, edge: &EdgeConfig) -> Result<EdgeConfig, StateError> {
+    if edge.https_listen == Some(listen) {
+        return Err(StateError::InvalidConfig(
+            "HTTP and HTTPS listeners must be distinct".into(),
+        ));
+    }
+    let apps_domain = edge
+        .apps_domain
+        .as_deref()
+        .map(|domain| {
+            if domain.trim_start().starts_with("*.") {
+                return Err(StateError::InvalidConfig(
+                    "apps_domain must be a hostname, not a wildcard pattern".into(),
+                ));
+            }
+            canonical_domain(domain)
+                .ok_or_else(|| StateError::InvalidConfig(format!("invalid apps_domain {domain:?}")))
+        })
+        .transpose()?;
+    let acme = edge
+        .acme
+        .as_ref()
+        .map(|acme| {
+            if edge.https_listen.is_none() {
+                return Err(StateError::InvalidConfig(
+                    "ACME requires an HTTPS listener".into(),
+                ));
+            }
+            let email = acme.email.trim();
+            if email != acme.email
+                || email.len() > 254
+                || !email.contains('@')
+                || email.chars().any(char::is_control)
+            {
+                return Err(StateError::InvalidConfig(
+                    "ACME email must be a canonical printable address".into(),
+                ));
+            }
+            let directory_url = acme.directory_url.trim();
+            if directory_url != acme.directory_url
+                || directory_url.len() > 2048
+                || !directory_url.starts_with("https://")
+                || directory_url.trim_start_matches("https://").is_empty()
+                || directory_url.chars().any(char::is_whitespace)
+            {
+                return Err(StateError::InvalidConfig(
+                    "ACME directory_url must be a canonical HTTPS URL".into(),
+                ));
+            }
+            if let Some(provider) = acme.dns_provider.as_deref()
+                && (provider.is_empty()
+                    || provider.len() > 64
+                    || !provider.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'_')
+                    }))
+            {
+                return Err(StateError::InvalidConfig(
+                    "DNS provider must be a lowercase identifier".into(),
+                ));
+            }
+            Ok(AcmeConfig {
+                email: email.into(),
+                directory_url: directory_url.into(),
+                dns_provider: acme.dns_provider.clone(),
+            })
+        })
+        .transpose()?;
+    Ok(EdgeConfig {
+        https_listen: edge.https_listen,
+        apps_domain,
+        acme,
+    })
+}
+
+fn canonical_certificate_domains(domains: &[String]) -> Result<Vec<String>, StateError> {
+    if domains.is_empty() {
+        return Err(StateError::InvalidRecord {
+            kind: "certificate",
+            detail: "at least one certificate domain is required".into(),
+        });
+    }
+    let mut canonical = canonical_domains(domains)?;
+    canonical.sort();
+    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(StateError::InvalidRecord {
+            kind: "certificate",
+            detail: "certificate domains must be unique after normalization".into(),
+        });
+    }
+    Ok(canonical)
 }
 
 fn canonical_domains(domains: &[String]) -> Result<Vec<String>, StateError> {
@@ -2708,6 +3108,7 @@ mod tests {
     fn config() -> NodeConfig {
         NodeConfig {
             listen: "127.0.0.1:8080".parse().expect("address"),
+            edge: EdgeConfig::default(),
             apps: vec![AppConfig {
                 name: "api".into(),
                 domains: vec!["API.Example.com.".into(), "*.Apps.Example.com".into()],
@@ -2909,7 +3310,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         drop(state);
         let _ = fs::remove_file(path);
     }
@@ -2967,7 +3368,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         drop(state);
         let _ = fs::remove_file(path);
     }
@@ -3012,7 +3413,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         let deployment = state.deployment("dep-v2").unwrap().unwrap();
         assert_eq!(deployment.status, DeploymentStatus::Active);
         assert_eq!(
@@ -3307,7 +3708,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         drop(state);
         let _ = fs::remove_file(path);
     }
@@ -3782,5 +4183,120 @@ mod tests {
         assert_eq!(state.audit_records().unwrap().len(), 1);
         drop(state);
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn edge_configuration_is_canonical_persisted_and_audited() {
+        let path = temp_db("edge-config");
+        let mut state = State::open(&path).unwrap();
+        let mut input = config();
+        input.edge = EdgeConfig {
+            https_listen: Some("0.0.0.0:443".parse().unwrap()),
+            apps_domain: Some("Apps.Example.COM.".into()),
+            acme: Some(AcmeConfig {
+                email: "ops@example.com".into(),
+                directory_url: crate::edge::DEFAULT_ACME_DIRECTORY.into(),
+                dns_provider: Some("cloudflare".into()),
+            }),
+        };
+        state.apply(&input).unwrap();
+        assert_eq!(
+            state.load().unwrap().edge.apps_domain.as_deref(),
+            Some("apps.example.com")
+        );
+
+        let updated = EdgeConfig {
+            https_listen: Some("127.0.0.1:8443".parse().unwrap()),
+            apps_domain: Some("preview.example.com".into()),
+            acme: Some(AcmeConfig {
+                email: "admin@example.com".into(),
+                directory_url: "https://acme.test/directory".into(),
+                dns_provider: None,
+            }),
+        };
+        state
+            .update_edge_config(&updated, &audit_context("edge-update"))
+            .unwrap();
+        assert_eq!(state.load().unwrap().edge, updated);
+        assert_eq!(state.audit_records().unwrap().len(), 1);
+
+        let mut invalid = updated;
+        invalid.https_listen = Some(input.listen);
+        assert!(
+            state
+                .update_edge_config(&invalid, &audit_context("edge-invalid"))
+                .is_err()
+        );
+        assert_eq!(state.audit_records().unwrap().len(), 1);
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn certificate_generations_are_immutable_private_and_transactional() {
+        let root = temp_db("certificate-store").with_extension("state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("state.db");
+        let mut state = State::open(&path).unwrap();
+        let certificate = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
+        let private_key = b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n";
+        let first = state
+            .install_certificate(
+                &CertificateInput {
+                    id: "apps-wildcard".into(),
+                    domains: vec!["*.Apps.Example.COM.".into(), "api.example.com".into()],
+                    certificate_pem: certificate.to_vec(),
+                    private_key_pem: private_key.to_vec(),
+                    not_after_unix: 4_102_444_800,
+                },
+                &audit_context("certificate-one"),
+            )
+            .unwrap();
+        assert_eq!(first.domains, ["*.apps.example.com", "api.example.com"]);
+        assert_eq!(
+            fs::symlink_metadata(&first.private_key_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&first.certificate_path).unwrap(), certificate);
+
+        let second_certificate =
+            b"-----BEGIN CERTIFICATE-----\nZGlmZmVyZW50\n-----END CERTIFICATE-----\n";
+        let second = state
+            .install_certificate(
+                &CertificateInput {
+                    id: "apps-wildcard".into(),
+                    domains: vec!["*.apps.example.com".into()],
+                    certificate_pem: second_certificate.to_vec(),
+                    private_key_pem: private_key.to_vec(),
+                    not_after_unix: 4_102_444_900,
+                },
+                &audit_context("certificate-two"),
+            )
+            .unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert!(first.certificate_path.exists());
+        assert_eq!(state.certificates().unwrap(), [second]);
+        assert_eq!(state.audit_records().unwrap().len(), 2);
+
+        assert!(matches!(
+            state.install_certificate(
+                &CertificateInput {
+                    id: "conflict".into(),
+                    domains: vec!["*.apps.example.com".into()],
+                    certificate_pem: certificate.to_vec(),
+                    private_key_pem: private_key.to_vec(),
+                    not_after_unix: 4_102_445_000,
+                },
+                &audit_context("certificate-conflict"),
+            ),
+            Err(StateError::CertificateDomainConflict { owner, .. }) if owner == "apps-wildcard"
+        ));
+        assert_eq!(state.audit_records().unwrap().len(), 2);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 }

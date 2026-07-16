@@ -663,6 +663,7 @@ mod tests {
         app.env.insert("CYGNUS_FIXTURE_MODE".into(), "uds".into());
         let config = NodeConfig {
             listen: "127.0.0.1:0".parse().expect("listen address"),
+            edge: Default::default(),
             apps: vec![app],
         };
         let mut state = State::open(&state_path).expect("open state");
