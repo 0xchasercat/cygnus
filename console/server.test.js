@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   ACTOR_SUBJECT,
   MAX_JSON_BODY_BYTES,
@@ -15,12 +18,18 @@ import {
 
 const previousBootstrap = process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
 const previousSessionKey = process.env.CYGNUS_CONSOLE_SESSION_KEY;
+const previousBootstrapFile = process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE;
+const previousSessionFile = process.env.CYGNUS_CONSOLE_SESSION_KEY_FILE;
 
 afterEach(() => {
   if (previousBootstrap === undefined) delete process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
   else process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = previousBootstrap;
   if (previousSessionKey === undefined) delete process.env.CYGNUS_CONSOLE_SESSION_KEY;
   else process.env.CYGNUS_CONSOLE_SESSION_KEY = previousSessionKey;
+  if (previousBootstrapFile === undefined) delete process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE;
+  else process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE = previousBootstrapFile;
+  if (previousSessionFile === undefined) delete process.env.CYGNUS_CONSOLE_SESSION_KEY_FILE;
+  else process.env.CYGNUS_CONSOLE_SESSION_KEY_FILE = previousSessionFile;
 });
 
 describe("console session primitives", () => {
@@ -37,6 +46,26 @@ describe("console session primitives", () => {
     expect(constantTimeTokenMatch("correct horse")).toBe(true);
     expect(constantTimeTokenMatch("wrong")).toBe(false);
     expect(constantTimeTokenMatch("")).toBe(false);
+  });
+
+  test("loads independent raw credentials from rooted cage files", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cygnus-console-credentials-"));
+    const bootstrap = Buffer.alloc(32, 0xab);
+    const session = Buffer.alloc(32, 0xcd);
+    const bootstrapPath = join(directory, "bootstrap.token");
+    const sessionPath = join(directory, "session.key");
+    writeFileSync(bootstrapPath, bootstrap);
+    writeFileSync(sessionPath, session);
+    delete process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
+    delete process.env.CYGNUS_CONSOLE_SESSION_KEY;
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE = bootstrapPath;
+    process.env.CYGNUS_CONSOLE_SESSION_KEY_FILE = sessionPath;
+
+    expect(constantTimeTokenMatch(bootstrap.toString("hex"))).toBe(true);
+    expect(constantTimeTokenMatch(session.toString("hex"))).toBe(false);
+    const cookie = signSession({ iat: 100, exp: 200 }, 100_000);
+    expect(verifySessionCookie(cookie, 100_000)?.sub).toBe(ACTOR_SUBJECT);
+    rmSync(directory, { recursive: true, force: true });
   });
   test("sets a signed cookie and bounds repeated failures", async () => {
     process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";

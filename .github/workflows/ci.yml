@@ -39,3 +39,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run build
+      - run: bash scripts/build-release-test.sh
+        working-directory: .
+      - run: bash scripts/install-test.sh
+        working-directory: .

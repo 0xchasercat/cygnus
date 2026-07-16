@@ -3,6 +3,7 @@ import {
   createHmac,
   timingSafeEqual,
 } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { AdminProtocolError, adminRequest } from "./admin-client.js";
 
 const indexPath = `${import.meta.dir}/dist/index.html`;
@@ -216,8 +217,8 @@ function sessionStatus(request) {
 }
 
 export function authStatus() {
-  const bootstrap = process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN ?? "";
-  const sessionKey = process.env.CYGNUS_CONSOLE_SESSION_KEY ?? "";
+  const bootstrap = credential("CYGNUS_CONSOLE_BOOTSTRAP_TOKEN", "CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE");
+  const sessionKey = credential("CYGNUS_CONSOLE_SESSION_KEY", "CYGNUS_CONSOLE_SESSION_KEY_FILE");
   return {
     configured: bootstrap.length > 0 && sessionKey.length > 0,
     bootstrapConfigured: bootstrap.length > 0,
@@ -226,7 +227,7 @@ export function authStatus() {
 }
 
 export function constantTimeTokenMatch(candidate) {
-  const configured = process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN ?? "";
+  const configured = credential("CYGNUS_CONSOLE_BOOTSTRAP_TOKEN", "CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE");
   const left = createHash("sha256").update(String(candidate ?? ""), "utf8").digest();
   const right = createHash("sha256").update(configured, "utf8").digest();
   return timingSafeEqual(left, right) && configured.length > 0;
@@ -275,9 +276,22 @@ export function verifySessionCookie(cookie, now = Date.now()) {
 }
 
 function sessionSignature(payload) {
-  const key = process.env.CYGNUS_CONSOLE_SESSION_KEY ?? "";
+  const key = credential("CYGNUS_CONSOLE_SESSION_KEY", "CYGNUS_CONSOLE_SESSION_KEY_FILE");
   if (!key) return "";
   return createHmac("sha256", key).update(payload, "utf8").digest("base64url");
+}
+
+function credential(valueName, fileName) {
+  const direct = process.env[valueName] ?? "";
+  if (direct) return direct;
+  const path = process.env[fileName]?.trim() ?? "";
+  if (!path.startsWith("/")) return "";
+  try {
+    const raw = readFileSync(path);
+    return raw.length === 32 ? raw.toString("hex") : "";
+  } catch {
+    return "";
+  }
 }
 
 function sessionSetCookie(value) {

@@ -50,6 +50,7 @@ const BUILD_CACHE_CAGE_PATH: &str = "/workspace/.cygnus-cache";
 const BUILD_HOME_CAGE_PATH: &str = "/cygnus/home";
 const BUILD_TMPDIR_CAGE_PATH: &str = "/cygnus/tmp";
 const BUILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const INIT_CAGE_PATH: &str = "/usr/local/bin/cygnus-init";
 const BUILD_REGISTRY: &str = "https://registry.npmjs.org";
 const BUILD_REGISTRY_DOMAIN: &str = "registry.npmjs.org";
 const BUILD_ROOTFS_TMPFS_SIZE: u64 = 512 * 1024 * 1024;
@@ -630,6 +631,9 @@ fn build_job(
         EgressMode::None
     };
     job.seccomp = Some(FilterMode::Enforce);
+    if linux {
+        job.init = Some(PathBuf::from(INIT_CAGE_PATH));
+    }
     job.timeout = JobConfig::DEFAULT_TIMEOUT;
     job.stdout_limit = MAX_BUILD_OUTPUT;
     job.stderr_limit = MAX_BUILD_OUTPUT;
@@ -724,6 +728,7 @@ fn runtime_config(
             lowerdirs: vec![engine.host_root.clone(), artifact_path.to_path_buf()],
             ..RootfsConfig::default()
         }),
+        init: linux.then(|| PathBuf::from(INIT_CAGE_PATH)),
         seccomp: Some(SeccompMode::Enforce),
         egress: crate::state::EgressConfig::None,
         ..AppConfig::default()
@@ -1870,6 +1875,10 @@ mod tests {
             Some(&OsString::from(BUILD_REGISTRY)),
         );
         assert!(matches!(job.egress, EgressMode::BuildDomains { .. }));
+        assert_eq!(
+            job.init,
+            cfg!(target_os = "linux").then(|| PathBuf::from(INIT_CAGE_PATH))
+        );
         if cfg!(target_os = "linux") {
             assert_eq!(
                 job.rootfs.as_ref().unwrap().tmpfs_size,
