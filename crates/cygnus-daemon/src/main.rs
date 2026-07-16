@@ -1096,13 +1096,15 @@ mod tests {
         }
     }
 
-    fn fake_runtime() -> (
+    type FakeRuntime = (
         LiveDeployRuntime<FakeInstance>,
         Arc<Supervisor<FakeInstance>>,
         Arc<Router>,
         Arc<parking_lot::Mutex<Vec<&'static str>>>,
         Arc<std::sync::atomic::AtomicUsize>,
-    ) {
+    );
+
+    fn fake_runtime() -> FakeRuntime {
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let boot_events = Arc::clone(&events);
@@ -1233,8 +1235,10 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let state_path = directory.join("state.db");
         let config_path = directory.join("node.json");
-        let mut config = NodeConfig::default();
-        config.listen = "127.0.0.1:3300".parse().unwrap();
+        let mut config = NodeConfig {
+            listen: "127.0.0.1:3300".parse().unwrap(),
+            ..Default::default()
+        };
         let bytes = serde_json::to_vec(&config).unwrap();
         fs::write(&config_path, &bytes).unwrap();
 

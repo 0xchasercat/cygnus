@@ -477,7 +477,7 @@ atomic_install_dir() {
   rm -rf -- "$tmp" "$old"
   mkdir -p -- "$tmp"
   chmod 0755 "$tmp"
-  cp -R -- "$src/." "$tmp/"
+  cp -Rp -- "$src/." "$tmp/"
   [[ -d $tmp && ! -L $tmp ]] || fail "staged ${kind} root is invalid"
   if [[ -e $dest ]]; then
     mv -- "$dest" "$old" || fail "unable to stage existing ${kind} root for replacement"

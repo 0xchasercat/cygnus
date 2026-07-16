@@ -843,31 +843,32 @@ impl GitHubManager {
                 &removed,
             )?;
             let jobs = derive_event_jobs(&state, &session.event, action.as_deref(), &value)?;
-            if session.event == "pull_request" && action.as_deref() == Some("closed") {
-                if let Some(number) = value.get("number").and_then(Value::as_i64) {
-                    let key = format!(
-                        "{}:{}:pr:{number}",
-                        installation_id,
-                        value
-                            .pointer("/repository/id")
-                            .and_then(Value::as_i64)
-                            .unwrap_or_default()
-                    );
-                    for prior in state.github_jobs(200, None)? {
-                        if prior.key == key
-                            && matches!(
-                                prior.status,
-                                GitHubDeployJobStatus::Queued
-                                    | GitHubDeployJobStatus::Retry
-                                    | GitHubDeployJobStatus::Running
-                            )
-                        {
-                            state.finish_github_job(
-                                &prior.id,
-                                GitHubDeployJobStatus::Cancelled,
-                                Some("pull request closed"),
-                            )?;
-                        }
+            if session.event == "pull_request"
+                && action.as_deref() == Some("closed")
+                && let Some(number) = value.get("number").and_then(Value::as_i64)
+            {
+                let key = format!(
+                    "{}:{}:pr:{number}",
+                    installation_id,
+                    value
+                        .pointer("/repository/id")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default()
+                );
+                for prior in state.github_jobs(200, None)? {
+                    if prior.key == key
+                        && matches!(
+                            prior.status,
+                            GitHubDeployJobStatus::Queued
+                                | GitHubDeployJobStatus::Retry
+                                | GitHubDeployJobStatus::Running
+                        )
+                    {
+                        state.finish_github_job(
+                            &prior.id,
+                            GitHubDeployJobStatus::Cancelled,
+                            Some("pull request closed"),
+                        )?;
                     }
                 }
             }
@@ -1701,9 +1702,12 @@ fn worker_audit(job: &GitHubDeployJob) -> AuditContext {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type FakeRequest = (String, String, Option<String>, Vec<u8>);
+
     struct FakeTransport {
         statuses: Mutex<Vec<u16>>,
-        seen: Mutex<Vec<(String, String, Option<String>, Vec<u8>)>>,
+        seen: Mutex<Vec<FakeRequest>>,
     }
     impl GitHubTransport for FakeTransport {
         fn request(
