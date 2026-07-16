@@ -7,12 +7,14 @@ use std::sync::Arc;
 use super::{
     ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode, AdminHandler,
     AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppView, DeploymentView,
-    MAX_LOG_CHUNK_BYTES, NodeView,
+    GitHubJobView, MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES, NodeView,
 };
 use crate::deploy::DeployRequest;
+use crate::github::{GitHubError, GitHubManager};
 use crate::state::{
-    AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentStatus, LoadedApp,
-    NodeConfig, State,
+    AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentStatus,
+    GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, LoadedApp, NodeConfig, State,
+    StateError,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -71,6 +73,7 @@ pub struct StateAdminHandler {
     state_path: PathBuf,
     lifecycle: Arc<LifecycleLookup>,
     mutations: Arc<dyn AdminMutationHandler>,
+    github: Option<Arc<GitHubManager>>,
 }
 
 impl StateAdminHandler {
@@ -83,7 +86,13 @@ impl StateAdminHandler {
             state_path: state_path.into(),
             lifecycle: Arc::new(lifecycle),
             mutations,
+            github: None,
         }
+    }
+
+    pub fn with_github(mut self, github: Arc<GitHubManager>) -> Self {
+        self.github = Some(github);
+        self
     }
 
     fn dispatch(
@@ -217,6 +226,103 @@ impl StateAdminHandler {
                 },
                 "rollback",
             ),
+            AdminCommand::ConvertManifest { code, owner } => {
+                let github = self.github_manager()?;
+                let audit = self.request_audit(role, peer, request, "convert_manifest")?;
+                let app = github
+                    .manifest_conversion(&code, owner.as_deref(), &audit)
+                    .map_err(github_fault)?;
+                Ok(AdminData::ManifestConverted { app })
+            }
+            AdminCommand::GitHubStatus => {
+                let github = self.github_manager()?;
+                let app = github.app_status().map_err(github_fault)?;
+                Ok(AdminData::GitHubStatus {
+                    configured: app.is_some(),
+                    app,
+                })
+            }
+            AdminCommand::ListRepositories { limit } => {
+                let github = self.github_manager()?;
+                let mut repositories = github.repositories().map_err(github_fault)?;
+                repositories.truncate(usize::from(limit));
+                Ok(AdminData::Repositories { repositories })
+            }
+            AdminCommand::ListInstallationRepositories { installation_id } => {
+                let github = self.github_manager()?;
+                let mut repositories = github
+                    .installation_repositories(installation_id)
+                    .map_err(github_fault)?;
+                repositories.truncate(usize::from(MAX_ADMIN_LIST_LIMIT));
+                Ok(AdminData::InstallationRepositories { repositories })
+            }
+            AdminCommand::ConfigureRepository { repository } => {
+                let github = self.github_manager()?;
+                let audit = self.request_audit(role, peer, request, "configure_repository")?;
+                let repository = github
+                    .configure_repository(repository, &audit)
+                    .map_err(github_fault)?;
+                Ok(AdminData::RepositoryConfigured { repository })
+            }
+            AdminCommand::WebhookBegin {
+                delivery_id,
+                event,
+                signature,
+                total_bytes,
+            } => {
+                let github = self.github_manager()?;
+                let duplicate = !github
+                    .webhook_begin(delivery_id.clone(), event, signature, total_bytes)
+                    .map_err(github_fault)?;
+                Ok(AdminData::WebhookBegun {
+                    delivery_id,
+                    duplicate,
+                })
+            }
+            AdminCommand::WebhookChunk {
+                delivery_id,
+                chunk_base64,
+            } => {
+                let github = self.github_manager()?;
+                let received_bytes = github
+                    .webhook_chunk(&delivery_id, &chunk_base64)
+                    .map_err(github_fault)?;
+                Ok(AdminData::WebhookChunked {
+                    delivery_id,
+                    received_bytes,
+                })
+            }
+            AdminCommand::WebhookFinish { delivery_id } => {
+                let github = self.github_manager()?;
+                let audit = self.request_audit(role, peer, request, "webhook_finish")?;
+                let result = github
+                    .webhook_finish(&delivery_id, &audit)
+                    .map_err(github_fault)?;
+                Ok(AdminData::WebhookAccepted {
+                    delivery_id: result.delivery_id,
+                    duplicate: result.duplicate,
+                    jobs: result.jobs,
+                })
+            }
+            AdminCommand::ListDeployJobs { cursor, limit } => {
+                let github = self.github_manager()?;
+                let jobs = github
+                    .list_jobs(limit, cursor.as_deref())
+                    .map_err(github_fault)?;
+                let next_cursor = (jobs.len() == usize::from(limit))
+                    .then(|| jobs.last().map(|job| job.id.clone()))
+                    .flatten();
+                Ok(AdminData::DeployJobs {
+                    jobs: jobs.into_iter().map(job_view).collect(),
+                    next_cursor,
+                })
+            }
+            AdminCommand::RetryDeployJob { job_id } => {
+                let github = self.github_manager()?;
+                let audit = self.request_audit(role, peer, request, "retry_deploy_job")?;
+                let job = github.retry_job(&job_id, &audit).map_err(github_fault)?;
+                Ok(AdminData::DeployJobRetried { job: job_view(job) })
+            }
             AdminCommand::ReadLog {
                 deployment,
                 stream,
@@ -277,10 +383,39 @@ impl StateAdminHandler {
                     .map_err(HandlerFault::internal)?;
                 Err(HandlerFault {
                     code: error.code,
-                    message: error.message,
+                    message: redact_public_error(&error.message),
                 })
             }
         }
+    }
+
+    fn github_manager(&self) -> Result<&GitHubManager, HandlerFault> {
+        self.github
+            .as_deref()
+            .ok_or_else(|| HandlerFault::internal("GitHub integration is unavailable"))
+    }
+
+    fn request_audit(
+        &self,
+        role: AdminRole,
+        peer: AdminPeerCredentials,
+        request: &AdminRequest,
+        command_kind: &str,
+    ) -> Result<AuditContext, HandlerFault> {
+        let encoded = serde_json::to_vec(request).map_err(HandlerFault::internal)?;
+        Ok(AuditContext {
+            endpoint_role: match role {
+                AdminRole::Host => AuditEndpointRole::Host,
+                AdminRole::TenantZero => AuditEndpointRole::TenantZero,
+            },
+            peer_uid: peer.uid,
+            peer_gid: peer.gid,
+            peer_pid: peer.pid,
+            actor_subject: request.actor.clone(),
+            request_id: request.request_id.clone(),
+            command_kind: command_kind.into(),
+            request_digest: format!("{:x}", Sha256::digest(encoded)),
+        })
     }
 
     fn open_state(&self) -> Result<State, HandlerFault> {
@@ -354,6 +489,85 @@ fn app_page_start(apps: &[LoadedApp], cursor: Option<&str>) -> Result<usize, Han
         .position(|app| app.name == cursor)
         .map(|position| position + 1)
         .ok_or_else(|| HandlerFault::not_found("app cursor does not exist"))
+}
+fn job_view(job: GitHubDeployJob) -> GitHubJobView {
+    GitHubJobView {
+        id: bounded_text(job.id, 128),
+        key: bounded_text(job.key, 128),
+        installation_id: job.installation_id,
+        repository_id: job.repository_id,
+        owner: bounded_text(job.owner, 128),
+        name: bounded_text(job.name, 128),
+        environment: bounded_text(job.environment, 128),
+        kind: match job.kind {
+            GitHubJobKind::Production => "production",
+            GitHubJobKind::Preview => "preview",
+        }
+        .into(),
+        pull_request: job.pull_request,
+        sha: bounded_text(job.sha, 128),
+        status: match job.status {
+            GitHubDeployJobStatus::Queued => "queued",
+            GitHubDeployJobStatus::Running => "running",
+            GitHubDeployJobStatus::Succeeded => "succeeded",
+            GitHubDeployJobStatus::Failed => "failed",
+            GitHubDeployJobStatus::Retry => "retry",
+            GitHubDeployJobStatus::Cancelled => "cancelled",
+        }
+        .into(),
+        attempts: job.attempts,
+        next_attempt_at: bounded_text(job.next_attempt_at, 64),
+        error: job.error.as_deref().map(redact_public_error),
+        check_run_id: job.check_run_id,
+        deployment_id: job.deployment_id,
+        created_at: bounded_text(job.created_at, 64),
+        updated_at: bounded_text(job.updated_at, 64),
+    }
+}
+
+fn bounded_text(value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn github_fault(error: GitHubError) -> HandlerFault {
+    let code = match &error {
+        GitHubError::InvalidInput(_)
+        | GitHubError::Json(_)
+        | GitHubError::UnsafeArchive(_)
+        | GitHubError::IncompleteWebhook
+        | GitHubError::InvalidSignature => AdminErrorCode::Validation,
+        GitHubError::Transient(_) => AdminErrorCode::Conflict,
+        GitHubError::State(StateError::InvalidRecord { .. }) => AdminErrorCode::Validation,
+        GitHubError::State(StateError::AppNotFound(_)) => AdminErrorCode::NotFound,
+        _ => AdminErrorCode::Internal,
+    };
+    HandlerFault {
+        code,
+        message: redact_public_error(&error.to_string()),
+    }
+}
+
+fn redact_public_error(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let sensitive = lower.contains("secret")
+        || lower.contains("private key")
+        || lower.contains("begin ")
+        || lower.contains("artifact_root")
+        || lower.contains("upstream")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control);
+    if sensitive {
+        return "GitHub operation failed".into();
+    }
+    bounded_text(value.to_owned(), 512)
 }
 
 fn deployment_view(deployment: DeploymentRecord, role: AdminRole) -> DeploymentView {
@@ -595,6 +809,18 @@ mod tests {
         ));
         fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn github_error_and_job_paths_are_bounded_and_redacted() {
+        let fault = github_fault(GitHubError::InvalidInput(
+            "private key at /srv/daemon/key.pem".into(),
+        ));
+        assert_eq!(fault.message, "GitHub operation failed");
+        let long = "x".repeat(2048);
+        assert_eq!(redact_public_error(&long).len(), 512);
+        assert!(redact_public_error(&"é".repeat(1024)).len() <= 512);
+        assert!(!redact_public_error("upstream /run/secret.sock").contains("secret.sock"));
+    }
+
     #[test]
     fn mutation_failure_records_endpoint_peer_actor_and_digest() {
         let path = state_path();

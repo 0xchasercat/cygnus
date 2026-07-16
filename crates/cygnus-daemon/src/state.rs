@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,6 +10,8 @@ use crate::edge::{
     AcmeConfig, CertificateInput, CertificateRecord, CertificateStore, CertificateStoreError,
     EdgeConfig,
 };
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use cygnus_cage::{
     CageError, CageSpec, CgroupLimits, DEFAULT_READINESS_TIMEOUT, EgressMode,
     EgressRule as CageEgressRule, FilterMode, IngressSpec, RootfsSpec,
@@ -18,17 +21,27 @@ use cygnus_supervisor::{
     DEFAULT_BACKOFF_BASE, DEFAULT_BACKOFF_MAX, DEFAULT_CRASH_LOOP_THRESHOLD, DEFAULT_CRASH_WINDOW,
     DEFAULT_IDLE_TTL, LifecycleConfig,
 };
+use getrandom::fill as random_fill;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const SHA256_HEX_LEN: usize = 64;
+const NODE_KEY_LEN: usize = 32;
+const SECRET_NONCE_LEN: usize = 24;
+const SECRET_AAD: &[u8] = b"cygnus/github-secret/v5";
+const MAX_GITHUB_ATTEMPTS: u32 = 8;
+const RETRY_BASE_SECONDS: i64 = 5;
+const RETRY_MAX_SECONDS: i64 = 3600;
+const MAX_GITHUB_TEXT_LEN: usize = 16 * 1024;
+const MAX_GITHUB_JOBS_PER_DELIVERY: usize = 256;
+pub const MAX_GITHUB_WEBHOOK_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Deployment lifecycle persisted by the daemon.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -480,6 +493,104 @@ pub struct LoadedApp {
     pub lifecycle: LifecycleConfig,
 }
 
+/// Public metadata for the configured GitHub App. Secret material is kept separate.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitHubAppRecord {
+    pub app_id: String,
+    pub client_id: String,
+    pub name: String,
+    pub html_url: Option<String>,
+    pub owner: Option<String>,
+    pub configured_at: String,
+}
+
+/// Secret material for the GitHub App. This type intentionally does not implement
+/// `Debug`, `Serialize`, or `Deserialize`, preventing accidental wire/log exposure.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitHubAppSecrets {
+    pub client_secret: String,
+    pub pem: String,
+    pub webhook_secret: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubRepositoryConfig {
+    pub installation_id: i64,
+    pub repository_id: i64,
+    pub owner: String,
+    pub name: String,
+    pub branch: String,
+    pub app: String,
+    pub domain: String,
+    pub engine_version: String,
+    pub entry: PathBuf,
+    pub artifact_root: PathBuf,
+    pub upstream: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubDelivery {
+    pub delivery_id: String,
+    pub event: String,
+    pub action: Option<String>,
+    pub payload_path: PathBuf,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubJobKind {
+    Production,
+    Preview,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubDeployJobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Retry,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubJobSpec {
+    pub id: String,
+    pub key: String,
+    pub installation_id: i64,
+    pub repository_id: i64,
+    pub owner: String,
+    pub name: String,
+    pub environment: String,
+    pub kind: GitHubJobKind,
+    pub pull_request: Option<i64>,
+    pub sha: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubDeployJob {
+    pub id: String,
+    pub key: String,
+    pub installation_id: i64,
+    pub repository_id: i64,
+    pub owner: String,
+    pub name: String,
+    pub environment: String,
+    pub kind: GitHubJobKind,
+    pub pull_request: Option<i64>,
+    pub sha: String,
+    pub status: GitHubDeployJobStatus,
+    pub attempts: u32,
+    pub next_attempt_at: String,
+    pub error: Option<String>,
+    pub check_run_id: Option<i64>,
+    pub deployment_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Durable state and configuration errors.
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -487,6 +598,8 @@ pub enum StateError {
     Sqlite(#[from] rusqlite::Error),
     #[error("state filesystem error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("secret authentication failed")]
+    SecretAuthentication,
     #[error("state schema version {found} is unsupported (expected {expected})")]
     UnknownSchemaVersion { found: i32, expected: i32 },
     #[error("configuration for app {app:?} has an invalid cage specification: {source}")]
@@ -546,6 +659,7 @@ pub enum StateError {
 pub struct State {
     connection: Connection,
     certificate_store: CertificateStore,
+    node_key: [u8; NODE_KEY_LEN],
 }
 
 impl State {
@@ -558,10 +672,12 @@ impl State {
         {
             fs::create_dir_all(parent)?;
         }
+        let node_key = load_node_key(path)?;
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "secure_delete", "ON")?;
         connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
 
         let mut version: i32 =
@@ -585,6 +701,7 @@ impl State {
                 1 => migrate_v1_to_v2(&transaction)?,
                 2 => migrate_v2_to_v3(&transaction)?,
                 3 => migrate_v3_to_v4(&transaction)?,
+                4 => migrate_v4_to_v5(&transaction, &node_key)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -592,9 +709,11 @@ impl State {
             transaction.commit()?;
             version = next;
         }
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(Self {
             connection,
             certificate_store,
+            node_key,
         })
     }
 
@@ -607,10 +726,11 @@ impl State {
         transaction.commit()?;
         Ok(())
     }
+    /// Validate and materialize a configuration without changing durable state.
     pub fn preview(&self, config: &NodeConfig) -> Result<Snapshot, StateError> {
         snapshot_from_config(config)
     }
-
+    /// Apply a complete configuration and append its success audit in one transaction.
     pub fn apply_with_audit(
         &mut self,
         config: &NodeConfig,
@@ -917,6 +1037,7 @@ impl State {
         )?;
         Ok(engine.clone())
     }
+    /// Register an engine and append its success audit in one transaction.
     pub fn register_engine_with_audit(
         &mut self,
         engine: &EngineRecord,
@@ -1657,6 +1778,321 @@ impl State {
             .map_err(StateError::from)
     }
 
+    pub fn github_app(&self) -> Result<Option<GitHubAppRecord>, StateError> {
+        self.connection.query_row(
+            "SELECT app_id, client_id, name, html_url, owner, configured_at FROM github_app WHERE id = 1",
+            [], |row| Ok(GitHubAppRecord {
+                app_id: row.get(0)?, client_id: row.get(1)?, name: row.get(2)?,
+                html_url: row.get(3)?, owner: row.get(4)?, configured_at: row.get(5)?,
+            }),
+        ).optional().map_err(StateError::from)
+    }
+
+    pub fn github_app_secrets(&self) -> Result<Option<GitHubAppSecrets>, StateError> {
+        self.connection.query_row(
+            "SELECT client_secret, pem, webhook_secret FROM github_app_secrets WHERE app_id = 1",
+            [], |row| {
+                let client_secret: Vec<u8> = row.get(0)?;
+                let pem: Vec<u8> = row.get(1)?;
+                let webhook_secret: Vec<u8> = row.get(2)?;
+                Ok((client_secret, pem, webhook_secret))
+            },
+        ).optional()?.map(|(client_secret, pem, webhook_secret)| Ok(GitHubAppSecrets {
+            client_secret: decrypt_secret(&self.node_key, &client_secret)?,
+            pem: decrypt_secret(&self.node_key, &pem)?,
+            webhook_secret: decrypt_secret(&self.node_key, &webhook_secret)?,
+        })).transpose()
+    }
+
+    pub fn set_github_app(
+        &mut self,
+        app: &GitHubAppRecord,
+        secrets: &GitHubAppSecrets,
+    ) -> Result<(), StateError> {
+        validate_github_app(app, secrets)?;
+        let transaction = self.connection.transaction()?;
+        upsert_github_app_tx(&transaction, app, secrets, &self.node_key)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_github_app_with_audit(
+        &mut self,
+        app: &GitHubAppRecord,
+        secrets: &GitHubAppSecrets,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        validate_github_app(app, secrets)?;
+        let transaction = self.connection.transaction()?;
+        upsert_github_app_tx(&transaction, app, secrets, &self.node_key)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn github_repositories(&self) -> Result<Vec<GitHubRepositoryConfig>, StateError> {
+        let mut statement = self.connection.prepare("SELECT installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream FROM github_repositories WHERE enabled = 1 ORDER BY owner, name")?;
+        let rows = statement.query_map([], github_repository_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    pub fn github_repository(
+        &self,
+        installation_id: i64,
+        repository_id: i64,
+    ) -> Result<Option<GitHubRepositoryConfig>, StateError> {
+        self.connection.query_row(
+            "SELECT installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream FROM github_repositories WHERE installation_id = ?1 AND repository_id = ?2 AND enabled = 1",
+            params![installation_id, repository_id], github_repository_from_row,
+        ).optional().map_err(StateError::from)
+    }
+
+    pub fn configure_github_repository(
+        &mut self,
+        config: &GitHubRepositoryConfig,
+    ) -> Result<(), StateError> {
+        validate_github_repository(config)?;
+        let transaction = self.connection.transaction()?;
+        upsert_github_repository_tx(&transaction, config)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn configure_github_repository_with_audit(
+        &mut self,
+        config: &GitHubRepositoryConfig,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        validate_github_repository(config)?;
+        let transaction = self.connection.transaction()?;
+        upsert_github_repository_tx(&transaction, config)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn github_delivery_exists(&self, delivery_id: &str) -> Result<bool, StateError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM github_deliveries WHERE delivery_id = ?1)",
+            [delivery_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn accept_github_delivery(
+        &mut self,
+        delivery: &GitHubDelivery,
+        jobs: &[GitHubJobSpec],
+    ) -> Result<bool, StateError> {
+        validate_github_delivery(delivery)?;
+        if jobs.len() > MAX_GITHUB_JOBS_PER_DELIVERY {
+            return Err(StateError::InvalidRecord {
+                kind: "github delivery",
+                detail: "too many jobs in one delivery".into(),
+            });
+        }
+        for job in jobs {
+            validate_github_job_spec(job)?;
+        }
+        let transaction = self.connection.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO github_deliveries (delivery_id, event, action, payload_path, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![delivery.delivery_id, delivery.event, delivery.action, delivery.payload_path.to_string_lossy(), delivery.accepted_at],
+        )?;
+        if inserted == 0 {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        for job in jobs {
+            transaction.execute(
+                "INSERT OR IGNORE INTO github_deploy_jobs (id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', 0, CURRENT_TIMESTAMP)",
+                params![job.id, job.key, job.installation_id, job.repository_id, job.owner, job.name, job.environment, github_job_kind_name(&job.kind), job.pull_request, job.sha],
+            )?;
+            transaction.execute(
+                "UPDATE github_deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE job_key = ?1 AND sha <> ?2 AND status IN ('queued','retry') AND rowid < (SELECT rowid FROM github_deploy_jobs WHERE id = ?3)",
+                params![job.key, job.sha, job.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn github_jobs(
+        &self,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<Vec<GitHubDeployJob>, StateError> {
+        let limit = i64::from(limit.clamp(1, 200));
+        let mut statement = self.connection.prepare("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE (?1 IS NULL OR id > ?1) ORDER BY created_at, id LIMIT ?2")?;
+        let rows = statement.query_map(params![cursor, limit], github_job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    pub fn github_job(&self, id: &str) -> Result<Option<GitHubDeployJob>, StateError> {
+        self.connection.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [id], github_job_from_row).optional().map_err(StateError::from)
+    }
+
+    pub fn current_github_job(&self, key: &str) -> Result<Option<GitHubDeployJob>, StateError> {
+        self.connection.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE job_key = ?1 AND status <> 'cancelled' ORDER BY created_at DESC, rowid DESC LIMIT 1", [key], github_job_from_row).optional().map_err(StateError::from)
+    }
+
+    pub fn recover_github_jobs(&mut self) -> Result<usize, StateError> {
+        let changed = self.connection.execute("UPDATE github_deploy_jobs SET status = CASE WHEN attempts >= ?1 THEN 'failed' ELSE 'retry' END, next_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, error = COALESCE(error, 'daemon restarted while job was running') WHERE status = 'running'", [i64::from(MAX_GITHUB_ATTEMPTS)])?;
+        Ok(changed)
+    }
+
+    pub fn claim_github_job(&mut self) -> Result<Option<GitHubDeployJob>, StateError> {
+        let transaction = self.connection.transaction()?;
+        let id = transaction.query_row("SELECT j.id FROM github_deploy_jobs j JOIN github_repositories r ON r.installation_id = j.installation_id AND r.repository_id = j.repository_id AND r.enabled = 1 WHERE j.status IN ('queued','retry') AND datetime(j.next_attempt_at) <= CURRENT_TIMESTAMP AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = j.job_key AND (newer.created_at > j.created_at OR (newer.created_at = j.created_at AND newer.rowid > j.rowid)) AND newer.status <> 'cancelled') ORDER BY j.next_attempt_at, j.created_at, j.rowid LIMIT 1", [], |row| row.get::<_, String>(0)).optional()?;
+        let Some(id) = id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let changed = transaction.execute("UPDATE github_deploy_jobs SET status = 'running', attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('queued','retry') AND attempts < ?2", params![id, i64::from(MAX_GITHUB_ATTEMPTS)])?;
+        if changed == 0 {
+            transaction.rollback()?;
+            return Ok(None);
+        }
+        let job = transaction.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [&id], github_job_from_row)?;
+        transaction.commit()?;
+        Ok(Some(job))
+    }
+
+    pub fn update_github_job_report(
+        &mut self,
+        id: &str,
+        check_run_id: Option<i64>,
+        deployment_id: Option<i64>,
+    ) -> Result<(), StateError> {
+        self.connection.execute("UPDATE github_deploy_jobs SET check_run_id = COALESCE(?2, check_run_id), deployment_id = COALESCE(?3, deployment_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", params![id, check_run_id, deployment_id])?;
+        Ok(())
+    }
+
+    pub fn finish_github_job(
+        &mut self,
+        id: &str,
+        status: GitHubDeployJobStatus,
+        error: Option<&str>,
+    ) -> Result<(), StateError> {
+        if !matches!(
+            status,
+            GitHubDeployJobStatus::Succeeded
+                | GitHubDeployJobStatus::Failed
+                | GitHubDeployJobStatus::Cancelled
+        ) {
+            return Err(StateError::InvalidRecord {
+                kind: "github job",
+                detail: "finish requires a terminal status".into(),
+            });
+        }
+        self.connection.execute("UPDATE github_deploy_jobs SET status = ?2, error = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", params![id, github_job_status_name(&status), error])?;
+        Ok(())
+    }
+
+    pub fn retry_github_job_with_error(&mut self, id: &str, error: &str) -> Result<(), StateError> {
+        if error.trim().is_empty()
+            || error.len() > MAX_GITHUB_TEXT_LEN
+            || error.chars().any(char::is_control)
+        {
+            return Err(StateError::InvalidRecord {
+                kind: "github job",
+                detail: "retry error must be printable".into(),
+            });
+        }
+        let attempts: i64 = self
+            .connection
+            .query_row(
+                "SELECT attempts FROM github_deploy_jobs WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "github job",
+                detail: format!("job {id:?} does not exist"),
+            })?;
+        let shift = attempts.saturating_sub(1).min(7) as u32;
+        let delay = RETRY_BASE_SECONDS
+            .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
+            .min(RETRY_MAX_SECONDS);
+        self.connection.execute("UPDATE github_deploy_jobs SET status = CASE WHEN attempts >= ?2 THEN 'failed' ELSE 'retry' END, next_attempt_at = datetime(CURRENT_TIMESTAMP, '+' || ?3 || ' seconds'), error = ?4, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", params![id, i64::from(MAX_GITHUB_ATTEMPTS), delay, error])?;
+        Ok(())
+    }
+
+    pub fn retry_github_job(&mut self, id: &str) -> Result<GitHubDeployJob, StateError> {
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute("UPDATE github_deploy_jobs SET status = 'queued', attempts = 0, next_attempt_at = CURRENT_TIMESTAMP, error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('failed','retry','cancelled') AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", [id])?;
+        if changed == 0 {
+            transaction.rollback()?;
+            return Err(StateError::InvalidRecord {
+                kind: "github job",
+                detail: format!("job {id:?} cannot be retried"),
+            });
+        }
+        let job = transaction.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [id], github_job_from_row)?;
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    pub fn retry_github_job_with_audit(
+        &mut self,
+        id: &str,
+        audit: &AuditContext,
+    ) -> Result<GitHubDeployJob, StateError> {
+        validate_audit_context(audit)?;
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute("UPDATE github_deploy_jobs SET status = 'queued', attempts = 0, next_attempt_at = CURRENT_TIMESTAMP, error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('failed','retry','cancelled') AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", [id])?;
+        if changed == 0 {
+            transaction.rollback()?;
+            return Err(StateError::InvalidRecord {
+                kind: "github job",
+                detail: format!("job {id:?} cannot be retried"),
+            });
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        let job = transaction.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [id], github_job_from_row)?;
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    pub fn reconcile_github_event(
+        &mut self,
+        event: &str,
+        action: Option<&str>,
+        installation_id: i64,
+        removed_repository_ids: &[i64],
+    ) -> Result<(), StateError> {
+        let transaction = self.connection.transaction()?;
+        if event == "installation" && matches!(action, Some("suspend") | Some("deleted")) {
+            transaction.execute(
+                "UPDATE github_repositories SET enabled = 0 WHERE installation_id = ?1",
+                [installation_id],
+            )?;
+            transaction.execute("UPDATE github_deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE installation_id = ?1 AND status IN ('queued','retry')", [installation_id])?;
+        } else if event == "installation"
+            && matches!(
+                action,
+                Some("unsuspend") | Some("created") | Some("new_permissions_accepted")
+            )
+        {
+            transaction.execute(
+                "UPDATE github_repositories SET enabled = 1 WHERE installation_id = ?1",
+                [installation_id],
+            )?;
+        } else if event == "installation_repositories" {
+            for repository_id in removed_repository_ids {
+                transaction.execute("UPDATE github_repositories SET enabled = 0 WHERE installation_id = ?1 AND repository_id = ?2", params![installation_id, repository_id])?;
+                transaction.execute("UPDATE github_deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE installation_id = ?1 AND repository_id = ?2 AND status IN ('queued','retry')", params![installation_id, repository_id])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn load_domains(&self, app_id: i64, app: &str) -> Result<Vec<String>, StateError> {
         let mut statement = self.connection.prepare(
             "SELECT domain FROM domains WHERE app_id = ?1 ORDER BY domain COLLATE BINARY ASC",
@@ -1834,6 +2270,426 @@ fn migrate_v3_to_v4(connection: &Connection) -> Result<(), StateError> {
          CREATE INDEX certificate_domains_certificate_id
              ON certificate_domains(certificate_id);",
     )?;
+    Ok(())
+}
+fn github_text(value: &str, field: &'static str) -> Result<(), StateError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_GITHUB_TEXT_LEN
+        || value.chars().any(char::is_control)
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "github",
+            detail: format!("{field} must be nonempty and printable"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_github_app(
+    app: &GitHubAppRecord,
+    secrets: &GitHubAppSecrets,
+) -> Result<(), StateError> {
+    for (value, field) in [
+        (&app.app_id, "app id"),
+        (&app.client_id, "client id"),
+        (&app.name, "name"),
+        (&secrets.client_secret, "client secret"),
+        (&secrets.webhook_secret, "webhook secret"),
+    ] {
+        github_text(value, field)?;
+    }
+    if secrets.pem.trim().is_empty()
+        || secrets.pem.len() > MAX_GITHUB_TEXT_LEN
+        || secrets.pem.bytes().any(|byte| byte == 0)
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "github",
+            detail: "private key must be bounded UTF-8 text".into(),
+        });
+    }
+    if let Some(url) = &app.html_url {
+        github_text(url, "html URL")?;
+    }
+    if let Some(owner) = &app.owner {
+        github_text(owner, "owner")?;
+    }
+    github_text(&app.configured_at, "configured timestamp")
+}
+
+fn validate_github_repository(config: &GitHubRepositoryConfig) -> Result<(), StateError> {
+    if config.installation_id <= 0 || config.repository_id <= 0 {
+        return Err(StateError::InvalidRecord {
+            kind: "github repository",
+            detail: "installation and repository ids must be positive".into(),
+        });
+    }
+    for (value, field) in [
+        (&config.owner, "owner"),
+        (&config.name, "name"),
+        (&config.branch, "branch"),
+        (&config.app, "app"),
+        (&config.domain, "domain"),
+        (&config.engine_version, "engine version"),
+    ] {
+        github_text(value, field)?;
+    }
+    for (path, field) in [
+        (&config.entry, "entry"),
+        (&config.artifact_root, "artifact root"),
+        (&config.upstream, "upstream"),
+    ] {
+        validate_absolute_path(path, field)?;
+    }
+    Ok(())
+}
+
+fn validate_github_delivery(delivery: &GitHubDelivery) -> Result<(), StateError> {
+    for (value, field) in [
+        (&delivery.delivery_id, "delivery id"),
+        (&delivery.event, "event"),
+        (&delivery.accepted_at, "accepted timestamp"),
+    ] {
+        github_text(value, field)?;
+    }
+    if let Some(action) = &delivery.action {
+        github_text(action, "action")?;
+    }
+    if delivery.payload_path.as_os_str().as_bytes().len() > 4096 {
+        return Err(StateError::InvalidRecord {
+            kind: "github delivery",
+            detail: "payload path is too long".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_github_job_spec(job: &GitHubJobSpec) -> Result<(), StateError> {
+    for (value, field) in [
+        (&job.id, "job id"),
+        (&job.key, "job key"),
+        (&job.owner, "owner"),
+        (&job.name, "name"),
+        (&job.environment, "environment"),
+    ] {
+        github_text(value, field)?;
+    }
+    if job.installation_id <= 0 || job.repository_id <= 0 {
+        return Err(StateError::InvalidRecord {
+            kind: "github job",
+            detail: "installation and repository ids must be positive".into(),
+        });
+    }
+    validate_hash(&job.sha, "github SHA")
+}
+
+fn upsert_github_app_tx(
+    transaction: &Transaction<'_>,
+    app: &GitHubAppRecord,
+    secrets: &GitHubAppSecrets,
+    key: &[u8; NODE_KEY_LEN],
+) -> Result<(), StateError> {
+    transaction.execute("INSERT INTO github_app (id, app_id, client_id, name, html_url, owner, configured_at) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO UPDATE SET app_id=excluded.app_id, client_id=excluded.client_id, name=excluded.name, html_url=excluded.html_url, owner=excluded.owner, configured_at=excluded.configured_at", params![app.app_id, app.client_id, app.name, app.html_url, app.owner, app.configured_at])?;
+    transaction.execute("INSERT INTO github_app_secrets (app_id, client_secret, pem, webhook_secret) VALUES (1, ?1, ?2, ?3) ON CONFLICT(app_id) DO UPDATE SET client_secret=excluded.client_secret, pem=excluded.pem, webhook_secret=excluded.webhook_secret", params![encrypt_secret(key, &secrets.client_secret)?, encrypt_secret(key, &secrets.pem)?, encrypt_secret(key, &secrets.webhook_secret)?])?;
+    Ok(())
+}
+
+fn upsert_github_repository_tx(
+    transaction: &Transaction<'_>,
+    config: &GitHubRepositoryConfig,
+) -> Result<(), StateError> {
+    transaction.execute("INSERT INTO github_repositories (installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1) ON CONFLICT(installation_id, repository_id) DO UPDATE SET owner=excluded.owner, name=excluded.name, branch=excluded.branch, app=excluded.app, domain=excluded.domain, engine_version=excluded.engine_version, entry=excluded.entry, artifact_root=excluded.artifact_root, upstream=excluded.upstream, enabled=1", params![config.installation_id, config.repository_id, config.owner, config.name, config.branch, config.app, config.domain, config.engine_version, config.entry.to_string_lossy(), config.artifact_root.to_string_lossy(), config.upstream.to_string_lossy()])?;
+    Ok(())
+}
+
+fn github_repository_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<GitHubRepositoryConfig, rusqlite::Error> {
+    Ok(GitHubRepositoryConfig {
+        installation_id: row.get(0)?,
+        repository_id: row.get(1)?,
+        owner: row.get(2)?,
+        name: row.get(3)?,
+        branch: row.get(4)?,
+        app: row.get(5)?,
+        domain: row.get(6)?,
+        engine_version: row.get(7)?,
+        entry: PathBuf::from(row.get::<_, String>(8)?),
+        artifact_root: PathBuf::from(row.get::<_, String>(9)?),
+        upstream: PathBuf::from(row.get::<_, String>(10)?),
+    })
+}
+
+fn github_job_kind_name(kind: &GitHubJobKind) -> &'static str {
+    match kind {
+        GitHubJobKind::Production => "production",
+        GitHubJobKind::Preview => "preview",
+    }
+}
+fn github_job_status_name(status: &GitHubDeployJobStatus) -> &'static str {
+    match status {
+        GitHubDeployJobStatus::Queued => "queued",
+        GitHubDeployJobStatus::Running => "running",
+        GitHubDeployJobStatus::Succeeded => "succeeded",
+        GitHubDeployJobStatus::Failed => "failed",
+        GitHubDeployJobStatus::Retry => "retry",
+        GitHubDeployJobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn github_job_from_row(row: &rusqlite::Row<'_>) -> Result<GitHubDeployJob, rusqlite::Error> {
+    let kind: String = row.get(7)?;
+    let status: String = row.get(10)?;
+    let kind = match kind.as_str() {
+        "production" => GitHubJobKind::Production,
+        "preview" => GitHubJobKind::Preview,
+        _ => {
+            return Err(rusqlite::Error::InvalidColumnType(
+                7,
+                "kind".into(),
+                rusqlite::types::Type::Text,
+            ));
+        }
+    };
+    let status = match status.as_str() {
+        "queued" => GitHubDeployJobStatus::Queued,
+        "running" => GitHubDeployJobStatus::Running,
+        "succeeded" => GitHubDeployJobStatus::Succeeded,
+        "failed" => GitHubDeployJobStatus::Failed,
+        "retry" => GitHubDeployJobStatus::Retry,
+        "cancelled" => GitHubDeployJobStatus::Cancelled,
+        _ => {
+            return Err(rusqlite::Error::InvalidColumnType(
+                10,
+                "status".into(),
+                rusqlite::types::Type::Text,
+            ));
+        }
+    };
+    Ok(GitHubDeployJob {
+        id: row.get(0)?,
+        key: row.get(1)?,
+        installation_id: row.get(2)?,
+        repository_id: row.get(3)?,
+        owner: row.get(4)?,
+        name: row.get(5)?,
+        environment: row.get(6)?,
+        kind,
+        pull_request: row.get(8)?,
+        sha: row.get(9)?,
+        status,
+        attempts: row.get::<_, i64>(11)?.try_into().unwrap_or(u32::MAX),
+        next_attempt_at: row.get(12)?,
+        error: row.get(13)?,
+        check_run_id: row.get(14)?,
+        deployment_id: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
+}
+
+fn load_node_key(db_path: &Path) -> Result<[u8; NODE_KEY_LEN], StateError> {
+    let parent = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let key_path = parent.join("node.key");
+    let mut file = match fs::symlink_metadata(&key_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(StateError::InvalidConfig(
+                    "node key must be a regular file".into(),
+                ));
+            }
+            if metadata.permissions().mode() & 0o7777 != 0o600 {
+                return Err(StateError::InvalidConfig(
+                    "node key permissions must be 0600".into(),
+                ));
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&key_path)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut key = [0u8; NODE_KEY_LEN];
+            random_fill(&mut key)
+                .map_err(|error| StateError::Io(std::io::Error::other(error.to_string())))?;
+            let mut options = OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW);
+            match options.open(&key_path) {
+                Ok(mut created) => {
+                    use std::io::Write;
+                    created.write_all(&key)?;
+                    created.sync_all()?;
+                    return Ok(key);
+                }
+                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&key_path)?;
+                    if metadata.file_type().is_symlink()
+                        || !metadata.file_type().is_file()
+                        || metadata.permissions().mode() & 0o7777 != 0o600
+                    {
+                        return Err(StateError::InvalidConfig(
+                            "node key must be a regular 0600 file".into(),
+                        ));
+                    }
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(&key_path)?
+                }
+                Err(create_error) => return Err(StateError::Io(create_error)),
+            }
+        }
+        Err(error) => return Err(StateError::Io(error)),
+    };
+    let metadata = file.metadata()?;
+    if metadata.len() != NODE_KEY_LEN as u64 {
+        return Err(StateError::InvalidConfig(
+            "node key must contain exactly 32 bytes".into(),
+        ));
+    }
+    let mut key = [0u8; NODE_KEY_LEN];
+    file.read_exact(&mut key)?;
+    Ok(key)
+}
+
+fn encrypt_secret(key: &[u8; NODE_KEY_LEN], secret: &str) -> Result<Vec<u8>, StateError> {
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key).map_err(|_| StateError::SecretAuthentication)?;
+    let mut nonce = [0u8; SECRET_NONCE_LEN];
+    random_fill(&mut nonce)
+        .map_err(|error| StateError::Io(std::io::Error::other(error.to_string())))?;
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            chacha20poly1305::aead::Payload {
+                msg: secret.as_bytes(),
+                aad: SECRET_AAD,
+            },
+        )
+        .map_err(|_| StateError::SecretAuthentication)?;
+    let mut result = Vec::with_capacity(SECRET_NONCE_LEN + ciphertext.len());
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+fn decrypt_secret(key: &[u8; NODE_KEY_LEN], blob: &[u8]) -> Result<String, StateError> {
+    if blob.len() < SECRET_NONCE_LEN + 16 {
+        return Err(StateError::SecretAuthentication);
+    }
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key).map_err(|_| StateError::SecretAuthentication)?;
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&blob[..SECRET_NONCE_LEN]),
+            chacha20poly1305::aead::Payload {
+                msg: &blob[SECRET_NONCE_LEN..],
+                aad: SECRET_AAD,
+            },
+        )
+        .map_err(|_| StateError::SecretAuthentication)?;
+    String::from_utf8(plaintext).map_err(|_| StateError::SecretAuthentication)
+}
+
+fn create_github_schema_v4(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS github_app (
+             id INTEGER PRIMARY KEY CHECK (id = 1), app_id TEXT NOT NULL, client_id TEXT NOT NULL,
+             name TEXT NOT NULL, html_url TEXT, owner TEXT, client_secret TEXT NOT NULL,
+             pem TEXT NOT NULL, webhook_secret TEXT NOT NULL,
+             configured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE IF NOT EXISTS github_repositories (
+             installation_id INTEGER NOT NULL, repository_id INTEGER NOT NULL,
+             owner TEXT NOT NULL, name TEXT NOT NULL, branch TEXT NOT NULL, app TEXT NOT NULL,
+             domain TEXT NOT NULL, engine_version TEXT NOT NULL, entry TEXT NOT NULL,
+             artifact_root TEXT NOT NULL, upstream TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+             PRIMARY KEY (installation_id, repository_id)
+         );
+         CREATE TABLE IF NOT EXISTS github_deliveries (
+             delivery_id TEXT PRIMARY KEY, event TEXT NOT NULL, action TEXT,
+             payload_path TEXT NOT NULL, accepted_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS github_deploy_jobs (
+             id TEXT PRIMARY KEY, job_key TEXT NOT NULL, installation_id INTEGER NOT NULL,
+             repository_id INTEGER NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL,
+             environment TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('production','preview')),
+             pull_request INTEGER, sha TEXT NOT NULL, status TEXT NOT NULL
+                CHECK (status IN ('queued','running','succeeded','failed','retry','cancelled')),
+             attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+             error TEXT, check_run_id INTEGER, deployment_id INTEGER,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             UNIQUE(job_key, sha)
+         );
+         CREATE INDEX IF NOT EXISTS github_jobs_due ON github_deploy_jobs(status, next_attempt_at, created_at);
+         CREATE INDEX IF NOT EXISTS github_jobs_key ON github_deploy_jobs(job_key, created_at DESC);
+         CREATE INDEX IF NOT EXISTS github_repositories_enabled ON github_repositories(enabled);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(connection: &Connection, key: &[u8; NODE_KEY_LEN]) -> Result<(), StateError> {
+    create_github_schema_v4(connection)?;
+    let old_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'github_app')",
+        [],
+        |row| row.get(0),
+    )?;
+    let old = if old_exists {
+        connection.execute_batch("ALTER TABLE github_app RENAME TO github_app_v4")?;
+        connection.query_row(
+            "SELECT app_id, client_id, name, html_url, owner, client_secret, pem, webhook_secret, configured_at FROM github_app_v4 WHERE id = 1",
+            [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?))).optional()?
+    } else {
+        None
+    };
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS github_app (
+             id INTEGER PRIMARY KEY CHECK (id = 1), app_id TEXT NOT NULL, client_id TEXT NOT NULL,
+             name TEXT NOT NULL, html_url TEXT, owner TEXT,
+             configured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE IF NOT EXISTS github_app_secrets (
+             app_id INTEGER PRIMARY KEY REFERENCES github_app(id) ON DELETE CASCADE,
+             client_secret BLOB NOT NULL, pem BLOB NOT NULL, webhook_secret BLOB NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS github_repositories_enabled ON github_repositories(enabled);
+         CREATE INDEX IF NOT EXISTS github_jobs_due ON github_deploy_jobs(status, next_attempt_at, created_at);
+         CREATE INDEX IF NOT EXISTS github_jobs_key ON github_deploy_jobs(job_key, created_at DESC);",
+    )?;
+    if let Some((
+        app_id,
+        client_id,
+        name,
+        html_url,
+        owner,
+        client_secret,
+        pem,
+        webhook_secret,
+        configured_at,
+    )) = old
+    {
+        let encrypted_client = encrypt_secret(key, &client_secret)?;
+        let encrypted_pem = encrypt_secret(key, &pem)?;
+        let encrypted_webhook = encrypt_secret(key, &webhook_secret)?;
+        connection.execute(
+            "INSERT OR REPLACE INTO github_app (id, app_id, client_id, name, html_url, owner, configured_at) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![app_id, client_id, name, html_url, owner, configured_at])?;
+        connection.execute(
+            "INSERT OR REPLACE INTO github_app_secrets (app_id, client_secret, pem, webhook_secret) VALUES (1, ?1, ?2, ?3)",
+            params![encrypted_client, encrypted_pem, encrypted_webhook])?;
+    }
+    if old_exists {
+        connection.execute_batch("DROP TABLE github_app_v4")?;
+    }
     Ok(())
 }
 
@@ -3098,11 +3954,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "cygnus-state-{label}-{}-{nonce}-{}.db",
+        let directory = std::env::temp_dir().join(format!(
+            "cygnus-state-{label}-{}-{nonce}-{}",
             std::process::id(),
             TEMP_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        ))
+        ));
+        fs::create_dir_all(&directory).expect("create temporary state directory");
+        directory.join("state.db")
     }
 
     #[test]
@@ -3119,6 +3977,7 @@ mod tests {
             }"#,
         )
         .expect("minimal config parses");
+
         assert_eq!(input.apps[0].seccomp, Some(SeccompMode::Enforce));
         assert_eq!(input.apps[0].limits, LimitsConfig::default());
         assert_eq!(input.apps[0].lifecycle, LifecyclePolicy::default());
@@ -4332,5 +5191,282 @@ mod tests {
         assert_eq!(state.audit_records().unwrap().len(), 2);
         drop(state);
         fs::remove_dir_all(root).unwrap();
+    }
+    fn github_app_fixture() -> (GitHubAppRecord, GitHubAppSecrets) {
+        (
+            GitHubAppRecord {
+                app_id: "123".into(),
+                client_id: "client".into(),
+                name: "Cygnus".into(),
+                html_url: Some("https://github.com/apps/cygnus".into()),
+                owner: Some("acme".into()),
+                configured_at: "2026-01-01T00:00:00Z".into(),
+            },
+            GitHubAppSecrets {
+                client_secret: "client-secret".into(),
+                pem: "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----".into(),
+                webhook_secret: "webhook-secret".into(),
+            },
+        )
+    }
+
+    fn github_repo_fixture() -> GitHubRepositoryConfig {
+        GitHubRepositoryConfig {
+            installation_id: 7,
+            repository_id: 8,
+            owner: "acme".into(),
+            name: "site".into(),
+            branch: "main".into(),
+            app: "site".into(),
+            domain: "site.example.com".into(),
+            engine_version: "bun".into(),
+            entry: "/app/index.js".into(),
+            artifact_root: "/var/lib/cygnus/artifacts/site".into(),
+            upstream: "/run/cygnus/site.sock".into(),
+        }
+    }
+
+    fn github_job_fixture(id: &str, sha: &str) -> GitHubJobSpec {
+        GitHubJobSpec {
+            id: id.into(),
+            key: "installation:7/repository:8/production".into(),
+            installation_id: 7,
+            repository_id: 8,
+            owner: "acme".into(),
+            name: "site".into(),
+            environment: "production".into(),
+            kind: GitHubJobKind::Production,
+            pull_request: None,
+            sha: sha.into(),
+        }
+    }
+
+    #[test]
+    fn github_secrets_are_encrypted_and_reopenable_with_audited_write() {
+        let path = temp_db("github-secrets");
+        let (app, secrets) = github_app_fixture();
+        let audit = audit_context("github-app");
+        let state = {
+            let mut state = State::open(&path).unwrap();
+            state
+                .set_github_app_with_audit(&app, &secrets, &audit)
+                .unwrap();
+            let blobs: (Vec<u8>, Vec<u8>, Vec<u8>) = state.connection.query_row(
+                "SELECT client_secret, pem, webhook_secret FROM github_app_secrets WHERE app_id = 1",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            let joined = blobs
+                .0
+                .iter()
+                .chain(blobs.1.iter())
+                .chain(blobs.2.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(
+                !joined
+                    .windows(b"PRIVATE KEY".len())
+                    .any(|window| window == b"PRIVATE KEY")
+            );
+            assert!(
+                !joined
+                    .windows(b"client-secret".len())
+                    .any(|window| window == b"client-secret")
+            );
+            let loaded = state.github_app_secrets().unwrap().unwrap();
+            assert_eq!(loaded.client_secret, secrets.client_secret);
+            assert_eq!(loaded.pem, secrets.pem);
+            assert_eq!(loaded.webhook_secret, secrets.webhook_secret);
+            state
+        };
+        assert_eq!(state.audit_records().unwrap().len(), 1);
+        drop(state);
+        let key_path = path.parent().unwrap().join("node.key");
+        let metadata = fs::metadata(&key_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let reopened = State::open(&path).unwrap();
+        assert_eq!(reopened.github_app().unwrap().unwrap(), app);
+        let loaded = reopened.github_app_secrets().unwrap().unwrap();
+        assert_eq!(loaded.client_secret, secrets.client_secret);
+        assert_eq!(loaded.pem, secrets.pem);
+        assert_eq!(loaded.webhook_secret, secrets.webhook_secret);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn github_secret_tampering_and_wrong_node_key_are_generic_auth_failures() {
+        let path = temp_db("github-secret-tamper");
+        let (_, secrets) = github_app_fixture();
+        {
+            let mut state = State::open(&path).unwrap();
+            let (app, _) = github_app_fixture();
+            state.set_github_app(&app, &secrets).unwrap();
+            state
+                .connection
+                .execute(
+                    "UPDATE github_app_secrets SET pem = zeroblob(length(pem)) WHERE app_id = 1",
+                    [],
+                )
+                .unwrap();
+            assert!(matches!(
+                state.github_app_secrets(),
+                Err(StateError::SecretAuthentication)
+            ));
+        }
+        let key_path = path.parent().unwrap().join("node.key");
+        let mut wrong = [0u8; NODE_KEY_LEN];
+        wrong[0] = 1;
+        fs::write(&key_path, wrong).unwrap();
+        assert!(matches!(
+            State::open(&path).unwrap().github_app_secrets(),
+            Err(StateError::SecretAuthentication)
+        ));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn github_delivery_jobs_are_idempotent_revision_aware_and_recoverable() {
+        let path = temp_db("github-jobs");
+        let mut state = State::open(&path).unwrap();
+        state
+            .configure_github_repository(&github_repo_fixture())
+            .unwrap();
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let delivery = |id: &str| GitHubDelivery {
+            delivery_id: id.into(),
+            event: "push".into(),
+            action: None,
+            payload_path: format!("/tmp/{id}.json").into(),
+            accepted_at: "2026-01-01T00:00:00Z".into(),
+        };
+        assert!(
+            state
+                .accept_github_delivery(&delivery("d1"), &[github_job_fixture("j1", &first)])
+                .unwrap()
+        );
+        assert!(
+            !state
+                .accept_github_delivery(&delivery("d1"), &[github_job_fixture("j1", &first)])
+                .unwrap()
+        );
+        let running = state.claim_github_job().unwrap().unwrap();
+        assert_eq!(running.id, "j1");
+        assert!(
+            state
+                .accept_github_delivery(&delivery("d2"), &[github_job_fixture("j2", &second)])
+                .unwrap()
+        );
+        state
+            .finish_github_job("j1", GitHubDeployJobStatus::Succeeded, None)
+            .unwrap();
+        assert_eq!(
+            state.github_job("j1").unwrap().unwrap().status,
+            GitHubDeployJobStatus::Running
+        );
+        assert_eq!(
+            state.current_github_job(&running.key).unwrap().unwrap().id,
+            "j2"
+        );
+        let recovered = state.recover_github_jobs().unwrap();
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            state.github_job("j1").unwrap().unwrap().status,
+            GitHubDeployJobStatus::Retry
+        );
+        state.connection.execute("UPDATE github_deploy_jobs SET next_attempt_at = datetime(CURRENT_TIMESTAMP, '-1 second') WHERE id = 'j1'", []).unwrap();
+        assert_eq!(state.claim_github_job().unwrap().unwrap().id, "j2");
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(path.parent().unwrap().join("node.key"));
+    }
+
+    #[test]
+    fn github_installation_suspend_disables_repositories_and_cancels_queued_work() {
+        let path = temp_db("github-suspend");
+        let mut state = State::open(&path).unwrap();
+        state
+            .configure_github_repository(&github_repo_fixture())
+            .unwrap();
+        let spec = github_job_fixture("suspend-job", &"c".repeat(64));
+        let delivery = GitHubDelivery {
+            delivery_id: "suspend-delivery".into(),
+            event: "push".into(),
+            action: None,
+            payload_path: "/tmp/suspend.json".into(),
+            accepted_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.accept_github_delivery(&delivery, &[spec]).unwrap();
+        state
+            .reconcile_github_event("installation", Some("suspend"), 7, &[])
+            .unwrap();
+        assert!(state.github_repository(7, 8).unwrap().is_none());
+        assert_eq!(
+            state.github_job("suspend-job").unwrap().unwrap().status,
+            GitHubDeployJobStatus::Cancelled
+        );
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(path.parent().unwrap().join("node.key"));
+    }
+    #[test]
+    fn migrates_v4_plaintext_github_app_to_encrypted_columns() {
+        let path = temp_db("github-v4-migrate");
+        let (app, secrets) = github_app_fixture();
+        {
+            let connection = Connection::open(&path).unwrap();
+            create_schema(&connection).unwrap();
+            migrate_v1_to_v2(&connection).unwrap();
+            migrate_v2_to_v3(&connection).unwrap();
+            create_github_schema_v4(&connection).unwrap();
+            connection.execute("INSERT INTO github_app (id, app_id, client_id, name, html_url, owner, client_secret, pem, webhook_secret, configured_at) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![app.app_id, app.client_id, app.name, app.html_url, app.owner, secrets.client_secret, secrets.pem, secrets.webhook_secret, app.configured_at]).unwrap();
+            connection
+                .pragma_update(None, "user_version", 4_i32)
+                .unwrap();
+        }
+        let state = State::open(&path).unwrap();
+        assert_eq!(state.github_app().unwrap().unwrap(), app);
+        let loaded = state.github_app_secrets().unwrap().unwrap();
+        assert_eq!(loaded.client_secret, secrets.client_secret);
+        assert_eq!(loaded.pem, secrets.pem);
+        assert_eq!(loaded.webhook_secret, secrets.webhook_secret);
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(b"client-secret".len())
+                .any(|window| window == b"client-secret")
+        );
+        assert!(
+            !raw.windows(b"PRIVATE KEY".len())
+                .any(|window| window == b"PRIVATE KEY")
+        );
+        let key_path = path.parent().unwrap().join("node.key");
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn rejects_node_key_wrong_mode_and_symlink() {
+        let path = temp_db("github-node-key");
+        let state = State::open(&path).unwrap();
+        drop(state);
+        let key_path = path.parent().unwrap().join("node.key");
+        let mut permissions = fs::metadata(&key_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&key_path, permissions).unwrap();
+        assert!(
+            matches!(State::open(&path), Err(StateError::InvalidConfig(message)) if message.contains("permissions"))
+        );
+        fs::remove_file(&key_path).unwrap();
+        let target = path.parent().unwrap().join("key-target");
+        fs::write(&target, [0u8; NODE_KEY_LEN]).unwrap();
+        let mut target_permissions = fs::metadata(&target).unwrap().permissions();
+        target_permissions.set_mode(0o600);
+        fs::set_permissions(&target, target_permissions).unwrap();
+        std::os::unix::fs::symlink(&target, &key_path).unwrap();
+        assert!(
+            matches!(State::open(&path), Err(StateError::InvalidConfig(message)) if message.contains("regular"))
+        );
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(key_path);
+        let _ = fs::remove_file(target);
     }
 }

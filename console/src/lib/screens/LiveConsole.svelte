@@ -11,22 +11,18 @@
   let deployments = $state([]);
   let token = $state('');
   let tokenInput = $state();
-  let deployOpen = $state(false);
   let submitting = $state('');
   let rollbackTarget = $state(null);
-  let deployedRoute = $state('');
-  let mapDomains = $state({});
-  let mapErrors = $state({});
-  let deployError = $state('');
-  let deploy = $state({
-    source_dir: '',
-    app: '',
-    domain: '',
-    engine_version: '',
-    entry: 'index.ts',
-    artifact_root: '',
-    upstream: '',
-  });
+  let github = $state({ configured: false, app: null });
+  let configuredRepos = $state([]);
+  let installationRepos = $state([]);
+  let jobs = $state([]);
+  let githubOwner = $state('');
+  let installationId = $state('');
+  let githubError = $state('');
+  let githubNotice = $state('');
+  let repoErrors = $state({});
+  let repoConfig = $state({});
 
   class ApiError extends Error {
     constructor(message, status, code) {
@@ -70,6 +66,16 @@
       } else {
         phase = 'ready';
         await load();
+        const callback = new URLSearchParams(window.location.search);
+        const githubCallback = callback.get('github');
+        const callbackInstallation = callback.get('installation_id');
+        if (githubCallback === 'configured') githubNotice = 'GitHub App created. Install it, then return to choose repositories.';
+        if (githubCallback === 'setup' && /^\d+$/.test(callbackInstallation ?? '') && Number(callbackInstallation) > 0) {
+          installationId = callbackInstallation;
+          githubNotice = 'GitHub App installed. Reading the selected repositories…';
+          await loadInstallationRepositories();
+        }
+        if (githubCallback) window.history.replaceState({}, '', window.location.pathname);
       }
     } catch (cause) {
       phase = 'locked';
@@ -117,10 +123,34 @@
       deployments = [];
       success = 'Signed out.';
       focusToken();
+      github = { configured: false, app: null };
+      configuredRepos = [];
+      installationRepos = [];
+      jobs = [];
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Logout failed';
     } finally {
       submitting = '';
+    }
+  }
+
+  async function loadGithub() {
+    githubError = '';
+    try {
+      const [statusData, repoData, jobData] = await Promise.all([
+        api('/api/v1/github/status'),
+        api('/api/v1/github/repositories?limit=50'),
+        api('/api/v1/github/jobs?limit=50'),
+      ]);
+      github = { configured: statusData?.configured === true, app: statusData?.app ?? null };
+      configuredRepos = Array.isArray(repoData?.repositories) ? repoData.repositories : [];
+      jobs = Array.isArray(jobData?.jobs) ? jobData.jobs : [];
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        phase = 'signin';
+        focusToken();
+      }
+      githubError = cause instanceof Error ? cause.message : 'GitHub state unavailable';
     }
   }
 
@@ -139,6 +169,7 @@
       for (const app of apps) {
         if (!(app.name in mapDomains)) mapDomains[app.name] = '';
       }
+      await loadGithub();
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 401) {
         phase = 'signin';
@@ -172,24 +203,99 @@
     }
   }
 
-  async function submitDeploy(event) {
+  async function connectGithub(event) {
     event.preventDefault();
     if (submitting) return;
-    deployError = '';
-    success = '';
-    deployedRoute = '';
-    submitting = 'deploy';
+    submitting = 'github-connect';
+    githubError = '';
+    githubNotice = '';
     try {
-      await api('/api/v1/deploy', {
-        method: 'POST',
-        body: JSON.stringify({ request: { ...deploy } }),
-      });
-      deployedRoute = deploy.domain;
-      success = `Deploy submitted for ${deploy.app}. Refreshing node state…`;
-      deployOpen = false;
-      await load();
+      const body = githubOwner.trim() ? JSON.stringify({ owner: githubOwner.trim() }) : JSON.stringify({});
+      const result = await api('/api/v1/github/manifest', { method: 'POST', body });
+      if (!result?.action || !result?.manifest) throw new Error('GitHub setup link was incomplete');
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = result.action;
+      form.hidden = true;
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'manifest';
+      input.value = JSON.stringify(result.manifest);
+      form.append(input);
+      document.body.append(form);
+      form.submit();
     } catch (cause) {
-      deployError = cause instanceof Error ? cause.message : 'Deploy failed';
+      githubError = cause instanceof Error ? cause.message : 'GitHub setup could not start';
+    } finally {
+      submitting = '';
+    }
+  }
+
+  async function loadInstallationRepositories(event) {
+    event.preventDefault();
+    if (submitting) return;
+    const id = installationId.trim();
+    if (!/^\d+$/u.test(id) || Number(id) <= 0) {
+      githubError = 'Enter the positive installation ID from GitHub.';
+      return;
+    }
+    submitting = 'github-repositories';
+    githubError = '';
+    try {
+      const result = await api(`/api/v1/github/installations/${encodeURIComponent(id)}/repositories`);
+      installationRepos = Array.isArray(result?.repositories) ? result.repositories : [];
+      githubNotice = installationRepos.length ? `${installationRepos.length} repositories available to configure.` : 'No repositories are available to this installation.';
+      for (const repo of installationRepos) {
+        if (!repoConfig[repo.repository_id]) repoConfig[repo.repository_id] = { app: repo.name, domain: '', engine_version: 'bun', entry: 'index.ts' };
+      }
+    } catch (cause) {
+      githubError = cause instanceof Error ? cause.message : 'Repository discovery failed';
+    } finally {
+      submitting = '';
+    }
+  }
+
+  async function configureRepository(event, repo) {
+    event.preventDefault();
+    if (submitting) return;
+    const draft = repoConfig[repo.repository_id] ?? {};
+    const key = `repo:${repo.repository_id}`;
+    repoErrors[repo.repository_id] = '';
+    submitting = key;
+    try {
+      await api('/api/v1/github/repositories', {
+        method: 'POST',
+        body: JSON.stringify({
+          installation_id: repo.installation_id,
+          repository_id: repo.repository_id,
+          owner: repo.owner,
+          name: repo.name,
+          branch: repo.default_branch,
+          app: draft.app ?? repo.name,
+          domain: draft.domain ?? '',
+          engine_version: draft.engine_version ?? 'bun',
+          entry: draft.entry ?? 'index.ts',
+        }),
+      });
+      githubNotice = `Mapped ${repo.full_name ?? `${repo.owner}/${repo.name}`} to Tenant Zero.`;
+      await loadGithub();
+    } catch (cause) {
+      repoErrors[repo.repository_id] = cause instanceof Error ? cause.message : 'Repository configuration failed';
+    } finally {
+      submitting = '';
+    }
+  }
+
+  async function retryJob(job) {
+    if (submitting) return;
+    submitting = `retry:${job.id}`;
+    githubError = '';
+    try {
+      await api(`/api/v1/github/jobs/${encodeURIComponent(job.id)}/retry`, { method: 'POST' });
+      githubNotice = `Retry queued for ${job.name}.`;
+      await loadGithub();
+    } catch (cause) {
+      githubError = cause instanceof Error ? cause.message : 'Retry could not be queued';
     } finally {
       submitting = '';
     }
@@ -227,14 +333,6 @@
     }
   }
 
-  function openDeploy(app = null) {
-    deployOpen = true;
-    if (app) {
-      deploy.app = app.name;
-      deploy.domain = app.domains?.[0] ?? '';
-      deploy.engine_version = app.active?.engine_version ?? deploy.engine_version;
-    }
-  }
 
   function shortHash(value) {
     return value ? `${value.slice(0, 10)}…${value.slice(-6)}` : '—';
@@ -295,37 +393,73 @@
     </header>
 
     {#if success}
-      <section class="success" role="status" aria-live="polite">{success}{#if deployedRoute} <a href={`http://${deployedRoute}`}>{deployedRoute}</a>{/if}</section>
+      <section class="success" role="status" aria-live="polite">{success}</section>
     {/if}
     {#if error}
       <section class="fault" role="alert"><strong>Live state unavailable.</strong><span>{error}</span><button onclick={load} disabled={!!submitting}>Retry</button></section>
     {/if}
 
-    {#if apps.length === 0 && !loading}
-      <section class="panel onboarding" aria-labelledby="onboarding-title">
-        <div class="panel-head"><div><p class="eyebrow">FIRST APP</p><h2 id="onboarding-title">Connect a host project</h2></div><span class="count num">1 / 1</span></div>
-        <p class="onboarding-copy">Deploy your first app from an absolute host source path, then map its live route.</p>
-        <button class="primary" onclick={() => openDeploy()} disabled={!!submitting}>Deploy first app</button>
-      </section>
-    {/if}
-
-    {#if deployOpen}
-      <section class="panel form-panel" aria-labelledby="deploy-title">
-        <div class="panel-head"><div><p class="eyebrow">AUDITED DEPLOY</p><h2 id="deploy-title">Deploy from host</h2></div><button onclick={() => (deployOpen = false)} disabled={!!submitting}>Close</button></div>
-        <form onsubmit={submitDeploy} class="deploy-form">
-          <label>Source directory <input bind:value={deploy.source_dir} placeholder="/Users/me/project" required /></label>
-          <label>App <input bind:value={deploy.app} placeholder="my-app" maxlength="64" required /></label>
-          <label>Domain <input bind:value={deploy.domain} placeholder="my-app.localhost" maxlength="253" required /></label>
-          <label>Engine version <input bind:value={deploy.engine_version} placeholder="bun-1.2.3" maxlength="128" required /></label>
-          <label>Entry <input bind:value={deploy.entry} placeholder="index.ts" maxlength="4096" required /></label>
-          <label>Artifact root <input bind:value={deploy.artifact_root} placeholder="/var/lib/cygnus/artifacts" required /></label>
-          <label>Upstream socket <input bind:value={deploy.upstream} placeholder="/run/cygnus/my-app.sock" required /></label>
-          {#if deployError}<p class="inline-error" role="alert">{deployError}</p>{/if}
-          <div class="form-actions"><button class="primary" type="submit" disabled={!!submitting}>{submitting === 'deploy' ? 'Deploying…' : 'Deploy app'}</button></div>
+    <section class="panel github-panel" aria-labelledby="github-title">
+      <div class="panel-head"><div><p class="eyebrow">GITHUB APP</p><h2 id="github-title">Connect Tenant Zero</h2></div><span class="count num">{github.configured ? 'CONNECTED' : 'STEP 1 / 3'}</span></div>
+      {#if !github.configured}
+        <p class="onboarding-copy">Create the private Cygnus GitHub App, install it on the repositories you want to deploy, then return here to map one branch.</p>
+        <form class="github-start" onsubmit={connectGithub}>
+          <label for="github-owner">Organization (optional)<input id="github-owner" bind:value={githubOwner} maxlength="39" placeholder="acme" autocomplete="organization" /></label>
+          <p class="fine">Leave blank for a personal GitHub account. The browser receives only the public manifest; secrets stay in the daemon.</p>
+          {#if githubError}<p class="inline-error" role="alert">{githubError}</p>{/if}
+          <button class="primary" type="submit" disabled={!!submitting}>{submitting === 'github-connect' ? 'Opening GitHub…' : 'Connect with GitHub'}</button>
         </form>
+      {:else}
+        <div class="github-connected">
+          <div><span class="state state-ready"><i></i>app configured</span><strong>{github.app?.name ?? 'Cygnus Tenant Zero'}</strong><small>{github.app?.owner ?? 'GitHub owner not reported'} · {github.app?.html_url ?? 'private app'}</small></div>
+          <p class="fine">Install the app from GitHub, then paste its installation ID to discover the repositories selected there.</p>
+        </div>
+        <form class="installation-form" onsubmit={loadInstallationRepositories}>
+          <label for="installation-id">Installation ID<input id="installation-id" bind:value={installationId} inputmode="numeric" pattern="[0-9]+" required placeholder="12345678" /></label>
+          <button class="primary" type="submit" disabled={!!submitting}>{submitting === 'github-repositories' ? 'Discovering…' : 'Discover repositories'}</button>
+        </form>
+        {#if installationRepos.length}
+          <div class="repo-list" aria-label="Installation repositories">
+            <div class="repo-list-head"><span>AVAILABLE REPOSITORIES</span><span>{installationRepos.length} shown</span></div>
+            {#each installationRepos as repo (repo.repository_id)}
+              {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: '', engine_version: 'bun', entry: 'index.ts' }}
+              <form class="repo-row" onsubmit={(event) => configureRepository(event, repo)}>
+                <div class="repo-identity"><strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong><small>{repo.private ? 'private' : 'public'} · default {repo.default_branch}</small></div>
+                <label>App<input value={draft.app} oninput={(event) => (repoConfig[repo.repository_id].app = event.currentTarget.value)} maxlength="64" required /></label>
+                <label>Domain<input value={draft.domain} oninput={(event) => (repoConfig[repo.repository_id].domain = event.currentTarget.value)} maxlength="253" placeholder="app.example.com" required /></label>
+                <label>Engine<input value={draft.engine_version} oninput={(event) => (repoConfig[repo.repository_id].engine_version = event.currentTarget.value)} maxlength="128" required /></label>
+                <label>Entry<input value={draft.entry} oninput={(event) => (repoConfig[repo.repository_id].entry = event.currentTarget.value)} maxlength="4096" required /></label>
+                <button class="primary" type="submit" disabled={!!submitting}>{submitting === `repo:${repo.repository_id}` ? 'Saving…' : 'Map repository'}</button>
+                {#if repoErrors[repo.repository_id]}<p class="inline-error" role="alert">{repoErrors[repo.repository_id]}</p>{/if}
+              </form>
+            {/each}
+          </div>
+        {:else}
+          <p class="empty">No installation repositories loaded yet. Discovery respects the selection made in GitHub.</p>
+        {/if}
+      {/if}
+    </section>
+    {#if githubNotice}<section class="success" role="status" aria-live="polite">{githubNotice}</section>{/if}
+    {#if githubError && github.configured}<section class="fault" role="alert"><strong>GitHub state unavailable.</strong><span>{githubError}</span><button onclick={loadGithub} disabled={!!submitting}>Retry</button></section>{/if}
+
+    {#if jobs.length || github.configured}
+      <section class="panel jobs-panel" aria-labelledby="jobs-title">
+        <div class="panel-head"><div><p class="eyebrow">WEBHOOK DELIVERY</p><h2 id="jobs-title">Deploy jobs</h2></div><span class="count num">{jobs.length} shown</span></div>
+        {#if jobs.length === 0}<p class="empty">No webhook jobs yet. Push the default branch or open a pull request after mapping a repository.</p>{:else}
+          <div class="table-wrap"><table><thead><tr><th>Repository</th><th>Environment</th><th>Revision</th><th>State</th><th>Attempts</th><th>Action</th></tr></thead><tbody>
+            {#each jobs as job (job.id)}
+              <tr>
+                <td><strong>{job.owner}/{job.name}</strong><small>{job.kind}{#if job.pull_request} · PR #{job.pull_request}{/if}</small></td>
+                <td>{job.environment}</td>
+                <td><code>{shortHash(job.sha)}</code></td>
+                <td><span class="state state-{job.status}"><i></i>{job.status}</span>{#if job.error}<p class="deploy-error">{job.error}</p>{/if}</td>
+                <td class="num">{job.attempts}</td>
+                <td>{#if ['failed', 'cancelled'].includes(job.status)}<button onclick={() => retryJob(job)} disabled={!!submitting}>{submitting === `retry:${job.id}` ? 'Retrying…' : 'Retry job'}</button>{:else}<span class="muted">—</span>{/if}</td>
+              </tr>
+            {/each}
+          </tbody></table></div>
+        {/if}
       </section>
-    {:else if apps.length > 0}
-      <button class="deploy-toggle" onclick={() => openDeploy()} disabled={!!submitting}>+ Deploy another app</button>
     {/if}
 
     {#if loading && !status}
@@ -340,7 +474,7 @@
 
       <section class="panel">
         <div class="panel-head"><div><p class="eyebrow">RUNTIME FLEET</p><h2>Apps</h2></div><span class="count num">{apps.length} shown</span></div>
-        {#if apps.length === 0}<p class="empty">No apps are registered yet. Deploy from a host source path above.</p>{:else}
+        {#if apps.length === 0}<p class="empty">No runtime apps are registered yet. Configure a GitHub repository above to create the first deployment.</p>{:else}
           <div class="table-wrap"><table><thead><tr><th>App</th><th>State</th><th>Routes</th><th>Policy</th><th>Active artifact</th><th>Map domain</th></tr></thead><tbody>
             {#each apps as app (app.name)}
               <tr>
@@ -399,7 +533,6 @@
   .state-building i, .state-booting i { background: var(--amber); }
   .success, .fault, .confirm { margin-top: 18px; border-radius: 10px; padding: 14px 18px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; line-height: 1.45; }
   .success { border: 1px solid color-mix(in srgb, var(--green) 35%, var(--line)); color: var(--green); }
-  .success a { color: inherit; overflow-wrap: anywhere; }
   .fault { border: 1px solid color-mix(in srgb, var(--red) 35%, var(--line)); color: var(--red); }
   .fault span { color: var(--ink-3); overflow-wrap: anywhere; }
   .fault button { margin-left: auto; }
@@ -429,24 +562,38 @@
   .deploy-grid p { margin: 10px 0 0; color: var(--ink-3); font-size: 10px; }
   .deploy-grid .deploy-error, .inline-error { color: var(--red); }
   .rollback { margin-top: 16px; padding: 7px 10px; font-size: 10px; }
+  .github-panel { border-color: color-mix(in srgb, var(--blue) 28%, var(--line)); }
+  .github-start, .installation-form { display: grid; gap: 14px; padding: 22px 24px 24px; }
+  .github-start { max-width: 620px; }
+  .github-start .primary { justify-self: start; }
+  .github-connected { display: grid; gap: 8px; padding: 22px 24px 0; }
+  .github-connected strong { display: block; margin-top: 9px; font-size: 18px; }
+  .github-connected small { display: block; margin-top: 5px; color: var(--ink-4); overflow-wrap: anywhere; }
+  .installation-form { grid-template-columns: minmax(180px, 320px) auto; align-items: end; }
+  .repo-list { border-top: 1px solid var(--line); }
+  .repo-list-head { display: flex; justify-content: space-between; gap: 16px; padding: 14px 24px; color: var(--ink-4); font: 600 9px var(--mono); letter-spacing: .1em; }
+  .repo-row { display: grid; grid-template-columns: minmax(150px, 1.2fr) repeat(4, minmax(105px, 1fr)) auto; gap: 12px; align-items: end; padding: 18px 24px; border-top: 1px solid var(--line); }
+  .repo-row label { min-width: 0; }
+  .repo-row input { min-width: 0; }
+  .repo-identity { min-width: 0; align-self: center; }
+  .repo-identity strong, .repo-identity small { display: block; overflow-wrap: anywhere; }
+  .repo-identity small { margin-top: 6px; color: var(--ink-4); font-size: 10px; }
+  .repo-row .inline-error { grid-column: 1 / -1; }
+  .jobs-panel .state { white-space: nowrap; }
   footer { margin-top: 22px; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
-  .auth-form, .deploy-form { display: grid; gap: 14px; margin-top: 26px; }
+  .auth-form { display: grid; gap: 14px; margin-top: 26px; }
   label { display: grid; gap: 7px; color: var(--ink-2); font: 600 10px var(--mono); text-transform: uppercase; letter-spacing: .04em; }
   input { width: 100%; box-sizing: border-box; border: 1px solid var(--line-2); border-radius: 7px; background: var(--paper); color: var(--ink-1); padding: 11px 12px; font: 12px var(--mono); }
-  input:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-  .deploy-form { grid-template-columns: repeat(2, 1fr); padding: 22px 24px 24px; }
-  .deploy-form .inline-error, .deploy-form .form-actions { grid-column: 1 / -1; }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
   .inline-error { margin: 3px 0 0; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
   .map-form { display: flex; gap: 6px; min-width: 220px; }
   .map-form input { min-width: 0; padding: 8px 9px; font-size: 10px; }
   .map-form button { padding: 8px 10px; }
   .onboarding { padding-bottom: 22px; }
   .onboarding-copy { margin: 20px 24px; color: var(--ink-3); font-size: 13px; line-height: 1.5; }
-  .onboarding > .primary { margin-left: 24px; }
-  .deploy-toggle { margin-top: 18px; }
   .confirm { justify-content: space-between; border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--line)); background: color-mix(in srgb, var(--amber) 8%, var(--paper)); }
   .confirm p:not(.eyebrow) { max-width: 660px; margin: 8px 0 0; color: var(--ink-3); font-size: 12px; line-height: 1.5; }
-  @media (max-width: 900px) { .live-shell { width: min(100% - 28px, 720px); padding-top: 28px; } .mast { align-items: flex-start; flex-direction: column; } .metrics { grid-template-columns: repeat(2, 1fr); } .metrics article:nth-child(2) { border-right: 0; } .deploy-grid { grid-template-columns: 1fr; } .deploy-grid article { border-right: 0; } }
-  @media (max-width: 560px) { .mast-actions { width: 100%; justify-content: flex-start; } .metrics { grid-template-columns: 1fr; } .metrics article { border-right: 0; border-bottom: 1px solid var(--line); } .deploy-form { grid-template-columns: 1fr; padding: 18px; } .deploy-form .inline-error, .deploy-form .form-actions { grid-column: auto; } .panel-head { padding: 18px; } .onboarding-copy { margin-inline: 18px; } .onboarding > .primary { margin-left: 18px; } }
+  @media (max-width: 900px) { .live-shell { width: min(100% - 28px, 720px); padding-top: 28px; } .mast { align-items: flex-start; flex-direction: column; } .metrics { grid-template-columns: repeat(2, 1fr); } .metrics article:nth-child(2) { border-right: 0; } .deploy-grid { grid-template-columns: 1fr; } .deploy-grid article { border-right: 0; } .repo-row { grid-template-columns: repeat(2, minmax(0, 1fr)); } .repo-identity, .repo-row .primary, .repo-row .inline-error { grid-column: 1 / -1; } }
+  @media (max-width: 560px) { .mast-actions { width: 100%; justify-content: flex-start; } .metrics { grid-template-columns: 1fr; } .metrics article { border-right: 0; border-bottom: 1px solid var(--line); } .installation-form { grid-template-columns: 1fr; } .repo-row { grid-template-columns: 1fr; padding-inline: 18px; } .repo-identity, .repo-row .primary, .repo-row .inline-error { grid-column: auto; } .panel-head { padding: 18px; } .onboarding-copy, .github-start, .installation-form, .github-connected { margin-inline: 0; padding-inline: 18px; } .repo-list-head { padding-inline: 18px; } }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; } }
 </style>
