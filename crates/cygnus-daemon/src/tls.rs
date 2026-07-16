@@ -5,7 +5,9 @@ use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::ingress::BodyGuard;
 use arc_swap::ArcSwap;
 use cygnus_router::normalize_host;
 use rustls::crypto::ring::default_provider;
@@ -18,6 +20,7 @@ use crate::edge::CertificateRecord;
 
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const TLS_BUFFER_LIMIT: usize = 256 * 1024;
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -130,15 +133,22 @@ impl ResolvesServerCert for CertificateResolver {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TlsRelayStats {
+    pub to_upstream: u64,
+    pub to_client: u64,
+}
+
 pub(crate) fn relay_tls(
     mut connection: ServerConnection,
     mut client: TcpStream,
     mut upstream: UnixStream,
-) -> io::Result<()> {
+    mut body_guard: BodyGuard,
+) -> io::Result<TlsRelayStats> {
     client.set_nonblocking(true)?;
     upstream.set_nonblocking(true)?;
 
-    let mut client_closed = false;
+    let mut client_closed = body_guard.is_complete();
     let mut upstream_closed = false;
     let mut upstream_write_closed = false;
     let mut close_notify_sent = false;
@@ -147,6 +157,8 @@ pub(crate) fn relay_tls(
     let mut to_client = Vec::new();
     let mut to_client_offset = 0;
     let mut buffer = [0_u8; RELAY_BUFFER_BYTES];
+    let mut stats = TlsRelayStats::default();
+    let mut last_progress = Instant::now();
 
     loop {
         let mut progressed = false;
@@ -174,6 +186,13 @@ pub(crate) fn relay_tls(
             match connection.reader().read(&mut buffer) {
                 Ok(0) => {}
                 Ok(read) => {
+                    body_guard.observe(&buffer[..read]).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("request body rejected: {error:?}"),
+                        )
+                    })?;
+                    client_closed = body_guard.is_complete();
                     to_upstream.extend_from_slice(&buffer[..read]);
                     progressed = true;
                 }
@@ -187,6 +206,7 @@ pub(crate) fn relay_tls(
                 Ok(0) => upstream_closed = true,
                 Ok(written) => {
                     to_upstream_offset += written;
+                    stats.to_upstream += written as u64;
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -240,6 +260,7 @@ pub(crate) fn relay_tls(
                 Ok(0) => {}
                 Ok(written) => {
                     to_client_offset += written;
+                    stats.to_client += written as u64;
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -274,10 +295,18 @@ pub(crate) fn relay_tls(
 
         if close_notify_sent && !connection.wants_write() {
             let _ = client.shutdown(Shutdown::Write);
-            return Ok(());
+            return Ok(stats);
         }
         if client_closed && upstream_closed && !connection.wants_write() {
-            return Ok(());
+            return Ok(stats);
+        }
+        if progressed {
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= RELAY_IDLE_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS relay idle timeout",
+            ));
         }
         if !progressed {
             wait_for_io(
@@ -432,7 +461,7 @@ mod tests {
             stream.read_exact(&mut request).unwrap();
             relay_upstream.write_all(&request).unwrap();
             let (connection, client) = stream.into_parts();
-            relay_tls(connection, client, relay_upstream).unwrap();
+            relay_tls(connection, client, relay_upstream, BodyGuard::none()).unwrap();
         });
         let upstream = thread::spawn(move || {
             let mut request = [0_u8; 4];

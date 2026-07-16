@@ -609,8 +609,10 @@ mod tests {
         RequestHead {
             method: "GET".into(),
             target: target.into(),
+            version: "HTTP/1.1".into(),
             host: Some(host.into()),
             head_len: 0,
+            body: cygnus_router::BodyFraming::None,
         }
     }
 
