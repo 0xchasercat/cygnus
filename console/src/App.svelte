@@ -1,4 +1,5 @@
 <script>
+  import { onMount } from 'svelte';
   import { ui } from './lib/stores.svelte.js';
   import Nav from './lib/components/Nav.svelte';
   import TopBar from './lib/components/TopBar.svelte';
@@ -11,6 +12,7 @@
   import Observe from './lib/screens/Observe.svelte';
   import NodeScreen from './lib/screens/NodeScreen.svelte';
   import SettingsScreen from './lib/screens/SettingsScreen.svelte';
+  import LiveConsole from './lib/screens/LiveConsole.svelte';
 
   const SCREENS = {
     overview: Overview,
@@ -24,6 +26,17 @@
 
   const Screen = $derived(SCREENS[ui.screen] ?? Overview);
   const screenKey = $derived(`${ui.screen}·${ui.appId ?? ''}·${ui.deployId ?? ''}`);
+  let dataMode = $state('loading');
+
+  onMount(async () => {
+    try {
+      const response = await fetch('/healthz', { headers: { accept: 'application/json' } });
+      const health = await response.json();
+      dataMode = response.ok && health.mode === 'live' ? 'live' : 'preview';
+    } catch {
+      dataMode = 'preview';
+    }
+  });
 
   function onKeydown(e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -40,24 +53,30 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="canvas-marks"></div>
+{#if dataMode === 'live'}
+  <LiveConsole />
+{:else if dataMode === 'preview'}
+  <div class="canvas-marks"></div>
 
-<div class="shell">
-  <Nav />
-  <TopBar />
-  <main>
-    {#key screenKey}
-      <Screen />
-    {/key}
-  </main>
+  <div class="shell">
+    <Nav />
+    <TopBar />
+    <main>
+      {#key screenKey}
+        <Screen />
+      {/key}
+    </main>
 
-  <footer class="colophon num">
-    cygnus 0.9.2 · AGPL-3.0 · your hardware, your swan
-  </footer>
-</div>
+    <footer class="colophon num">
+      preview dataset · cygnus 0.9.2 · no daemon connection
+    </footer>
+  </div>
 
-<Palette />
-<ShipModal />
+  <Palette />
+  <ShipModal />
+{:else}
+  <div class="loading num">LOCATING TENANT ZERO…</div>
+{/if}
 
 <style>
   .shell {

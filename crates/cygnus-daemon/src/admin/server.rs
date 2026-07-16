@@ -25,10 +25,21 @@ pub enum AdminRole {
     Host,
     TenantZero,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdminPeerCredentials {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub pid: Option<u32>,
+}
 
 /// The state-backed implementation of the admin protocol.
 pub trait AdminHandler: Send + Sync + 'static {
-    fn handle(&self, role: AdminRole, request: AdminRequest) -> AdminResponse;
+    fn handle(
+        &self,
+        role: AdminRole,
+        peer: AdminPeerCredentials,
+        request: AdminRequest,
+    ) -> AdminResponse;
 }
 
 pub const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +47,7 @@ pub const DEFAULT_ADMIN_WORKERS: usize = 4;
 pub const DEFAULT_ADMIN_QUEUE_CAPACITY: usize = 64;
 pub const MAX_ADMIN_ACTOR_BYTES: usize = 128;
 pub const MAX_ADMIN_APP_BYTES: usize = 128;
+pub const MAX_ADMIN_DOMAIN_BYTES: usize = 253;
 pub const MAX_ADMIN_DEPLOYMENT_BYTES: usize = 128;
 pub const MAX_ADMIN_LIST_LIMIT: u16 = 50;
 
@@ -403,7 +415,22 @@ fn serve_connection(stream: &mut UnixStream, role: AdminRole, handler: &dyn Admi
         return;
     }
 
-    let response = handler.handle(role, request);
+    let peer = match peer_credentials(stream) {
+        Ok(peer) => peer,
+        Err(_) => {
+            let _ = write_frame(
+                stream,
+                &AdminResponse::error(
+                    request.request_id,
+                    AdminErrorCode::Unauthorized,
+                    "admin peer credentials unavailable",
+                ),
+            );
+            return;
+        }
+    };
+
+    let response = handler.handle(role, peer, request);
     let _ = write_frame(stream, &response);
 }
 
@@ -434,6 +461,23 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         }
         AdminCommand::GetDeployment { deployment } => {
             validate_text(deployment, MAX_ADMIN_DEPLOYMENT_BYTES, "deployment")?;
+        }
+        AdminCommand::MapDomain { app, domain } => {
+            validate_text(app, MAX_ADMIN_APP_BYTES, "app")?;
+            validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+        }
+        AdminCommand::Rollback {
+            app,
+            deployment,
+            expected_active_artifact,
+        } => {
+            validate_text(app, MAX_ADMIN_APP_BYTES, "app")?;
+            validate_text(deployment, MAX_ADMIN_DEPLOYMENT_BYTES, "deployment")?;
+            if !valid_sha256(expected_active_artifact) {
+                return Err(
+                    "expected_active_artifact must be 64 lowercase hexadecimal characters".into(),
+                );
+            }
         }
         AdminCommand::ReadLog {
             deployment, limit, ..
@@ -497,11 +541,16 @@ fn validate_text(value: &str, max_bytes: usize, field: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Check the peer effective UID where the host operating system exposes it.
-/// Unsupported Unix platforms are permitted rather than guessing an identity.
-fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Read peer credentials where the host exposes them.
+fn peer_credentials(stream: &UnixStream) -> io::Result<AdminPeerCredentials> {
     let fd = stream.as_raw_fd();
-    let daemon_uid = unsafe { libc::geteuid() };
 
     #[cfg(target_os = "linux")]
     {
@@ -520,11 +569,14 @@ fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
                 &mut length,
             )
         };
-        if result == 0 {
-            Ok(credentials.uid == daemon_uid)
-        } else {
-            Err(io::Error::last_os_error())
+        if result != 0 {
+            return Err(io::Error::last_os_error());
         }
+        return Ok(AdminPeerCredentials {
+            uid: Some(credentials.uid),
+            gid: Some(credentials.gid),
+            pid: u32::try_from(credentials.pid).ok(),
+        });
     }
 
     #[cfg(any(
@@ -539,11 +591,14 @@ fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
         let mut uid = 0;
         let mut gid = 0;
         let result = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
-        if result == 0 {
-            Ok(uid == daemon_uid)
-        } else {
-            Err(io::Error::last_os_error())
+        if result != 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(AdminPeerCredentials {
+            uid: Some(uid),
+            gid: Some(gid),
+            pid: None,
+        })
     }
 
     #[cfg(not(any(
@@ -556,9 +611,17 @@ fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
         target_os = "dragonfly"
     )))]
     {
-        let _ = (fd, daemon_uid);
-        Ok(true)
+        let _ = fd;
+        Ok(AdminPeerCredentials::default())
     }
+}
+
+/// Check the peer effective UID where the host operating system exposes it.
+fn peer_uid_matches(stream: &UnixStream) -> io::Result<bool> {
+    let daemon_uid = unsafe { libc::geteuid() };
+    Ok(peer_credentials(stream)?
+        .uid
+        .is_none_or(|uid| uid == daemon_uid))
 }
 
 #[cfg(test)]
@@ -575,7 +638,12 @@ mod tests {
     }
 
     impl AdminHandler for TestHandler {
-        fn handle(&self, _role: AdminRole, _request: AdminRequest) -> AdminResponse {
+        fn handle(
+            &self,
+            _role: AdminRole,
+            _peer: AdminPeerCredentials,
+            _request: AdminRequest,
+        ) -> AdminResponse {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.response.clone()
         }

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use super::protocol::{AdminRequest, AdminResponse, read_frame, write_frame};
 use super::server::ADMIN_IO_TIMEOUT;
+#[cfg(test)]
+use super::server::AdminPeerCredentials;
 
 const ZERO_REQUEST_ID: &str = "00000000000000000000000000000000";
 
@@ -120,7 +122,12 @@ mod tests {
     }
 
     impl AdminHandler for Handler {
-        fn handle(&self, _role: AdminRole, request: AdminRequest) -> AdminResponse {
+        fn handle(
+            &self,
+            _role: AdminRole,
+            _peer: AdminPeerCredentials,
+            request: AdminRequest,
+        ) -> AdminResponse {
             self.calls.fetch_add(1, Ordering::Relaxed);
             AdminResponse::ok(
                 request.request_id,

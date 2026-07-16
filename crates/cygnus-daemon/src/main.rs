@@ -12,14 +12,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use cygnus_cage::{Cage, CageSpec};
+use cygnus_cage::{ADMIN_CAGE_DIR, ADMIN_SOCKET_FILENAME, AdminSocketSpec, Cage, CageSpec};
 use cygnus_daemon::Frontend;
 use cygnus_daemon::admin::{
-    AdminBinding, AdminHandler, AdminRole, AdminServer, DEFAULT_HOST_ADMIN_SOCKET,
-    StateAdminHandler,
+    ActiveDeploymentView, AdminBinding, AdminData, AdminErrorCode, AdminHandler, AdminMutation,
+    AdminMutationError, AdminMutationHandler, AdminRole, AdminServer, DEFAULT_HOST_ADMIN_SOCKET,
+    DEFAULT_TENANT_ADMIN_SOCKET, StateAdminHandler,
 };
 use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
-use cygnus_daemon::state::{DEFAULT_STATE_PATH, LoadedApp, NodeConfig, State};
+use cygnus_daemon::state::{
+    AuditContext, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State, StateError,
+};
 use cygnus_router::{Route, RouteTable, Router};
 use cygnus_supervisor::{LifecycleState, Supervisor};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -33,6 +36,9 @@ struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_STATE_PATH)]
     state: PathBuf,
 
+    /// Daemon-owned endpoint mounted read-only into Tenant Zero.
+    #[arg(long, global = true, default_value = DEFAULT_TENANT_ADMIN_SOCKET)]
+    tenant_admin_socket: PathBuf,
     /// Root-only local administration socket.
     #[arg(long, global = true, default_value = DEFAULT_HOST_ADMIN_SOCKET)]
     admin_socket: PathBuf,
@@ -102,10 +108,9 @@ fn main() -> ExitCode {
         }
     }
 }
-
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve(&cli.state, &cli.admin_socket),
+        Command::Serve => serve(&cli.state, &cli.admin_socket, &cli.tenant_admin_socket),
         Command::Apply { config } => apply(&cli.state, &config),
         Command::Engine { command } => engine_command(&cli.state, command),
         Command::Deploy {
@@ -167,22 +172,214 @@ fn apply(state_path: &Path, config_path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn serve(state_path: &Path, admin_socket: &Path) -> Result<(), Box<dyn Error>> {
+struct LiveAdminMutations {
+    state_path: PathBuf,
+    supervisor: Arc<Supervisor<Cage>>,
+    router: Arc<Router>,
+    tenant_admin_socket: PathBuf,
+}
+
+impl AdminMutationHandler for LiveAdminMutations {
+    fn execute(
+        &self,
+        mutation: AdminMutation,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        match mutation {
+            AdminMutation::MapDomain { app, domain } => self.map_domain(&app, &domain, audit),
+            AdminMutation::Rollback {
+                app,
+                deployment,
+                expected_active_artifact,
+            } => self.rollback(&app, &deployment, &expected_active_artifact, audit),
+        }
+    }
+}
+
+impl LiveAdminMutations {
+    fn map_domain(
+        &self,
+        app: &str,
+        domain: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let snapshot = state.load().map_err(map_admin_state_error)?;
+        let loaded = snapshot
+            .apps
+            .iter()
+            .find(|candidate| candidate.name == app)
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::NotFound, "app does not exist")
+            })?;
+        let mut routes = route_table(&snapshot);
+        let canonical = state
+            .map_domain(app, domain, audit)
+            .map_err(map_admin_state_error)?;
+        routes.insert(
+            &canonical,
+            Route {
+                app: loaded.spec.name.clone(),
+                upstream: loaded.upstream.clone(),
+            },
+        );
+        drop(self.router.install(routes));
+        Ok(AdminData::DomainMapped {
+            app: app.to_owned(),
+            domain: canonical,
+        })
+    }
+
+    fn rollback(
+        &self,
+        app: &str,
+        deployment: &str,
+        expected_active_artifact: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let mut plan = state
+            .plan_rollback(app, deployment, expected_active_artifact)
+            .map_err(map_admin_state_error)?;
+        configure_tenant_admin(&mut plan.candidate, &self.tenant_admin_socket).map_err(|_| {
+            AdminMutationError::new(
+                AdminErrorCode::Internal,
+                "Tenant admin mount is unavailable",
+            )
+        })?;
+        let target = state
+            .deployment(deployment)
+            .map_err(map_admin_state_error)?
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::NotFound, "deployment does not exist")
+            })?;
+        let mut snapshot = state.load().map_err(map_admin_state_error)?;
+        let current = snapshot
+            .apps
+            .iter_mut()
+            .find(|candidate| candidate.name == app)
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::NotFound, "app does not exist")
+            })?;
+        *current = plan.candidate.clone();
+        let routes = route_table(&snapshot);
+        let runtime_changed = plan.previous_runtime_key.as_deref() != Some(&plan.runtime_key);
+        if runtime_changed {
+            self.supervisor.register(
+                plan.runtime_key.clone(),
+                plan.candidate.spec.clone(),
+                plan.candidate.lifecycle.clone(),
+            );
+            if self.supervisor.acquire(&plan.runtime_key).is_err() {
+                let _ = self.supervisor.remove(&plan.runtime_key);
+                return Err(AdminMutationError::new(
+                    AdminErrorCode::Internal,
+                    "rollback candidate did not become ready",
+                ));
+            }
+        }
+        if let Err(error) = state.commit_activation(&plan, audit) {
+            if runtime_changed {
+                let _ = self.supervisor.remove(&plan.runtime_key);
+            }
+            return Err(map_admin_state_error(error));
+        }
+        let retired = self.router.install(routes);
+        if runtime_changed && let Some(previous) = plan.previous_runtime_key.clone() {
+            let supervisor = Arc::clone(&self.supervisor);
+            thread::spawn(move || {
+                while !retired.is_quiescent() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if let Err(error) = supervisor.remove(&previous) {
+                    eprintln!("cygnus-daemon: retired runtime {previous:?} did not stop: {error}");
+                }
+            });
+        }
+        Ok(AdminData::Activated {
+            app: app.to_owned(),
+            active: ActiveDeploymentView {
+                deployment_id: deployment.to_owned(),
+                artifact_hash: plan.target_artifact_hash,
+                engine_version: target.engine_version,
+            },
+        })
+    }
+}
+
+fn map_admin_state_error(error: StateError) -> AdminMutationError {
+    let code = match error {
+        StateError::AppNotFound(_) => AdminErrorCode::NotFound,
+        StateError::DomainConflict { .. } | StateError::ActivationConflict { .. } => {
+            AdminErrorCode::Conflict
+        }
+        StateError::InvalidConfig(_)
+        | StateError::InvalidRecord { .. }
+        | StateError::InvalidDeploymentTransition { .. }
+        | StateError::ArtifactOwnership { .. }
+        | StateError::MetadataMismatch => AdminErrorCode::Validation,
+        _ => AdminErrorCode::Internal,
+    };
+    let message = match code {
+        AdminErrorCode::NotFound => "requested object does not exist",
+        AdminErrorCode::Conflict => "state changed; refresh and try again",
+        AdminErrorCode::Validation => "mutation was rejected",
+        _ => "admin mutation failed",
+    };
+    AdminMutationError::new(code, message)
+}
+
+fn route_table(snapshot: &Snapshot) -> RouteTable {
+    let mut routes = RouteTable::new();
+    for app in &snapshot.apps {
+        for domain in &app.domains {
+            routes.insert(
+                domain,
+                Route {
+                    app: app.spec.name.clone(),
+                    upstream: app.upstream.clone(),
+                },
+            );
+        }
+    }
+    routes
+}
+
+fn serve(
+    state_path: &Path,
+    admin_socket: &Path,
+    tenant_admin_socket: &Path,
+) -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let state = State::open(state_path)?;
-    let snapshot = state.load()?;
+    let mut snapshot = state.load()?;
     drop(state);
     let listener = TcpListener::bind(snapshot.listen)?;
+    if admin_socket == tenant_admin_socket {
+        return Err("host and Tenant Zero admin sockets must be distinct".into());
+    }
+    let mut admin_bindings = vec![AdminBinding::bind(admin_socket, AdminRole::Host)?];
+    if snapshot.apps.iter().any(|app| app.tenant_admin) {
+        admin_bindings.push(AdminBinding::bind(
+            tenant_admin_socket,
+            AdminRole::TenantZero,
+        )?);
+    }
 
+    let router = Arc::new(Router::new(RouteTable::new()));
     let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
     let mut routes = RouteTable::new();
     let mut pinned = Vec::new();
 
+    for app in &mut snapshot.apps {
+        configure_tenant_admin(app, tenant_admin_socket)?;
+    }
     for app in snapshot.apps {
         install_app(&supervisor, &mut routes, &mut pinned, app);
     }
+    drop(router.install(routes));
 
     for app in pinned {
         if let Err(error) = supervisor.acquire(&app) {
@@ -191,17 +388,31 @@ fn serve(state_path: &Path, admin_socket: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     spawn_reaper(Arc::downgrade(&supervisor));
-    let frontend = Arc::new(Frontend::new(
-        Arc::new(Router::new(routes)),
-        Arc::clone(&supervisor),
-    ));
+    let frontend = Arc::new(Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)));
     let lifecycle_supervisor = Arc::clone(&supervisor);
-    let admin_handler: Arc<dyn AdminHandler> =
-        Arc::new(StateAdminHandler::new(state_path, move |app| {
-            lifecycle_supervisor.state(app).map(lifecycle_state_name)
-        }));
-    let admin_binding = AdminBinding::bind(admin_socket, AdminRole::Host)?;
-    let admin_server = AdminServer::new(vec![admin_binding], admin_handler);
+    let lifecycle_state_path = state_path.to_owned();
+    let mutations: Arc<dyn AdminMutationHandler> = Arc::new(LiveAdminMutations {
+        state_path: state_path.to_owned(),
+        supervisor: Arc::clone(&supervisor),
+        tenant_admin_socket: tenant_admin_socket.to_owned(),
+        router: Arc::clone(&router),
+    });
+    let admin_handler: Arc<dyn AdminHandler> = Arc::new(StateAdminHandler::new(
+        state_path,
+        move |app| {
+            let state = State::open(&lifecycle_state_path).ok()?;
+            let snapshot = state.load().ok()?;
+            let runtime = snapshot
+                .apps
+                .into_iter()
+                .find(|candidate| candidate.name == app)?;
+            lifecycle_supervisor
+                .state(&runtime.spec.name)
+                .map(lifecycle_state_name)
+        },
+        mutations,
+    ));
+    let admin_server = AdminServer::new(admin_bindings, admin_handler);
     let admin_shutdown = Arc::clone(&shutdown);
     let admin_failure = Arc::clone(&shutdown);
     let admin_thread = thread::spawn(move || {
@@ -228,6 +439,23 @@ fn serve(state_path: &Path, admin_socket: &Path) -> Result<(), Box<dyn Error>> {
     admin_result?;
     Ok(())
 }
+fn configure_tenant_admin(app: &mut LoadedApp, socket: &Path) -> Result<(), Box<dyn Error>> {
+    if !app.tenant_admin {
+        return Ok(());
+    }
+    let parent = socket
+        .parent()
+        .ok_or("Tenant Zero admin socket has no parent directory")?;
+    app.spec.admin_socket = Some(AdminSocketSpec::new(parent));
+    app.spec.env.insert(
+        "CYGNUS_ADMIN_SOCKET".into(),
+        PathBuf::from(ADMIN_CAGE_DIR)
+            .join(ADMIN_SOCKET_FILENAME)
+            .into_os_string(),
+    );
+    app.spec.validate()?;
+    Ok(())
+}
 
 fn install_app(
     supervisor: &Supervisor<Cage>,
@@ -236,22 +464,24 @@ fn install_app(
     app: LoadedApp,
 ) {
     let LoadedApp {
-        name,
+        name: _,
         domains,
         upstream,
         spec,
         lifecycle,
+        tenant_admin: _,
     } = app;
 
+    let runtime_key = spec.name.clone();
     if lifecycle.min_instances >= 1 {
-        pinned.push(name.clone());
+        pinned.push(runtime_key.clone());
     }
-    supervisor.register(name.clone(), spec, lifecycle);
+    supervisor.register(runtime_key.clone(), spec, lifecycle);
     for domain in domains {
         routes.insert(
             &domain,
             Route {
-                app: name.clone(),
+                app: runtime_key.clone(),
                 upstream: upstream.clone(),
             },
         );

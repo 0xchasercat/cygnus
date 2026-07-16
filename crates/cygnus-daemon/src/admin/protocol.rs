@@ -41,6 +41,15 @@ pub enum AdminCommand {
     GetDeployment {
         deployment: String,
     },
+    MapDomain {
+        app: String,
+        domain: String,
+    },
+    Rollback {
+        app: String,
+        deployment: String,
+        expected_active_artifact: String,
+    },
     ReadLog {
         deployment: String,
         stream: LogStream,
@@ -132,6 +141,14 @@ pub enum AdminData {
     },
     App {
         app: AppView,
+    },
+    DomainMapped {
+        app: String,
+        domain: String,
+    },
+    Activated {
+        app: String,
+        active: ActiveDeploymentView,
     },
     Deployments {
         deployments: Vec<DeploymentView>,

@@ -4,39 +4,87 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::{
+    ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode, AdminHandler,
+    AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppView, DeploymentView,
+    MAX_LOG_CHUNK_BYTES, NodeView,
+};
+use crate::state::{
+    AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentStatus, LoadedApp,
+    State,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cygnus_cage::EgressMode;
-
-use super::{
-    ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode, AdminHandler, AdminRequest,
-    AdminResponse, AdminRole, AppView, DeploymentView, MAX_LOG_CHUNK_BYTES, NodeView,
-};
-use crate::state::{DeploymentRecord, DeploymentStatus, LoadedApp, State};
+use sha2::{Digest, Sha256};
 
 const APP_PAGE_QUERY_LIMIT: usize = 50;
 
 type LifecycleLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminMutation {
+    MapDomain {
+        app: String,
+        domain: String,
+    },
+    Rollback {
+        app: String,
+        deployment: String,
+        expected_active_artifact: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminMutationError {
+    pub code: AdminErrorCode,
+    pub message: String,
+}
+
+impl AdminMutationError {
+    pub fn new(code: AdminErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+pub trait AdminMutationHandler: Send + Sync + 'static {
+    fn execute(
+        &self,
+        mutation: AdminMutation,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError>;
+}
+
 /// State-backed implementation of the read-only v1 admin command set.
 pub struct StateAdminHandler {
     state_path: PathBuf,
     lifecycle: Arc<LifecycleLookup>,
+    mutations: Arc<dyn AdminMutationHandler>,
 }
 
 impl StateAdminHandler {
     pub fn new(
         state_path: impl Into<PathBuf>,
         lifecycle: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+        mutations: Arc<dyn AdminMutationHandler>,
     ) -> Self {
         Self {
             state_path: state_path.into(),
             lifecycle: Arc::new(lifecycle),
+            mutations,
         }
     }
 
-    fn dispatch(&self, role: AdminRole, command: AdminCommand) -> Result<AdminData, HandlerFault> {
-        match command {
+    fn dispatch(
+        &self,
+        role: AdminRole,
+        peer: AdminPeerCredentials,
+        request: &AdminRequest,
+    ) -> Result<AdminData, HandlerFault> {
+        match request.command.clone() {
             AdminCommand::Health => Ok(AdminData::Health {
                 service: "cygnus-daemon".into(),
                 isolation: cygnus_cage::ISOLATION.into(),
@@ -106,6 +154,28 @@ impl StateAdminHandler {
                     deployment: deployment_view(deployment, role),
                 })
             }
+            AdminCommand::MapDomain { app, domain } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::MapDomain { app, domain },
+                "map_domain",
+            ),
+            AdminCommand::Rollback {
+                app,
+                deployment,
+                expected_active_artifact,
+            } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::Rollback {
+                    app,
+                    deployment,
+                    expected_active_artifact,
+                },
+                "rollback",
+            ),
             AdminCommand::ReadLog {
                 deployment,
                 stream,
@@ -126,6 +196,47 @@ impl StateAdminHandler {
                     next_offset,
                     eof,
                     data_base64: BASE64_STANDARD.encode(bytes),
+                })
+            }
+        }
+    }
+
+    fn mutate(
+        &self,
+        role: AdminRole,
+        peer: AdminPeerCredentials,
+        request: &AdminRequest,
+        mutation: AdminMutation,
+        command_kind: &str,
+    ) -> Result<AdminData, HandlerFault> {
+        let encoded = serde_json::to_vec(request).map_err(HandlerFault::internal)?;
+        let audit = AuditContext {
+            endpoint_role: match role {
+                AdminRole::Host => AuditEndpointRole::Host,
+                AdminRole::TenantZero => AuditEndpointRole::TenantZero,
+            },
+            peer_uid: peer.uid,
+            peer_gid: peer.gid,
+            peer_pid: peer.pid,
+            actor_subject: request.actor.clone(),
+            request_id: request.request_id.clone(),
+            command_kind: command_kind.into(),
+            request_digest: format!("{:x}", Sha256::digest(encoded)),
+        };
+        match self.mutations.execute(mutation, &audit) {
+            Ok(data) => Ok(data),
+            Err(error) => {
+                let mut state = self.open_state()?;
+                state
+                    .append_audit(
+                        &audit,
+                        AuditOutcome::Failure,
+                        Some(admin_error_name(error.code)),
+                    )
+                    .map_err(HandlerFault::internal)?;
+                Err(HandlerFault {
+                    code: error.code,
+                    message: error.message,
                 })
             }
         }
@@ -167,10 +278,27 @@ impl StateAdminHandler {
     }
 }
 
+fn admin_error_name(code: AdminErrorCode) -> &'static str {
+    match code {
+        AdminErrorCode::InvalidRequest => "invalid_request",
+        AdminErrorCode::UnsupportedVersion => "unsupported_version",
+        AdminErrorCode::Unauthorized => "unauthorized",
+        AdminErrorCode::NotFound => "not_found",
+        AdminErrorCode::Conflict => "conflict",
+        AdminErrorCode::Validation => "validation",
+        AdminErrorCode::Internal => "internal",
+    }
+}
+
 impl AdminHandler for StateAdminHandler {
-    fn handle(&self, role: AdminRole, request: AdminRequest) -> AdminResponse {
-        let request_id = request.request_id;
-        match self.dispatch(role, request.command) {
+    fn handle(
+        &self,
+        role: AdminRole,
+        peer: AdminPeerCredentials,
+        request: AdminRequest,
+    ) -> AdminResponse {
+        let request_id = request.request_id.clone();
+        match self.dispatch(role, peer, &request) {
             Ok(data) => AdminResponse::ok(request_id, data),
             Err(error) => AdminResponse::error(request_id, error.code, error.message),
         }
@@ -304,6 +432,37 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    struct UnusedMutations;
+
+    impl AdminMutationHandler for UnusedMutations {
+        fn execute(
+            &self,
+            _mutation: AdminMutation,
+            _audit: &AuditContext,
+        ) -> Result<AdminData, AdminMutationError> {
+            panic!("read-only handler test invoked a mutation")
+        }
+    }
+
+    fn unused_mutations() -> Arc<dyn AdminMutationHandler> {
+        Arc::new(UnusedMutations)
+    }
+
+    struct FailingMutations;
+
+    impl AdminMutationHandler for FailingMutations {
+        fn execute(
+            &self,
+            _mutation: AdminMutation,
+            _audit: &AuditContext,
+        ) -> Result<AdminData, AdminMutationError> {
+            Err(AdminMutationError::new(
+                AdminErrorCode::Conflict,
+                "state changed",
+            ))
+        }
+    }
+
     fn state_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -341,9 +500,14 @@ mod tests {
             .unwrap();
         drop(state);
 
-        let handler = StateAdminHandler::new(&path, |name| (name == "api").then(|| "cold".into()));
+        let handler = StateAdminHandler::new(
+            &path,
+            |name| (name == "api").then(|| "cold".into()),
+            unused_mutations(),
+        );
         let response = handler.handle(
             AdminRole::TenantZero,
+            AdminPeerCredentials::default(),
             request(AdminCommand::ListApps {
                 cursor: None,
                 limit: 50,
@@ -367,9 +531,10 @@ mod tests {
     fn app_cursor_and_missing_objects_return_typed_faults() {
         let path = state_path();
         State::open(&path).unwrap();
-        let handler = StateAdminHandler::new(&path, |_| None);
+        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations());
         let response = handler.handle(
             AdminRole::Host,
+            AdminPeerCredentials::default(),
             request(AdminCommand::GetApp {
                 app: "missing".into(),
             }),
@@ -384,6 +549,49 @@ mod tests {
                 ..
             }
         ));
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn mutation_failure_records_endpoint_peer_actor_and_digest() {
+        let path = state_path();
+        State::open(&path).unwrap();
+        let handler = StateAdminHandler::new(&path, |_| None, Arc::new(FailingMutations));
+        let mut mutation = request(AdminCommand::MapDomain {
+            app: "api".into(),
+            domain: "api.example".into(),
+        });
+        mutation.actor = Some("github:alice".into());
+        let response = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials {
+                uid: Some(1000),
+                gid: Some(1001),
+                pid: Some(42),
+            },
+            mutation,
+        );
+        assert!(matches!(
+            response,
+            AdminResponse::Error {
+                error: super::super::AdminFault {
+                    code: AdminErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        let state = State::open(&path).unwrap();
+        let records = state.audit_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].endpoint_role, AuditEndpointRole::TenantZero);
+        assert_eq!(records[0].peer_uid, Some(1000));
+        assert_eq!(records[0].peer_gid, Some(1001));
+        assert_eq!(records[0].peer_pid, Some(42));
+        assert_eq!(records[0].actor_subject.as_deref(), Some("github:alice"));
+        assert_eq!(records[0].outcome, AuditOutcome::Failure);
+        assert_eq!(records[0].error_code.as_deref(), Some("conflict"));
+        assert_eq!(records[0].request_digest.len(), 64);
+        drop(state);
         fs::remove_file(path).unwrap();
     }
 }
