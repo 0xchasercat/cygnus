@@ -148,7 +148,7 @@ pub enum AdminResponse {
     Ok {
         version: u16,
         request_id: String,
-        data: AdminData,
+        data: Box<AdminData>,
     },
     Error {
         version: u16,
@@ -162,7 +162,7 @@ impl AdminResponse {
         Self::Ok {
             version: ADMIN_PROTOCOL_VERSION,
             request_id: request_id.into(),
-            data,
+            data: Box::new(data),
         }
     }
 

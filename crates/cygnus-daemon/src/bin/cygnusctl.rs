@@ -224,7 +224,7 @@ fn call(client: &AdminClient, command: AdminCommand) -> Result<AdminData, Box<dy
         command,
     };
     match client.request(&request)? {
-        AdminResponse::Ok { data, .. } => Ok(data),
+        AdminResponse::Ok { data, .. } => Ok(*data),
         AdminResponse::Error { error, .. } => {
             Err(format!("{:?}: {}", error.code, error.message).into())
         }

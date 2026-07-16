@@ -771,12 +771,11 @@ mod tests {
                 limit: 50,
             }),
         );
-        let AdminResponse::Ok {
-            data: AdminData::Apps { apps, .. },
-            ..
-        } = response
-        else {
+        let AdminResponse::Ok { data, .. } = response else {
             panic!("unexpected response");
+        };
+        let AdminData::Apps { apps, .. } = *data else {
+            panic!("unexpected data kind");
         };
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].env_keys, ["SECRET_NAME"]);
