@@ -2,12 +2,12 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use cygnus_cage::IngressSpec;
+use cygnus_cage::{AdminSocketSpec, IngressSpec};
 use cygnus_cage::{Cage, CageError, CageSpec, RootfsSpec};
 
 #[test]
@@ -221,6 +221,75 @@ fn ingress_socket_created_in_pivoted_root_is_host_visible() {
     fs::remove_dir_all(&fixture).expect("remove ingress fixture");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn rooted_tenant_connects_through_read_only_admin_mount() {
+    use std::io::{Read, Write};
+
+    let name = unique_name("tenant-admin");
+    let fixture = env::temp_dir().join(format!("cygnus-tenant-admin-{name}"));
+    let ingress_dir = fixture.join("io");
+    let admin_dir = fixture.join("admin");
+    let readiness = ingress_dir.join("app.sock");
+    let admin_socket = admin_dir.join("admin.sock");
+    let _ = fs::remove_dir_all(&fixture);
+    fs::create_dir_all(&ingress_dir).expect("create ingress directory");
+    fs::create_dir_all(&admin_dir).expect("create admin directory");
+    fs::set_permissions(
+        &admin_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("restrict admin directory");
+    let admin_listener = UnixListener::bind(&admin_socket).expect("bind host admin socket");
+    let admin_thread = std::thread::spawn(move || {
+        let (mut stream, _) = admin_listener.accept().expect("accept admin connection");
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).expect("read admin probe");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").expect("write admin probe");
+    });
+    let lower = build_fixture_root(&fixture).expect("build fixture root");
+
+    let mut spec = CageSpec::new(&name, "/fixture");
+    spec.args.extend([
+        OsString::from("--exact"),
+        OsString::from("cage_fixture_process"),
+        OsString::from("--nocapture"),
+    ]);
+    spec.env.insert(
+        OsString::from("CYGNUS_FIXTURE_MODE"),
+        OsString::from("admin-connect"),
+    );
+    spec.rootfs = Some(RootfsSpec::new(vec![lower]));
+    spec.ingress = Some(IngressSpec::new(ingress_dir));
+    spec.admin_socket = Some(AdminSocketSpec::new(admin_dir));
+    spec.readiness_uds = Some(readiness);
+    spec.seccomp = None;
+
+    let cage = match Cage::boot(spec) {
+        Ok(cage) => cage,
+        Err(error) => {
+            let mut stream = UnixStream::connect(&admin_socket).expect("release admin probe");
+            stream.write_all(b"ping").expect("write release probe");
+            let mut response = [0_u8; 4];
+            stream.read_exact(&mut response).expect("read release probe");
+            admin_thread.join().expect("join skipped admin probe");
+            let _ = fs::remove_dir_all(&fixture);
+            if environment_unavailable(&error)
+                && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none()
+            {
+                eprintln!("skipping privileged Tenant admin mount test: {error}");
+                return;
+            }
+            panic!("cage boot failed: {error}");
+        }
+    };
+
+    admin_thread.join().expect("join admin probe");
+    cage.teardown().expect("tear down Tenant admin cage");
+    fs::remove_dir_all(&fixture).expect("remove Tenant admin fixture");
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn rootfs_is_inert_on_the_plain_process_backend() {
@@ -389,6 +458,24 @@ fn cage_fixture_process() {
                     .expect("write fixture response head");
                     stream.write_all(body).expect("write fixture response body");
                 }
+            }
+        }
+        Ok("admin-connect") => {
+            assert!(
+                fs::write("/cygnus/admin/probe", b"must fail").is_err(),
+                "Tenant admin mount unexpectedly allowed writes"
+            );
+            let mut admin = UnixStream::connect("/cygnus/admin/admin.sock")
+                .expect("connect mounted admin socket");
+            admin.write_all(b"ping").expect("write admin probe");
+            let mut response = [0_u8; 4];
+            admin.read_exact(&mut response).expect("read admin probe");
+            assert_eq!(&response, b"pong");
+            drop(admin);
+
+            let listener = UnixListener::bind("/cygnus/io/app.sock").expect("bind fixture UDS");
+            for stream in listener.incoming() {
+                let _ = stream.expect("accept fixture UDS");
             }
         }
         Ok(mode) => panic!("unknown fixture mode {mode:?}"),

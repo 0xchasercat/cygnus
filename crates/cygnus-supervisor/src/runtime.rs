@@ -272,6 +272,41 @@ impl<I: Instance> Supervisor<I> {
         reaped
     }
 
+    /// Remove one registered generation and release its ready instance.
+    /// In-flight boot/drain transitions finish before the slot is destroyed.
+    pub fn remove(&self, name: &str) -> Result<bool, String> {
+        let slot = {
+            let mut apps = recover(self.apps.lock());
+            apps.remove(name)
+        };
+        let Some(slot) = slot else {
+            return Ok(false);
+        };
+
+        let mut state = recover(slot.state.lock());
+        while matches!(
+            state.lifecycle.state(),
+            LifecycleState::Booting | LifecycleState::Draining
+        ) {
+            state = recover(slot.progress.wait(state));
+        }
+        let instance = if state.lifecycle.state() == LifecycleState::Ready {
+            state.lifecycle.begin_drain();
+            state.instance.take()
+        } else {
+            None
+        };
+        drop(state);
+
+        let shutdown = instance.map(Instance::shutdown).transpose();
+        let mut state = recover(slot.state.lock());
+        state.lifecycle.mark_cold();
+        state.retry_after = None;
+        slot.progress.notify_all();
+        shutdown?;
+        Ok(true)
+    }
+
     /// Stop admitting boots, wait for in-flight lifecycle transitions, and
     /// release every ready instance. Returns per-app teardown failures.
     pub fn shutdown_all(&self) -> Vec<(String, String)> {
@@ -436,6 +471,25 @@ mod tests {
         assert_eq!(supervisor.state("app"), Some(LifecycleState::Ready));
         assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
     }
+    #[test]
+    fn remove_releases_one_ready_generation() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_counter = Arc::clone(&shutdowns);
+        let supervisor = Supervisor::new(move |_spec| {
+            Ok(StatusInstance {
+                status: InstanceStatus::Running,
+                shutdowns: Arc::clone(&shutdown_counter),
+            })
+        });
+        supervisor.register("app@old", spec(), LifecycleConfig::default());
+
+        assert_eq!(supervisor.acquire("app@old"), Ok(()));
+        assert_eq!(supervisor.remove("app@old"), Ok(true));
+        assert_eq!(supervisor.remove("app@old"), Ok(false));
+        assert_eq!(supervisor.state("app@old"), None);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn shutdown_releases_ready_instances_and_rejects_new_acquires() {
         let shutdowns = Arc::new(AtomicUsize::new(0));

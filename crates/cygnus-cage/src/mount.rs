@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
@@ -13,7 +13,8 @@ use nix::errno::Errno;
 use crate::error::CageError;
 use crate::net;
 use crate::spec::{
-    BUILD_OUTPUT_CAGE_DIR, BuildOutputSpec, INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
+    ADMIN_CAGE_DIR, ADMIN_SOCKET_FILENAME, AdminSocketSpec, BUILD_OUTPUT_CAGE_DIR, BuildOutputSpec,
+    INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
 };
 
 /// Directory name the old root is pivoted onto before it is detached.
@@ -117,6 +118,7 @@ pub(crate) struct MountPlan {
     root: CString,
     overlay: Option<OverlayPlan>,
     ingress: Option<IngressPlan>,
+    admin_socket: Option<AdminSocketPlan>,
     build_output: Option<BuildOutputPlan>,
     proc_source: CString,
     proc_target: CString,
@@ -129,12 +131,22 @@ impl MountPlan {
     pub(crate) fn new(
         rootfs: Option<&StagedRootfs>,
         ingress: Option<&IngressSpec>,
+        admin_socket: Option<&AdminSocketSpec>,
         build_output: Option<&BuildOutputSpec>,
     ) -> Result<Self, CageError> {
         let ingress_plan = match (rootfs, ingress) {
             (Some(_), Some(ingress)) => Some(IngressPlan::new(ingress)?),
             (None, Some(_)) => {
                 return Err(CageError::InvalidSpec("ingress requires a rootfs".into()));
+            }
+            (Some(_), None) | (None, None) => None,
+        };
+        let admin_plan = match (rootfs, admin_socket) {
+            (Some(_), Some(admin)) => Some(AdminSocketPlan::new(admin)?),
+            (None, Some(_)) => {
+                return Err(CageError::InvalidSpec(
+                    "Tenant admin socket requires a rootfs".into(),
+                ));
             }
             (Some(_), None) | (None, None) => None,
         };
@@ -153,6 +165,7 @@ impl MountPlan {
             root: CString::new("/").expect("root path has no NUL byte"),
             overlay,
             ingress: ingress_plan,
+            admin_socket: admin_plan,
             build_output: build_output_plan,
             proc_source: CString::new("proc").expect("proc source has no NUL byte"),
             proc_target: CString::new("/proc").expect("proc target has no NUL byte"),
@@ -195,6 +208,7 @@ impl MountPlan {
                 overlay.apply(
                     &self.root,
                     self.ingress.as_ref(),
+                    self.admin_socket.as_ref(),
                     self.build_output.as_ref(),
                     &self.proc_source,
                     &self.proc_fstype,
@@ -320,6 +334,48 @@ impl IngressPlan {
 }
 
 #[derive(Debug)]
+struct AdminSocketPlan(IngressPlan);
+
+impl AdminSocketPlan {
+    fn new(admin: &AdminSocketSpec) -> Result<Self, CageError> {
+        let directory = fs::symlink_metadata(&admin.host_dir).map_err(|source| {
+            CageError::io(
+                "verify Tenant admin host directory",
+                &admin.host_dir,
+                source,
+            )
+        })?;
+        let daemon_uid = unsafe { nix::libc::geteuid() };
+        if !directory.file_type().is_dir()
+            || directory.uid() != daemon_uid
+            || directory.mode() & 0o077 != 0
+        {
+            return Err(CageError::InvalidSpec(format!(
+                "Tenant admin host directory {:?} must be daemon-owned with mode 0700",
+                admin.host_dir
+            )));
+        }
+        let socket = admin.host_dir.join(ADMIN_SOCKET_FILENAME);
+        let socket_metadata = fs::symlink_metadata(&socket)
+            .map_err(|source| CageError::io("verify Tenant admin socket", &socket, source))?;
+        if !socket_metadata.file_type().is_socket() {
+            return Err(CageError::InvalidSpec(format!(
+                "Tenant admin socket {socket:?} must be a Unix socket"
+            )));
+        }
+
+        let mut plan =
+            IngressPlan::from_host_dir(&admin.host_dir, ADMIN_CAGE_DIR, "Tenant admin socket")?;
+        plan.remount_flags |= nix::libc::MS_RDONLY;
+        Ok(Self(plan))
+    }
+
+    unsafe fn apply(&self) -> Result<(), i32> {
+        unsafe { self.0.apply() }
+    }
+}
+
+#[derive(Debug)]
 struct BuildOutputPlan(IngressPlan);
 
 impl BuildOutputPlan {
@@ -349,10 +405,8 @@ const APPROVED_DEVICE_PATHS: [(&str, &str); 4] = [
 
 /// Device bind mounts must clear `nodev` while retaining the other hardening
 /// flags. The overlay and writable tmpfs remain globally `nodev`.
-const DEVICE_REMOUNT_FLAGS: nix::libc::c_ulong = nix::libc::MS_BIND
-    | nix::libc::MS_REMOUNT
-    | nix::libc::MS_NOSUID
-    | nix::libc::MS_NOEXEC;
+const DEVICE_REMOUNT_FLAGS: nix::libc::c_ulong =
+    nix::libc::MS_BIND | nix::libc::MS_REMOUNT | nix::libc::MS_NOSUID | nix::libc::MS_NOEXEC;
 
 #[derive(Debug)]
 struct DevicePlan {
@@ -506,6 +560,7 @@ impl OverlayPlan {
         &self,
         root: &CString,
         ingress: Option<&IngressPlan>,
+        admin_socket: Option<&AdminSocketPlan>,
         build_output: Option<&BuildOutputPlan>,
         proc_source: &CString,
         proc_fstype: &CString,
@@ -592,6 +647,9 @@ impl OverlayPlan {
         // its source path resolves through the host tree at this point.
         if let Some(ingress) = ingress {
             unsafe { ingress.apply()? };
+        }
+        if let Some(admin) = admin_socket {
+            unsafe { admin.apply()? };
         }
         if let Some(output) = build_output {
             unsafe { output.apply()? };
@@ -792,7 +850,7 @@ mod tests {
 
     #[test]
     fn plan_paths_are_valid_c_strings() {
-        let plan = MountPlan::new(None, None, None).expect("plan without a rootfs");
+        let plan = MountPlan::new(None, None, None, None).expect("plan without a rootfs");
         assert_eq!(plan.root.to_bytes(), b"/");
         assert_eq!(plan.proc_source.to_bytes(), b"proc");
         assert_eq!(plan.proc_target.to_bytes(), b"/proc");
@@ -831,7 +889,7 @@ mod tests {
         rootfs.staging_dir = Some(base.clone());
 
         let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
-        let plan = MountPlan::new(Some(&staged), None, None).expect("plan with a rootfs");
+        let plan = MountPlan::new(Some(&staged), None, None, None).expect("plan with a rootfs");
         let overlay = plan.overlay.as_ref().expect("overlay plan present");
 
         let staging = base.join("cygnus-cage-app");
@@ -855,7 +913,6 @@ mod tests {
             format!("nameserver {}\noptions edns0\n", net::GATEWAY).as_bytes()
         );
 
-
         drop(staged);
         assert!(!staging.exists());
         let _ = fs::remove_dir_all(&base);
@@ -868,17 +925,29 @@ mod tests {
         rootfs.staging_dir = Some(base.clone());
 
         let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
-        let plan = MountPlan::new(Some(&staged), None, None).expect("plan with devices");
+        let plan = MountPlan::new(Some(&staged), None, None, None).expect("plan with devices");
         let overlay = plan.overlay.as_ref().expect("overlay plan present");
-        assert_eq!(overlay.merged_dev.to_bytes(),
-            base.join("cygnus-cage-app/merged/dev").as_os_str().as_bytes());
+        assert_eq!(
+            overlay.merged_dev.to_bytes(),
+            base.join("cygnus-cage-app/merged/dev")
+                .as_os_str()
+                .as_bytes()
+        );
         assert_eq!(overlay.devices.len(), APPROVED_DEVICE_PATHS.len());
         for ((name, source), device) in APPROVED_DEVICE_PATHS.iter().zip(&overlay.devices) {
             assert_eq!(device.source.to_bytes(), source.as_bytes());
-            assert_eq!(device.target.to_bytes(),
-                base.join(format!("cygnus-cage-app/merged/dev/{name}")).as_os_str().as_bytes());
-            assert_eq!(device.placeholder.to_bytes(),
-                base.join(format!("cygnus-cage-app/upper/dev/{name}")).as_os_str().as_bytes());
+            assert_eq!(
+                device.target.to_bytes(),
+                base.join(format!("cygnus-cage-app/merged/dev/{name}"))
+                    .as_os_str()
+                    .as_bytes()
+            );
+            assert_eq!(
+                device.placeholder.to_bytes(),
+                base.join(format!("cygnus-cage-app/upper/dev/{name}"))
+                    .as_os_str()
+                    .as_bytes()
+            );
         }
         assert_eq!(DEVICE_REMOUNT_FLAGS & nix::libc::MS_NODEV, 0);
 
@@ -914,7 +983,7 @@ mod tests {
 
         let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
         let ingress = IngressSpec::new(host_dir.clone());
-        let plan = MountPlan::new(Some(&staged), Some(&ingress), None).expect("ingress plan");
+        let plan = MountPlan::new(Some(&staged), Some(&ingress), None, None).expect("ingress plan");
         let ingress_plan = plan.ingress.as_ref().expect("ingress plan present");
 
         assert_eq!(
@@ -937,6 +1006,38 @@ mod tests {
     }
 
     #[test]
+    fn tenant_admin_plan_is_exclusive_and_read_only() {
+        let base = unique_staging_base("admin-plan");
+        let host_dir = base.join("tenant0-admin");
+        fs::create_dir_all(&host_dir).expect("create admin host directory");
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o700))
+            .expect("restrict admin host directory");
+        let listener = std::os::unix::net::UnixListener::bind(host_dir.join(ADMIN_SOCKET_FILENAME))
+            .expect("bind admin socket");
+        let mut rootfs = RootfsSpec::new(vec![PathBuf::from("/lower")]);
+        rootfs.staging_dir = Some(base.join("staging"));
+        let staged = StagedRootfs::create("tenant-0", &rootfs).expect("stage rootfs");
+        let admin = AdminSocketSpec::new(host_dir.clone());
+        let plan =
+            MountPlan::new(Some(&staged), None, Some(&admin), None).expect("admin mount plan");
+        let admin_plan = plan.admin_socket.as_ref().expect("admin plan present");
+
+        assert_eq!(admin_plan.0.target.to_bytes(), ADMIN_CAGE_DIR.as_bytes());
+        assert_eq!(
+            admin_plan.0.source.to_bytes(),
+            format!("/{OLD_ROOT_NAME}{}", host_dir.display()).as_bytes()
+        );
+        assert_eq!(
+            admin_plan.0.remount_flags,
+            INGRESS_REMOUNT_FLAGS | nix::libc::MS_RDONLY
+        );
+
+        drop(listener);
+        drop(staged);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn build_output_plan_uses_the_fixed_hardened_mount() {
         let base = unique_staging_base("output-plan");
         let host_dir = base.join("host-output");
@@ -946,7 +1047,7 @@ mod tests {
 
         let staged = StagedRootfs::create("app", &rootfs).expect("stage rootfs");
         let output = BuildOutputSpec::new(host_dir.clone());
-        let plan = MountPlan::new(Some(&staged), None, Some(&output)).expect("output plan");
+        let plan = MountPlan::new(Some(&staged), None, None, Some(&output)).expect("output plan");
         let output_plan = plan.build_output.as_ref().expect("output plan present");
         assert_eq!(
             output_plan.0.target.to_bytes(),

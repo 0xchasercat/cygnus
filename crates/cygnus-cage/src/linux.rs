@@ -102,6 +102,7 @@ impl Cage {
         let mount_plan = MountPlan::new(
             staging.as_ref(),
             spec.ingress.as_ref(),
+            spec.admin_socket.as_ref(),
             spec.build_output.as_ref(),
         )?;
         let capabilities = CapabilityPlan::new()?;

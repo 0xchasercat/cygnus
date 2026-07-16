@@ -1,4 +1,4 @@
-//! Source intake, finite Bun builds, and first-app activation.
+//! Source intake, finite Bun builds, and deployment activation.
 //!
 //! Deployments intentionally copy source into a daemon-owned workspace before
 //! beginning any durable deployment. The build cage never receives a caller
@@ -7,6 +7,8 @@
 mod publish;
 
 use std::collections::BTreeMap;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -30,8 +32,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::state::{
-    AppConfig, ArtifactInput, DeploymentInput, DeploymentRecord, EngineRecord, RootfsConfig,
-    SeccompMode, State, StateError,
+    AppConfig, ArtifactInput, AuditContext, AuditEndpointRole, DeploymentInput, DeploymentRecord,
+    EngineRecord, RootfsConfig, SeccompMode, State, StateError,
 };
 use publish::PublishDir;
 
@@ -58,6 +60,7 @@ const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_BUN_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BUILD_OUTPUT: usize = 4 * 1024 * 1024;
 const LOG_STAGING_REL: &str = ".logs";
+const LOG_REL: &str = "logs";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARTIFACT_INODES: u64 = 8_192;
 
@@ -210,8 +213,28 @@ fn verify_engine(engine: &EngineRecord) -> Result<(), DeployError> {
 }
 
 /// Intake source, build it with the registered engine, seal the artifact, and
-/// atomically activate the first app in the state database.
+/// atomically activate a new or replacement app in the state database.
 pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult, DeployError> {
+    let audit = AuditContext {
+        endpoint_role: AuditEndpointRole::Host,
+        peer_uid: None,
+        peer_gid: None,
+        peer_pid: None,
+        actor_subject: None,
+        request_id: new_deployment_id(),
+        command_kind: "deploy".into(),
+        request_digest: deploy_request_digest(&request),
+    };
+    deploy_with_audit(state, request, &audit)
+}
+
+/// Build and activate a source deployment with caller-supplied audit
+/// provenance. Administrative entry points should use this form.
+pub fn deploy_with_audit(
+    state: &mut State,
+    request: DeployRequest,
+    audit: &AuditContext,
+) -> Result<DeployResult, DeployError> {
     validate_entry(&request.entry)?;
     if request.app.trim().is_empty() || request.domain.trim().is_empty() {
         return Err(DeployError::InvalidInput(
@@ -219,11 +242,9 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
         ));
     }
     validate_upstream(&request.upstream)?;
-    if !state.load()?.apps.is_empty() {
-        return Err(DeployError::InvalidInput(
-            "source deployment currently activates the first app only".into(),
-        ));
-    }
+    let expected_active_artifact = state
+        .active_deployment(&request.app)?
+        .map(|active| active.artifact_hash);
     let engine = state.engine(&request.engine_version)?.ok_or_else(|| {
         DeployError::InvalidInput(format!(
             "engine {:?} is not registered",
@@ -260,7 +281,6 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
         return Err(error);
     };
 
-
     let input = DeploymentInput {
         id: deployment_id.clone(),
         app: request.app.clone(),
@@ -277,18 +297,14 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
         Ok(path) => path,
         Err(error) => {
             let detail = error.to_string();
-            let terminal = match state.mark_deployment_failed(&deployment_id, &detail) {
-                Ok(_) => detail,
-                Err(state_error) => {
-                    format!("{detail}; unable to persist failed state: {state_error}")
-                }
-            };
-            let _ = remove_work(&artifact_root, &deployment_id);
-            return Err(DeployError::BuildFailed {
-                id: deployment_id,
-                detail: terminal,
-                logs: artifact_root.join(LOG_STAGING_REL),
-            });
+            return Err(fail_build(
+                state,
+                &artifact_root,
+                &building,
+                &artifact_root.join(LOG_STAGING_REL).join(&deployment_id),
+                &deployment_id,
+                detail,
+            ));
         }
     };
     let result = (|| {
@@ -353,8 +369,7 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
         let close_result = publish.close();
         close_result?;
         staging_result?;
-        fs::rename(&log_staging, building.join("logs"))?;
-        let _ = fs::remove_dir(artifact_root.join(LOG_STAGING_REL));
+        persist_success_logs(state, &artifact_root, &deployment_id, &log_staging)?;
 
         let generated = expected_generated_entry(&building.join("app"), &entry)?;
         let sidecar = generated.with_extension("js.jsc");
@@ -402,15 +417,14 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
         let metadata_json = serde_json::to_string(&metadata)?;
         fs::write(meta_dir.join("meta.json"), metadata_json.as_bytes())?;
         let final_path = artifact_root.join(&artifact_hash);
-        if final_path.exists() {
-            return Err(DeployError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("artifact {} already exists", final_path.display()),
-            )));
-        }
-        let runtime = runtime_config(&request, &engine, &final_path, &generated_relative)?;
-        make_read_only(&building)?;
-        fs::rename(&building, &final_path)?;
+        let runtime = runtime_config(
+            &request,
+            &engine,
+            &final_path,
+            &generated_relative,
+            &deployment_id,
+        )?;
+        publish_or_reuse(&building, &final_path, &artifact_hash, &metadata_json)?;
         let _ = remove_work(&artifact_root, &deployment_id);
 
         let artifact = ArtifactInput {
@@ -425,18 +439,35 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
             return Err(fail_build(
                 state,
                 &artifact_root,
-                &final_path,
+                &building,
                 &log_staging,
                 &deployment_id,
                 format!("artifact could not be sealed: {error}"),
             ));
         }
-        let deployment = state
-            .activate_first(&runtime, &artifact_hash)
+        let plan = state
+            .plan_activation(
+                &deployment_id,
+                &runtime,
+                expected_active_artifact.as_deref(),
+            )
             .map_err(|error| DeployError::ActivationFailed {
                 id: deployment_id.clone(),
                 detail: error.to_string(),
             })?;
+        state
+            .commit_activation(&plan, audit)
+            .map_err(|error| DeployError::ActivationFailed {
+                id: deployment_id.clone(),
+                detail: error.to_string(),
+            })?;
+        let deployment =
+            state
+                .deployment(&deployment_id)?
+                .ok_or_else(|| DeployError::ActivationFailed {
+                    id: deployment_id.clone(),
+                    detail: "deployment disappeared after activation".into(),
+                })?;
         Ok(DeployResult {
             deployment_id: deployment_id.clone(),
             source_hash,
@@ -555,6 +586,7 @@ fn runtime_config(
     engine: &EngineRecord,
     artifact_path: &Path,
     generated_relative: &str,
+    deployment_id: &str,
 ) -> Result<AppConfig, DeployError> {
     let relative = engine
         .cage_executable
@@ -575,15 +607,16 @@ fn runtime_config(
         .parent()
         .ok_or_else(|| DeployError::InvalidInput("upstream must have a parent directory".into()))?;
     fs::create_dir_all(socket_dir)?;
+    let runtime_id = format!("{}--{deployment_id}", request.app);
+    let host_upstream = socket_dir.join(format!("{runtime_id}.sock"));
     let socket = if linux {
         PathBuf::from(cygnus_cage::INGRESS_CAGE_DIR).join(
-            request
-                .upstream
+            host_upstream
                 .file_name()
                 .ok_or_else(|| DeployError::InvalidInput("upstream must have a filename".into()))?,
         )
     } else {
-        request.upstream.clone()
+        host_upstream.clone()
     };
     let (shim, entry) = if linux {
         (
@@ -604,7 +637,7 @@ fn runtime_config(
     Ok(AppConfig {
         name: request.app.clone(),
         domains: vec![request.domain.clone()],
-        upstream: request.upstream.clone(),
+        upstream: host_upstream,
         command,
         args: vec![
             "--preload".into(),
@@ -620,6 +653,23 @@ fn runtime_config(
         egress: crate::state::EgressConfig::None,
         ..AppConfig::default()
     })
+}
+
+fn deploy_request_digest(request: &DeployRequest) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        request.source_dir.as_os_str(),
+        OsStr::new(&request.app),
+        OsStr::new(&request.domain),
+        OsStr::new(&request.engine_version),
+        request.entry.as_os_str(),
+        request.artifact_root.as_os_str(),
+        request.upstream.as_os_str(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    hex_digest(hasher)
 }
 
 fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
@@ -648,7 +698,7 @@ fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
                 || dependency_section_nonempty(package, "optionalDependencies")?
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return preflight_lock_only(workspace)
+            return preflight_lock_only(workspace);
         }
         Err(error) => return Err(error.into()),
     };
@@ -707,11 +757,7 @@ fn preflight_lock_only(workspace: &Path) -> Result<BuildPlan, DeployError> {
     Ok(BuildPlan { install: false })
 }
 
-fn reject_workspace_path(
-    workspace: &Path,
-    name: &str,
-    directory: bool,
-) -> Result<(), DeployError> {
+fn reject_workspace_path(workspace: &Path, name: &str, directory: bool) -> Result<(), DeployError> {
     let path = workspace.join(name);
     match fs::symlink_metadata(&path) {
         Ok(_) if directory => Err(DeployError::InvalidInput(format!(
@@ -767,18 +813,16 @@ fn read_control_file(path: &Path, max_bytes: u64, name: &str) -> Result<Vec<u8>,
 }
 
 fn validate_bun_lock(bytes: &[u8]) -> Result<(), DeployError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        DeployError::InvalidInput("bun.lock must be regular UTF-8 text".into())
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| DeployError::InvalidInput("bun.lock must be regular UTF-8 text".into()))?;
     if text.is_empty() || text.as_bytes().contains(&0) {
         return Err(DeployError::InvalidInput(
             "bun.lock must be regular UTF-8 text".into(),
         ));
     }
     let normalized = strip_trailing_json_commas(text)?;
-    let value: serde_json::Value = serde_json::from_str(&normalized).map_err(|error| {
-        DeployError::InvalidInput(format!("bun.lock is malformed: {error}"))
-    })?;
+    let value: serde_json::Value = serde_json::from_str(&normalized)
+        .map_err(|error| DeployError::InvalidInput(format!("bun.lock is malformed: {error}")))?;
     if !value.is_object() || value.get("lockfileVersion").is_none() {
         return Err(DeployError::InvalidInput(
             "bun.lock is not a Bun text lockfile".into(),
@@ -849,10 +893,7 @@ fn stage_build_controls(rootfs: &Path) -> Result<(), DeployError> {
 }
 
 fn write_control_asset(path: &Path, bytes: &[u8]) -> Result<(), DeployError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
     Ok(())
@@ -1172,6 +1213,20 @@ fn write_logs(logs: &Path, stdout: &[u8], stderr: &[u8]) -> Result<(), io::Error
     Ok(())
 }
 
+fn persist_success_logs(
+    state: &mut State,
+    artifact_root: &Path,
+    id: &str,
+    log_staging: &Path,
+) -> Result<PathBuf, DeployError> {
+    let deployment_logs = artifact_root.join(LOG_REL).join(id);
+    fs::create_dir_all(artifact_root.join(LOG_REL))?;
+    fs::rename(log_staging, &deployment_logs)?;
+    let _ = fs::remove_dir(artifact_root.join(LOG_STAGING_REL));
+    state.set_deployment_log_path(id, &deployment_logs)?;
+    Ok(deployment_logs)
+}
+
 fn fail_build(
     state: &mut State,
     artifact_root: &Path,
@@ -1186,11 +1241,14 @@ fn fail_build(
     let _ = fs::create_dir_all(artifact_root.join(FAILED_REL));
     let _ = fs::remove_dir_all(&failed);
     let _ = fs::create_dir(&failed);
-    if output.exists() {
+    if output.exists() && !is_content_addressed_publication(artifact_root, output) {
         let _ = fs::rename(output, &failed_output);
     }
     let logs = if log_staging.exists() {
         let _ = fs::rename(log_staging, &failed_logs);
+        failed_logs
+    } else if artifact_root.join(LOG_REL).join(id).is_dir() {
+        let _ = fs::rename(artifact_root.join(LOG_REL).join(id), &failed_logs);
         failed_logs
     } else if failed_output.join("logs").is_dir() {
         failed_output.join("logs")
@@ -1209,7 +1267,10 @@ fn fail_build(
         .create_new(true)
         .open(logs.join("pipeline.error.log"))
         .and_then(|mut file| file.write_all(detail.as_bytes()));
-    let terminal = match state.mark_deployment_failed(id, &detail) {
+    let terminal = match state
+        .set_deployment_log_path(id, &logs)
+        .and_then(|_| state.mark_deployment_failed(id, &detail))
+    {
         Ok(_) => detail,
         Err(error) => format!("{detail}; unable to persist failed state: {error}"),
     };
@@ -1222,6 +1283,17 @@ fn fail_build(
     }
 }
 
+fn is_content_addressed_publication(artifact_root: &Path, path: &Path) -> bool {
+    path.parent() == Some(artifact_root)
+        && path.file_name().is_some_and(|name| {
+            let bytes = name.as_bytes();
+            bytes.len() == 64
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
 fn remove_work(artifact_root: &Path, id: &str) -> Result<(), io::Error> {
     let work = artifact_root.join(WORKSPACE_REL).join(id);
     if work.exists() {
@@ -1229,6 +1301,170 @@ fn remove_work(artifact_root: &Path, id: &str) -> Result<(), io::Error> {
     }
     let _ = fs::remove_dir(artifact_root.join(WORKSPACE_REL));
     Ok(())
+}
+
+/// Atomically publish a completed content-addressed directory, or recover an
+/// earlier publication that reached the filesystem before state was sealed.
+/// Existing content is only validated and reused; it is never replaced.
+fn publish_or_reuse(
+    building: &Path,
+    final_path: &Path,
+    artifact_hash: &str,
+    metadata_json: &str,
+) -> Result<bool, DeployError> {
+    validate_tree(building)?;
+    if hash_manifest(&build_manifest(building)?) != artifact_hash {
+        return Err(DeployError::InvalidInput(
+            "staged artifact content does not match its computed hash".into(),
+        ));
+    }
+
+    if final_path.exists() {
+        validate_reusable_artifact(final_path, artifact_hash, metadata_json)?;
+        fs::remove_dir_all(building)?;
+        return Ok(true);
+    }
+
+    sync_tree(building)?;
+    make_read_only(building)?;
+    sync_tree(building)?;
+    match rename_noreplace(building, final_path) {
+        Ok(()) => {
+            if let Some(parent) = final_path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(false)
+        }
+        Err(_error) if final_path.exists() => {
+            validate_reusable_artifact(final_path, artifact_hash, metadata_json)?;
+            remove_read_only_tree(building)?;
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_reusable_artifact(
+    path: &Path,
+    artifact_hash: &str,
+    metadata_json: &str,
+) -> Result<(), DeployError> {
+    validate_tree(path)?;
+    validate_read_only_tree(path)?;
+    let actual_hash = hash_manifest(&build_manifest(path)?);
+    if actual_hash != artifact_hash {
+        return Err(DeployError::InvalidInput(format!(
+            "existing artifact {} hashes to {actual_hash}, not {artifact_hash}",
+            path.display()
+        )));
+    }
+    let existing: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join("meta/meta.json"))?)?;
+    let expected: serde_json::Value = serde_json::from_str(metadata_json)?;
+    if existing != expected {
+        return Err(DeployError::InvalidInput(format!(
+            "existing artifact {} metadata does not match this deployment",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> Result<(), io::Error> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target path contains NUL"))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(from: &Path, to: &Path) -> Result<(), io::Error> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target path contains NUL"))?;
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_noreplace(from: &Path, to: &Path) -> Result<(), io::Error> {
+    if to.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "artifact target already exists",
+        ));
+    }
+    fs::rename(from, to)
+}
+
+fn sync_tree(path: &Path) -> Result<(), io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_file() {
+        return File::open(path)?.sync_all();
+    }
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other("artifact contains unsupported file type"));
+    }
+    for entry in fs::read_dir(path)? {
+        sync_tree(&entry?.path())?;
+    }
+    File::open(path)?.sync_all()
+}
+
+fn validate_read_only_tree(path: &Path) -> Result<(), DeployError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.permissions().mode() & 0o222 != 0 {
+        return Err(DeployError::InvalidInput(format!(
+            "existing artifact {} is not sealed read-only content",
+            path.display()
+        )));
+    }
+    if metadata.file_type().is_dir() {
+        for entry in fs::read_dir(path)? {
+            validate_read_only_tree(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_read_only_tree(path: &Path) -> Result<(), io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    let mut permissions = metadata.permissions();
+    if metadata.file_type().is_dir() {
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+        for entry in fs::read_dir(path)? {
+            remove_read_only_tree(&entry?.path())?;
+        }
+    } else {
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    if path.is_dir() {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn make_read_only(root: &Path) -> Result<(), io::Error> {
@@ -1385,8 +1621,8 @@ fn hex_digest(hasher: Sha256) -> String {
 mod tests {
     use super::*;
     use crate::state::DeploymentStatus;
-    use std::os::unix::fs::symlink;
     use std::ffi::OsStr;
+    use std::os::unix::fs::symlink;
 
     fn temp_dir(label: &str) -> PathBuf {
         let path =
@@ -1443,20 +1679,35 @@ mod tests {
         let root = temp_dir("preflight");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
-        assert_eq!(preflight_workspace(&workspace).unwrap(), BuildPlan { install: false });
+        assert_eq!(
+            preflight_workspace(&workspace).unwrap(),
+            BuildPlan { install: false }
+        );
 
-        fs::write(workspace.join("package.json"), br#"{"name":"app","dependencies":{}}"#)
-            .unwrap();
-        assert_eq!(preflight_workspace(&workspace).unwrap(), BuildPlan { install: false });
+        fs::write(
+            workspace.join("package.json"),
+            br#"{"name":"app","dependencies":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_workspace(&workspace).unwrap(),
+            BuildPlan { install: false }
+        );
         fs::write(
             workspace.join("package.json"),
             br#"{"name":"app","dependencies":{"left-pad":"1.3.0"}}"#,
         )
         .unwrap();
         assert!(preflight_workspace(&workspace).is_err());
-        fs::write(workspace.join("bun.lock"), br#"{"lockfileVersion":1,"workspaces":{},}"#)
-            .unwrap();
-        assert_eq!(preflight_workspace(&workspace).unwrap(), BuildPlan { install: true });
+        fs::write(
+            workspace.join("bun.lock"),
+            br#"{"lockfileVersion":1,"workspaces":{},}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_workspace(&workspace).unwrap(),
+            BuildPlan { install: true }
+        );
         fs::write(workspace.join("package-lock.json"), b"{}\n").unwrap();
         assert!(preflight_workspace(&workspace).is_err());
         fs::remove_file(workspace.join("package-lock.json")).unwrap();
@@ -1528,11 +1779,14 @@ mod tests {
                 OsString::from("index.ts"),
             ]
         );
-        assert_eq!(job.working_dir, Some(if cfg!(target_os = "linux") {
-            PathBuf::from("/cygnus")
-        } else {
-            workspace.parent().unwrap().to_path_buf()
-        }));
+        assert_eq!(
+            job.working_dir,
+            Some(if cfg!(target_os = "linux") {
+                PathBuf::from("/cygnus")
+            } else {
+                workspace.parent().unwrap().to_path_buf()
+            })
+        );
         assert_eq!(job.limits.memory_max, BUILD_INSTALL_MEMORY_MAX);
         assert_eq!(job.limits.pids_max, BUILD_INSTALL_PIDS_MAX);
         assert!(!job.env.contains_key(OsStr::new("BUN_OPTIONS")));
@@ -1542,7 +1796,10 @@ mod tests {
         );
         assert!(matches!(job.egress, EgressMode::BuildDomains { .. }));
         if cfg!(target_os = "linux") {
-            assert_eq!(job.rootfs.as_ref().unwrap().tmpfs_size, BUILD_ROOTFS_TMPFS_SIZE);
+            assert_eq!(
+                job.rootfs.as_ref().unwrap().tmpfs_size,
+                BUILD_ROOTFS_TMPFS_SIZE
+            );
         }
         fs::remove_dir_all(workspace.ancestors().nth(2).unwrap()).unwrap();
     }
@@ -1674,7 +1931,121 @@ mod tests {
             state.deployment(&id).unwrap().unwrap().status,
             DeploymentStatus::Failed
         );
+        assert_eq!(
+            state.deployment(&id).unwrap().unwrap().log_path,
+            Some(logs.clone())
+        );
+        assert_eq!(state.deployment_logs_dir(&id).unwrap(), Some(logs));
         assert!(artifacts.join("failed").join(id).is_dir());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_build_logs_are_persisted_per_deployment_outside_artifacts() {
+        let root = temp_dir("successful-logs");
+        let artifacts = fs::canonicalize(&root).unwrap();
+        let mut state = State::open(root.join("state.db")).unwrap();
+        register_engine(
+            &mut state,
+            "shell",
+            "/",
+            fs::canonicalize("/bin/sh").unwrap(),
+        )
+        .unwrap();
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "dep-success".into(),
+                app: "api".into(),
+                source_hash: "b".repeat(64),
+                engine_version: "shell".into(),
+            })
+            .unwrap();
+        let staging = prepare_log_staging(&artifacts, "dep-success").unwrap();
+        write_logs(&staging, b"stdout", b"stderr").unwrap();
+
+        let logs = persist_success_logs(&mut state, &artifacts, "dep-success", &staging).unwrap();
+        assert_eq!(logs, artifacts.join("logs/dep-success"));
+        assert_eq!(
+            state.deployment_logs_dir("dep-success").unwrap(),
+            Some(logs.clone())
+        );
+        assert_eq!(fs::read(logs.join("build.stdout.log")).unwrap(), b"stdout");
+        assert!(!artifacts.join("c".repeat(64)).join("logs").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_reuses_a_valid_interrupted_artifact_without_rewriting_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = temp_dir("publication-recovery");
+        let first = root.join("first");
+        fs::create_dir_all(first.join("app")).unwrap();
+        fs::write(first.join("app/index.js"), b"compiled").unwrap();
+        let hash = hash_manifest(&build_manifest(&first).unwrap());
+        let metadata_json = format!(
+            "{{\"sourceHash\":\"{}\",\"artifactHash\":\"{hash}\",\"bunVersion\":\"bun\",\"runtimeEntry\":\"/app/index.js\"}}",
+            "b".repeat(64)
+        );
+        fs::create_dir_all(first.join("meta")).unwrap();
+        fs::write(first.join("meta/meta.json"), &metadata_json).unwrap();
+        let final_path = root.join(&hash);
+        assert!(!publish_or_reuse(&first, &final_path, &hash, &metadata_json).unwrap());
+        let inode = fs::metadata(&final_path).unwrap().ino();
+
+        let recovered = root.join("recovered");
+        write_publish_fixture(&recovered, &metadata_json);
+        assert!(publish_or_reuse(&recovered, &final_path, &hash, &metadata_json).unwrap());
+        assert_eq!(fs::metadata(&final_path).unwrap().ino(), inode);
+        assert!(!recovered.exists());
+        remove_read_only_tree(&final_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failure_cleanup_never_moves_a_content_addressed_publication() {
+        let root = temp_dir("sealed-failure-cleanup");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        let final_path = artifacts.join("c".repeat(64));
+        fs::create_dir_all(&final_path).unwrap();
+        fs::write(final_path.join("sentinel"), b"sealed").unwrap();
+
+        let mut state = State::open(root.join("state.db")).unwrap();
+        register_engine(
+            &mut state,
+            "shell",
+            "/",
+            fs::canonicalize("/bin/sh").unwrap(),
+        )
+        .unwrap();
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "dep-cleanup".into(),
+                app: "api".into(),
+                source_hash: "b".repeat(64),
+                engine_version: "shell".into(),
+            })
+            .unwrap();
+        let log_staging = prepare_log_staging(&artifacts, "dep-cleanup").unwrap();
+        write_logs(&log_staging, b"out", b"err").unwrap();
+
+        let _ = fail_build(
+            &mut state,
+            &artifacts,
+            &final_path,
+            &log_staging,
+            "dep-cleanup",
+            "state seal failed".into(),
+        );
+        assert_eq!(fs::read(final_path.join("sentinel")).unwrap(), b"sealed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_publish_fixture(path: &Path, metadata_json: &str) {
+        fs::create_dir_all(path.join("app")).unwrap();
+        fs::create_dir_all(path.join("meta")).unwrap();
+        fs::write(path.join("app/index.js"), b"compiled").unwrap();
+        fs::write(path.join("meta/meta.json"), metadata_json).unwrap();
     }
 }

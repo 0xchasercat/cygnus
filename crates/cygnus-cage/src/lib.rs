@@ -31,9 +31,9 @@ mod spec;
 #[cfg(target_os = "linux")]
 pub use dns::{DnsForwarder, DnsLease};
 pub use error::CageError;
-pub use jobs::{JobConfig, JobExitOutcome, JobResult, run_job};
 #[cfg(target_os = "linux")]
 pub use jobs::run_job_with_dns;
+pub use jobs::{JobConfig, JobExitOutcome, JobResult, run_job};
 #[cfg(target_os = "linux")]
 pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]
@@ -41,10 +41,11 @@ pub use process::Cage;
 #[cfg(target_os = "linux")]
 pub use seccomp::{SeccompPlan, denied_syscalls};
 pub use spec::{
-    BUILD_OUTPUT_CAGE_DIR, BootTimings, BuildOutputSpec, CageSpec, CgroupLimits,
-    DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA, DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX,
-    DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT, DEFAULT_ROOTFS_TMPFS_SIZE, DomainEgressRule,
-    EgressMode, EgressRule, FilterMode, INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
+    ADMIN_CAGE_DIR, ADMIN_SOCKET_FILENAME, AdminSocketSpec, BUILD_OUTPUT_CAGE_DIR, BootTimings,
+    BuildOutputSpec, CageSpec, CgroupLimits, DEFAULT_CPU_PERIOD, DEFAULT_CPU_QUOTA,
+    DEFAULT_MEMORY_HIGH, DEFAULT_MEMORY_MAX, DEFAULT_PIDS_MAX, DEFAULT_READINESS_TIMEOUT,
+    DEFAULT_ROOTFS_TMPFS_SIZE, DomainEgressRule, EgressMode, EgressRule, FilterMode,
+    INGRESS_CAGE_DIR, IngressSpec, RootfsSpec,
 };
 
 /// Nonblocking status reported by a cage process.

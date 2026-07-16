@@ -22,7 +22,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const SHA256_HEX_LEN: usize = 64;
 
@@ -88,6 +88,87 @@ pub struct DeploymentRecord {
     pub artifact_hash: Option<String>,
     pub status: DeploymentStatus,
     pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub log_path: Option<PathBuf>,
+}
+
+/// The deployment currently selected by an app's active artifact pointer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveDeploymentRecord {
+    pub deployment_id: String,
+    pub artifact_hash: String,
+    pub engine_version: String,
+}
+
+/// Administrative endpoint provenance persisted with an audit event.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEndpointRole {
+    Host,
+    TenantZero,
+}
+
+/// Result recorded for an audited command.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditOutcome {
+    Success,
+    Failure,
+}
+
+/// Caller and request provenance supplied by an administrative command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditContext {
+    pub endpoint_role: AuditEndpointRole,
+    pub peer_uid: Option<u32>,
+    pub peer_gid: Option<u32>,
+    pub peer_pid: Option<u32>,
+    pub actor_subject: Option<String>,
+    pub request_id: String,
+    pub command_kind: String,
+    pub request_digest: String,
+}
+
+/// One immutable command audit event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub recorded_at: String,
+    pub endpoint_role: AuditEndpointRole,
+    pub peer_uid: Option<u32>,
+    pub peer_gid: Option<u32>,
+    pub peer_pid: Option<u32>,
+    pub actor_subject: Option<String>,
+    pub request_id: String,
+    pub command_kind: String,
+    pub request_digest: String,
+    pub outcome: AuditOutcome,
+    pub error_code: Option<String>,
+}
+
+/// A read-only, deployment-specific candidate for activation or rollback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationPlan {
+    pub logical_app: String,
+    pub candidate: LoadedApp,
+    pub target_deployment_id: String,
+    pub target_artifact_hash: String,
+    pub expected_active_artifact: Option<String>,
+    pub previous_runtime_key: Option<String>,
+    pub previous_upstream: Option<PathBuf>,
+    pub runtime_key: String,
+}
+
+/// Result of an atomic activation commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActivationRecord {
+    pub deployment_id: String,
+    pub artifact_hash: String,
+    pub runtime_key: String,
+    pub previous_deployment_id: Option<String>,
+    pub previous_artifact_hash: Option<String>,
+    pub previous_runtime_key: Option<String>,
 }
 
 /// The JSON document accepted by the daemon's apply operation.
@@ -114,6 +195,8 @@ pub struct AppConfig {
     pub name: String,
     #[serde(default)]
     pub domains: Vec<String>,
+    #[serde(default)]
+    pub tenant_admin: bool,
     pub upstream: PathBuf,
     pub command: String,
     #[serde(default)]
@@ -143,6 +226,7 @@ impl Default for AppConfig {
         Self {
             name: String::new(),
             domains: Vec::new(),
+            tenant_admin: false,
             upstream: PathBuf::new(),
             command: String::new(),
             args: Vec::new(),
@@ -382,6 +466,7 @@ pub struct Snapshot {
 pub struct LoadedApp {
     pub name: String,
     pub domains: Vec<String>,
+    pub tenant_admin: bool,
     pub upstream: PathBuf,
     pub spec: CageSpec,
     pub lifecycle: LifecycleConfig,
@@ -431,6 +516,18 @@ pub enum StateError {
     },
     #[error("artifact metadata does not agree with its deployment")]
     MetadataMismatch,
+    #[error(
+        "activation CAS conflict for app {app:?}: expected active artifact {expected:?}, found {actual:?}"
+    )]
+    ActivationConflict {
+        app: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+    #[error("app {0:?} does not exist")]
+    AppNotFound(String),
+    #[error("domain {domain:?} is already mapped to app {owner:?}")]
+    DomainConflict { domain: String, owner: String },
 }
 
 /// A SQLite-backed node configuration store.
@@ -472,6 +569,7 @@ impl State {
             let transaction = connection.transaction()?;
             match version {
                 1 => migrate_v1_to_v2(&transaction)?,
+                2 => migrate_v2_to_v3(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -539,7 +637,24 @@ impl State {
             })?;
             let runtime = stored.runtime;
             let domains = self.load_domains(id, &name)?;
-            apps.push(loaded_from_stored(&name, &upstream, domains, runtime)?);
+            let mut loaded = loaded_from_stored(&name, &upstream, domains, runtime)?;
+            let active_artifact_hash = self
+                .connection
+                .query_row(
+                    "SELECT d.artifact_hash
+                     FROM deployments d
+                     JOIN app_artifacts aa ON aa.app_id = ?1
+                     JOIN artifacts ar ON ar.id = aa.artifact_id AND ar.artifact_hash = d.artifact_hash
+                     WHERE d.app = ?2 AND d.status = 'active'
+                     LIMIT 1",
+                    params![id, name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(artifact_hash) = active_artifact_hash {
+                loaded.spec.name = format!("r-{artifact_hash}");
+            }
+            apps.push(loaded);
         }
         let snapshot = Snapshot { listen, apps };
         validate_snapshot(&snapshot)?;
@@ -612,11 +727,33 @@ impl State {
             })?;
         ensure_transition(id, current.status, DeploymentStatus::Failed)?;
         self.connection.execute(
-            "UPDATE deployments SET status = 'failed', error = ?2 WHERE id = ?1",
+            "UPDATE deployments SET status = 'failed', error = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id, error],
         )?;
         self.deployment(id)?.ok_or_else(|| {
             StateError::IncompleteState(format!("deployment {id:?} disappeared after failure"))
+        })
+    }
+
+    /// Persist the daemon-owned build log directory for any deployment state.
+    pub fn set_deployment_log_path(
+        &mut self,
+        id: &str,
+        log_path: &Path,
+    ) -> Result<DeploymentRecord, StateError> {
+        validate_absolute_path(log_path, "deployment log path")?;
+        let changed = self.connection.execute(
+            "UPDATE deployments SET log_path = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id, log_path.to_string_lossy()],
+        )?;
+        if changed == 0 {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("deployment {id:?} does not exist"),
+            });
+        }
+        self.deployment(id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!("deployment {id:?} disappeared after log update"))
         })
     }
 
@@ -650,119 +787,608 @@ impl State {
                 detail: format!("engine {:?} is not registered", artifact.engine_version),
             });
         }
+        if let Some(existing) = query_artifact_tx(&transaction, &artifact.artifact_hash)? {
+            if existing.record.app != artifact.app
+                || existing.record.source_hash != artifact.source_hash
+                || existing.record.engine_version != artifact.engine_version
+                || existing.record.host_path != artifact.host_path
+                || !metadata_json_equal(&existing.record.metadata_json, &artifact.metadata_json)
+            {
+                return Err(StateError::ArtifactOwnership {
+                    artifact: artifact.artifact_hash.clone(),
+                    deployment: id.to_owned(),
+                });
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO artifacts (app, source_hash, artifact_hash, engine_version, host_path, metadata_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sealed')",
+                params![artifact.app, artifact.source_hash, artifact.artifact_hash, artifact.engine_version, artifact.host_path.to_string_lossy(), artifact.metadata_json],
+            )?;
+        }
         transaction.execute(
-            "INSERT INTO artifacts (app, source_hash, artifact_hash, engine_version, host_path, metadata_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sealed')",
-            params![artifact.app, artifact.source_hash, artifact.artifact_hash, artifact.engine_version, artifact.host_path.to_string_lossy(), artifact.metadata_json],
+            "UPDATE deployments SET artifact_hash = ?2, status = 'sealed', error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id, artifact.artifact_hash],
         )?;
-        transaction.execute("UPDATE deployments SET artifact_hash = ?2, status = 'sealed', error = NULL WHERE id = ?1", params![id, artifact.artifact_hash])?;
         transaction.commit()?;
-        self.artifact(&artifact.artifact_hash)?.ok_or_else(|| {
+        self.deployment_artifact(id)?.ok_or_else(|| {
             StateError::IncompleteState(format!(
-                "artifact {:?} disappeared after sealing",
-                artifact.artifact_hash
+                "artifact for deployment {id:?} disappeared after sealing"
             ))
         })
     }
 
     pub fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>, StateError> {
         self.connection.query_row(
-            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE id = ?1",
+            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path FROM deployments WHERE id = ?1",
             [id],
-            |row| {
-                let status: String = row.get(5)?;
-                Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
-            },
+            deployment_from_row,
         ).optional().map_err(StateError::from)
     }
 
-    pub fn artifact(&self, hash: &str) -> Result<Option<ArtifactRecord>, StateError> {
-        self.connection.query_row(
-            "SELECT app, source_hash, artifact_hash, engine_version, host_path, metadata_json FROM artifacts WHERE artifact_hash = ?1 AND status = 'sealed'",
-            [hash],
-            |row| Ok(ArtifactRecord { app: row.get(0)?, source_hash: row.get(1)?, artifact_hash: row.get(2)?, engine_version: row.get(3)?, host_path: PathBuf::from(row.get::<_, String>(4)?), metadata_json: row.get(5)? }),
-        ).optional().map_err(StateError::from)
-    }
-
-    /// Atomically register the first runtime app and activate its sealed artifact.
-    pub fn activate_first(
-        &mut self,
-        app: &AppConfig,
-        artifact_hash: &str,
-    ) -> Result<DeploymentRecord, StateError> {
-        let snapshot = snapshot_from_config(&NodeConfig {
-            listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
-            apps: vec![app.clone()],
-        })?;
-        let stored = snapshot_to_stored(&snapshot)?;
-        let stored_app = stored
-            .apps
-            .first()
-            .ok_or_else(|| StateError::InvalidConfig("activation app is empty".into()))?;
-        validate_absolute_path(&app.upstream, "app upstream")?;
-        validate_hash(artifact_hash, "artifact hash")?;
-        let transaction = self.connection.transaction()?;
-        let artifact = query_artifact_tx(&transaction, artifact_hash)?.ok_or_else(|| {
-            StateError::InvalidRecord {
-                kind: "artifact",
-                detail: format!("sealed artifact {artifact_hash:?} does not exist"),
-            }
-        })?;
-        if artifact.app != app.name {
-            return Err(StateError::ArtifactOwnership {
-                artifact: artifact_hash.to_owned(),
-                deployment: artifact.app,
+    /// List newest deployments, optionally scoped to one app.
+    pub fn deployments(
+        &self,
+        app: Option<&str>,
+        cursor: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<DeploymentRecord>, StateError> {
+        if limit == 0 || limit > 51 {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment query",
+                detail: "limit must be between 1 and 51".into(),
             });
         }
-        let existing_app = transaction
-            .query_row("SELECT name FROM apps ORDER BY id LIMIT 1", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?;
-        if let Some(existing) = existing_app {
-            return Err(StateError::InvalidConfig(format!(
-                "first activation requires an empty node (existing app {existing:?})"
-            )));
+        if app.is_some_and(|name| name.trim().is_empty()) {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment query",
+                detail: "app filter must be nonempty".into(),
+            });
         }
+        let before = if let Some(cursor) = cursor {
+            let rowid = self
+                .connection
+                .query_row(
+                    "SELECT rowid FROM deployments WHERE id = ?1",
+                    [cursor],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| StateError::InvalidRecord {
+                    kind: "deployment cursor",
+                    detail: format!("deployment cursor {cursor:?} does not exist"),
+                })?;
+            Some(rowid)
+        } else {
+            None
+        };
+
+        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path";
+        let mut deployments = Vec::new();
+        match (app, before) {
+            (Some(app), Some(before)) => {
+                let sql = format!(
+                    "SELECT {columns} FROM deployments WHERE app = ?1 AND rowid < ?2 ORDER BY rowid DESC LIMIT ?3"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement
+                    .query_map(params![app, before, i64::from(limit)], deployment_from_row)?;
+                for row in rows {
+                    deployments.push(row?);
+                }
+            }
+            (Some(app), None) => {
+                let sql = format!(
+                    "SELECT {columns} FROM deployments WHERE app = ?1 ORDER BY rowid DESC LIMIT ?2"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows =
+                    statement.query_map(params![app, i64::from(limit)], deployment_from_row)?;
+                for row in rows {
+                    deployments.push(row?);
+                }
+            }
+            (None, Some(before)) => {
+                let sql = format!(
+                    "SELECT {columns} FROM deployments WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows =
+                    statement.query_map(params![before, i64::from(limit)], deployment_from_row)?;
+                for row in rows {
+                    deployments.push(row?);
+                }
+            }
+            (None, None) => {
+                let sql = format!("SELECT {columns} FROM deployments ORDER BY rowid DESC LIMIT ?1");
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map([i64::from(limit)], deployment_from_row)?;
+                for row in rows {
+                    deployments.push(row?);
+                }
+            }
+        }
+        Ok(deployments)
+    }
+
+    /// Resolve the deployment selected by an app's active artifact pointer.
+    pub fn active_deployment(
+        &self,
+        app: &str,
+    ) -> Result<Option<ActiveDeploymentRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT d.id, ar.artifact_hash, ar.engine_version
+                 FROM apps a
+                 JOIN app_artifacts aa ON aa.app_id = a.id
+                 JOIN artifacts ar ON ar.id = aa.artifact_id
+                 JOIN deployments d ON d.artifact_hash = ar.artifact_hash
+                 WHERE a.name = ?1 AND d.status = 'active'",
+                [app],
+                |row| {
+                    Ok(ActiveDeploymentRecord {
+                        deployment_id: row.get(0)?,
+                        artifact_hash: row.get(1)?,
+                        engine_version: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    /// Return the daemon-owned log directory for a deployment in any state.
+    pub fn deployment_logs_dir(&self, id: &str) -> Result<Option<PathBuf>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT log_path FROM deployments WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|path| path.flatten().map(PathBuf::from))
+            .map_err(StateError::from)
+    }
+
+    /// Resolve the sealed artifact linked to one deployment ID.
+    pub fn deployment_artifact(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<ArtifactRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT ar.app, ar.source_hash, ar.artifact_hash, ar.engine_version, ar.host_path, ar.metadata_json
+                 FROM deployments d
+                 JOIN artifacts ar ON ar.artifact_hash = d.artifact_hash
+                 WHERE d.id = ?1 AND ar.status = 'sealed'",
+                [deployment_id],
+                artifact_record_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+    /// Validate and materialize a deployment-specific runtime without writes.
+    pub fn plan_activation(
+        &self,
+        deployment_id: &str,
+        candidate: &AppConfig,
+        expected_active_artifact: Option<&str>,
+    ) -> Result<ActivationPlan, StateError> {
+        if let Some(expected) = expected_active_artifact {
+            validate_hash(expected, "expected active artifact hash")?;
+        }
+        let snapshot = snapshot_from_config(&NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            apps: vec![candidate.clone()],
+        })?;
+        let mut loaded = snapshot
+            .apps
+            .into_iter()
+            .next()
+            .ok_or_else(|| StateError::InvalidConfig("activation app is empty".into()))?;
         let deployment =
-            query_deployment_by_artifact_tx(&transaction, artifact_hash)?.ok_or_else(|| {
-                StateError::IncompleteState("artifact deployment relation is missing".into())
-            })?;
-        ensure_transition(&deployment.id, deployment.status, DeploymentStatus::Active)?;
+            self.deployment(deployment_id)?
+                .ok_or_else(|| StateError::InvalidRecord {
+                    kind: "deployment",
+                    detail: format!("deployment {deployment_id:?} does not exist"),
+                })?;
+        if deployment.status != DeploymentStatus::Sealed {
+            return Err(StateError::InvalidDeploymentTransition {
+                id: deployment_id.to_owned(),
+                from: deployment.status,
+                to: DeploymentStatus::Active,
+            });
+        }
+        let artifact = self.deployment_artifact(deployment_id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "deployment {deployment_id:?} has no retained artifact"
+            ))
+        })?;
+        validate_artifact_record_metadata(&artifact)?;
+        if deployment.app != candidate.name || artifact.app != candidate.name {
+            return Err(StateError::ArtifactOwnership {
+                artifact: artifact.artifact_hash,
+                deployment: deployment_id.to_owned(),
+            });
+        }
+        if artifact.source_hash != deployment.source_hash
+            || artifact.engine_version != deployment.engine_version
+        {
+            return Err(StateError::ArtifactOwnership {
+                artifact: artifact.artifact_hash,
+                deployment: deployment_id.to_owned(),
+            });
+        }
+        let active = self.active_deployment(&candidate.name)?;
+        let actual = active.as_ref().map(|active| active.artifact_hash.clone());
+        let expected = expected_active_artifact.map(str::to_owned);
+        if actual != expected {
+            return Err(StateError::ActivationConflict {
+                app: candidate.name.clone(),
+                expected,
+                actual,
+            });
+        }
+        let previous_runtime_key = active
+            .as_ref()
+            .map(|active| format!("r-{}", active.artifact_hash));
+        let previous_upstream = self
+            .load()?
+            .apps
+            .into_iter()
+            .find(|app| app.name == candidate.name)
+            .map(|app| app.upstream);
+        let runtime_key = format!("r-{}", artifact.artifact_hash);
+        loaded.spec.name = runtime_key.clone();
+        let upstream = revision_upstream(&candidate.upstream, &artifact.artifact_hash)?;
+        loaded.upstream = upstream.clone();
+        loaded.spec.readiness_uds = Some(upstream.clone());
+        loaded.spec.env.insert(
+            OsString::from("CYGNUS_SOCKET"),
+            runtime_socket_path(&upstream).into_os_string(),
+        );
+        validate_snapshot(&Snapshot {
+            listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            apps: vec![loaded.clone()],
+        })?;
+        Ok(ActivationPlan {
+            logical_app: candidate.name.clone(),
+            candidate: loaded,
+            target_deployment_id: deployment_id.to_owned(),
+            target_artifact_hash: artifact.artifact_hash,
+            expected_active_artifact: expected_active_artifact.map(str::to_owned),
+            previous_runtime_key,
+            previous_upstream,
+            runtime_key,
+        })
+    }
+
+    pub fn commit_activation(
+        &mut self,
+        plan: &ActivationPlan,
+        audit: &AuditContext,
+    ) -> Result<ActivationRecord, StateError> {
+        validate_audit_context(audit)?;
+        let expected_runtime_key = format!("r-{}", plan.target_artifact_hash);
+        let expected_upstream =
+            revision_upstream(&plan.candidate.upstream, &plan.target_artifact_hash)?;
+        let expected_runtime_socket = runtime_socket_path(&expected_upstream).into_os_string();
+        if plan.candidate.name != plan.logical_app
+            || plan.runtime_key != expected_runtime_key
+            || plan.candidate.spec.name != expected_runtime_key
+            || plan.candidate.upstream != expected_upstream
+            || plan
+                .candidate
+                .spec
+                .env
+                .get(std::ffi::OsStr::new("CYGNUS_SOCKET"))
+                != Some(&expected_runtime_socket)
+            || plan.candidate.spec.readiness_uds.as_ref() != Some(&expected_upstream)
+        {
+            return Err(StateError::InvalidRecord {
+                kind: "activation plan",
+                detail: "candidate identity or readiness path was modified".into(),
+            });
+        }
+        validate_snapshot(&Snapshot {
+            listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            apps: vec![plan.candidate.clone()],
+        })?;
+        let stored_runtime = StoredRuntime::from_app(&plan.candidate)?;
+        let stored_upstream = plan.candidate.upstream.to_string_lossy().into_owned();
         let runtime_json = serde_json::to_string(&StoredApp {
-            name: &stored_app.name,
-            upstream: &stored_app.upstream,
+            name: &plan.logical_app,
+            upstream: &stored_upstream,
             domains: &[],
-            runtime: &stored_app.runtime,
+            runtime: &stored_runtime,
         })
         .map_err(|error| {
-            StateError::InvalidConfig(format!("serialize app {:?}: {error}", app.name))
+            StateError::InvalidConfig(format!("serialize app {:?}: {error}", plan.logical_app))
         })?;
-        let app_id = transaction.query_row(
-            "INSERT INTO apps (name, upstream, runtime_json) VALUES (?1, ?2, ?3) RETURNING id",
-            params![stored_app.name, stored_app.upstream, runtime_json],
-            |row| row.get::<_, i64>(0),
-        )?;
-        for domain in &stored_app.domains {
+        let transaction = self.connection.transaction()?;
+        let target =
+            query_deployment_tx(&transaction, &plan.target_deployment_id)?.ok_or_else(|| {
+                StateError::InvalidRecord {
+                    kind: "deployment",
+                    detail: format!("deployment {:?} does not exist", plan.target_deployment_id),
+                }
+            })?;
+        if target.status != DeploymentStatus::Sealed
+            || target.app != plan.logical_app
+            || target.artifact_hash.as_deref() != Some(plan.target_artifact_hash.as_str())
+        {
+            return Err(StateError::InvalidDeploymentTransition {
+                id: plan.target_deployment_id.clone(),
+                from: target.status,
+                to: DeploymentStatus::Active,
+            });
+        }
+        let artifact =
+            query_artifact_tx(&transaction, &plan.target_artifact_hash)?.ok_or_else(|| {
+                StateError::IncompleteState(format!(
+                    "deployment {:?} references a missing artifact",
+                    plan.target_deployment_id
+                ))
+            })?;
+        if artifact.record.app != plan.logical_app
+            || artifact.record.source_hash != target.source_hash
+            || artifact.record.engine_version != target.engine_version
+        {
+            return Err(StateError::ArtifactOwnership {
+                artifact: plan.target_artifact_hash.clone(),
+                deployment: plan.target_deployment_id.clone(),
+            });
+        }
+        validate_artifact_record_metadata(&artifact.record)?;
+        let actual = transaction.query_row("SELECT ar.artifact_hash FROM apps a JOIN app_artifacts aa ON aa.app_id = a.id JOIN artifacts ar ON ar.id = aa.artifact_id WHERE a.name = ?1", [&plan.logical_app], |row| row.get::<_, String>(0)).optional()?;
+        if actual != plan.expected_active_artifact {
+            return Err(StateError::ActivationConflict {
+                app: plan.logical_app.clone(),
+                expected: plan.expected_active_artifact.clone(),
+                actual,
+            });
+        }
+        let previous = transaction
+            .query_row(
+                "SELECT id, artifact_hash FROM deployments WHERE app = ?1 AND status = 'active'",
+                [&plan.logical_app],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let app_id = transaction
+            .query_row(
+                "SELECT id FROM apps WHERE name = ?1",
+                [&plan.logical_app],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let app_id = if let Some(app_id) = app_id {
+            transaction.execute(
+                "UPDATE apps SET upstream = ?2, runtime_json = ?3 WHERE id = ?1",
+                params![
+                    app_id,
+                    plan.candidate.upstream.to_string_lossy(),
+                    runtime_json
+                ],
+            )?;
+            transaction.execute("DELETE FROM domains WHERE app_id = ?1", [app_id])?;
+            app_id
+        } else {
+            transaction.query_row(
+                "INSERT INTO apps (name, upstream, runtime_json) VALUES (?1, ?2, ?3) RETURNING id",
+                params![
+                    plan.logical_app,
+                    plan.candidate.upstream.to_string_lossy(),
+                    runtime_json
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        for domain in &plan.candidate.domains {
             transaction.execute(
                 "INSERT INTO domains (app_id, domain) VALUES (?1, ?2)",
                 params![app_id, domain],
             )?;
         }
-        transaction.execute(
-            "INSERT INTO app_artifacts (app_id, artifact_id) VALUES (?1, ?2)",
-            params![app_id, artifact.id],
-        )?;
-        transaction.execute(
-            "UPDATE deployments SET status = 'active' WHERE id = ?1",
-            [deployment.id.as_str()],
-        )?;
+        transaction.execute("INSERT INTO app_artifacts (app_id, artifact_id, activated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP) ON CONFLICT(app_id) DO UPDATE SET artifact_id = excluded.artifact_id, activated_at = CURRENT_TIMESTAMP", params![app_id, artifact.id])?;
+        transaction.execute("UPDATE deployments SET status = 'sealed', updated_at = CURRENT_TIMESTAMP WHERE app = ?1 AND status = 'active'", [&plan.logical_app])?;
+        transaction.execute("UPDATE deployments SET status = 'active', error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1", [&plan.target_deployment_id])?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
-        self.deployment(&deployment.id)?.ok_or_else(|| {
+        Ok(ActivationRecord {
+            deployment_id: plan.target_deployment_id.clone(),
+            artifact_hash: plan.target_artifact_hash.clone(),
+            runtime_key: plan.runtime_key.clone(),
+            previous_deployment_id: previous.as_ref().map(|item| item.0.clone()),
+            previous_artifact_hash: previous.and_then(|item| item.1),
+            previous_runtime_key: plan.previous_runtime_key.clone(),
+        })
+    }
+
+    /// Plan and commit activation without a live runtime handoff.
+    /// Main should use [`State::plan_activation`] and
+    /// [`State::commit_activation`] separately when it boots a candidate.
+    pub fn activate_deployment(
+        &mut self,
+        deployment_id: &str,
+        candidate: &AppConfig,
+        expected_active_artifact: Option<&str>,
+        audit: &AuditContext,
+    ) -> Result<DeploymentRecord, StateError> {
+        let plan = self.plan_activation(deployment_id, candidate, expected_active_artifact)?;
+        self.commit_activation(&plan, audit)?;
+        self.deployment(deployment_id)?.ok_or_else(|| {
             StateError::IncompleteState(format!(
-                "deployment {:?} disappeared after activation",
-                deployment.id
+                "deployment {deployment_id:?} disappeared after activation"
             ))
         })
+    }
+
+    /// Build a rollback candidate from current logical settings and target metadata.
+    pub fn plan_rollback(
+        &self,
+        app: &str,
+        target_deployment_id: &str,
+        expected_active_artifact: &str,
+    ) -> Result<ActivationPlan, StateError> {
+        if app.trim().is_empty() {
+            return Err(StateError::InvalidRecord {
+                kind: "rollback",
+                detail: "app must be nonempty".into(),
+            });
+        }
+        validate_hash(expected_active_artifact, "expected active artifact hash")?;
+        let active = self
+            .active_deployment(app)?
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "rollback",
+                detail: format!("logical app {app:?} has no active deployment"),
+            })?;
+        if active.artifact_hash != expected_active_artifact {
+            return Err(StateError::ActivationConflict {
+                app: app.to_owned(),
+                expected: Some(expected_active_artifact.to_owned()),
+                actual: Some(active.artifact_hash),
+            });
+        }
+        let deployment =
+            self.deployment(target_deployment_id)?
+                .ok_or_else(|| StateError::InvalidRecord {
+                    kind: "deployment",
+                    detail: format!("deployment {target_deployment_id:?} does not exist"),
+                })?;
+        if deployment.app != app {
+            return Err(StateError::ArtifactOwnership {
+                artifact: deployment.artifact_hash.unwrap_or_default(),
+                deployment: target_deployment_id.to_owned(),
+            });
+        }
+        if deployment.status != DeploymentStatus::Sealed {
+            return Err(StateError::InvalidDeploymentTransition {
+                id: target_deployment_id.to_owned(),
+                from: deployment.status,
+                to: DeploymentStatus::Active,
+            });
+        }
+        let artifact = self
+            .deployment_artifact(target_deployment_id)?
+            .ok_or_else(|| {
+                StateError::IncompleteState(format!(
+                    "deployment {target_deployment_id:?} has no retained artifact"
+                ))
+            })?;
+        validate_artifact_record_metadata(&artifact)?;
+        let engine = self.engine(&deployment.engine_version)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "deployment {target_deployment_id:?} references an unregistered engine"
+            ))
+        })?;
+        let current = self
+            .load()?
+            .apps
+            .into_iter()
+            .find(|item| item.name == app)
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "rollback",
+                detail: format!("logical app {app:?} does not exist"),
+            })?;
+        let mut candidate = app_config_from_loaded(current)?;
+        candidate.command = engine_runtime_command(&engine)?;
+        let runtime_entry = metadata_runtime_entry(&artifact.metadata_json)?;
+        candidate.args = vec!["--preload".into(), "/cygnus/shim.js".into(), runtime_entry];
+        let mut rootfs = candidate.rootfs.unwrap_or_default();
+        rootfs.lowerdirs = vec![engine.host_root, artifact.host_path];
+        candidate.rootfs = Some(rootfs);
+        self.plan_activation(
+            target_deployment_id,
+            &candidate,
+            Some(expected_active_artifact),
+        )
+    }
+
+    /// Add one canonical route and its success audit event atomically.
+    pub fn map_domain(
+        &mut self,
+        app: &str,
+        domain: &str,
+        audit: &AuditContext,
+    ) -> Result<String, StateError> {
+        validate_audit_context(audit)?;
+        let canonical = canonical_domain(domain).ok_or_else(|| {
+            StateError::InvalidConfig(format!("invalid DNS host pattern {domain:?}"))
+        })?;
+        let transaction = self.connection.transaction()?;
+        let app_id = transaction
+            .query_row("SELECT id FROM apps WHERE name = ?1", [app], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?
+            .ok_or_else(|| StateError::AppNotFound(app.to_owned()))?;
+        let owner = transaction
+            .query_row(
+                "SELECT a.name FROM domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?1",
+                [&canonical],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            Some(existing) if existing != app => {
+                return Err(StateError::DomainConflict {
+                    domain: canonical,
+                    owner: existing.to_owned(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                transaction.execute(
+                    "INSERT INTO domains (app_id, domain) VALUES (?1, ?2)",
+                    params![app_id, canonical],
+                )?;
+            }
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(canonical)
+    }
+
+    /// Append one explicit success or failure event.
+    pub fn append_audit(
+        &mut self,
+        context: &AuditContext,
+        outcome: AuditOutcome,
+        error_code: Option<&str>,
+    ) -> Result<AuditRecord, StateError> {
+        validate_audit_context(context)?;
+        let transaction = self.connection.transaction()?;
+        let id = append_audit_tx(&transaction, context, outcome, error_code)?;
+        transaction.commit()?;
+        self.audit_record(id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!("audit event {id} disappeared after insert"))
+        })
+    }
+
+    /// Return audit events in insertion order.
+    pub fn audit_records(&self) -> Result<Vec<AuditRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, recorded_at, endpoint_role, peer_uid, peer_gid, peer_pid,
+                    actor_subject, request_id, command_kind, request_digest, outcome, error_code
+             FROM audit_log ORDER BY id",
+        )?;
+        let rows = statement.query_map([], audit_record_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    fn audit_record(&self, id: i64) -> Result<Option<AuditRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT id, recorded_at, endpoint_role, peer_uid, peer_gid, peer_pid,
+                        actor_subject, request_id, command_kind, request_digest, outcome, error_code
+                 FROM audit_log WHERE id = ?1",
+                [id],
+                audit_record_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
     }
 
     fn load_domains(&self, app_id: i64, app: &str) -> Result<Vec<String>, StateError> {
@@ -846,10 +1472,79 @@ fn migrate_v1_to_v2(connection: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn migrate_v2_to_v3(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "ALTER TABLE deployments RENAME TO deployments_v2;
+         CREATE TABLE deployments (
+             id TEXT PRIMARY KEY,
+             app TEXT NOT NULL,
+             source_hash TEXT NOT NULL,
+             engine_version TEXT NOT NULL REFERENCES engines(version),
+             artifact_hash TEXT REFERENCES artifacts(artifact_hash),
+             status TEXT NOT NULL CHECK (status IN ('building', 'failed', 'sealed', 'active')),
+             error TEXT,
+             log_path TEXT,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         INSERT INTO deployments
+             (id, app, source_hash, engine_version, artifact_hash, status, error)
+         SELECT id, app, source_hash, engine_version, artifact_hash, status, error
+         FROM deployments_v2;
+         DROP TABLE deployments_v2;
+         UPDATE deployments AS d
+         SET status = 'sealed', updated_at = CURRENT_TIMESTAMP
+         WHERE d.status = 'active'
+           AND d.rowid <> COALESCE(
+               (SELECT d2.rowid
+                FROM deployments d2
+                JOIN artifacts ar ON ar.artifact_hash = d2.artifact_hash
+                JOIN app_artifacts aa ON aa.artifact_id = ar.id
+                JOIN apps a ON a.id = aa.app_id AND a.name = d2.app
+                WHERE d2.app = d.app AND d2.status = 'active'
+                ORDER BY d2.rowid DESC LIMIT 1),
+               (SELECT MAX(d3.rowid)
+                FROM deployments d3
+                WHERE d3.app = d.app AND d3.status = 'active')
+           );
+         CREATE INDEX deployments_app ON deployments(app);
+         CREATE INDEX deployments_artifact_hash ON deployments(artifact_hash);
+         CREATE INDEX deployments_created_at ON deployments(created_at DESC, id DESC);
+         CREATE INDEX deployments_status_updated_at
+             ON deployments(status, updated_at DESC);
+         CREATE UNIQUE INDEX deployments_one_active_per_app
+             ON deployments(app) WHERE status = 'active';
+         CREATE TABLE audit_log (
+             id INTEGER PRIMARY KEY,
+             recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             endpoint_role TEXT NOT NULL CHECK (endpoint_role IN ('host', 'tenant_zero')),
+             peer_uid INTEGER,
+             peer_gid INTEGER,
+             peer_pid INTEGER,
+             actor_subject TEXT,
+             request_id TEXT NOT NULL,
+             command_kind TEXT NOT NULL,
+             request_digest TEXT NOT NULL,
+             outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+             error_code TEXT,
+             CHECK ((outcome = 'success' AND error_code IS NULL)
+                 OR (outcome = 'failure' AND error_code IS NOT NULL))
+         );
+         CREATE INDEX audit_log_recorded_at ON audit_log(recorded_at DESC, id DESC);
+         CREATE TRIGGER audit_log_no_update
+             BEFORE UPDATE ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
+         CREATE TRIGGER audit_log_no_delete
+             BEFORE DELETE ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;",
+    )?;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct ArtifactRow {
     id: i64,
-    app: String,
+    record: ArtifactRecord,
 }
 
 fn validate_engine(engine: &EngineRecord) -> Result<(), StateError> {
@@ -1031,15 +1726,281 @@ fn validate_metadata(artifact: &ArtifactInput) -> Result<(), StateError> {
         metadata_value(object, "sourceHash", "source_hash").ok_or(StateError::MetadataMismatch)?;
     let bun =
         metadata_value(object, "bunVersion", "bun_version").ok_or(StateError::MetadataMismatch)?;
-    if source != artifact.source_hash || bun != artifact.engine_version {
-        return Err(StateError::MetadataMismatch);
-    }
-    if let Some(hash) = metadata_value(object, "artifactHash", "artifact_hash")
-        && hash != artifact.artifact_hash
+    let hash = metadata_value(object, "artifactHash", "artifact_hash")
+        .ok_or(StateError::MetadataMismatch)?;
+    let runtime_entry = metadata_value(object, "runtimeEntry", "runtime_entry")
+        .ok_or(StateError::MetadataMismatch)?;
+    if source != artifact.source_hash
+        || bun != artifact.engine_version
+        || hash != artifact.artifact_hash
+        || validate_cage_path(Path::new(runtime_entry), "artifact runtime entry").is_err()
     {
         return Err(StateError::MetadataMismatch);
     }
     Ok(())
+}
+
+fn validate_artifact_record_metadata(artifact: &ArtifactRecord) -> Result<(), StateError> {
+    validate_metadata(&ArtifactInput {
+        app: artifact.app.clone(),
+        source_hash: artifact.source_hash.clone(),
+        artifact_hash: artifact.artifact_hash.clone(),
+        engine_version: artifact.engine_version.clone(),
+        host_path: artifact.host_path.clone(),
+        metadata_json: artifact.metadata_json.clone(),
+    })
+}
+
+fn metadata_runtime_entry(metadata_json: &str) -> Result<String, StateError> {
+    let value: serde_json::Value =
+        serde_json::from_str(metadata_json).map_err(|_| StateError::MetadataMismatch)?;
+    let object = value.as_object().ok_or(StateError::MetadataMismatch)?;
+    let entry = metadata_value(object, "runtimeEntry", "runtime_entry")
+        .ok_or(StateError::MetadataMismatch)?;
+    validate_cage_path(Path::new(entry), "artifact runtime entry")
+        .map_err(|_| StateError::MetadataMismatch)?;
+    Ok(entry.to_owned())
+}
+
+fn revision_upstream(base: &Path, artifact_hash: &str) -> Result<PathBuf, StateError> {
+    validate_hash(artifact_hash, "runtime artifact hash")?;
+    let parent = base.parent().ok_or_else(|| {
+        StateError::InvalidConfig("activation upstream has no parent directory".into())
+    })?;
+    let upstream = parent.join(format!("r-{artifact_hash}.sock"));
+    validate_absolute_path(&upstream, "activation upstream")?;
+    if upstream.as_os_str().as_bytes().len() > 100 {
+        return Err(StateError::InvalidConfig(
+            "activation upstream exceeds Unix socket path limit".into(),
+        ));
+    }
+    Ok(upstream)
+}
+
+fn runtime_socket_path(upstream: &Path) -> PathBuf {
+    PathBuf::from(cygnus_cage::INGRESS_CAGE_DIR).join(
+        upstream
+            .file_name()
+            .expect("validated activation upstream has a filename"),
+    )
+}
+
+fn engine_runtime_command(engine: &EngineRecord) -> Result<String, StateError> {
+    if cfg!(target_os = "linux") {
+        return Ok(engine.cage_executable.to_string_lossy().into_owned());
+    }
+    let relative =
+        engine
+            .cage_executable
+            .strip_prefix("/")
+            .map_err(|_| StateError::InvalidRecord {
+                kind: "engine",
+                detail: "engine cage executable must be absolute".into(),
+            })?;
+    Ok(engine
+        .host_root
+        .join(relative)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn app_config_from_loaded(app: LoadedApp) -> Result<AppConfig, StateError> {
+    let egress = match app.spec.egress {
+        EgressMode::None => EgressConfig::None,
+        EgressMode::Public => EgressConfig::Public,
+        EgressMode::Open => EgressConfig::Open,
+        EgressMode::Restricted { allow } => EgressConfig::Restricted {
+            allow: allow
+                .into_iter()
+                .map(|rule| EgressRuleConfig {
+                    cidr: rule.cidr,
+                    ports: rule.ports,
+                })
+                .collect(),
+        },
+        EgressMode::BuildDomains { .. } => {
+            return Err(StateError::InvalidPersisted {
+                app: app.name,
+                detail: "build-only egress cannot be a persisted runtime policy".into(),
+            });
+        }
+    };
+    Ok(AppConfig {
+        name: app.name,
+        domains: app.domains,
+        tenant_admin: app.tenant_admin,
+        upstream: app.upstream,
+        command: app.spec.command.to_string_lossy().into_owned(),
+        args: app
+            .spec
+            .args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        env: app
+            .spec
+            .env
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect(),
+        limits: LimitsConfig {
+            memory_max: app.spec.limits.memory_max,
+            memory_high: app.spec.limits.memory_high,
+            cpu_quota: app.spec.limits.cpu_quota,
+            cpu_period: app.spec.limits.cpu_period,
+            pids_max: app.spec.limits.pids_max,
+        },
+        rootfs: app.spec.rootfs.map(|rootfs| RootfsConfig {
+            lowerdirs: rootfs.lowerdirs,
+            tmpfs_size: rootfs.tmpfs_size,
+            staging_dir: rootfs.staging_dir,
+        }),
+        seccomp: app.spec.seccomp.map(|mode| match mode {
+            FilterMode::Enforce => SeccompMode::Enforce,
+            FilterMode::Audit => SeccompMode::Audit,
+        }),
+        egress,
+        init: app.spec.init,
+        readiness_timeout_ms: duration_millis(app.spec.readiness_timeout),
+        lifecycle: LifecyclePolicy {
+            idle_ttl_ms: duration_millis(app.lifecycle.idle_ttl),
+            min_instances: app.lifecycle.min_instances,
+            backoff_base_ms: duration_millis(app.lifecycle.backoff_base),
+            backoff_max_ms: duration_millis(app.lifecycle.backoff_max),
+            crash_window_ms: duration_millis(app.lifecycle.crash_window),
+            crash_loop_threshold: app.lifecycle.crash_loop_threshold,
+        },
+    })
+}
+
+fn validate_audit_context(context: &AuditContext) -> Result<(), StateError> {
+    for (kind, value) in [
+        ("request id", context.request_id.as_str()),
+        ("command kind", context.command_kind.as_str()),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(StateError::InvalidRecord {
+                kind: "audit",
+                detail: format!("{kind} must be nonempty and printable"),
+            });
+        }
+    }
+    if context
+        .actor_subject
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "audit",
+            detail: "actor subject must be nonempty and printable when supplied".into(),
+        });
+    }
+    validate_hash(&context.request_digest, "audit request digest")
+}
+
+fn append_audit_tx(
+    transaction: &Transaction<'_>,
+    context: &AuditContext,
+    outcome: AuditOutcome,
+    error_code: Option<&str>,
+) -> Result<i64, StateError> {
+    validate_audit_context(context)?;
+    if matches!(outcome, AuditOutcome::Success) && error_code.is_some()
+        || matches!(outcome, AuditOutcome::Failure)
+            && error_code
+                .is_none_or(|code| code.trim().is_empty() || code.chars().any(char::is_control))
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "audit",
+            detail: "success must omit error_code and failure must supply a printable error_code"
+                .into(),
+        });
+    }
+    transaction.execute(
+        "INSERT INTO audit_log
+         (endpoint_role, peer_uid, peer_gid, peer_pid, actor_subject, request_id,
+          command_kind, request_digest, outcome, error_code)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            audit_endpoint_role_name(context.endpoint_role),
+            context.peer_uid,
+            context.peer_gid,
+            context.peer_pid,
+            context.actor_subject,
+            context.request_id,
+            context.command_kind,
+            context.request_digest,
+            audit_outcome_name(outcome),
+            error_code,
+        ],
+    )?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn audit_endpoint_role_name(role: AuditEndpointRole) -> &'static str {
+    match role {
+        AuditEndpointRole::Host => "host",
+        AuditEndpointRole::TenantZero => "tenant_zero",
+    }
+}
+
+fn audit_outcome_name(outcome: AuditOutcome) -> &'static str {
+    match outcome {
+        AuditOutcome::Success => "success",
+        AuditOutcome::Failure => "failure",
+    }
+}
+
+fn audit_record_from_row(row: &rusqlite::Row<'_>) -> Result<AuditRecord, rusqlite::Error> {
+    let endpoint_role: String = row.get(2)?;
+    let endpoint_role = match endpoint_role.as_str() {
+        "host" => AuditEndpointRole::Host,
+        "tenant_zero" => AuditEndpointRole::TenantZero,
+        other => {
+            return Err(invalid_text_column(
+                2,
+                format!("unknown audit endpoint role {other:?}"),
+            ));
+        }
+    };
+    let outcome: String = row.get(10)?;
+    let outcome = match outcome.as_str() {
+        "success" => AuditOutcome::Success,
+        "failure" => AuditOutcome::Failure,
+        other => {
+            return Err(invalid_text_column(
+                10,
+                format!("unknown audit outcome {other:?}"),
+            ));
+        }
+    };
+    Ok(AuditRecord {
+        id: row.get(0)?,
+        recorded_at: row.get(1)?,
+        endpoint_role,
+        peer_uid: row.get(3)?,
+        peer_gid: row.get(4)?,
+        peer_pid: row.get(5)?,
+        actor_subject: row.get(6)?,
+        request_id: row.get(7)?,
+        command_kind: row.get(8)?,
+        request_digest: row.get(9)?,
+        outcome,
+        error_code: row.get(11)?,
+    })
+}
+
+fn invalid_text_column(column: usize, detail: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::other(detail)),
+    )
 }
 
 fn parse_status(status: &str) -> Result<DeploymentStatus, String> {
@@ -1090,10 +2051,37 @@ fn query_deployment_tx(
     transaction: &Transaction<'_>,
     id: &str,
 ) -> Result<Option<DeploymentRecord>, StateError> {
-    transaction.query_row("SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE id = ?1", [id], |row| {
-        let status: String = row.get(5)?;
-        Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
-    }).optional().map_err(StateError::from)
+    transaction
+        .query_row(
+            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path FROM deployments WHERE id = ?1",
+            [id],
+            deployment_from_row,
+        )
+        .optional()
+        .map_err(StateError::from)
+}
+
+fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusqlite::Error> {
+    let status: String = row.get(5)?;
+    let status = parse_status(&status).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error)),
+        )
+    })?;
+    Ok(DeploymentRecord {
+        id: row.get(0)?,
+        app: row.get(1)?,
+        source_hash: row.get(2)?,
+        engine_version: row.get(3)?,
+        artifact_hash: row.get(4)?,
+        status,
+        error: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        log_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+    })
 }
 
 fn query_artifact_tx(
@@ -1102,12 +2090,20 @@ fn query_artifact_tx(
 ) -> Result<Option<ArtifactRow>, StateError> {
     transaction
         .query_row(
-            "SELECT id, app FROM artifacts WHERE artifact_hash = ?1 AND status = 'sealed'",
+            "SELECT id, app, source_hash, artifact_hash, engine_version, host_path, metadata_json
+             FROM artifacts WHERE artifact_hash = ?1 AND status = 'sealed'",
             [hash],
             |row| {
                 Ok(ArtifactRow {
                     id: row.get(0)?,
-                    app: row.get(1)?,
+                    record: ArtifactRecord {
+                        app: row.get(1)?,
+                        source_hash: row.get(2)?,
+                        artifact_hash: row.get(3)?,
+                        engine_version: row.get(4)?,
+                        host_path: PathBuf::from(row.get::<_, String>(5)?),
+                        metadata_json: row.get(6)?,
+                    },
                 })
             },
         )
@@ -1115,14 +2111,25 @@ fn query_artifact_tx(
         .map_err(StateError::from)
 }
 
-fn query_deployment_by_artifact_tx(
-    transaction: &Transaction<'_>,
-    hash: &str,
-) -> Result<Option<DeploymentRecord>, StateError> {
-    transaction.query_row("SELECT id, app, source_hash, engine_version, artifact_hash, status, error FROM deployments WHERE artifact_hash = ?1", [hash], |row| {
-        let status: String = row.get(5)?;
-        Ok(DeploymentRecord { id: row.get(0)?, app: row.get(1)?, source_hash: row.get(2)?, engine_version: row.get(3)?, artifact_hash: row.get(4)?, status: parse_status(&status).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?, error: row.get(6)? })
-    }).optional().map_err(StateError::from)
+fn artifact_record_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactRecord, rusqlite::Error> {
+    Ok(ArtifactRecord {
+        app: row.get(0)?,
+        source_hash: row.get(1)?,
+        artifact_hash: row.get(2)?,
+        engine_version: row.get(3)?,
+        host_path: PathBuf::from(row.get::<_, String>(4)?),
+        metadata_json: row.get(5)?,
+    })
+}
+
+fn metadata_json_equal(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(left),
+        serde_json::from_str::<serde_json::Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1164,6 +2171,8 @@ struct StoredRuntime {
     command: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    tenant_admin: bool,
     limits: StoredLimits,
     rootfs: Option<StoredRootfs>,
     seccomp: Option<StoredSeccomp>,
@@ -1333,6 +2342,7 @@ impl StoredRuntime {
             command,
             args,
             env,
+            tenant_admin: app.tenant_admin,
             limits: StoredLimits {
                 memory_max: app.spec.limits.memory_max,
                 memory_high: app.spec.limits.memory_high,
@@ -1418,6 +2428,7 @@ fn loaded_from_stored(
     Ok(LoadedApp {
         name: name.to_owned(),
         domains,
+        tenant_admin: runtime.tenant_admin,
         upstream: upstream_path,
         spec,
         lifecycle,
@@ -1493,6 +2504,7 @@ fn snapshot_from_config(config: &NodeConfig) -> Result<Snapshot, StateError> {
         apps.push(LoadedApp {
             name: input.name.clone(),
             domains: canonical_domains(&input.domains)?,
+            tenant_admin: input.tenant_admin,
             upstream: input.upstream.clone(),
             spec,
             lifecycle,
@@ -1510,7 +2522,22 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), StateError> {
     let mut names = BTreeSet::new();
     let mut upstreams = BTreeSet::new();
     let mut domains = BTreeSet::new();
+    let mut tenant_admin_count = 0;
     for app in &snapshot.apps {
+        if app.tenant_admin {
+            tenant_admin_count += 1;
+            if app.spec.rootfs.is_none() {
+                return Err(StateError::InvalidConfig(format!(
+                    "Tenant Zero app {:?} requires a rootfs",
+                    app.name
+                )));
+            }
+            if tenant_admin_count > 1 {
+                return Err(StateError::InvalidConfig(
+                    "only one app may be designated as Tenant Zero".into(),
+                ));
+            }
+        }
         if !names.insert(app.name.clone()) {
             return Err(StateError::InvalidConfig(format!(
                 "duplicate app name {:?}",
@@ -1627,7 +2654,10 @@ fn canonical_domain(input: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1635,8 +2665,9 @@ mod tests {
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "cygnus-state-{label}-{}-{nonce}.db",
-            std::process::id()
+            "cygnus-state-{label}-{}-{nonce}-{}.db",
+            std::process::id(),
+            TEMP_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         ))
     }
 
@@ -1684,6 +2715,68 @@ mod tests {
                 command: "/bin/true".into(),
                 ..AppConfig::default()
             }],
+        }
+    }
+
+    fn audit_context(request_id: &str) -> AuditContext {
+        AuditContext {
+            endpoint_role: AuditEndpointRole::Host,
+            peer_uid: Some(0),
+            peer_gid: Some(0),
+            peer_pid: Some(42),
+            actor_subject: Some("root".into()),
+            request_id: request_id.into(),
+            command_kind: "activate_deployment".into(),
+            request_digest: "f".repeat(64),
+        }
+    }
+
+    fn artifact_input(
+        app: &str,
+        source_hash: &str,
+        artifact_hash: &str,
+        engine_version: &str,
+        host_path: &str,
+        runtime_entry: &str,
+    ) -> ArtifactInput {
+        ArtifactInput {
+            app: app.into(),
+            source_hash: source_hash.into(),
+            artifact_hash: artifact_hash.into(),
+            engine_version: engine_version.into(),
+            host_path: host_path.into(),
+            metadata_json: format!(
+                "{{\"bunVersion\":\"{engine_version}\",\"sourceHash\":\"{source_hash}\",\"artifactHash\":\"{artifact_hash}\",\"runtimeEntry\":\"{runtime_entry}\"}}"
+            ),
+        }
+    }
+
+    fn register_test_engine(state: &mut State, version: &str) -> EngineRecord {
+        let engine = EngineRecord {
+            version: version.into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "a".repeat(64),
+        };
+        state.register_engine(&engine).unwrap();
+        engine
+    }
+
+    fn test_artifact(
+        app: &str,
+        source_hash: &str,
+        artifact_hash: &str,
+        engine_version: &str,
+    ) -> ArtifactInput {
+        ArtifactInput {
+            app: app.into(),
+            source_hash: source_hash.into(),
+            artifact_hash: artifact_hash.into(),
+            engine_version: engine_version.into(),
+            host_path: PathBuf::from(format!("/var/lib/cygnus/apps/{app}/{artifact_hash}")),
+            metadata_json: format!(
+                "{{\"bunVersion\":\"{engine_version}\",\"sourceHash\":\"{source_hash}\",\"artifactHash\":\"{artifact_hash}\",\"runtimeEntry\":\"/app/index.js\"}}"
+            ),
         }
     }
 
@@ -1816,13 +2909,233 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         drop(state);
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn artifact_deployment_round_trip_and_first_activation_are_atomic() {
+    fn migrates_v2_deployments_without_losing_the_active_row() {
+        let path = temp_db("v2-migrate");
+        let source_hash = "b".repeat(64);
+        let artifact_hash = "c".repeat(64);
+        {
+            let connection = Connection::open(&path).expect("fixture database");
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE node_config (id INTEGER PRIMARY KEY CHECK (id = 1), listen TEXT NOT NULL);
+                     CREATE TABLE apps (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, upstream TEXT NOT NULL UNIQUE, runtime_json TEXT NOT NULL);
+                     CREATE TABLE domains (id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE, domain TEXT NOT NULL COLLATE BINARY UNIQUE);
+                     CREATE TABLE engines (id INTEGER PRIMARY KEY, version TEXT NOT NULL UNIQUE, host_root TEXT NOT NULL, cage_executable TEXT NOT NULL, sha256 TEXT NOT NULL);
+                     CREATE TABLE artifacts (id INTEGER PRIMARY KEY, app TEXT NOT NULL, source_hash TEXT NOT NULL, artifact_hash TEXT NOT NULL UNIQUE, engine_version TEXT NOT NULL REFERENCES engines(version), host_path TEXT NOT NULL UNIQUE, metadata_json TEXT NOT NULL, status TEXT NOT NULL CHECK (status = 'sealed'));
+                     CREATE TABLE deployments (id TEXT PRIMARY KEY, app TEXT NOT NULL, source_hash TEXT NOT NULL, engine_version TEXT NOT NULL REFERENCES engines(version), artifact_hash TEXT UNIQUE REFERENCES artifacts(artifact_hash), status TEXT NOT NULL CHECK (status IN ('building', 'failed', 'sealed', 'active')), error TEXT);
+                     CREATE TABLE app_artifacts (app_id INTEGER PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE, artifact_id INTEGER NOT NULL UNIQUE REFERENCES artifacts(id), activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                     INSERT INTO node_config VALUES (1, '127.0.0.1:3000');
+                     INSERT INTO apps VALUES (1, 'api', '/run/api.sock', '{{\"name\":\"api\",\"upstream\":\"/run/api.sock\",\"domains\":[],\"runtime\":{{\"command\":\"/bin/true\",\"args\":[],\"env\":{{}},\"limits\":{{\"memory_max\":268435456,\"memory_high\":234881024,\"cpu_quota\":100000,\"cpu_period\":100000,\"pids_max\":128}},\"rootfs\":null,\"seccomp\":\"enforce\",\"egress\":{{\"mode\":\"none\"}},\"init\":null,\"readiness_timeout_ms\":5000,\"idle_ttl_ms\":600000,\"min_instances\":0,\"backoff_base_ms\":100,\"backoff_max_ms\":30000,\"crash_window_ms\":60000,\"crash_loop_threshold\":5}}}}');
+                     INSERT INTO engines VALUES (1, '1.2.3', '/', '/usr/bin/true', '{}');
+                     INSERT INTO artifacts VALUES (1, 'api', '{source_hash}', '{artifact_hash}', '1.2.3', '/artifacts/{artifact_hash}', '{{\"sourceHash\":\"{source_hash}\",\"artifactHash\":\"{artifact_hash}\",\"bunVersion\":\"1.2.3\",\"runtimeEntry\":\"/app/index.js\"}}', 'sealed');
+                     INSERT INTO deployments VALUES ('dep-active', 'api', '{source_hash}', '1.2.3', '{artifact_hash}', 'active', NULL);
+                     INSERT INTO app_artifacts VALUES (1, 1, CURRENT_TIMESTAMP);
+                     PRAGMA user_version = 2;",
+                    "a".repeat(64)
+                ))
+                .expect("write v2 fixture");
+        }
+
+        let state = State::open(&path).expect("migrate fixture");
+        let deployment = state
+            .deployment("dep-active")
+            .unwrap()
+            .expect("active deployment preserved");
+        assert_eq!(deployment.status, DeploymentStatus::Active);
+        assert_eq!(
+            deployment.artifact_hash.as_deref(),
+            Some(artifact_hash.as_str())
+        );
+        assert_eq!(deployment.log_path, None);
+        assert!(!deployment.created_at.is_empty());
+        assert!(!deployment.updated_at.is_empty());
+        assert_eq!(
+            state
+                .active_deployment("api")
+                .unwrap()
+                .unwrap()
+                .deployment_id,
+            "dep-active"
+        );
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_v2_fixture_without_losing_active_deployment() {
+        let path = temp_db("v2-migrate");
+        let source_hash = "b".repeat(64);
+        let artifact_hash = "c".repeat(64);
+        {
+            let connection = Connection::open(&path).expect("fixture database");
+            connection
+                .execute_batch(&format!(
+                    r#"CREATE TABLE node_config (id INTEGER PRIMARY KEY CHECK (id = 1), listen TEXT NOT NULL);
+                     CREATE TABLE apps (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, upstream TEXT NOT NULL UNIQUE, runtime_json TEXT NOT NULL);
+                     CREATE TABLE domains (id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE, domain TEXT NOT NULL COLLATE BINARY UNIQUE);
+                     CREATE INDEX domains_app_id ON domains(app_id);
+                     CREATE TABLE engines (id INTEGER PRIMARY KEY, version TEXT NOT NULL UNIQUE, host_root TEXT NOT NULL, cage_executable TEXT NOT NULL, sha256 TEXT NOT NULL);
+                     CREATE TABLE artifacts (id INTEGER PRIMARY KEY, app TEXT NOT NULL, source_hash TEXT NOT NULL, artifact_hash TEXT NOT NULL UNIQUE, engine_version TEXT NOT NULL REFERENCES engines(version), host_path TEXT NOT NULL UNIQUE, metadata_json TEXT NOT NULL, status TEXT NOT NULL CHECK (status = 'sealed'));
+                     CREATE TABLE deployments (id TEXT PRIMARY KEY, app TEXT NOT NULL, source_hash TEXT NOT NULL, engine_version TEXT NOT NULL REFERENCES engines(version), artifact_hash TEXT UNIQUE REFERENCES artifacts(artifact_hash), status TEXT NOT NULL CHECK (status IN ('building', 'failed', 'sealed', 'active')), error TEXT);
+                     CREATE TABLE app_artifacts (app_id INTEGER PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE, artifact_id INTEGER NOT NULL UNIQUE REFERENCES artifacts(id), activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                     INSERT INTO node_config VALUES (1, '127.0.0.1:3000');
+                     INSERT INTO apps VALUES (1, 'api', '/run/api.sock', '{{"name":"api","upstream":"/run/api.sock","domains":[],"runtime":{{"command":"/bin/true","args":[],"env":{{}},"limits":{{"memory_max":268435456,"memory_high":234881024,"cpu_quota":100000,"cpu_period":100000,"pids_max":128}},"rootfs":null,"seccomp":"enforce","egress":{{"mode":"none"}},"init":null,"readiness_timeout_ms":5000,"idle_ttl_ms":600000,"min_instances":0,"backoff_base_ms":100,"backoff_max_ms":30000,"crash_window_ms":60000,"crash_loop_threshold":5}}}}');
+                     INSERT INTO engines VALUES (1, '1', '/', '/usr/bin/true', '{}');
+                     INSERT INTO artifacts VALUES (1, 'api', '{}', '{}', '1', '/artifacts/c', '{{"bunVersion":"1","sourceHash":"{}","artifactHash":"{}","runtimeEntry":"/app/index.js"}}', 'sealed');
+                     INSERT INTO deployments VALUES ('dep-v2', 'api', '{}', '1', '{}', 'active', NULL);
+                     INSERT INTO app_artifacts (app_id, artifact_id) VALUES (1, 1);
+                     PRAGMA user_version = 2;"#,
+                    "a".repeat(64),
+                    source_hash,
+                    artifact_hash,
+                    source_hash,
+                    artifact_hash,
+                    source_hash,
+                    artifact_hash,
+                ))
+                .expect("write v2 fixture");
+        }
+
+        let state = State::open(&path).expect("migrate fixture");
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let deployment = state.deployment("dep-v2").unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Active);
+        assert_eq!(
+            deployment.artifact_hash.as_deref(),
+            Some(artifact_hash.as_str())
+        );
+        assert_eq!(
+            state
+                .active_deployment("api")
+                .unwrap()
+                .unwrap()
+                .deployment_id,
+            "dep-v2"
+        );
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identical_artifact_is_reused_by_same_app_deployments_only() {
+        let path = temp_db("artifact-reuse");
+        let mut state = State::open(&path).unwrap();
+        let engine = register_test_engine(&mut state, "1");
+        let source_hash = "b".repeat(64);
+        let artifact_hash = "c".repeat(64);
+        for (id, app) in [("dep-1", "api"), ("dep-2", "api"), ("dep-foreign", "web")] {
+            state
+                .begin_deployment(&DeploymentInput {
+                    id: id.into(),
+                    app: app.into(),
+                    source_hash: source_hash.clone(),
+                    engine_version: engine.version.clone(),
+                })
+                .unwrap();
+        }
+        let artifact = test_artifact("api", &source_hash, &artifact_hash, &engine.version);
+        state.seal_deployment("dep-1", &artifact).unwrap();
+        state.seal_deployment("dep-2", &artifact).unwrap();
+        assert_eq!(
+            state
+                .deployment("dep-2")
+                .unwrap()
+                .unwrap()
+                .artifact_hash
+                .as_deref(),
+            Some(artifact_hash.as_str())
+        );
+
+        let foreign = test_artifact("web", &source_hash, &artifact_hash, &engine.version);
+        assert!(matches!(
+            state.seal_deployment("dep-foreign", &foreign),
+            Err(StateError::ArtifactOwnership { .. })
+        ));
+        assert_eq!(
+            state.deployment("dep-foreign").unwrap().unwrap().status,
+            DeploymentStatus::Building
+        );
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reused_artifact_keeps_content_addressed_runtime_identity_after_load() {
+        let path = temp_db("artifact-runtime-identity");
+        let mut state = State::open(&path).unwrap();
+        let engine = register_test_engine(&mut state, "1");
+        let source_hash = "b".repeat(64);
+        let artifact_hash = "c".repeat(64);
+        let artifact = test_artifact("api", &source_hash, &artifact_hash, &engine.version);
+        for id in ["dep-1", "dep-2"] {
+            state
+                .begin_deployment(&DeploymentInput {
+                    id: id.into(),
+                    app: "api".into(),
+                    source_hash: source_hash.clone(),
+                    engine_version: engine.version.clone(),
+                })
+                .unwrap();
+            state.seal_deployment(id, &artifact).unwrap();
+        }
+        let app = AppConfig {
+            name: "api".into(),
+            domains: vec!["api.example".into()],
+            upstream: "/run/api.sock".into(),
+            command: "/usr/bin/true".into(),
+            ..AppConfig::default()
+        };
+        state
+            .activate_deployment("dep-1", &app, None, &audit_context("identity-1"))
+            .unwrap();
+        state
+            .activate_deployment(
+                "dep-2",
+                &app,
+                Some(&artifact_hash),
+                &audit_context("identity-2"),
+            )
+            .unwrap();
+
+        let loaded = state.load().unwrap();
+        assert_eq!(loaded.apps[0].spec.name, format!("r-{artifact_hash}"));
+        assert_eq!(
+            loaded.apps[0].upstream,
+            PathBuf::from(format!("/run/r-{artifact_hash}.sock"))
+        );
+        assert_eq!(
+            state
+                .active_deployment("api")
+                .unwrap()
+                .unwrap()
+                .deployment_id,
+            "dep-2"
+        );
+        assert_eq!(
+            state.deployment("dep-1").unwrap().unwrap().status,
+            DeploymentStatus::Sealed
+        );
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_deployment_round_trip_and_activation_are_atomic() {
         let path = temp_db("activation");
         let mut state = State::open(&path).expect("open state");
         let engine = EngineRecord {
@@ -1844,17 +3157,18 @@ mod tests {
             state.begin_deployment(&input).unwrap().status,
             DeploymentStatus::Building
         );
-        let artifact = ArtifactInput {
-            app: "api".into(),
-            source_hash: source_hash.clone(),
-            artifact_hash: artifact_hash.clone(),
-            engine_version: engine.version.clone(),
-            host_path: "/var/lib/cygnus/apps/api/c".into(),
-            metadata_json: format!(
-                "{{\"bunVersion\":\"{}\",\"sourceHash\":\"{}\"}}",
-                engine.version, source_hash
-            ),
-        };
+        let success_logs = PathBuf::from("/var/log/cygnus/deployments/dep-1");
+        state
+            .set_deployment_log_path("dep-1", &success_logs)
+            .unwrap();
+        let artifact = artifact_input(
+            "api",
+            &source_hash,
+            &artifact_hash,
+            &engine.version,
+            "/var/lib/cygnus/apps/api/c",
+            "/app/index.js",
+        );
         assert_eq!(
             state
                 .seal_deployment("dep-1", &artifact)
@@ -1870,15 +3184,39 @@ mod tests {
             ..AppConfig::default()
         };
         assert_eq!(
-            state.activate_first(&app, &artifact_hash).unwrap().status,
+            state
+                .activate_deployment("dep-1", &app, None, &audit_context("activate-1"))
+                .unwrap()
+                .status,
             DeploymentStatus::Active
         );
         assert_eq!(state.load().unwrap().apps[0].name, "api");
-        assert!(state.activate_first(&app, &artifact_hash).is_err());
+        assert!(
+            state
+                .activate_deployment("dep-1", &app, None, &audit_context("activate-again"))
+                .is_err()
+        );
         assert_eq!(
             state.deployment("dep-1").unwrap().unwrap().status,
             DeploymentStatus::Active
         );
+        assert_eq!(
+            state.active_deployment("api").unwrap(),
+            Some(ActiveDeploymentRecord {
+                deployment_id: "dep-1".into(),
+                artifact_hash: artifact_hash.clone(),
+                engine_version: engine.version.clone(),
+            })
+        );
+        assert_eq!(
+            state.deployment_logs_dir("dep-1").unwrap(),
+            Some(success_logs)
+        );
+        assert_eq!(
+            state.deployments(Some("api"), None, 10).unwrap(),
+            vec![state.deployment("dep-1").unwrap().unwrap()]
+        );
+        assert!(state.deployments(None, None, 0).is_err());
         let second_source_hash = "d".repeat(64);
         let second_artifact_hash = "e".repeat(64);
         state
@@ -1892,17 +3230,14 @@ mod tests {
         state
             .seal_deployment(
                 "dep-2",
-                &ArtifactInput {
-                    app: "worker".into(),
-                    source_hash: second_source_hash.clone(),
-                    artifact_hash: second_artifact_hash.clone(),
-                    engine_version: engine.version.clone(),
-                    host_path: "/var/lib/cygnus/apps/worker/e".into(),
-                    metadata_json: format!(
-                        "{{\"bunVersion\":\"{}\",\"sourceHash\":\"{}\"}}",
-                        engine.version, second_source_hash
-                    ),
-                },
+                &artifact_input(
+                    "worker",
+                    &second_source_hash,
+                    &second_artifact_hash,
+                    &engine.version,
+                    "/var/lib/cygnus/apps/worker/e",
+                    "/app/worker.js",
+                ),
             )
             .unwrap();
         let worker = AppConfig {
@@ -1914,17 +3249,418 @@ mod tests {
         };
         assert!(
             state
-                .activate_first(&worker, &second_artifact_hash)
-                .is_err()
+                .activate_deployment("dep-2", &worker, None, &audit_context("activate-2"))
+                .is_ok()
+        );
+        assert_eq!(
+            state.deployment("dep-2").unwrap().unwrap().status,
+            DeploymentStatus::Active
+        );
+        assert_eq!(
+            state
+                .deployments(None, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|deployment| deployment.id)
+                .collect::<Vec<_>>(),
+            ["dep-2", "dep-1"]
+        );
+        assert_eq!(
+            state
+                .deployments(None, Some("dep-2"), 10)
+                .unwrap()
+                .into_iter()
+                .map(|deployment| deployment.id)
+                .collect::<Vec<_>>(),
+            ["dep-1"]
+        );
+        assert!(state.deployments(None, Some("missing"), 10).is_err());
+        assert!(matches!(
+            state.apply(&NodeConfig::default()),
+            Err(StateError::DestructiveApply)
+        ));
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_v2_deployments_preserving_active_row_and_adds_v3_shape() {
+        let path = temp_db("v2-migrate");
+        {
+            let connection = Connection::open(&path).unwrap();
+            create_schema(&connection).unwrap();
+            migrate_v1_to_v2(&connection).unwrap();
+            connection.execute_batch(
+                "INSERT INTO engines VALUES (1, 'bun', '/', '/usr/bin/true', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 INSERT INTO artifacts VALUES (1, 'api', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'bun', '/artifacts/c', '{\"bunVersion\":\"bun\",\"sourceHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"artifactHash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"runtimeEntry\":\"/app/index.js\"}', 'sealed');
+                 INSERT INTO deployments VALUES ('legacy-active', 'api', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'bun', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'active', NULL);
+                 PRAGMA user_version = 2;",
+            ).unwrap();
+        }
+        let state = State::open(&path).unwrap();
+        let deployment = state.deployment("legacy-active").unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Active);
+        assert!(!deployment.created_at.is_empty());
+        assert!(!deployment.updated_at.is_empty());
+        assert_eq!(deployment.log_path, None);
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identical_artifact_can_seal_two_same_app_deployments_but_not_foreign_or_mismatched() {
+        let path = temp_db("artifact-reuse");
+        let mut state = State::open(&path).unwrap();
+        let engine = EngineRecord {
+            version: "bun".into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "a".repeat(64),
+        };
+        state.register_engine(&engine).unwrap();
+        let source = "b".repeat(64);
+        let hash = "c".repeat(64);
+        let artifact = artifact_input(
+            "api",
+            &source,
+            &hash,
+            "bun",
+            "/artifacts/c",
+            "/app/index.js",
+        );
+        for id in ["dep-1", "dep-2"] {
+            state
+                .begin_deployment(&DeploymentInput {
+                    id: id.into(),
+                    app: "api".into(),
+                    source_hash: source.clone(),
+                    engine_version: "bun".into(),
+                })
+                .unwrap();
+            state.seal_deployment(id, &artifact).unwrap();
+        }
+        assert_eq!(
+            state.deployment_artifact("dep-2").unwrap(),
+            Some(state.deployment_artifact("dep-1").unwrap().unwrap())
+        );
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "foreign".into(),
+                app: "other".into(),
+                source_hash: source.clone(),
+                engine_version: "bun".into(),
+            })
+            .unwrap();
+        let mut foreign = artifact.clone();
+        foreign.app = "other".into();
+        assert!(matches!(
+            state.seal_deployment("foreign", &foreign),
+            Err(StateError::ArtifactOwnership { .. })
+        ));
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "mismatch".into(),
+                app: "api".into(),
+                source_hash: "d".repeat(64),
+                engine_version: "bun".into(),
+            })
+            .unwrap();
+        let mut mismatch = artifact;
+        mismatch.source_hash = "d".repeat(64);
+        mismatch.metadata_json = mismatch.metadata_json.replace(&source, &"d".repeat(64));
+        assert!(matches!(
+            state.seal_deployment("mismatch", &mismatch),
+            Err(StateError::ArtifactOwnership { .. })
+        ));
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn activation_cas_conflict_rolls_back_without_config_status_or_audit_writes() {
+        let path = temp_db("activation-cas");
+        let mut state = State::open(&path).unwrap();
+        let engine = EngineRecord {
+            version: "bun".into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "a".repeat(64),
+        };
+        state.register_engine(&engine).unwrap();
+        let source = "b".repeat(64);
+        let first_hash = "c".repeat(64);
+        let second_hash = "d".repeat(64);
+        for (id, hash, path) in [
+            ("dep-1", &first_hash, "/artifacts/c"),
+            ("dep-2", &second_hash, "/artifacts/d"),
+        ] {
+            state
+                .begin_deployment(&DeploymentInput {
+                    id: id.into(),
+                    app: "api".into(),
+                    source_hash: source.clone(),
+                    engine_version: "bun".into(),
+                })
+                .unwrap();
+            state
+                .seal_deployment(
+                    id,
+                    &artifact_input("api", &source, hash, "bun", path, "/app/index.js"),
+                )
+                .unwrap();
+        }
+        let first = AppConfig {
+            name: "api".into(),
+            domains: vec!["one.example".into()],
+            upstream: "/run/api-dep-1.sock".into(),
+            command: "/usr/bin/true".into(),
+            ..AppConfig::default()
+        };
+        state
+            .activate_deployment("dep-1", &first, None, &audit_context("first"))
+            .unwrap();
+        let replacement = AppConfig {
+            domains: vec!["two.example".into()],
+            upstream: "/run/api-dep-2.sock".into(),
+            ..first.clone()
+        };
+        let error = state
+            .activate_deployment(
+                "dep-2",
+                &replacement,
+                Some(&"e".repeat(64)),
+                &audit_context("conflict"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StateError::ActivationConflict { .. }));
+        assert_eq!(
+            state
+                .active_deployment("api")
+                .unwrap()
+                .unwrap()
+                .deployment_id,
+            "dep-1"
         );
         assert_eq!(
             state.deployment("dep-2").unwrap().unwrap().status,
             DeploymentStatus::Sealed
         );
+        assert_eq!(state.load().unwrap().apps[0].domains, ["one.example"]);
+        assert_eq!(state.audit_records().unwrap().len(), 1);
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rollback_plan_is_read_only_and_active_sealed_active_transition_is_atomic() {
+        let path = temp_db("rollback-plan");
+        let mut state = State::open(&path).unwrap();
+        let engine = EngineRecord {
+            version: "bun".into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "a".repeat(64),
+        };
+        state.register_engine(&engine).unwrap();
+        let source = "b".repeat(64);
+        for (id, hash, artifact_path, entry) in [
+            ("dep-1", "c".repeat(64), "/artifacts/c", "/app/one.js"),
+            ("dep-2", "d".repeat(64), "/artifacts/d", "/app/two.js"),
+        ] {
+            state
+                .begin_deployment(&DeploymentInput {
+                    id: id.into(),
+                    app: "api".into(),
+                    source_hash: source.clone(),
+                    engine_version: "bun".into(),
+                })
+                .unwrap();
+            state
+                .seal_deployment(
+                    id,
+                    &artifact_input("api", &source, &hash, "bun", artifact_path, entry),
+                )
+                .unwrap();
+        }
+        let app = AppConfig {
+            name: "api".into(),
+            domains: vec!["api.example".into()],
+            upstream: "/run/api-initial.sock".into(),
+            command: "/usr/bin/true".into(),
+            ..AppConfig::default()
+        };
+        state
+            .activate_deployment("dep-1", &app, None, &audit_context("one"))
+            .unwrap();
+        let first_hash = "c".repeat(64);
+        let plan = state.plan_rollback("api", "dep-2", &first_hash).unwrap();
+        assert_eq!(
+            plan.expected_active_artifact.as_deref(),
+            Some(first_hash.as_str())
+        );
+        let second_hash = "d".repeat(64);
+        assert_eq!(plan.runtime_key, format!("r-{second_hash}"));
+        assert_eq!(plan.candidate.spec.name, format!("r-{second_hash}"));
+        assert_eq!(
+            plan.candidate.upstream,
+            PathBuf::from(format!("/run/r-{second_hash}.sock"))
+        );
+        assert_eq!(
+            plan.candidate.spec.args.last().map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("/app/two.js"))
+        );
+        assert_eq!(
+            state.deployment("dep-2").unwrap().unwrap().status,
+            DeploymentStatus::Sealed
+        );
+        state
+            .commit_activation(&plan, &audit_context("two"))
+            .unwrap();
+        assert_eq!(
+            state.deployment("dep-1").unwrap().unwrap().status,
+            DeploymentStatus::Sealed
+        );
+        let reverse = state
+            .plan_rollback("api", "dep-1", &"d".repeat(64))
+            .unwrap();
+        state
+            .commit_activation(&reverse, &audit_context("rollback"))
+            .unwrap();
+        assert_eq!(
+            state.deployment("dep-1").unwrap().unwrap().status,
+            DeploymentStatus::Active
+        );
+        assert_eq!(
+            state.deployment("dep-2").unwrap().unwrap().status,
+            DeploymentStatus::Sealed
+        );
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_rows_are_typed_and_append_only() {
+        let path = temp_db("audit-append-only");
+        let mut state = State::open(&path).unwrap();
+        state
+            .append_audit(
+                &audit_context("request-1"),
+                AuditOutcome::Failure,
+                Some("conflict"),
+            )
+            .unwrap();
+        let records = state.audit_records().unwrap();
+        assert_eq!(records[0].endpoint_role, AuditEndpointRole::Host);
+        assert_eq!(records[0].outcome, AuditOutcome::Failure);
+        assert_eq!(records[0].error_code.as_deref(), Some("conflict"));
+        assert!(
+            state
+                .connection
+                .execute(
+                    "UPDATE audit_log SET error_code = NULL WHERE id = ?1",
+                    [records[0].id]
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .connection
+                .execute("DELETE FROM audit_log WHERE id = ?1", [records[0].id])
+                .is_err()
+        );
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deployment_log_path_is_persisted_for_terminal_queries() {
+        let path = temp_db("log-path");
+        let mut state = State::open(&path).unwrap();
+        state
+            .register_engine(&EngineRecord {
+                version: "bun".into(),
+                host_root: "/".into(),
+                cage_executable: "/usr/bin/true".into(),
+                sha256: "a".repeat(64),
+            })
+            .unwrap();
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "dep".into(),
+                app: "api".into(),
+                source_hash: "b".repeat(64),
+                engine_version: "bun".into(),
+            })
+            .unwrap();
+        state
+            .set_deployment_log_path("dep", Path::new("/var/log/cygnus/dep"))
+            .unwrap();
+        state.mark_deployment_failed("dep", "failed").unwrap();
+        assert_eq!(
+            state.deployment("dep").unwrap().unwrap().log_path,
+            Some(PathBuf::from("/var/log/cygnus/dep"))
+        );
+        assert_eq!(
+            state.deployment_logs_dir("dep").unwrap(),
+            Some(PathBuf::from("/var/log/cygnus/dep"))
+        );
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sealing_requires_artifact_hash_and_runtime_entry_metadata() {
+        let path = temp_db("metadata-switch-fields");
+        let mut state = State::open(&path).unwrap();
+        state
+            .register_engine(&EngineRecord {
+                version: "bun".into(),
+                host_root: "/".into(),
+                cage_executable: "/usr/bin/true".into(),
+                sha256: "a".repeat(64),
+            })
+            .unwrap();
+        let source = "b".repeat(64);
+        let hash = "c".repeat(64);
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "dep".into(),
+                app: "api".into(),
+                source_hash: source.clone(),
+                engine_version: "bun".into(),
+            })
+            .unwrap();
+        let mut artifact = artifact_input(
+            "api",
+            &source,
+            &hash,
+            "bun",
+            "/artifacts/c",
+            "/app/index.js",
+        );
+        artifact.metadata_json = format!(
+            "{{\"bunVersion\":\"bun\",\"sourceHash\":\"{source}\",\"runtimeEntry\":\"/app/index.js\"}}"
+        );
         assert!(matches!(
-            state.apply(&NodeConfig::default()),
-            Err(StateError::DestructiveApply)
+            state.seal_deployment("dep", &artifact),
+            Err(StateError::MetadataMismatch)
         ));
+        artifact.metadata_json = format!(
+            "{{\"bunVersion\":\"bun\",\"sourceHash\":\"{source}\",\"artifactHash\":\"{hash}\"}}"
+        );
+        assert!(matches!(
+            state.seal_deployment("dep", &artifact),
+            Err(StateError::MetadataMismatch)
+        ));
+        assert_eq!(
+            state.deployment("dep").unwrap().unwrap().status,
+            DeploymentStatus::Building
+        );
         drop(state);
         let _ = fs::remove_file(path);
     }
@@ -1970,6 +3706,80 @@ mod tests {
             .unwrap();
         state.mark_deployment_failed("dep", "build failed").unwrap();
         assert!(state.mark_deployment_failed("dep", "again").is_err());
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn tenant_admin_requires_one_rooted_app_and_round_trips() {
+        let path = temp_db("tenant-admin");
+        let mut state = State::open(&path).unwrap();
+        let mut input = config();
+        input.apps[0].tenant_admin = true;
+        assert!(matches!(
+            state.apply(&input),
+            Err(StateError::InvalidConfig(message)) if message.contains("requires a rootfs")
+        ));
+
+        input.apps[0].rootfs = Some(RootfsConfig {
+            lowerdirs: vec![PathBuf::from("/lower")],
+            ..RootfsConfig::default()
+        });
+        state.apply(&input).unwrap();
+        assert!(state.load().unwrap().apps[0].tenant_admin);
+
+        input.apps.push(AppConfig {
+            name: "other".into(),
+            upstream: "/run/other.sock".into(),
+            command: "/bin/true".into(),
+            rootfs: Some(RootfsConfig {
+                lowerdirs: vec![PathBuf::from("/other")],
+                ..RootfsConfig::default()
+            }),
+            tenant_admin: true,
+            ..AppConfig::default()
+        });
+        assert!(matches!(
+            state.apply(&input),
+            Err(StateError::InvalidConfig(message)) if message.contains("only one app")
+        ));
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn domain_mapping_is_canonical_atomic_and_conflict_safe() {
+        let path = temp_db("map-domain");
+        let mut state = State::open(&path).unwrap();
+        let mut input = config();
+        input.apps.push(AppConfig {
+            name: "other".into(),
+            upstream: "/run/other.sock".into(),
+            command: "/bin/true".into(),
+            ..AppConfig::default()
+        });
+        state.apply(&input).unwrap();
+        let audit = audit_context("map-domain");
+
+        let canonical = state.map_domain("api", "New.Example.COM.", &audit).unwrap();
+        assert_eq!(canonical, "new.example.com");
+        assert!(
+            state
+                .load()
+                .unwrap()
+                .apps
+                .iter()
+                .find(|app| app.name == "api")
+                .unwrap()
+                .domains
+                .contains(&canonical)
+        );
+        assert_eq!(state.audit_records().unwrap().len(), 1);
+
+        assert!(matches!(
+            state.map_domain("other", &canonical, &audit),
+            Err(StateError::DomainConflict { owner, .. }) if owner == "api"
+        ));
+        assert_eq!(state.audit_records().unwrap().len(), 1);
         drop(state);
         let _ = fs::remove_file(path);
     }
