@@ -1,19 +1,26 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ACTOR_SUBJECT,
   MAX_JSON_BODY_BYTES,
+  MAX_WEBHOOK_BODY_BYTES,
+  MAX_WEBHOOK_CHUNK_BYTES,
+  buildGithubManifest,
+  clearManifestStates,
   commandForRequest,
+  configureRepositoryCommand,
   constantTimeTokenMatch,
-  deployCommand,
+  consumeManifestState,
   handleApi,
   mapDomainCommand,
   rollbackCommand,
   signSession,
   statusForDaemonCode,
   verifySessionCookie,
+  webhookIngress,
 } from "./server.js";
 
 const previousBootstrap = process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
@@ -87,31 +94,145 @@ describe("console session primitives", () => {
 });
 
 describe("console request validation", () => {
-  test("rejects unknown mutation fields and unsafe paths", () => {
+  test("rejects unknown fields and host paths cannot enter GitHub config", async () => {
     expect(() => mapDomainCommand({ app: "demo", domain: "demo.test", actor: "host" })).toThrow("unsupported fields");
     expect(() => rollbackCommand({ app: "../demo", deployment: "dpl_1", expected_active_artifact: "abc" })).toThrow("app is invalid");
-    expect(() => deployCommand({ request: {
-      source_dir: "relative", app: "demo", domain: "demo.test", engine_version: "bun-1",
-      entry: "index.ts", artifact_root: "/tmp/artifacts", upstream: "/tmp/demo.sock",
-    } })).toThrow("absolute host path");
+    expect(() => configureRepositoryCommand({
+      installation_id: 1,
+      repository_id: 2,
+      owner: "acme",
+      name: "demo",
+      branch: "main",
+      app: "demo",
+      domain: "demo.test",
+      engine_version: "bun-1",
+      entry: "index.ts",
+      artifact_root: "/tmp/artifacts",
+    })).toThrow("unsupported fields");
   });
 
-  test("emits documented typed deploy payload without an actor field", async () => {
-    const request = new Request("http://localhost/api/v1/deploy", {
+  test("emits strict ConfigureRepository payload without daemon paths", async () => {
+    const request = new Request("http://localhost/api/v1/github/repositories", {
       method: "POST",
-      body: JSON.stringify({ request: {
-        source_dir: "/tmp/src", app: "demo", domain: "demo.test", engine_version: "bun-1.2",
-        entry: "src/index.ts", artifact_root: "/var/lib/cygnus/artifacts", upstream: "/run/cygnus/demo.sock",
-      } }),
+      body: JSON.stringify({ installation_id: 1, repository_id: 2, owner: "acme", name: "demo", branch: "main", app: "demo", domain: "demo.test", engine_version: "bun-1.2", entry: "src/index.ts" }),
     });
     const command = await commandForRequest(request, new URL(request.url));
-    expect(command).toEqual({ type: "deploy", request: {
-      source_dir: "/tmp/src", app: "demo", domain: "demo.test", engine_version: "bun-1.2",
-      entry: "src/index.ts", artifact_root: "/var/lib/cygnus/artifacts", upstream: "/run/cygnus/demo.sock",
-    } });
-    expect(command.actor).toBeUndefined();
+    expect(command).toEqual({ type: "configure_repository", repository: { installation_id: 1, repository_id: 2, owner: "acme", name: "demo", branch: "main", app: "demo", domain: "demo.test", engine_version: "bun-1.2", entry: "src/index.ts" } });
+    expect(JSON.stringify(command)).not.toContain("artifact_root");
+    expect(JSON.stringify(command)).not.toContain("upstream");
   });
 
+  test("builds exact public manifest and consumes session-bound state once", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "manifest-bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "manifest-session";
+    clearManifestStates();
+    const cookie = signSession();
+    const url = new URL("http://localhost/api/v1/github/manifest");
+    const response = await handleApi(new Request(url, { method: "POST", headers: { origin: url.origin, cookie, "content-type": "application/json" }, body: JSON.stringify({ owner: "acme" }) }), url);
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result.data.manifest).toEqual(buildGithubManifest("http://localhost"));
+    expect(result.data.manifest).toEqual({ name: "Cygnus Tenant Zero", url: "http://localhost", redirect_url: "http://localhost/github/app/manifest/callback", setup_url: "http://localhost/github/app/setup", callback_urls: ["http://localhost/github/app/install/callback"], public: false, hook_attributes: { url: "http://localhost/github/webhook", active: true }, default_permissions: { contents: "read", pull_requests: "read", checks: "write", deployments: "write" }, default_events: ["push", "pull_request"] });
+    const state = new URL(result.data.action).searchParams.get("state");
+    expect(state).toBeTruthy();
+    expect(consumeManifestState(state, cookie)?.owner).toBe("acme");
+    expect(consumeManifestState(state, cookie)).toBeNull();
+  });
+
+  test("streams an exact 25 MiB webhook through frame-safe chunks", async () => {
+    const body = Buffer.alloc(MAX_WEBHOOK_BODY_BYTES, 0x5a);
+    const expected = createHash("sha256").update(body).digest("hex");
+    const observed = createHash("sha256");
+    let chunks = 0;
+    let bytes = 0;
+    const commands = [];
+    const requestAdmin = async (_socket, command, actor) => {
+      commands.push(command.type);
+      expect(actor).toBe("github:webhook");
+      if (command.type === "webhook_begin") {
+        expect(command.total_bytes).toBe(body.length);
+        return { data: { duplicate: false } };
+      }
+      if (command.type === "webhook_chunk") {
+        const chunk = Buffer.from(command.chunk_base64, "base64");
+        expect(chunk.length).toBeLessThanOrEqual(MAX_WEBHOOK_CHUNK_BYTES);
+        observed.update(chunk);
+        bytes += chunk.length;
+        chunks += 1;
+        return { data: { received_bytes: bytes } };
+      }
+      return { data: { delivery_id: "delivery-1", duplicate: false, jobs: 1 } };
+    };
+    const request = new Request("https://cygnus.apps.test/github/webhook", {
+      method: "POST",
+      headers: {
+        "content-length": String(body.length),
+        "x-github-delivery": "delivery-1",
+        "x-github-event": "push",
+        "x-hub-signature-256": `sha256=${"a".repeat(64)}`,
+      },
+      body,
+    });
+
+    const response = await webhookIngress(request, requestAdmin, "/cygnus/admin/admin.sock");
+    expect(response.status).toBe(202);
+    expect(bytes).toBe(body.length);
+    expect(observed.digest("hex")).toBe(expected);
+    expect(chunks).toBe(Math.ceil(body.length / MAX_WEBHOOK_CHUNK_BYTES));
+    expect(commands[0]).toBe("webhook_begin");
+    expect(commands.at(-1)).toBe("webhook_finish");
+  });
+
+  test("rejects malformed webhooks before admin work and short-circuits duplicates", async () => {
+    let calls = 0;
+    const send = async () => { calls += 1; return { data: { duplicate: true } }; };
+    const missingLength = new Request("https://cygnus.apps.test/github/webhook", {
+      method: "POST",
+      headers: {
+        "x-github-delivery": "delivery-2",
+        "x-github-event": "push",
+        "x-hub-signature-256": `sha256=${"b".repeat(64)}`,
+      },
+      body: "{}",
+    });
+    missingLength.headers.delete("content-length");
+    expect((await webhookIngress(missingLength, send, "/admin.sock")).status).toBe(411);
+    expect(calls).toBe(0);
+
+    const duplicate = new Request("https://cygnus.apps.test/github/webhook", {
+      method: "POST",
+      headers: {
+        "content-length": "2",
+        "x-github-delivery": "delivery-2",
+        "x-github-event": "push",
+        "x-hub-signature-256": `sha256=${"b".repeat(64)}`,
+      },
+      body: "{}",
+    });
+    expect((await webhookIngress(duplicate, send, "/admin.sock")).status).toBe(202);
+    expect(calls).toBe(1);
+  });
+
+  test("rejects non-HTTPS manifest origins and removes the host deploy route", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session";
+    const cookie = signSession();
+    const manifestUrl = new URL("http://console.example/api/v1/github/manifest");
+    const manifest = await handleApi(new Request(manifestUrl, {
+      method: "POST",
+      headers: { origin: manifestUrl.origin, cookie, "content-type": "application/json" },
+      body: "{}",
+    }), manifestUrl);
+    expect(manifest.status).toBe(422);
+
+    const deployUrl = new URL("https://cygnus.apps.test/api/v1/deploy");
+    const deploy = await handleApi(new Request(deployUrl, {
+      method: "POST",
+      headers: { origin: deployUrl.origin, cookie, "content-type": "application/json" },
+      body: "{}",
+    }), deployUrl);
+    expect(deploy.status).toBe(404);
+  });
   test("maps daemon error codes to safe HTTP statuses", () => {
     expect(statusForDaemonCode("unauthorized")).toBe(401);
     expect(statusForDaemonCode("forbidden")).toBe(403);

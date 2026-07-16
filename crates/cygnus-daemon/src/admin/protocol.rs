@@ -3,6 +3,10 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::deploy::DeployRequest;
+pub use crate::github::{
+    GitHubInstallationRepositoryView, GitHubManifestMetadata, GitHubRepositoryInput,
+    GitHubRepositoryView,
+};
 use crate::state::NodeConfig;
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
@@ -62,6 +66,45 @@ pub enum AdminCommand {
         deployment: String,
         expected_active_artifact: String,
     },
+    #[serde(alias = "github_convert_manifest")]
+    ConvertManifest {
+        code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+    },
+    #[serde(alias = "github_status")]
+    GitHubStatus,
+    #[serde(alias = "list_github_repositories")]
+    ListRepositories {
+        #[serde(default = "default_list_limit")]
+        limit: u16,
+    },
+    #[serde(alias = "configure_github_repository")]
+    ConfigureRepository {
+        repository: GitHubRepositoryInput,
+    },
+    WebhookBegin {
+        delivery_id: String,
+        event: String,
+        signature: String,
+        total_bytes: u64,
+    },
+    WebhookChunk {
+        delivery_id: String,
+        chunk_base64: String,
+    },
+    WebhookFinish {
+        delivery_id: String,
+    },
+    ListDeployJobs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default = "default_list_limit")]
+        limit: u16,
+    },
+    RetryDeployJob {
+        job_id: String,
+    },
     ReadLog {
         deployment: String,
         stream: LogStream,
@@ -69,6 +112,9 @@ pub enum AdminCommand {
         offset: u64,
         #[serde(default = "default_log_limit")]
         limit: u32,
+    },
+    ListInstallationRepositories {
+        installation_id: i64,
     },
 }
 
@@ -192,6 +238,44 @@ pub enum AdminData {
         eof: bool,
         data_base64: String,
     },
+    ManifestConverted {
+        app: GitHubManifestMetadata,
+    },
+    GitHubStatus {
+        configured: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<GitHubManifestMetadata>,
+    },
+    Repositories {
+        repositories: Vec<GitHubRepositoryView>,
+    },
+    RepositoryConfigured {
+        repository: GitHubRepositoryView,
+    },
+    WebhookBegun {
+        delivery_id: String,
+        duplicate: bool,
+    },
+    WebhookChunked {
+        delivery_id: String,
+        received_bytes: u64,
+    },
+    WebhookAccepted {
+        delivery_id: String,
+        duplicate: bool,
+        jobs: usize,
+    },
+    DeployJobs {
+        jobs: Vec<GitHubJobView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    DeployJobRetried {
+        job: GitHubJobView,
+    },
+    InstallationRepositories {
+        repositories: Vec<GitHubInstallationRepositoryView>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,6 +324,33 @@ pub struct DeploymentView {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubJobView {
+    pub id: String,
+    pub key: String,
+    pub installation_id: i64,
+    pub repository_id: i64,
+    pub owner: String,
+    pub name: String,
+    pub environment: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<i64>,
+    pub sha: String,
+    pub status: String,
+    pub attempts: u32,
+    pub next_attempt_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_run_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -350,6 +461,55 @@ mod tests {
             serde_json::from_value::<AdminRequest>(encoded).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn installation_repository_command_and_data_have_stable_nested_shapes() {
+        let request: AdminRequest = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "actor": "tenant:operator",
+            "command": { "type": "list_installation_repositories", "installation_id": 42 }
+        }))
+        .unwrap();
+        assert_eq!(
+            request.command,
+            AdminCommand::ListInstallationRepositories {
+                installation_id: 42
+            }
+        );
+        let encoded = serde_json::to_value(AdminData::InstallationRepositories {
+            repositories: vec![GitHubInstallationRepositoryView {
+                installation_id: 42,
+                repository_id: 7,
+                owner: "acme".into(),
+                name: "web".into(),
+                full_name: "acme/web".into(),
+                default_branch: "main".into(),
+                private: true,
+            }],
+        })
+        .unwrap();
+        assert_eq!(encoded["kind"], "installation_repositories");
+        assert!(encoded["repositories"][0].get("artifact_root").is_none());
+        assert!(encoded["repositories"][0].get("upstream").is_none());
+
+        let configured = serde_json::to_value(AdminData::RepositoryConfigured {
+            repository: GitHubRepositoryView {
+                installation_id: 42,
+                repository_id: 7,
+                owner: "acme".into(),
+                name: "web".into(),
+                branch: "main".into(),
+                app: "web".into(),
+                domain: "web.example".into(),
+                engine_version: "bun".into(),
+                entry: "src/index.ts".into(),
+            },
+        })
+        .unwrap();
+        assert!(configured["repository"].get("artifact_root").is_none());
+        assert!(configured["repository"].get("upstream").is_none());
     }
 
     #[test]

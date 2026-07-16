@@ -505,6 +505,71 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             validate_text(app, MAX_ADMIN_APP_BYTES, "app")?;
             validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
         }
+        AdminCommand::ConvertManifest { code, owner } => {
+            validate_text(code, 512, "manifest code")?;
+            if let Some(owner) = owner.as_deref() {
+                validate_text(owner, MAX_ADMIN_APP_BYTES, "owner")?;
+            }
+        }
+        AdminCommand::GitHubStatus => {}
+        AdminCommand::ListRepositories { limit } => validate_list_limit(*limit)?,
+        AdminCommand::ConfigureRepository { repository } => {
+            validate_text(&repository.owner, MAX_ADMIN_APP_BYTES, "repository owner")?;
+            validate_text(&repository.name, MAX_ADMIN_APP_BYTES, "repository name")?;
+            validate_text(&repository.branch, MAX_ADMIN_APP_BYTES, "repository branch")?;
+            validate_text(&repository.app, MAX_ADMIN_APP_BYTES, "app")?;
+            validate_text(&repository.domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            validate_text(
+                &repository.engine_version,
+                MAX_ADMIN_APP_BYTES,
+                "engine version",
+            )?;
+            validate_path(&repository.entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            if repository.installation_id <= 0 || repository.repository_id <= 0 {
+                return Err("installation and repository ids must be positive".into());
+            }
+        }
+        AdminCommand::ListInstallationRepositories { installation_id } => {
+            if *installation_id <= 0 {
+                return Err("installation id must be positive".into());
+            }
+        }
+        AdminCommand::WebhookBegin {
+            delivery_id,
+            event,
+            signature,
+            total_bytes,
+        } => {
+            validate_text(delivery_id, MAX_ADMIN_DEPLOYMENT_BYTES, "delivery id")?;
+            validate_text(event, MAX_ADMIN_APP_BYTES, "webhook event")?;
+            validate_text(signature, 128, "webhook signature")?;
+            if *total_bytes == 0 || *total_bytes > crate::state::MAX_GITHUB_WEBHOOK_BYTES {
+                return Err("webhook body exceeds 25 MiB".into());
+            }
+        }
+        AdminCommand::WebhookChunk {
+            delivery_id,
+            chunk_base64,
+        } => {
+            validate_text(delivery_id, MAX_ADMIN_DEPLOYMENT_BYTES, "delivery id")?;
+            validate_text(
+                chunk_base64,
+                MAX_ADMIN_FRAME_BYTES.saturating_sub(256),
+                "webhook chunk",
+            )?;
+        }
+        AdminCommand::WebhookFinish { delivery_id } => {
+            validate_text(delivery_id, MAX_ADMIN_DEPLOYMENT_BYTES, "delivery id")?
+        }
+        AdminCommand::ListDeployJobs { cursor, limit } => {
+            if let Some(cursor) = cursor.as_deref() {
+                validate_text(cursor, MAX_ADMIN_DEPLOYMENT_BYTES, "cursor")?;
+            }
+            validate_list_limit(*limit)?;
+        }
+        AdminCommand::RetryDeployJob { job_id } => {
+            validate_text(job_id, MAX_ADMIN_DEPLOYMENT_BYTES, "job id")?
+        }
         AdminCommand::Rollback {
             app,
             deployment,
@@ -535,7 +600,9 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
 fn authorize_actor(role: AdminRole, request: &AdminRequest) -> Result<(), String> {
     let host_only = matches!(
         request.command,
-        AdminCommand::ApplyConfig(_) | AdminCommand::RegisterEngine { .. }
+        AdminCommand::ApplyConfig(_)
+            | AdminCommand::RegisterEngine { .. }
+            | AdminCommand::Deploy { .. }
     );
     if host_only && role != AdminRole::Host {
         return Err("command is restricted to the host admin listener".into());
@@ -837,7 +904,7 @@ mod tests {
                 "/run/cygnus/hello.sock",
             ),
         };
-        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_ok());
+        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.command = AdminCommand::ApplyConfig(NodeConfig::default());
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.actor = Some("bad actor".into());
@@ -866,6 +933,34 @@ mod tests {
             },
         };
         assert!(validate_request(&oversized_log).is_err());
+    }
+
+    #[test]
+    fn github_bounds_and_tenant_authorization_are_enforced() {
+        let mut request = request();
+        request.actor = Some("github:user-1".into());
+        request.command = AdminCommand::ListInstallationRepositories { installation_id: 0 };
+        assert!(authorize_actor(AdminRole::TenantZero, &request).is_ok());
+        assert!(validate_request(&request).unwrap_err().contains("positive"));
+
+        request.command = AdminCommand::WebhookChunk {
+            delivery_id: "delivery".into(),
+            chunk_base64: "A".repeat(MAX_ADMIN_FRAME_BYTES),
+        };
+        assert!(validate_request(&request).is_err());
+
+        request.command = AdminCommand::Deploy {
+            request: crate::deploy::DeployRequest::new(
+                "/host/source",
+                "app",
+                "app.example",
+                "bun",
+                "index.ts",
+                "/host/artifacts",
+                "/host/upstream",
+            ),
+        };
+        assert!(authorize_actor(AdminRole::TenantZero, &request).is_err());
     }
 
     #[test]

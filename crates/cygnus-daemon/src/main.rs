@@ -22,17 +22,18 @@ use cygnus_daemon::admin::{
     DEFAULT_TENANT_ADMIN_SOCKET, StateAdminHandler,
 };
 use cygnus_daemon::deploy::{
-    ActivationPreparation, DeployError, DeployRequest, deploy_with_audit_and_prepare,
+    ActivationPreparation, DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare,
     register_engine_with_audit,
 };
 use cygnus_daemon::edge::EdgeConfig;
+use cygnus_daemon::github::{GitHubDeployExecutor, GitHubManager, GitHubWorker};
 use cygnus_daemon::state::{
     AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State,
     StateError,
 };
 use cygnus_daemon::tls::TlsServer;
 use cygnus_router::{Route, RouteTable, Router};
-use cygnus_supervisor::{LifecycleState, Supervisor};
+use cygnus_supervisor::{Instance, LifecycleState, Supervisor};
 use sha2::{Digest, Sha256};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
@@ -123,11 +124,157 @@ fn remove_sqlite_files(path: &Path) {
     }
 }
 
+struct LiveDeployRuntime<I> {
+    supervisor: Arc<Supervisor<I>>,
+    router: Arc<Router>,
+    tenant_admin_socket: PathBuf,
+    gate: Arc<parking_lot::Mutex<()>>,
+}
+
+impl<I: Instance + 'static> LiveDeployRuntime<I> {
+    fn new(
+        supervisor: Arc<Supervisor<I>>,
+        router: Arc<Router>,
+        tenant_admin_socket: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            supervisor,
+            router,
+            tenant_admin_socket: tenant_admin_socket.into(),
+            gate: Arc::new(parking_lot::Mutex::new(())),
+        }
+    }
+
+    fn prepare_candidate(
+        &self,
+        candidate: &LoadedApp,
+        previous_runtime_key: Option<&str>,
+    ) -> Result<ActivationPreparation, DeployError> {
+        let key = candidate.spec.name.clone();
+        if previous_runtime_key == Some(key.as_str()) {
+            return Ok(ActivationPreparation::new(|| {}));
+        }
+        self.supervisor.register(
+            key.clone(),
+            candidate.spec.clone(),
+            candidate.lifecycle.clone(),
+        );
+        match self.supervisor.acquire(&key) {
+            Ok(()) => {
+                let cleanup = Arc::clone(&self.supervisor);
+                Ok(ActivationPreparation::new(move || {
+                    let _ = cleanup.remove(&key);
+                }))
+            }
+            Err(error) => {
+                let _ = self.supervisor.remove(&key);
+                Err(DeployError::ActivationFailed {
+                    id: key,
+                    detail: format!("{error:?}"),
+                })
+            }
+        }
+    }
+
+    fn install_after_commit(
+        &self,
+        snapshot: &Snapshot,
+        previous_runtime_key: Option<String>,
+        new_runtime_key: &str,
+    ) {
+        if previous_runtime_key.as_deref() == Some(new_runtime_key) {
+            return;
+        }
+        let retired = self.router.install(route_table(snapshot));
+        if let Some(previous) = previous_runtime_key {
+            retire_runtime_after_quiescence(retired, Arc::clone(&self.supervisor), previous);
+        }
+    }
+
+    fn deploy(
+        &self,
+        state: &mut State,
+        request: DeployRequest,
+        audit: &AuditContext,
+    ) -> Result<DeployResult, DeployError> {
+        let _deployment_gate = self.gate.lock();
+        let previous_runtime_key = state
+            .load()?
+            .apps
+            .into_iter()
+            .find(|app| app.name == request.app)
+            .map(|app| app.spec.name);
+        let previous_for_prepare = previous_runtime_key.clone();
+        let tenant_socket = self.tenant_admin_socket.clone();
+        let result = deploy_with_audit_and_prepare(state, request, audit, |candidate| {
+            let mut candidate = candidate.clone();
+            configure_tenant_admin(&mut candidate, &tenant_socket)
+                .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
+            self.prepare_candidate(&candidate, previous_for_prepare.as_deref())
+        })?;
+
+        let new_runtime_key = format!("r-{}", result.artifact_hash);
+        self.install_after_commit(&state.load()?, previous_runtime_key, &new_runtime_key);
+        Ok(result)
+    }
+}
+
+struct ProductionGitHubDeployExecutor {
+    runtime: Arc<LiveDeployRuntime<Cage>>,
+}
+
+impl ProductionGitHubDeployExecutor {
+    fn new(runtime: Arc<LiveDeployRuntime<Cage>>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl GitHubDeployExecutor for ProductionGitHubDeployExecutor {
+    fn deploy(
+        &self,
+        state: &mut State,
+        _job: &cygnus_daemon::state::GitHubDeployJob,
+        config: &cygnus_daemon::state::GitHubRepositoryConfig,
+        source: &Path,
+        audit: &AuditContext,
+    ) -> Result<DeployResult, DeployError> {
+        self.runtime.deploy(
+            state,
+            DeployRequest::new(
+                source,
+                &config.app,
+                &config.domain,
+                &config.engine_version,
+                &config.entry,
+                &config.artifact_root,
+                &config.upstream,
+            ),
+            audit,
+        )
+    }
+}
+
+fn retire_runtime_after_quiescence<I: Instance + 'static>(
+    retired: Arc<RouteTable>,
+    supervisor: Arc<Supervisor<I>>,
+    previous: String,
+) {
+    thread::spawn(move || {
+        while !retired.is_quiescent() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if let Err(error) = supervisor.remove(&previous) {
+            eprintln!("cygnus-daemon: retired runtime {previous:?} did not stop: {error}");
+        }
+    });
+}
+
 struct LiveAdminMutations {
     state_path: PathBuf,
     supervisor: Arc<Supervisor<Cage>>,
     router: Arc<Router>,
     tenant_admin_socket: PathBuf,
+    runtime: Arc<LiveDeployRuntime<Cage>>,
 }
 
 impl AdminMutationHandler for LiveAdminMutations {
@@ -277,61 +424,11 @@ impl LiveAdminMutations {
         request: DeployRequest,
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
-        let supervisor = Arc::clone(&self.supervisor);
-        let tenant_socket = self.tenant_admin_socket.clone();
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
-        let previous_runtime_key = state
-            .load()
-            .map_err(map_admin_state_error)?
-            .apps
-            .into_iter()
-            .find(|app| app.name == request.app)
-            .map(|app| app.spec.name);
-        let previous_for_prepare = previous_runtime_key.clone();
-        let result = deploy_with_audit_and_prepare(&mut state, request, audit, move |candidate| {
-            let mut candidate = candidate.clone();
-            configure_tenant_admin(&mut candidate, &tenant_socket)
-                .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
-            let key = candidate.spec.name.clone();
-            if previous_for_prepare.as_deref() == Some(key.as_str()) {
-                return Ok(ActivationPreparation::new(|| {}));
-            }
-            supervisor.register(
-                key.clone(),
-                candidate.spec.clone(),
-                candidate.lifecycle.clone(),
-            );
-            supervisor
-                .acquire(&key)
-                .map_err(|error| DeployError::ActivationFailed {
-                    id: key.clone(),
-                    detail: format!("{error:?}"),
-                })?;
-            let cleanup = Arc::clone(&supervisor);
-            Ok(ActivationPreparation::new(move || {
-                let _ = cleanup.remove(&key);
-            }))
-        })
-        .map_err(map_deploy_error)?;
-        let snapshot = State::open(&self.state_path)
-            .map_err(map_admin_state_error)?
-            .load()
-            .map_err(map_admin_state_error)?;
-        let retired = self.router.install(route_table(&snapshot));
-        let new_runtime_key = format!("r-{}", result.artifact_hash);
-        if let Some(previous) = previous_runtime_key
-            && previous != new_runtime_key
-        {
-            let supervisor = Arc::clone(&self.supervisor);
-            thread::spawn(move || {
-                while !retired.is_quiescent() {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                if let Err(error) = supervisor.remove(&previous) {
-                    eprintln!("cygnus-daemon: retired runtime {previous:?} did not stop: {error}");
-                }
-            });
-        }
+        let result = self
+            .runtime
+            .deploy(&mut state, request, audit)
+            .map_err(map_deploy_error)?;
         Ok(AdminData::DeploymentActivated {
             app: result.deployment.app,
             deployment_id: result.deployment_id,
@@ -622,27 +719,52 @@ fn serve(
     });
     let lifecycle_supervisor = Arc::clone(&supervisor);
     let lifecycle_state_path = state_path.to_owned();
+    let live_runtime = Arc::new(LiveDeployRuntime::new(
+        Arc::clone(&supervisor),
+        Arc::clone(&router),
+        tenant_admin_socket.to_owned(),
+    ));
     let mutations: Arc<dyn AdminMutationHandler> = Arc::new(LiveAdminMutations {
         state_path: state_path.to_owned(),
         supervisor: Arc::clone(&supervisor),
         tenant_admin_socket: tenant_admin_socket.to_owned(),
         router: Arc::clone(&router),
+        runtime: Arc::clone(&live_runtime),
     });
-    let admin_handler: Arc<dyn AdminHandler> = Arc::new(StateAdminHandler::new(
-        state_path,
-        move |app| {
-            let state = State::open(&lifecycle_state_path).ok()?;
-            let snapshot = state.load().ok()?;
-            let runtime = snapshot
-                .apps
-                .into_iter()
-                .find(|candidate| candidate.name == app)?;
-            lifecycle_supervisor
-                .state(&runtime.spec.name)
-                .map(lifecycle_state_name)
-        },
-        mutations,
-    ));
+    let github = Arc::new(GitHubManager::new(state_path));
+    let github_worker = GitHubWorker::new(
+        (*github).clone(),
+        Arc::new(ProductionGitHubDeployExecutor::new(Arc::clone(
+            &live_runtime,
+        ))),
+    );
+    let github_shutdown = Arc::clone(&shutdown);
+    let github_thread = thread::spawn(move || {
+        while !github_shutdown.load(Ordering::Acquire) {
+            if let Err(error) = github_worker.run_once() {
+                eprintln!("cygnus-daemon: GitHub worker error: {error}");
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let admin_handler: Arc<dyn AdminHandler> = Arc::new(
+        StateAdminHandler::new(
+            state_path,
+            move |app| {
+                let state = State::open(&lifecycle_state_path).ok()?;
+                let snapshot = state.load().ok()?;
+                let runtime = snapshot
+                    .apps
+                    .into_iter()
+                    .find(|candidate| candidate.name == app)?;
+                lifecycle_supervisor
+                    .state(&runtime.spec.name)
+                    .map(lifecycle_state_name)
+            },
+            mutations,
+        )
+        .with_github(Arc::clone(&github)),
+    );
     let admin_server = AdminServer::new(admin_bindings, admin_handler);
     let admin_shutdown = Arc::clone(&shutdown);
     let admin_failure = Arc::clone(&shutdown);
@@ -679,6 +801,9 @@ fn serve(
             .join()
             .map_err(|_| io::Error::other("ACME renewal thread panicked"))?;
     }
+    github_thread
+        .join()
+        .map_err(|_| io::Error::other("GitHub worker thread panicked"))?;
     for (app, error) in supervisor.shutdown_all() {
         eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
     }
@@ -938,6 +1063,168 @@ mod tests {
             "cygnus-daemon-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[derive(Clone)]
+    struct FakeInstance {
+        events: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Instance for FakeInstance {
+        fn try_status(&mut self) -> Result<cygnus_supervisor::InstanceStatus, String> {
+            Ok(cygnus_supervisor::InstanceStatus::Running)
+        }
+
+        fn shutdown(self) -> Result<(), String> {
+            self.events.lock().push("shutdown");
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn runtime_candidate(runtime_key: &str) -> LoadedApp {
+        let upstream = PathBuf::from(format!("/tmp/{runtime_key}.sock"));
+        let spec = CageSpec::new(runtime_key, "/bin/true");
+        LoadedApp {
+            name: "app".into(),
+            domains: vec!["app.example".into()],
+            tenant_admin: false,
+            upstream,
+            spec,
+            lifecycle: Default::default(),
+        }
+    }
+
+    fn fake_runtime() -> (
+        LiveDeployRuntime<FakeInstance>,
+        Arc<Supervisor<FakeInstance>>,
+        Arc<Router>,
+        Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let boot_events = Arc::clone(&events);
+        let boot_shutdowns = Arc::clone(&shutdowns);
+        let supervisor = Arc::new(Supervisor::new(move |_spec| {
+            boot_events.lock().push("boot");
+            Ok(FakeInstance {
+                events: Arc::clone(&boot_events),
+                shutdowns: Arc::clone(&boot_shutdowns),
+            })
+        }));
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let runtime = LiveDeployRuntime::new(
+            Arc::clone(&supervisor),
+            Arc::clone(&router),
+            "/tmp/cygnus-test-admin.sock",
+        );
+        (runtime, supervisor, router, events, shutdowns)
+    }
+
+    #[test]
+    fn live_deploy_candidate_boot_precedes_commit() {
+        let (runtime, supervisor, _router, events, _shutdowns) = fake_runtime();
+        let candidate = runtime_candidate("r-new");
+        let preparation = runtime.prepare_candidate(&candidate, None).unwrap();
+        events.lock().push("commit");
+        assert_eq!(&*events.lock(), &["boot", "commit"]);
+        drop(preparation);
+        assert_eq!(supervisor.state("r-new"), None);
+    }
+
+    #[test]
+    fn live_deploy_commit_failure_preserves_old_route_and_runtime() {
+        let (runtime, supervisor, router, _events, _shutdowns) = fake_runtime();
+        let old = runtime_candidate("r-old");
+        supervisor.register("r-old", old.spec.clone(), old.lifecycle.clone());
+        supervisor.acquire("r-old").unwrap();
+        let mut routes = RouteTable::new();
+        routes.insert(
+            "app.example",
+            Route {
+                app: "r-old".into(),
+                upstream: old.upstream.clone(),
+            },
+        );
+        drop(router.install(routes));
+
+        let candidate = runtime_candidate("r-new");
+        let preparation = runtime
+            .prepare_candidate(&candidate, Some("r-old"))
+            .unwrap();
+        drop(preparation);
+
+        assert_eq!(router.resolve("app.example").unwrap().app, "r-old");
+        assert_eq!(supervisor.state("r-old"), Some(LifecycleState::Ready));
+        assert_eq!(supervisor.state("r-new"), None);
+        supervisor.shutdown_all();
+    }
+
+    #[test]
+    fn live_deploy_success_routes_new_runtime_and_retires_after_quiescence() {
+        let (runtime, supervisor, router, _events, shutdowns) = fake_runtime();
+        let old = runtime_candidate("r-old");
+        supervisor.register("r-old", old.spec.clone(), old.lifecycle.clone());
+        supervisor.acquire("r-old").unwrap();
+        let mut old_routes = RouteTable::new();
+        old_routes.insert(
+            "app.example",
+            Route {
+                app: "r-old".into(),
+                upstream: old.upstream.clone(),
+            },
+        );
+        drop(router.install(old_routes));
+        let old_route = router.resolve("app.example").unwrap();
+
+        let new = runtime_candidate("r-new");
+        let snapshot = Snapshot {
+            listen: "127.0.0.1:3000".parse().unwrap(),
+            edge: Default::default(),
+            apps: vec![new.clone()],
+        };
+        runtime.install_after_commit(&snapshot, Some("r-old".into()), "r-new");
+        assert_eq!(router.resolve("app.example").unwrap().app, "r-new");
+        assert_eq!(supervisor.state("r-old"), Some(LifecycleState::Ready));
+
+        drop(old_route);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while supervisor.state("r-old").is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(supervisor.state("r-old"), None);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        supervisor.shutdown_all();
+    }
+
+    #[test]
+    fn live_deploy_same_artifact_is_a_noop() {
+        let (runtime, supervisor, router, _events, _shutdowns) = fake_runtime();
+        let current = runtime_candidate("r-current");
+        supervisor.register("r-current", current.spec.clone(), current.lifecycle.clone());
+        supervisor.acquire("r-current").unwrap();
+        let mut routes = RouteTable::new();
+        routes.insert(
+            "app.example",
+            Route {
+                app: "r-current".into(),
+                upstream: current.upstream.clone(),
+            },
+        );
+        drop(router.install(routes));
+        let before = router.resolve("app.example").unwrap();
+        let snapshot = Snapshot {
+            listen: "127.0.0.1:3000".parse().unwrap(),
+            edge: Default::default(),
+            apps: vec![current],
+        };
+        runtime.install_after_commit(&snapshot, Some("r-current".into()), "r-current");
+        let after = router.resolve("app.example").unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(supervisor.state("r-current"), Some(LifecycleState::Ready));
+        supervisor.shutdown_all();
     }
 
     #[test]

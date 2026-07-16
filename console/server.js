@@ -1,6 +1,7 @@
 import {
   createHash,
   createHmac,
+  randomBytes,
   timingSafeEqual,
 } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -18,10 +19,19 @@ export const SESSION_COOKIE = "__Host-cygnus_session";
 export const SESSION_TTL_SECONDS = 12 * 60 * 60;
 export const MAX_JSON_BODY_BYTES = 32 * 1024;
 export const MAX_IDENTIFIER_LENGTH = 128;
+export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
+export const MAX_WEBHOOK_CHUNK_BYTES = 32 * 1024;
+export const MANIFEST_STATE_TTL_MS = 60 * 60 * 1000;
+export const MAX_MANIFEST_STATES = 1024;
+export const GITHUB_WEBHOOK_PATH = "/github/webhook";
+export const GITHUB_MANIFEST_CALLBACK_PATH = "/github/app/manifest/callback";
+export const GITHUB_SETUP_PATH = "/github/app/setup";
+export const GITHUB_INSTALL_CALLBACK_PATH = "/github/app/install/callback";
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOGIN_BLOCK_MS = 60_000;
 const MAX_LOGIN_TRACKED_IPS = 1024;
 const loginAttempts = new Map();
+const manifestStates = new Map();
 
 if (socketPath && !socketPath.startsWith("/")) {
   throw new Error(`CYGNUS_SOCKET must be an absolute path (received ${socketPath})`);
@@ -42,8 +52,16 @@ if (import.meta.main) {
     ...(socketPath ? { unix: socketPath } : { port }),
     async fetch(request) {
       const url = new URL(request.url);
-      if (request.method !== "GET" && request.method !== "HEAD" && !sameOrigin(request, url)) {
+      if (
+        request.method !== "GET" &&
+        request.method !== "HEAD" &&
+        url.pathname !== GITHUB_WEBHOOK_PATH &&
+        !sameOrigin(request, url)
+      ) {
         return apiError(403, "csrf", "request origin is not allowed");
+      }
+      if ([GITHUB_WEBHOOK_PATH, GITHUB_MANIFEST_CALLBACK_PATH, GITHUB_SETUP_PATH, GITHUB_INSTALL_CALLBACK_PATH].includes(url.pathname)) {
+        return handleApi(request, url);
       }
       if (url.pathname === "/healthz") {
         if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
@@ -101,22 +119,34 @@ export async function handleApi(request, url) {
     return logout(request);
   }
 
-  const mutationRoute = ["/api/v1/map-domain", "/api/v1/rollback", "/api/v1/deploy"].includes(path);
-  const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments))(?:\/[^/]+)?$/u.test(path);
+  if (path === GITHUB_WEBHOOK_PATH) return webhookIngress(request);
+  if (path === GITHUB_MANIFEST_CALLBACK_PATH) return manifestCallback(request, url);
+  if (path === GITHUB_SETUP_PATH || path === GITHUB_INSTALL_CALLBACK_PATH) return githubSetupRedirect(request, url);
+
+  const mutationRoute = [
+    "/api/v1/map-domain",
+    "/api/v1/rollback",
+    "/api/v1/github/manifest",
+    "/api/v1/github/repositories",
+  ].includes(path) || /^\/api\/v1\/github\/jobs\/[^/]+\/retry$/u.test(path);
+  const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|jobs))(?:\/[^/]+)?$/u.test(path);
   if (mutationRoute && request.method !== "POST") return methodNotAllowed("POST");
   if (readRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
   }
+  if (path === "/api/v1/deploy") return apiError(404, "not_found", "API route not found");
 
   const auth = authStatus();
   if (!auth.configured) {
     return apiError(503, "misconfigured", "console authentication is misconfigured");
   }
-  if (!verifySessionCookie(request.headers.get("cookie"))) {
+  const sessionCookie = request.headers.get("cookie");
+  if (!verifySessionCookie(sessionCookie)) {
     return apiError(401, "unauthorized", "authentication required");
   }
+  if (path === "/api/v1/github/manifest") return manifestStart(request, url, sessionCookie);
   if (!adminSocketPath) {
     return apiError(503, "unavailable", "daemon admin bridge unavailable");
   }
@@ -132,8 +162,8 @@ export async function handleApi(request, url) {
   if (!command) return apiError(404, "not_found", "API route not found");
 
   try {
-    const { data, requestId } = await adminRequest(adminSocketPath, command, ACTOR_SUBJECT);
-    return jsonResponse({ ok: true, data, requestId }, request.method === "HEAD");
+    const publicData = path.startsWith("/api/v1/github/") ? sanitizeGithubData(data) : data;
+    return jsonResponse({ ok: true, data: publicData, requestId }, request.method === "HEAD");
   } catch (error) {
     const code = error instanceof AdminProtocolError ? error.code : "internal";
     const status = statusForDaemonCode(code);
@@ -329,8 +359,12 @@ export async function commandForRequest(request, url) {
   if (parts.length === 3 && parts[2] === "rollback") {
     return rollbackCommand(await readJsonBody(request));
   }
-  if (parts.length === 3 && parts[2] === "deploy") {
-    return deployCommand(await readJsonBody(request));
+  if (parts.length === 4 && parts[2] === "github" && parts[3] === "repositories") {
+    return configureRepositoryCommand(await readJsonBody(request));
+  }
+  if (parts.length === 6 && parts[2] === "github" && parts[3] === "jobs" && parts[5] === "retry") {
+    await assertEmptyBody(request);
+    return retryDeployJobCommand(decodeSegment(parts[4], "job id"));
   }
   return null;
 }
@@ -367,6 +401,22 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
     assertQueryKeys(url, []);
     return { type: "get_deployment", deployment: safeDeployment(decodeSegment(parts[3], "deployment")) };
   }
+  if (parts.length === 4 && parts[2] === "github" && parts[3] === "status") {
+    assertQueryKeys(url, []);
+    return githubStatusCommand();
+  }
+  if (parts.length === 4 && parts[2] === "github" && parts[3] === "repositories") {
+    assertQueryKeys(url, ["limit"]);
+    return listRepositoriesCommand(listLimit(url));
+  }
+  if (parts.length === 6 && parts[2] === "github" && parts[3] === "installations" && parts[5] === "repositories") {
+    assertQueryKeys(url, []);
+    return listInstallationRepositoriesCommand(safePositiveId(decodeSegment(parts[4], "installation id")));
+  }
+  if (parts.length === 4 && parts[2] === "github" && parts[3] === "jobs") {
+    assertQueryKeys(url, ["cursor", "limit"]);
+    return listDeployJobsCommand(optionalQuery(url, "cursor"), listLimit(url));
+  }
   return null;
 }
 
@@ -385,30 +435,91 @@ export function rollbackCommand(body) {
   };
 }
 
-export function deployCommand(body) {
-  assertExactKeys(body, ["request"]);
-  assertExactKeys(body.request, [
-    "source_dir",
-    "app",
-    "domain",
-    "engine_version",
-    "entry",
-    "artifact_root",
-    "upstream",
-  ]);
-  const request = body.request;
+export function convertManifestCommand(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "code" && key !== "owner")) {
+    throw new HttpInputError(422, "validation", "request contains unsupported fields");
+  }
+  const code = body.code;
+  const owner = body.owner;
+  if (typeof code !== "string" || code.length === 0 || code.length > 512 || /[\u0000-\u001f\u007f]/u.test(code)) {
+    throw new HttpInputError(422, "validation", "manifest conversion code is invalid");
+  }
+  if (owner !== undefined) safeGithubOwner(owner);
+  const command = { type: "convert_manifest", code };
+  if (owner !== undefined) command.owner = owner;
+  return command;
+}
+
+export function githubStatusCommand() {
+  return { type: "github_status" };
+}
+
+export function listInstallationRepositoriesCommand(installationId) {
+  return { type: "list_installation_repositories", installation_id: safePositiveId(installationId) };
+}
+
+export function listRepositoriesCommand(limit = 50) {
+  return { type: "list_repositories", limit: safeListLimit(limit) };
+}
+
+export function configureRepositoryCommand(body) {
+  assertExactKeys(body, ["installation_id", "repository_id", "owner", "name", "branch", "app", "domain", "engine_version", "entry"]);
   return {
-    type: "deploy",
-    request: {
-      source_dir: absoluteHostPath(request.source_dir, "source_dir"),
-      app: safeApp(request.app),
-      domain: safeDomain(request.domain),
-      engine_version: safeVersion(request.engine_version),
-      entry: safeEntry(request.entry),
-      artifact_root: absoluteHostPath(request.artifact_root, "artifact_root"),
-      upstream: absoluteHostPath(request.upstream, "upstream"),
+    type: "configure_repository",
+    repository: {
+      installation_id: safePositiveId(body.installation_id),
+      repository_id: safePositiveId(body.repository_id),
+      owner: safeGithubOwner(body.owner),
+      name: safeGithubName(body.name),
+      branch: safeGithubBranch(body.branch),
+      app: safeApp(body.app),
+      domain: safeDomain(body.domain),
+      engine_version: safeVersion(body.engine_version),
+      entry: safeEntry(body.entry),
     },
   };
+}
+
+export function listDeployJobsCommand(cursor, limit = 50) {
+  if (cursor !== undefined) safeCursor(cursor);
+  return { type: "list_deploy_jobs", ...(cursor === undefined ? {} : { cursor }), limit: safeListLimit(limit) };
+}
+
+export function retryDeployJobCommand(jobId) {
+  return { type: "retry_deploy_job", job_id: safeDeployment(jobId) };
+}
+
+function safeListLimit(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 50) throw new HttpInputError(422, "validation", "limit must be an integer between 1 and 50");
+  return value;
+}
+
+function safePositiveId(value) {
+  const number = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) throw new HttpInputError(422, "validation", "identifier must be a positive integer");
+  return number;
+}
+
+function safeCursor(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_IDENTIFIER_LENGTH || /[\u0000-\u001f\u007f/\\]/u.test(value)) {
+    throw new HttpInputError(422, "validation", "cursor is invalid");
+  }
+  return value;
+}
+
+function safeGithubOwner(value) {
+  return safeIdentifier(value, "owner", /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/u);
+}
+
+function safeGithubName(value) {
+  return safeIdentifier(value, "repository name", /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u);
+}
+
+function safeGithubBranch(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 255 || value.startsWith("/") || value.includes("\\") || /[\u0000-\u001f\u007f]/u.test(value) || value.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new HttpInputError(422, "validation", "branch is invalid");
+  }
+  return value;
 }
 
 function assertExactKeys(value, expected) {
@@ -447,15 +558,6 @@ function safeDomain(value) {
   const host = value.startsWith("*.") ? value.slice(2) : value;
   if (!host || host.split(".").some((label) => !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/u.test(label))) {
     throw new HttpInputError(422, "validation", "domain is invalid");
-  }
-  return value;
-}
-function absoluteHostPath(value, name) {
-  if (typeof value !== "string" || value.length === 0 || value.length > 4096 || !value.startsWith("/") || /[\u0000-\u001f\u007f]/u.test(value)) {
-    throw new HttpInputError(422, "validation", `${name} must be an absolute host path`);
-  }
-  if (value.split("/").some((part) => part === "..")) {
-    throw new HttpInputError(422, "validation", `${name} contains an unsafe path segment`);
   }
   return value;
 }
@@ -522,6 +624,214 @@ async function readJsonBody(request) {
     throw new HttpInputError(422, "validation", "request body must be valid JSON");
   }
 }
+async function assertEmptyBody(request) {
+  const rawLength = request.headers.get("content-length");
+  if (rawLength !== null && (!/^\d+$/u.test(rawLength) || Number(rawLength) !== 0)) throw new HttpInputError(422, "validation", "request body must be empty");
+  const reader = request.body?.getReader();
+  if (!reader) return;
+  const { done, value } = await reader.read();
+  if (!done && value?.byteLength) {
+    await reader.cancel().catch(() => {});
+    throw new HttpInputError(422, "validation", "request body must be empty");
+  }
+}
+
+export function buildGithubManifest(origin) {
+  if (typeof origin !== "string" || !/^https?:\/\/[^/]+$/u.test(origin)) {
+    throw new HttpInputError(422, "validation", "console origin is invalid");
+  }
+  return {
+    name: "Cygnus Tenant Zero",
+    url: origin,
+    redirect_url: `${origin}${GITHUB_MANIFEST_CALLBACK_PATH}`,
+    setup_url: `${origin}${GITHUB_SETUP_PATH}`,
+    callback_urls: [`${origin}${GITHUB_INSTALL_CALLBACK_PATH}`],
+    public: false,
+    hook_attributes: { url: `${origin}${GITHUB_WEBHOOK_PATH}`, active: true },
+    default_permissions: {
+      contents: "read",
+      pull_requests: "read",
+      checks: "write",
+      deployments: "write",
+    },
+    default_events: ["push", "pull_request"],
+  };
+}
+
+export function manifestStateSize(now = Date.now()) {
+  pruneManifestStates(now);
+  return manifestStates.size;
+}
+
+export function clearManifestStates() {
+  manifestStates.clear();
+}
+
+async function manifestStart(request, url, sessionCookie) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    return apiError(422, "github_origin", "GitHub App setup requires an HTTPS console origin");
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (error) {
+    return apiError(error.status ?? 422, error.code ?? "validation", error.message ?? "invalid request");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return apiError(422, "validation", "request body must be a JSON object");
+  const keys = Object.keys(body);
+  let owner;
+  try {
+    owner = body.owner === undefined || body.owner === null || body.owner === "" ? undefined : safeGithubOwner(body.owner);
+  } catch (error) {
+    return apiError(error.status ?? 422, error.code ?? "validation", error.message ?? "owner is invalid");
+  }
+  const verified = verifySessionCookie(sessionCookie);
+  if (!verified) return apiError(401, "unauthorized", "authentication required");
+  const now = Date.now();
+  pruneManifestStates(now);
+  while (manifestStates.size >= MAX_MANIFEST_STATES) manifestStates.delete(manifestStates.keys().next().value);
+  const state = randomBytes(32).toString("base64url");
+  manifestStates.set(createHash("sha256").update(state, "utf8").digest("hex"), {
+    owner,
+    sessionHash: createHash("sha256").update(String(sessionCookie), "utf8").digest("hex"),
+    expiresAt: now + MANIFEST_STATE_TTL_MS,
+  });
+  const manifest = buildGithubManifest(url.origin);
+  const action = owner
+    ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/new?state=${encodeURIComponent(state)}`
+    : `https://github.com/settings/apps/new?state=${encodeURIComponent(state)}`;
+  return jsonResponse({ ok: true, data: { action, manifest } });
+}
+
+function pruneManifestStates(now = Date.now()) {
+  for (const [hash, entry] of manifestStates) if (entry.expiresAt <= now) manifestStates.delete(hash);
+}
+
+export function consumeManifestState(state, sessionCookie, now = Date.now()) {
+  if (typeof state !== "string" || state.length < 22 || state.length > 128 || !/^[A-Za-z0-9_-]+$/u.test(state)) return null;
+  pruneManifestStates(now);
+  const hash = createHash("sha256").update(state, "utf8").digest("hex");
+  const entry = manifestStates.get(hash);
+  if (!entry) return null;
+  const sessionHash = createHash("sha256").update(String(sessionCookie ?? ""), "utf8").digest("hex");
+  if (!constantTimeStringEqual(sessionHash, entry.sessionHash)) return null;
+  manifestStates.delete(hash);
+  return { ...entry };
+}
+
+async function manifestCallback(request, url) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  if ([...url.searchParams.keys()].some((key) => key !== "code" && key !== "state")) return apiError(400, "github_callback", "GitHub callback contains unsupported fields");
+  if (!code || !state) return apiError(400, "github_callback", "GitHub callback is missing code or state");
+  try {
+    convertManifestCommand({ code });
+  } catch (error) {
+    return apiError(error.status ?? 400, error.code ?? "github_callback", "GitHub callback code is invalid");
+  }
+  const auth = authStatus();
+  if (!auth.configured) return apiError(503, "misconfigured", "console authentication is misconfigured");
+  const cookie = request.headers.get("cookie");
+  if (!verifySessionCookie(cookie)) return apiError(401, "unauthorized", "authentication required");
+  const stateEntry = consumeManifestState(state, cookie);
+  if (!stateEntry) return apiError(400, "github_state", "GitHub callback state is invalid or expired");
+  if (!adminSocketPath) return apiError(503, "unavailable", "daemon admin bridge unavailable");
+  try {
+    await adminRequest(
+      adminSocketPath,
+      convertManifestCommand({ code, ...(stateEntry.owner === undefined ? {} : { owner: stateEntry.owner }) }),
+      ACTOR_SUBJECT,
+    );
+    return new Response(null, {
+      status: 303,
+      headers: { location: "/?github=configured", "cache-control": "no-store" },
+    });
+  } catch (error) {
+    const protocolCode = error instanceof AdminProtocolError ? error.code : "internal";
+    return apiError(statusForDaemonCode(protocolCode), publicDaemonCode(protocolCode), safeErrorMessage(protocolCode));
+  }
+}
+
+function githubSetupRedirect(request, url) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const installationId = url.searchParams.get("installation_id");
+  if ([...url.searchParams.keys()].some((key) => key !== "installation_id" && key !== "setup_action")) {
+    return apiError(400, "github_setup", "GitHub setup callback contains unsupported fields");
+  }
+  if (!installationId || !/^\d+$/u.test(installationId) || Number(installationId) <= 0) {
+    return apiError(400, "github_setup", "GitHub setup callback is missing installation_id");
+  }
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: `/?github=setup&installation_id=${encodeURIComponent(installationId)}`,
+      "cache-control": "no-store",
+    },
+  });
+}
+
+export async function webhookIngress(request, requestAdmin = adminRequest, socket = adminSocketPath) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  const rawLength = request.headers.get("content-length");
+  if (rawLength === null || !/^\d+$/u.test(rawLength)) return apiError(411, "length_required", "webhook Content-Length is required");
+  const totalBytes = Number(rawLength);
+  if (!Number.isSafeInteger(totalBytes) || totalBytes < 1 || totalBytes > MAX_WEBHOOK_BODY_BYTES) return apiError(413, "body_too_large", "webhook body is too large");
+  const deliveryId = request.headers.get("x-github-delivery") ?? "";
+  const event = request.headers.get("x-github-event") ?? "";
+  const signature = request.headers.get("x-hub-signature-256") ?? "";
+  if (!deliveryId || deliveryId.length > MAX_IDENTIFIER_LENGTH || /[\u0000-\u001f\u007f]/u.test(deliveryId)) return apiError(400, "webhook_delivery", "webhook delivery header is invalid");
+  if (!event || event.length > MAX_IDENTIFIER_LENGTH || /[^A-Za-z0-9_.-]/u.test(event)) return apiError(400, "webhook_event", "webhook event header is invalid");
+  if (!/^sha256=[0-9a-f]{64}$/u.test(signature)) return apiError(400, "webhook_signature", "webhook signature header is invalid");
+  if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
+  const reader = request.body?.getReader();
+  if (!reader) return apiError(400, "body_required", "webhook body is required");
+  let begun;
+  try {
+    begun = await requestAdmin(socket, { type: "webhook_begin", delivery_id: deliveryId, event, signature, total_bytes: totalBytes }, "github:webhook");
+  } catch (error) {
+    const code = error instanceof AdminProtocolError ? error.code : "internal";
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code));
+  }
+  const duplicate = begun?.data?.duplicate === true;
+  if (duplicate) {
+    await reader.cancel().catch(() => {});
+    return jsonResponse({ ok: true, data: { delivery_id: deliveryId, duplicate: true } }, false, 202);
+  }
+  let received = 0;
+  let carry = Buffer.alloc(0);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = Buffer.from(value);
+      received += bytes.length;
+      if (received > totalBytes || received > MAX_WEBHOOK_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        await requestAdmin(socket, { type: "webhook_finish", delivery_id: deliveryId }, "github:webhook").catch(() => {});
+        return apiError(413, "body_too_large", "webhook body is too large");
+      }
+      carry = carry.length ? Buffer.concat([carry, bytes]) : bytes;
+      while (carry.length >= MAX_WEBHOOK_CHUNK_BYTES) {
+        const chunk = carry.subarray(0, MAX_WEBHOOK_CHUNK_BYTES);
+        carry = carry.subarray(MAX_WEBHOOK_CHUNK_BYTES);
+        await requestAdmin(socket, { type: "webhook_chunk", delivery_id: deliveryId, chunk_base64: chunk.toString("base64") }, "github:webhook");
+      }
+    }
+    if (received !== totalBytes) {
+      await requestAdmin(socket, { type: "webhook_finish", delivery_id: deliveryId }, "github:webhook").catch(() => {});
+      return apiError(400, "length_mismatch", "webhook body length does not match Content-Length");
+    }
+    if (carry.length) await requestAdmin(socket, { type: "webhook_chunk", delivery_id: deliveryId, chunk_base64: carry.toString("base64") }, "github:webhook");
+    const finished = await requestAdmin(socket, { type: "webhook_finish", delivery_id: deliveryId }, "github:webhook");
+    return jsonResponse({ ok: true, data: finished?.data ?? { delivery_id: deliveryId, duplicate: false, jobs: 0 } }, false, 202);
+  } catch (error) {
+    await requestAdmin(socket, { type: "webhook_finish", delivery_id: deliveryId }, "github:webhook").catch(() => {});
+    const code = error instanceof AdminProtocolError ? error.code : "internal";
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code));
+  }
+}
 
 function sameOrigin(request, url) {
   const origin = request.headers.get("origin");
@@ -562,6 +872,88 @@ function publicDaemonCode(code) {
   if (code === "invalid_request" || code === "unsupported_version") return "validation";
   return "unavailable";
 }
+function sanitizeGithubData(data) {
+  if (!data || typeof data !== "object") return { kind: "unknown" };
+  const kind = data.kind;
+  if (kind === "repositories" || kind === "installation_repositories") {
+    const repositories = Array.isArray(data.repositories) ? data.repositories.map((repo) => kind === "repositories" ? sanitizeConfiguredRepository(repo) : sanitizeInstallationRepository(repo)) : [];
+    return { kind, repositories, ...(data.next_cursor ? { next_cursor: data.next_cursor } : {}) };
+  }
+  if (kind === "repository_configured") return { kind, repository: sanitizeConfiguredRepository(data.repository) };
+  if (kind === "github_status" || kind === "manifest_converted") {
+    return { kind, ...(typeof data.configured === "boolean" ? { configured: data.configured } : {}), ...(data.app ? { app: sanitizeGithubApp(data.app) } : {}) };
+  }
+  if (kind === "deploy_jobs") {
+    const jobs = Array.isArray(data.jobs) ? data.jobs.map(sanitizeGithubJob) : [];
+    return { kind, jobs, ...(data.next_cursor ? { next_cursor: data.next_cursor } : {}) };
+  }
+  if (kind === "deploy_job_retried") return { kind, job: sanitizeGithubJob(data.job) };
+  if (kind === "webhook_begun") return { kind, delivery_id: data.delivery_id, duplicate: data.duplicate === true };
+  if (kind === "webhook_chunked") return { kind, delivery_id: data.delivery_id, received_bytes: data.received_bytes };
+  if (kind === "webhook_accepted") return { kind, delivery_id: data.delivery_id, duplicate: data.duplicate === true, jobs: data.jobs };
+  return { kind: typeof kind === "string" ? kind : "unknown" };
+}
+
+function sanitizeGithubApp(app) {
+  return {
+    app_id: app?.app_id,
+    client_id: app?.client_id,
+    name: app?.name,
+    html_url: app?.html_url,
+    owner: app?.owner,
+    configured_at: app?.configured_at,
+  };
+}
+
+function sanitizeInstallationRepository(repo) {
+  return {
+    installation_id: repo?.installation_id,
+    repository_id: repo?.repository_id,
+    owner: repo?.owner,
+    name: repo?.name,
+    full_name: repo?.full_name,
+    default_branch: repo?.default_branch,
+    private: repo?.private === true,
+  };
+}
+
+function sanitizeConfiguredRepository(repo) {
+  return {
+    installation_id: repo?.installation_id,
+    repository_id: repo?.repository_id,
+    owner: repo?.owner,
+    name: repo?.name,
+    branch: repo?.branch,
+    app: repo?.app,
+    domain: repo?.domain,
+    engine_version: repo?.engine_version,
+    entry: repo?.entry,
+  };
+}
+
+function sanitizeGithubJob(job) {
+  return {
+    id: job?.id,
+    key: job?.key,
+    installation_id: job?.installation_id,
+    repository_id: job?.repository_id,
+    owner: job?.owner,
+    name: job?.name,
+    environment: job?.environment,
+    kind: job?.kind,
+    pull_request: job?.pull_request,
+    sha: job?.sha,
+    status: job?.status,
+    attempts: job?.attempts,
+    next_attempt_at: job?.next_attempt_at,
+    error: job?.error,
+    check_run_id: job?.check_run_id,
+    deployment_id: job?.deployment_id,
+    created_at: job?.created_at,
+    updated_at: job?.updated_at,
+  };
+}
+
 function safeErrorMessage(code) {
   if (code === "unauthorized") return "authentication required";
   if (code === "forbidden") return "permission denied";

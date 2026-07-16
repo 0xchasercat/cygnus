@@ -16,6 +16,7 @@ pub mod acme;
 pub mod admin;
 pub mod deploy;
 pub mod edge;
+pub mod github;
 pub mod ingress;
 pub mod state;
 pub mod tls;
@@ -136,6 +137,16 @@ pub fn read_head<R: Read>(client: &mut R) -> Result<(RequestHead, Vec<u8>), Stat
             HeadParse::Incomplete => {}
         }
     }
+}
+
+const MAX_GITHUB_WEBHOOK_BODY_BYTES: u64 = 25 * 1024 * 1024;
+
+fn request_body_limits(head: &RequestHead, defaults: &IngressLimits) -> IngressLimits {
+    let mut limits = defaults.clone();
+    if head.method == "POST" && head.target == "/github/webhook" {
+        limits.max_body_bytes = MAX_GITHUB_WEBHOOK_BODY_BYTES;
+    }
+    limits
 }
 
 fn body_guard(
@@ -324,7 +335,8 @@ impl Frontend {
             }
         };
         span.set_head(&head.method, head.host.as_deref(), buffered.len());
-        let body_guard = match body_guard(&head, &buffered, self.ingress.limits()) {
+        let limits = request_body_limits(&head, self.ingress.limits());
+        let body_guard = match body_guard(&head, &buffered, &limits) {
             Ok(guard) => guard,
             Err(status) => {
                 reject(&mut client, &mut span, status, "body_rejected");
@@ -419,7 +431,8 @@ impl Frontend {
             }
         };
         span.set_head(&head.method, head.host.as_deref(), buffered.len());
-        let body_guard = match body_guard(&head, &buffered, self.ingress.limits()) {
+        let limits = request_body_limits(&head, self.ingress.limits());
+        let body_guard = match body_guard(&head, &buffered, &limits) {
             Ok(guard) => guard,
             Err(status) => {
                 reject(&mut client, &mut span, status, "body_rejected");
@@ -600,6 +613,35 @@ mod tests {
         }
         worker.join().unwrap();
         response
+    }
+
+    #[test]
+    fn only_the_exact_github_webhook_path_gets_the_github_body_bound() {
+        let defaults = IngressLimits::default();
+        let parse = |target: &str, method: &str| {
+            let raw = format!(
+                "{method} {target} HTTP/1.1\r\nHost: cygnus.apps.test\r\nContent-Length: 0\r\n\r\n"
+            );
+            match parse_request_head(raw.as_bytes()) {
+                HeadParse::Complete(head) => head,
+                _ => panic!("request head did not parse"),
+            }
+        };
+
+        assert_eq!(
+            request_body_limits(&parse("/github/webhook", "POST"), &defaults).max_body_bytes,
+            MAX_GITHUB_WEBHOOK_BODY_BYTES
+        );
+        for head in [
+            parse("/github/webhook", "GET"),
+            parse("/github/webhook/extra", "POST"),
+            parse("/api/v1/deploy", "POST"),
+        ] {
+            assert_eq!(
+                request_body_limits(&head, &defaults).max_body_bytes,
+                defaults.max_body_bytes
+            );
+        }
     }
 
     #[test]
