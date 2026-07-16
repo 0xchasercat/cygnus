@@ -113,9 +113,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct Handler {
         calls: AtomicUsize,
@@ -139,12 +138,14 @@ mod tests {
         }
     }
 
+    static NEXT_TEMP_PATH: AtomicU64 = AtomicU64::new(1);
+
     fn temp_path() -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("cygnus-admin-client-{nonce}"));
+        let nonce = NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cygnus-admin-client-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         root.join("admin.sock")

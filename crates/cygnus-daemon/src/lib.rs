@@ -12,9 +12,13 @@
 //! `cygnus-proxy` for the body phase is a later optimization behind the same
 //! request path. The request-handling core (head read, routing, error
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
+pub mod acme;
 pub mod admin;
 pub mod deploy;
+pub mod edge;
+pub mod ingress;
 pub mod state;
+pub mod tls;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -24,21 +28,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use crate::acme::Http01Challenges;
+use crate::ingress::{BodyGuard, BodyGuardError, IngressController, IngressLimits, RequestSpan};
+use crate::tls::{TlsServer, relay_tls};
 use cygnus_cage::Cage;
-use cygnus_router::{HeadParse, RequestHead, Route, Router, parse_request_head};
+use cygnus_router::{
+    BodyFraming, HeadParse, RequestHead, Route, Router, normalize_host, parse_request_head,
+};
 use cygnus_supervisor::{AcquireError, Supervisor};
 
 /// How long a client has to send a complete request head before the connection
 /// is dropped, so a slow or stuck client cannot pin a worker thread.
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A minimal HTTP status the front returns on its own (never proxied).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     /// 400 — the request head was unusable (no host, malformed, or too slow).
     BadRequest,
+    /// 408 — the client did not complete the request head in time.
+    RequestTimeout,
+    /// 413 — the declared request body exceeds the edge policy.
+    PayloadTooLarge,
     /// 404 — no route matched the host.
     NotFound,
+    /// 421 — TLS SNI and HTTP Host disagree.
+    MisdirectedRequest,
+    /// 429 — ingress concurrency or rate admission failed.
+    TooManyRequests,
     /// 502 — the app booted but its socket could not be reached.
     BadGateway,
     /// 503 — the app is crash-looping or backing off; try again later.
@@ -52,14 +70,41 @@ pub fn error_response(status: Status) -> &'static [u8] {
         Status::BadRequest => {
             b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
         }
+        Status::RequestTimeout => {
+            b"HTTP/1.1 408 Request Timeout\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        }
+        Status::PayloadTooLarge => {
+            b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        }
         Status::NotFound => {
             b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        }
+        Status::MisdirectedRequest => {
+            b"HTTP/1.1 421 Misdirected Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        }
+        Status::TooManyRequests => {
+            b"HTTP/1.1 429 Too Many Requests\r\nconnection: close\r\nretry-after: 1\r\ncontent-length: 0\r\n\r\n"
         }
         Status::BadGateway => {
             b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
         }
         Status::Unavailable => {
             b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        }
+    }
+}
+
+impl Status {
+    fn code(self) -> u16 {
+        match self {
+            Self::BadRequest => 400,
+            Self::RequestTimeout => 408,
+            Self::PayloadTooLarge => 413,
+            Self::NotFound => 404,
+            Self::MisdirectedRequest => 421,
+            Self::TooManyRequests => 429,
+            Self::BadGateway => 502,
+            Self::Unavailable => 503,
         }
     }
 }
@@ -71,7 +116,16 @@ pub fn read_head<R: Read>(client: &mut R) -> Result<(RequestHead, Vec<u8>), Stat
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 4096];
     loop {
-        let read = client.read(&mut chunk).map_err(|_| Status::BadRequest)?;
+        let read = client.read(&mut chunk).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) {
+                Status::RequestTimeout
+            } else {
+                Status::BadRequest
+            }
+        })?;
         if read == 0 {
             return Err(Status::BadRequest);
         }
@@ -84,10 +138,45 @@ pub fn read_head<R: Read>(client: &mut R) -> Result<(RequestHead, Vec<u8>), Stat
     }
 }
 
+fn body_guard(
+    head: &RequestHead,
+    buffered: &[u8],
+    limits: &IngressLimits,
+) -> Result<BodyGuard, Status> {
+    let mut guard = match head.body {
+        BodyFraming::None => BodyGuard::none(),
+        BodyFraming::ContentLength(length) if length <= limits.max_body_bytes => {
+            BodyGuard::fixed(length)
+        }
+        BodyFraming::ContentLength(_) => return Err(Status::PayloadTooLarge),
+        BodyFraming::Chunked => BodyGuard::chunked(limits.max_body_bytes),
+    };
+    guard
+        .observe(&buffered[head.head_len..])
+        .map_err(|error| match error {
+            BodyGuardError::Malformed => Status::BadRequest,
+            BodyGuardError::TooLarge => Status::PayloadTooLarge,
+        })?;
+    Ok(guard)
+}
+
 /// Route a parsed head to its app, or a status to return instead.
 pub fn route_request(head: &RequestHead, router: &Router) -> Result<Arc<Route>, Status> {
     let host = head.host.as_deref().ok_or(Status::BadRequest)?;
     router.resolve(host).ok_or(Status::NotFound)
+}
+
+/// Route HTTPS by SNI and reject domain-fronted Host headers.
+pub fn route_tls_request(
+    head: &RequestHead,
+    server_name: &str,
+    router: &Router,
+) -> Result<Arc<Route>, Status> {
+    let host = head.host.as_deref().ok_or(Status::BadRequest)?;
+    if normalize_host(host) != normalize_host(server_name) {
+        return Err(Status::MisdirectedRequest);
+    }
+    router.resolve(server_name).ok_or(Status::NotFound)
 }
 
 /// Map a supervisor acquire failure to the status the client should see.
@@ -101,16 +190,44 @@ fn acquire_status(error: &AcquireError) -> Status {
     }
 }
 
+fn reject<W: Write>(writer: &mut W, span: &mut RequestSpan, status: Status, outcome: &'static str) {
+    let response = error_response(status);
+    span.responded(status.code(), outcome, response.len());
+    let _ = writer.write_all(response);
+    let _ = writer.flush();
+}
+
 /// The front: shared routing table plus the cage supervisor.
 pub struct Frontend {
     router: Arc<Router>,
     supervisor: Arc<Supervisor<Cage>>,
+    http01: Http01Challenges,
+    ingress: IngressController,
 }
 
 impl Frontend {
     /// Compose a front from a routing table and a supervisor.
     pub fn new(router: Arc<Router>, supervisor: Arc<Supervisor<Cage>>) -> Self {
-        Self { router, supervisor }
+        Self::with_limits(router, supervisor, IngressLimits::default())
+            .expect("default ingress limits are valid")
+    }
+
+    pub fn with_limits(
+        router: Arc<Router>,
+        supervisor: Arc<Supervisor<Cage>>,
+        limits: IngressLimits,
+    ) -> Result<Self, &'static str> {
+        Ok(Self {
+            router,
+            supervisor,
+            http01: Http01Challenges::default(),
+            ingress: IngressController::new(limits)?,
+        })
+    }
+
+    /// Return the shared HTTP-01 challenge registry used by the ACME manager.
+    pub fn http01_challenges(&self) -> Http01Challenges {
+        self.http01.clone()
     }
 
     /// Accept connections forever, handling each on its own thread. Returns
@@ -147,77 +264,293 @@ impl Frontend {
         }
         Ok(())
     }
+    /// Accept HTTPS connections until shutdown, selecting certificates by SNI.
+    pub fn serve_tls_until(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: TlsServer,
+        shutdown: &AtomicBool,
+    ) -> io::Result<()> {
+        listener.set_nonblocking(true)?;
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    let front = Arc::clone(&self);
+                    let tls = tls.clone();
+                    thread::spawn(move || front.serve_tls_connection(client, &tls));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 
-    /// Serve one accepted client connection end to end on the current thread.
-    /// This is the same path [`Self::serve`] dispatches to its workers.
-    pub fn serve_connection(&self, mut client: TcpStream) {
-        // Bound the head read so a slow client cannot hold the worker forever.
-        let _ = client.set_read_timeout(Some(HEAD_READ_TIMEOUT));
-        let (_head, buffered, route) = match self.route(&mut client) {
-            Ok(routed) => routed,
-            Err(status) => {
-                let _ = client.write_all(error_response(status));
+    pub fn serve_tls_connection(&self, client: TcpStream, tls: &TlsServer) {
+        let Ok(peer) = client.peer_addr().map(|address| address.ip()) else {
+            return;
+        };
+        let mut span = RequestSpan::new("https", peer);
+        let _connection_permit = match self.ingress.enter_connection(peer) {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut client = client;
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::TooManyRequests,
+                    "peer_concurrency",
+                );
                 return;
             }
         };
-
+        let _ = client.set_read_timeout(Some(HEAD_READ_TIMEOUT));
+        let connection = match tls.connection() {
+            Ok(connection) => connection,
+            Err(_) => {
+                span.relay_error();
+                return;
+            }
+        };
+        let mut client = rustls::StreamOwned::new(connection, client);
+        let (head, buffered) = match read_head(&mut client) {
+            Ok(parsed) => parsed,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "invalid_head");
+                return;
+            }
+        };
+        span.set_head(&head.method, head.host.as_deref(), buffered.len());
+        let body_guard = match body_guard(&head, &buffered, self.ingress.limits()) {
+            Ok(guard) => guard,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "body_rejected");
+                return;
+            }
+        };
+        let server_name = match client.conn.server_name() {
+            Some(server_name) => server_name.to_owned(),
+            None => {
+                reject(&mut client, &mut span, Status::BadRequest, "missing_sni");
+                return;
+            }
+        };
+        let route = match route_tls_request(&head, &server_name, &self.router) {
+            Ok(route) => route,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "route_rejected");
+                return;
+            }
+        };
+        span.set_app(&route.app);
+        let _request_permit = match self.ingress.enter_request(peer, &route.app) {
+            Ok(permit) => permit,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::TooManyRequests,
+                    "request_admission",
+                );
+                return;
+            }
+        };
         if let Err(error) = self.supervisor.acquire(&route.app) {
-            eprintln!("cygnus-daemon: app {:?} acquire failed: {error:?}", route.app);
-            let _ = client.write_all(error_response(acquire_status(&error)));
+            reject(
+                &mut client,
+                &mut span,
+                acquire_status(&error),
+                "app_unavailable",
+            );
             return;
         }
-
         let upstream = match UnixStream::connect(&route.upstream) {
             Ok(upstream) => upstream,
             Err(_) => {
-                let _ = client.write_all(error_response(Status::BadGateway));
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::BadGateway,
+                    "upstream_connect",
+                );
                 return;
             }
         };
         if (&upstream).write_all(&buffered).is_err() {
-            let _ = client.write_all(error_response(Status::BadGateway));
+            reject(&mut client, &mut span, Status::BadGateway, "upstream_write");
             return;
         }
-
-        // The connection is now long-lived; drop the head-read deadline so a
-        // quiet keep-alive or streaming response is not torn down.
+        let (connection, client) = client.into_parts();
         let _ = client.set_read_timeout(None);
-        let _ = relay(client, upstream);
+        match relay_tls(connection, client, upstream, body_guard) {
+            Ok(stats) => span.proxied(stats.to_upstream, stats.to_client),
+            Err(_) => span.relay_error(),
+        }
     }
 
-    /// Read and route the request head, returning the head, the bytes read, and
-    /// the matched route.
-    fn route(&self, client: &mut TcpStream) -> Result<(RequestHead, Vec<u8>, Arc<Route>), Status> {
-        let (head, buffered) = read_head(client)?;
-        let route = route_request(&head, &self.router)?;
-        Ok((head, buffered, route))
+    /// Serve one accepted client connection end to end on the current thread.
+    /// This is the same path [`Self::serve`] dispatches to its workers.
+    pub fn serve_connection(&self, mut client: TcpStream) {
+        let Ok(peer) = client.peer_addr().map(|address| address.ip()) else {
+            return;
+        };
+        let mut span = RequestSpan::new("http", peer);
+        let _connection_permit = match self.ingress.enter_connection(peer) {
+            Ok(permit) => permit,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::TooManyRequests,
+                    "peer_concurrency",
+                );
+                return;
+            }
+        };
+        let _ = client.set_read_timeout(Some(HEAD_READ_TIMEOUT));
+        let (head, buffered) = match read_head(&mut client) {
+            Ok(parsed) => parsed,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "invalid_head");
+                return;
+            }
+        };
+        span.set_head(&head.method, head.host.as_deref(), buffered.len());
+        let body_guard = match body_guard(&head, &buffered, self.ingress.limits()) {
+            Ok(guard) => guard,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "body_rejected");
+                return;
+            }
+        };
+        if let Some(response) = self.http01.response(&head) {
+            if client.write_all(&response).is_ok() {
+                span.responded(200, "acme_http01", response.len());
+            } else {
+                span.relay_error();
+            }
+            return;
+        }
+        let route = match route_request(&head, &self.router) {
+            Ok(route) => route,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "route_rejected");
+                return;
+            }
+        };
+        span.set_app(&route.app);
+        let _request_permit = match self.ingress.enter_request(peer, &route.app) {
+            Ok(permit) => permit,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::TooManyRequests,
+                    "request_admission",
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.supervisor.acquire(&route.app) {
+            reject(
+                &mut client,
+                &mut span,
+                acquire_status(&error),
+                "app_unavailable",
+            );
+            return;
+        }
+        let upstream = match UnixStream::connect(&route.upstream) {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::BadGateway,
+                    "upstream_connect",
+                );
+                return;
+            }
+        };
+        if (&upstream).write_all(&buffered).is_err() {
+            reject(&mut client, &mut span, Status::BadGateway, "upstream_write");
+            return;
+        }
+        let _ = client.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = client.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        match relay(client, upstream, body_guard) {
+            Ok(stats) => span.proxied(stats.to_upstream, stats.to_client),
+            Err(_) => span.relay_error(),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RelayStats {
+    to_upstream: u64,
+    to_client: u64,
 }
 
 /// Relay bytes both ways between the client and the upstream until each side
 /// closes, propagating half-close so a one-way finish (a drained response, a
 /// client that stopped sending) is passed through rather than hung on.
-fn relay(client: TcpStream, upstream: UnixStream) -> io::Result<()> {
+fn relay(client: TcpStream, upstream: UnixStream, body_guard: BodyGuard) -> io::Result<RelayStats> {
     let mut client_reader = client.try_clone()?;
     let mut upstream_writer = upstream.try_clone()?;
     let mut upstream_reader = upstream;
     let mut client_writer = client;
 
     let client_to_upstream = thread::spawn(move || {
-        let _ = io::copy(&mut client_reader, &mut upstream_writer);
+        let copied = copy_to_upstream(&mut client_reader, &mut upstream_writer, body_guard);
         let _ = upstream_writer.shutdown(Shutdown::Write);
+        copied
     });
-
-    let _ = io::copy(&mut upstream_reader, &mut client_writer);
+    let to_client = io::copy(&mut upstream_reader, &mut client_writer);
     let _ = client_writer.shutdown(Shutdown::Write);
-    let _ = client_to_upstream.join();
-    Ok(())
+    let to_upstream = client_to_upstream
+        .join()
+        .map_err(|_| io::Error::other("client relay thread panicked"))?;
+    Ok(RelayStats {
+        to_upstream: to_upstream?,
+        to_client: to_client?,
+    })
+}
+
+fn copy_to_upstream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    mut body_guard: BodyGuard,
+) -> io::Result<u64> {
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        if body_guard.is_complete() {
+            return Ok(copied);
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        body_guard.observe(&buffer[..read]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("request body rejected: {error:?}"),
+            )
+        })?;
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cygnus_router::RouteTable;
+    use cygnus_router::{BodyFraming, RouteTable};
     use std::io::Cursor;
     use std::path::PathBuf;
 
@@ -251,6 +584,24 @@ mod tests {
         Router::new(table)
     }
 
+    fn serve_once(frontend: Arc<Frontend>, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            frontend.serve_connection(client);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(request).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        if let Err(error) = client.read_to_end(&mut response) {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        }
+        worker.join().unwrap();
+        response
+    }
+
     #[test]
     fn read_head_returns_head_and_all_bytes() {
         let raw = b"GET /x HTTP/1.1\r\nHost: api.example.com\r\n\r\nBODY".to_vec();
@@ -275,6 +626,16 @@ mod tests {
     }
 
     #[test]
+    fn streamed_chunked_body_is_cut_off_before_oversized_bytes_reach_upstream() {
+        let mut reader = Cursor::new(b"4\r\nWiki\r\n0\r\n\r\n".to_vec());
+        let mut upstream = Vec::new();
+        let error =
+            copy_to_upstream(&mut reader, &mut upstream, BodyGuard::chunked(3)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(upstream.is_empty());
+    }
+
+    #[test]
     fn read_head_rejects_a_closed_connection() {
         let mut cursor = Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec());
         assert_eq!(read_head(&mut cursor), Err(Status::BadRequest));
@@ -293,8 +654,10 @@ mod tests {
         let head = RequestHead {
             method: "GET".into(),
             target: "/".into(),
+            version: "HTTP/1.1".into(),
             host: Some("api.example.com".into()),
             head_len: 0,
+            body: BodyFraming::None,
         };
         assert_eq!(route_request(&head, &router).unwrap().app, "api");
 
@@ -306,6 +669,29 @@ mod tests {
 
         let no_host = RequestHead { host: None, ..head };
         assert_eq!(route_request(&no_host, &router), Err(Status::BadRequest));
+    }
+
+    #[test]
+    fn tls_routing_rejects_domain_fronting() {
+        let router = router_with("api.example.com", "api");
+        let head = RequestHead {
+            method: "GET".into(),
+            target: "/".into(),
+            version: "HTTP/1.1".into(),
+            host: Some("API.EXAMPLE.COM:443".into()),
+            head_len: 0,
+            body: BodyFraming::None,
+        };
+        assert_eq!(
+            route_tls_request(&head, "api.example.com", &router)
+                .unwrap()
+                .app,
+            "api"
+        );
+        assert_eq!(
+            route_tls_request(&head, "other.example.com", &router),
+            Err(Status::MisdirectedRequest)
+        );
     }
 
     #[test]
@@ -332,6 +718,74 @@ mod tests {
     }
 
     #[test]
+    fn oversized_declared_body_is_rejected_before_routing() {
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let supervisor = Arc::new(Supervisor::new(|_| Err("must not boot".into())));
+        let limits = IngressLimits {
+            max_body_bytes: 10,
+            ..IngressLimits::default()
+        };
+        let frontend = Arc::new(Frontend::with_limits(router, supervisor, limits).unwrap());
+        let response = serve_once(
+            frontend,
+            b"POST / HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 11\r\n\r\n",
+        );
+        assert!(response.starts_with(b"HTTP/1.1 413 Payload Too Large"));
+    }
+
+    #[test]
+    fn peer_concurrency_limit_returns_retryable_429() {
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let supervisor = Arc::new(Supervisor::new(|_| Err("must not boot".into())));
+        let limits = IngressLimits {
+            max_connections_per_ip: 1,
+            ..IngressLimits::default()
+        };
+        let frontend = Arc::new(Frontend::with_limits(router, supervisor, limits).unwrap());
+        let _held = frontend
+            .ingress
+            .enter_connection("127.0.0.1".parse().unwrap())
+            .unwrap();
+        let response = serve_once(frontend, b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        assert!(response.starts_with(b"HTTP/1.1 429 Too Many Requests"));
+        assert!(
+            response
+                .windows(b"retry-after: 1".len())
+                .any(|window| window == b"retry-after: 1")
+        );
+    }
+
+    #[test]
+    fn http01_challenge_bypasses_application_routing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let supervisor = Arc::new(Supervisor::new(|_| Err("must not boot".into())));
+        let frontend = Arc::new(Frontend::new(router, supervisor));
+        frontend
+            .http01_challenges()
+            .insert("acme.example.com", "token", "token.thumbprint")
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            frontend.serve_connection(client);
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(
+                b"GET /.well-known/acme-challenge/token HTTP/1.1\r\nHost: acme.example.com\r\n\r\n",
+            )
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(response.ends_with(b"token.thumbprint"));
+    }
+
+    #[test]
     fn interruptible_serve_returns_without_accepting_after_shutdown() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let router = Arc::new(Router::new(RouteTable::new()));
@@ -348,5 +802,9 @@ mod tests {
         assert!(error_response(Status::Unavailable).starts_with(b"HTTP/1.1 503"));
         assert!(error_response(Status::BadGateway).starts_with(b"HTTP/1.1 502"));
         assert!(error_response(Status::BadRequest).starts_with(b"HTTP/1.1 400"));
+        assert!(error_response(Status::MisdirectedRequest).starts_with(b"HTTP/1.1 421"));
+        assert!(error_response(Status::RequestTimeout).starts_with(b"HTTP/1.1 408"));
+        assert!(error_response(Status::PayloadTooLarge).starts_with(b"HTTP/1.1 413"));
+        assert!(error_response(Status::TooManyRequests).starts_with(b"HTTP/1.1 429"));
     }
 }

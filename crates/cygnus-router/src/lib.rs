@@ -10,5 +10,5 @@
 mod http;
 mod route;
 
-pub use http::{HeadParse, MAX_HEAD_LEN, RequestHead, parse_request_head};
+pub use http::{BodyFraming, HeadParse, MAX_HEAD_LEN, RequestHead, parse_request_head};
 pub use route::{Route, RouteTable, Router, normalize_host};

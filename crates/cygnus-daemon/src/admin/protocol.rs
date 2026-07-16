@@ -172,6 +172,10 @@ pub enum AdminData {
 #[serde(deny_unknown_fields)]
 pub struct NodeView {
     pub listen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps_domain: Option<String>,
     pub app_count: usize,
 }
 

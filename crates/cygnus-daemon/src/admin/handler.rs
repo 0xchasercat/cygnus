@@ -95,6 +95,8 @@ impl StateAdminHandler {
                 Ok(AdminData::Status {
                     node: NodeView {
                         listen: snapshot.listen.to_string(),
+                        https_listen: snapshot.edge.https_listen.map(|value| value.to_string()),
+                        apps_domain: snapshot.edge.apps_domain,
                         app_count: snapshot.apps.len(),
                     },
                 })
@@ -430,7 +432,7 @@ mod tests {
     use crate::state::{AppConfig, NodeConfig};
     use std::fs;
     use std::net::SocketAddr;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct UnusedMutations;
 
@@ -463,12 +465,14 @@ mod tests {
         }
     }
 
+    static NEXT_STATE_PATH: AtomicU64 = AtomicU64::new(1);
+
     fn state_path() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("cygnus-admin-handler-{nonce}.db"))
+        let nonce = NEXT_STATE_PATH.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "cygnus-admin-handler-{}-{nonce}.db",
+            std::process::id()
+        ))
     }
 
     fn request(command: AdminCommand) -> AdminRequest {
@@ -495,6 +499,7 @@ mod tests {
         state
             .apply(&NodeConfig {
                 listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+                edge: Default::default(),
                 apps: vec![app],
             })
             .unwrap();

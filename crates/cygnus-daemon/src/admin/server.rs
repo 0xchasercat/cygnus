@@ -629,8 +629,7 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::sync::atomic::AtomicUsize;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     struct TestHandler {
         calls: Arc<AtomicUsize>,
@@ -649,11 +648,10 @@ mod tests {
         }
     }
 
+    static NEXT_TEMP_PATH: AtomicU64 = AtomicU64::new(1);
+
     fn temp_path(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("ca-{label}-{}-{nonce}", std::process::id()))
     }
 
