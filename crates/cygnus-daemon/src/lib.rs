@@ -12,6 +12,7 @@
 //! `cygnus-proxy` for the body phase is a later optimization behind the same
 //! request path. The request-handling core (head read, routing, error
 //! responses) is separated out and unit-tested; the socket plumbing is thin.
+pub mod acme;
 pub mod admin;
 pub mod deploy;
 pub mod edge;
@@ -26,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use crate::acme::Http01Challenges;
 use crate::tls::{TlsServer, relay_tls};
 use cygnus_cage::Cage;
 use cygnus_router::{HeadParse, RequestHead, Route, Router, normalize_host, parse_request_head};
@@ -126,12 +128,22 @@ fn acquire_status(error: &AcquireError) -> Status {
 pub struct Frontend {
     router: Arc<Router>,
     supervisor: Arc<Supervisor<Cage>>,
+    http01: Http01Challenges,
 }
 
 impl Frontend {
     /// Compose a front from a routing table and a supervisor.
     pub fn new(router: Arc<Router>, supervisor: Arc<Supervisor<Cage>>) -> Self {
-        Self { router, supervisor }
+        Self {
+            router,
+            supervisor,
+            http01: Http01Challenges::default(),
+        }
+    }
+
+    /// Return the shared HTTP-01 challenge registry used by the ACME manager.
+    pub fn http01_challenges(&self) -> Http01Challenges {
+        self.http01.clone()
     }
 
     /// Accept connections forever, handling each on its own thread. Returns
@@ -256,8 +268,19 @@ impl Frontend {
     pub fn serve_connection(&self, mut client: TcpStream) {
         // Bound the head read so a slow client cannot hold the worker forever.
         let _ = client.set_read_timeout(Some(HEAD_READ_TIMEOUT));
-        let (_head, buffered, route) = match self.route(&mut client) {
-            Ok(routed) => routed,
+        let (head, buffered) = match read_head(&mut client) {
+            Ok(parsed) => parsed,
+            Err(status) => {
+                let _ = client.write_all(error_response(status));
+                return;
+            }
+        };
+        if let Some(response) = self.http01.response(&head) {
+            let _ = client.write_all(&response);
+            return;
+        }
+        let route = match route_request(&head, &self.router) {
+            Ok(route) => route,
             Err(status) => {
                 let _ = client.write_all(error_response(status));
                 return;
@@ -289,13 +312,6 @@ impl Frontend {
         // quiet keep-alive or streaming response is not torn down.
         let _ = client.set_read_timeout(None);
         let _ = relay(client, upstream);
-    }
-
-    /// Read and route the request head, returning the head, the bytes read, and
-    fn route<R: Read>(&self, client: &mut R) -> Result<(RequestHead, Vec<u8>, Arc<Route>), Status> {
-        let (head, buffered) = read_head(client)?;
-        let route = route_request(&head, &self.router)?;
-        Ok((head, buffered, route))
     }
 }
 
@@ -455,6 +471,36 @@ mod tests {
             acquire_status(&AcquireError::BootFailed("boom".into())),
             Status::BadGateway
         );
+    }
+
+    #[test]
+    fn http01_challenge_bypasses_application_routing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let supervisor = Arc::new(Supervisor::new(|_| Err("must not boot".into())));
+        let frontend = Arc::new(Frontend::new(router, supervisor));
+        frontend
+            .http01_challenges()
+            .insert("acme.example.com", "token", "token.thumbprint")
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            frontend.serve_connection(client);
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(
+                b"GET /.well-known/acme-challenge/token HTTP/1.1\r\nHost: acme.example.com\r\n\r\n",
+            )
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(response.ends_with(b"token.thumbprint"));
     }
 
     #[test]

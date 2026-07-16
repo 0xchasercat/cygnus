@@ -6,6 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use cygnus_router::normalize_host;
 use rustls::crypto::ring::default_provider;
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -30,55 +31,65 @@ pub enum TlsError {
 
 #[derive(Clone, Debug)]
 pub struct TlsServer {
-    config: Arc<ServerConfig>,
+    config: Arc<ArcSwap<ServerConfig>>,
 }
 
 impl TlsServer {
     pub fn from_certificates(certificates: &[CertificateRecord]) -> Result<Self, TlsError> {
-        if certificates.is_empty() {
-            return Err(TlsError::Invalid(
-                "HTTPS requires at least one installed certificate".into(),
-            ));
-        }
-        let provider = Arc::new(default_provider());
-        let mut resolver = CertificateResolver::default();
-        for certificate in certificates {
-            let mut certificate_reader = BufReader::new(File::open(&certificate.certificate_path)?);
-            let chain =
-                rustls_pemfile::certs(&mut certificate_reader).collect::<Result<Vec<_>, _>>()?;
-            if chain.is_empty() {
-                return Err(TlsError::Invalid(format!(
-                    "certificate {:?} has no X.509 certificate blocks",
-                    certificate.id
-                )));
-            }
-            let mut key_reader = BufReader::new(File::open(&certificate.private_key_path)?);
-            let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
-                TlsError::Invalid(format!(
-                    "certificate {:?} has no supported private key",
-                    certificate.id
-                ))
-            })?;
-            let certified = Arc::new(CertifiedKey::from_der(chain, key, &provider)?);
-            for domain in &certificate.domains {
-                resolver.add(domain, Arc::clone(&certified))?;
-            }
-        }
-        let mut config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver));
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
-            config: Arc::new(config),
+            config: Arc::new(ArcSwap::from_pointee(server_config(certificates)?)),
         })
     }
 
+    /// Atomically replace the certificate resolver for future connections.
+    pub fn reload(&self, certificates: &[CertificateRecord]) -> Result<(), TlsError> {
+        self.config.store(Arc::new(server_config(certificates)?));
+        Ok(())
+    }
+
     pub(crate) fn connection(&self) -> Result<ServerConnection, TlsError> {
-        let mut connection = ServerConnection::new(Arc::clone(&self.config))?;
+        let mut connection = ServerConnection::new(self.config.load_full())?;
         connection.set_buffer_limit(Some(TLS_BUFFER_LIMIT));
         Ok(connection)
     }
+}
+
+fn server_config(certificates: &[CertificateRecord]) -> Result<ServerConfig, TlsError> {
+    if certificates.is_empty() {
+        return Err(TlsError::Invalid(
+            "HTTPS requires at least one installed certificate".into(),
+        ));
+    }
+    let provider = Arc::new(default_provider());
+    let mut resolver = CertificateResolver::default();
+    for certificate in certificates {
+        let mut certificate_reader = BufReader::new(File::open(&certificate.certificate_path)?);
+        let chain =
+            rustls_pemfile::certs(&mut certificate_reader).collect::<Result<Vec<_>, _>>()?;
+        if chain.is_empty() {
+            return Err(TlsError::Invalid(format!(
+                "certificate {:?} has no X.509 certificate blocks",
+                certificate.id
+            )));
+        }
+        let mut key_reader = BufReader::new(File::open(&certificate.private_key_path)?);
+        let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+            TlsError::Invalid(format!(
+                "certificate {:?} has no supported private key",
+                certificate.id
+            ))
+        })?;
+        let certified = Arc::new(CertifiedKey::from_der(chain, key, &provider)?);
+        for domain in &certificate.domains {
+            resolver.add(domain, Arc::clone(&certified))?;
+        }
+    }
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 #[derive(Debug, Default)]
@@ -389,6 +400,21 @@ mod tests {
 
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(record.certificate_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reload_swaps_only_valid_certificate_configs() {
+        let (first_directory, first, _) = certificate_fixture();
+        let tls = TlsServer::from_certificates(&[first]).unwrap();
+        let initial = tls.config.load_full();
+        assert!(tls.reload(&[]).is_err());
+        assert!(Arc::ptr_eq(&initial, &tls.config.load_full()));
+
+        let (second_directory, second, _) = certificate_fixture();
+        tls.reload(&[second]).unwrap();
+        assert!(!Arc::ptr_eq(&initial, &tls.config.load_full()));
+        fs::remove_dir_all(first_directory).unwrap();
+        fs::remove_dir_all(second_directory).unwrap();
     }
 
     #[test]

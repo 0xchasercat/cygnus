@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -9,23 +10,27 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use cygnus_cage::{ADMIN_CAGE_DIR, ADMIN_SOCKET_FILENAME, AdminSocketSpec, Cage, CageSpec};
 use cygnus_daemon::Frontend;
+use cygnus_daemon::acme::{AcmeManager, CloudflareDnsProvider, Dns01Provider, Http01Challenges};
 use cygnus_daemon::admin::{
     ActiveDeploymentView, AdminBinding, AdminData, AdminErrorCode, AdminHandler, AdminMutation,
     AdminMutationError, AdminMutationHandler, AdminRole, AdminServer, DEFAULT_HOST_ADMIN_SOCKET,
     DEFAULT_TENANT_ADMIN_SOCKET, StateAdminHandler,
 };
 use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
+use cygnus_daemon::edge::EdgeConfig;
 use cygnus_daemon::state::{
-    AuditContext, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State, StateError,
+    AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State,
+    StateError,
 };
 use cygnus_daemon::tls::TlsServer;
 use cygnus_router::{Route, RouteTable, Router};
 use cygnus_supervisor::{LifecycleState, Supervisor};
+use sha2::{Digest, Sha256};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 const REAPER_INTERVAL: Duration = Duration::from_secs(1);
@@ -356,16 +361,12 @@ fn serve(
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let state = State::open(state_path)?;
     let mut snapshot = state.load()?;
-    let tls = if let Some(https_listen) = snapshot.edge.https_listen {
-        let certificates = state.certificates()?;
-        Some((
-            TcpListener::bind(https_listen)?,
-            TlsServer::from_certificates(&certificates)?,
-        ))
-    } else {
-        None
-    };
     drop(state);
+    let https_listener = snapshot
+        .edge
+        .https_listen
+        .map(TcpListener::bind)
+        .transpose()?;
     let listener = TcpListener::bind(snapshot.listen)?;
     if admin_socket == tenant_admin_socket {
         return Err("host and Tenant Zero admin sockets must be distinct".into());
@@ -382,6 +383,14 @@ fn serve(
     let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
     let mut routes = RouteTable::new();
     let mut pinned = Vec::new();
+    let edge = snapshot.edge.clone();
+    let certificate_domains = snapshot
+        .apps
+        .iter()
+        .flat_map(|app| app.domains.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     for app in &mut snapshot.apps {
         configure_tenant_admin(app, tenant_admin_socket)?;
@@ -399,6 +408,44 @@ fn serve(
 
     spawn_reaper(Arc::downgrade(&supervisor));
     let frontend = Arc::new(Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)));
+    let http_address = local_addr(&listener);
+    let http_frontend = Arc::clone(&frontend);
+    let http_shutdown = Arc::clone(&shutdown);
+    let http_failure = Arc::clone(&shutdown);
+    eprintln!("cygnus-daemon: HTTP listening on {http_address}");
+    let http_thread = thread::spawn(move || {
+        let result = http_frontend.serve_until(listener, &http_shutdown);
+        if result.is_err() {
+            http_failure.store(true, Ordering::Release);
+        }
+        result
+    });
+    if https_listener.is_some() && edge.acme.is_some() {
+        ensure_acme_certificates(
+            state_path,
+            &edge,
+            &certificate_domains,
+            frontend.http01_challenges(),
+        )?;
+    }
+    let tls = https_listener
+        .map(|listener| {
+            let state = State::open(state_path)?;
+            let certificates = state.certificates()?;
+            Ok::<_, Box<dyn Error>>((listener, TlsServer::from_certificates(&certificates)?))
+        })
+        .transpose()?;
+    let renewal_thread = tls.as_ref().and_then(|(_, tls)| {
+        edge.acme.as_ref()?;
+        Some(spawn_certificate_renewer(
+            state_path.to_owned(),
+            edge.clone(),
+            certificate_domains.clone(),
+            frontend.http01_challenges(),
+            tls.clone(),
+            Arc::clone(&shutdown),
+        ))
+    });
     let tls_thread = tls.map(|(tls_listener, tls)| {
         let tls_address = local_addr(&tls_listener);
         let tls_frontend = Arc::clone(&frontend);
@@ -447,12 +494,16 @@ fn serve(
         result
     });
     eprintln!(
-        "cygnus-daemon: listening on {} (admin {})",
-        local_addr(&listener),
+        "cygnus-daemon: admin listening on {}",
         admin_socket.display()
     );
-    let serve_result = frontend.serve_until(listener, &shutdown);
+    while !shutdown.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(100));
+    }
     shutdown.store(true, Ordering::Release);
+    let http_result = http_thread
+        .join()
+        .map_err(|_| io::Error::other("HTTP server thread panicked"))?;
     let admin_result = admin_thread
         .join()
         .map_err(|_| io::Error::other("admin server thread panicked"))?;
@@ -463,16 +514,119 @@ fn serve(
                 .map_err(|_| io::Error::other("TLS server thread panicked"))
         })
         .transpose()?;
+    if let Some(thread) = renewal_thread {
+        thread
+            .join()
+            .map_err(|_| io::Error::other("ACME renewal thread panicked"))?;
+    }
     for (app, error) in supervisor.shutdown_all() {
         eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
     }
     if let Some(result) = tls_result {
         result?;
     }
-    serve_result?;
+    http_result?;
     admin_result?;
     Ok(())
 }
+fn ensure_acme_certificates(
+    state_path: &Path,
+    edge: &EdgeConfig,
+    domains: &[String],
+    challenges: Http01Challenges,
+) -> Result<(), Box<dyn Error>> {
+    let Some(config) = edge.acme.clone() else {
+        return Ok(());
+    };
+    if domains.is_empty() {
+        return Err("ACME is configured but no routed domains exist".into());
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let renew_before = now + 30 * 24 * 60 * 60;
+    let mut state = State::open(state_path)?;
+    let installed = state.certificates()?;
+    let pending = domains
+        .chunks(100)
+        .filter(|chunk| {
+            !installed.iter().any(|certificate| {
+                certificate.not_after_unix > renew_before
+                    && chunk
+                        .iter()
+                        .all(|domain| certificate.domains.iter().any(|covered| covered == domain))
+            })
+        })
+        .map(<[String]>::to_vec)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let dns: Option<Arc<dyn Dns01Provider>> = match config.dns_provider.as_deref() {
+        None => None,
+        Some("cloudflare") => Some(Arc::new(CloudflareDnsProvider::from_environment()?)),
+        Some(provider) => return Err(format!("unsupported DNS-01 provider {provider:?}").into()),
+    };
+    let manager = AcmeManager::new(config, state_path, challenges, dns)?;
+    for chunk in pending {
+        let input = manager.issue(&chunk)?;
+        let mut digest = Sha256::new();
+        for domain in &chunk {
+            digest.update(domain.as_bytes());
+        }
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        state.install_certificate(
+            &input,
+            &AuditContext {
+                endpoint_role: AuditEndpointRole::Host,
+                peer_uid: Some(unsafe { libc::geteuid() }),
+                peer_gid: Some(unsafe { libc::getegid() }),
+                peer_pid: Some(std::process::id()),
+                actor_subject: Some("cygnus-acme".into()),
+                request_id: format!("acme-{timestamp}"),
+                command_kind: "certificate_install".into(),
+                request_digest: format!("{:x}", digest.finalize()),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn spawn_certificate_renewer(
+    state_path: PathBuf,
+    edge: EdgeConfig,
+    domains: Vec<String>,
+    challenges: Http01Challenges,
+    tls: TlsServer,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut next_check = Instant::now() + Duration::from_secs(12 * 60 * 60);
+        while !shutdown.load(Ordering::Acquire) {
+            if Instant::now() < next_check {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            match ensure_acme_certificates(&state_path, &edge, &domains, challenges.clone()) {
+                Ok(()) => match State::open(&state_path)
+                    .and_then(|state| state.certificates())
+                    .map_err(|error| error.to_string())
+                    .and_then(|certificates| {
+                        tls.reload(&certificates).map_err(|error| error.to_string())
+                    }) {
+                    Ok(()) => next_check = Instant::now() + Duration::from_secs(12 * 60 * 60),
+                    Err(error) => {
+                        eprintln!("cygnus-daemon: TLS certificate reload failed: {error}");
+                        next_check = Instant::now() + Duration::from_secs(60 * 60);
+                    }
+                },
+                Err(error) => {
+                    eprintln!("cygnus-daemon: ACME renewal failed: {error}");
+                    next_check = Instant::now() + Duration::from_secs(60 * 60);
+                }
+            }
+        }
+    })
+}
+
 fn configure_tenant_admin(app: &mut LoadedApp, socket: &Path) -> Result<(), Box<dyn Error>> {
     if !app.tenant_admin {
         return Ok(());
