@@ -9,9 +9,10 @@ use super::{
     AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppView, DeploymentView,
     MAX_LOG_CHUNK_BYTES, NodeView,
 };
+use crate::deploy::DeployRequest;
 use crate::state::{
     AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentStatus, LoadedApp,
-    State,
+    NodeConfig, State,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -24,6 +25,13 @@ type LifecycleLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminMutation {
+    ApplyConfig(NodeConfig),
+    RegisterEngine {
+        version: String,
+        host_root: std::path::PathBuf,
+        cage_executable: std::path::PathBuf,
+    },
+    Deploy(DeployRequest),
     MapDomain {
         app: String,
         domain: String,
@@ -156,6 +164,37 @@ impl StateAdminHandler {
                     deployment: deployment_view(deployment, role),
                 })
             }
+            AdminCommand::ApplyConfig(config) => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::ApplyConfig(config),
+                "apply_config",
+            ),
+            AdminCommand::RegisterEngine {
+                version,
+                host_root,
+                cage_executable,
+            } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::RegisterEngine {
+                    version,
+                    host_root,
+                    cage_executable,
+                },
+                "register_engine",
+            ),
+            AdminCommand::Deploy {
+                request: deployment,
+            } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::Deploy(deployment),
+                "deploy",
+            ),
             AdminCommand::MapDomain { app, domain } => self.mutate(
                 role,
                 peer,

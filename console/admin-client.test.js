@@ -37,6 +37,22 @@ function listen(respond) {
 }
 
 describe("adminRequest", () => {
+  test("omits actor unless the authenticated caller supplies one", async () => {
+    let received;
+    const path = listen((request) => {
+      received = request;
+      return {
+        version: 1,
+        request_id: request.request_id,
+        status: "ok",
+        data: { kind: "health", service: "cygnus", isolation: "local" },
+      };
+    });
+
+    await adminRequest(path, { type: "health" });
+    expect(received.actor).toBeUndefined();
+  });
+
   test("round-trips one correlated typed frame", async () => {
     const path = listen((request) => ({
       version: 1,

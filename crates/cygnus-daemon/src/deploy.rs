@@ -28,12 +28,12 @@ use cygnus_cage::{
 };
 #[cfg(target_os = "linux")]
 use cygnus_cage::{DnsForwarder, run_job_with_dns};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::state::{
     AppConfig, ArtifactInput, AuditContext, AuditEndpointRole, DeploymentInput, DeploymentRecord,
-    EngineRecord, RootfsConfig, SeccompMode, State, StateError,
+    EngineRecord, LoadedApp, RootfsConfig, SeccompMode, State, StateError,
 };
 use publish::PublishDir;
 
@@ -69,7 +69,7 @@ struct BuildPlan {
     install: bool,
 }
 /// Inputs to one source deployment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeployRequest {
     pub source_dir: PathBuf,
     pub app: String,
@@ -110,6 +110,29 @@ pub struct DeployResult {
     pub artifact_hash: String,
     pub artifact_path: PathBuf,
     pub deployment: DeploymentRecord,
+}
+pub struct ActivationPreparation {
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ActivationPreparation {
+    pub fn new(cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    fn committed(mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl Drop for ActivationPreparation {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -161,14 +184,50 @@ pub fn register_engine(
         ));
     }
     let executable = engine_executable_path(&host_root, &cage_executable)?;
-    let sha256 = sha256_file(&executable)?;
     let record = EngineRecord {
         version,
         host_root,
         cage_executable,
-        sha256,
+        sha256: sha256_file(&executable)?,
     };
     Ok(state.register_engine(&record)?)
+}
+
+pub fn register_engine_with_audit(
+    state: &mut State,
+    version: impl Into<String>,
+    host_root: impl AsRef<Path>,
+    cage_executable: impl AsRef<Path>,
+    audit: &AuditContext,
+) -> Result<EngineRecord, DeployError> {
+    let version = version.into();
+    let host_root = fs::canonicalize(host_root.as_ref()).map_err(|error| {
+        DeployError::InvalidInput(format!(
+            "engine host root {} is unavailable: {error}",
+            host_root.as_ref().display()
+        ))
+    })?;
+    let cage_executable = cage_executable.as_ref().to_path_buf();
+    if !cage_executable.is_absolute()
+        || cage_executable.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeployError::InvalidInput(
+            "engine cage executable must be an absolute canonical path".into(),
+        ));
+    }
+    let executable = engine_executable_path(&host_root, &cage_executable)?;
+    let record = EngineRecord {
+        version,
+        host_root,
+        cage_executable,
+        sha256: sha256_file(&executable)?,
+    };
+    Ok(state.register_engine_with_audit(&record, audit)?)
 }
 
 fn engine_executable_path(
@@ -228,13 +287,26 @@ pub fn deploy(state: &mut State, request: DeployRequest) -> Result<DeployResult,
     deploy_with_audit(state, request, &audit)
 }
 
-/// Build and activate a source deployment with caller-supplied audit
-/// provenance. Administrative entry points should use this form.
+/// Build and activate a source deployment with caller-supplied audit provenance.
 pub fn deploy_with_audit(
     state: &mut State,
     request: DeployRequest,
     audit: &AuditContext,
 ) -> Result<DeployResult, DeployError> {
+    deploy_with_audit_and_prepare(state, request, audit, |_| {
+        Ok(ActivationPreparation::new(|| {}))
+    })
+}
+
+pub fn deploy_with_audit_and_prepare<F>(
+    state: &mut State,
+    request: DeployRequest,
+    audit: &AuditContext,
+    mut prepare: F,
+) -> Result<DeployResult, DeployError>
+where
+    F: FnMut(&LoadedApp) -> Result<ActivationPreparation, DeployError>,
+{
     validate_entry(&request.entry)?;
     if request.app.trim().is_empty() || request.domain.trim().is_empty() {
         return Err(DeployError::InvalidInput(
@@ -455,12 +527,15 @@ pub fn deploy_with_audit(
                 id: deployment_id.clone(),
                 detail: error.to_string(),
             })?;
-        state
-            .commit_activation(&plan, audit)
-            .map_err(|error| DeployError::ActivationFailed {
+        let preparation = prepare(&plan.candidate)?;
+        if let Err(error) = state.commit_activation(&plan, audit) {
+            drop(preparation);
+            return Err(DeployError::ActivationFailed {
                 id: deployment_id.clone(),
                 detail: error.to_string(),
-            })?;
+            });
+        }
+        preparation.committed();
         let deployment =
             state
                 .deployment(&deployment_id)?

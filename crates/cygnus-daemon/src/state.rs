@@ -607,6 +607,24 @@ impl State {
         transaction.commit()?;
         Ok(())
     }
+    pub fn preview(&self, config: &NodeConfig) -> Result<Snapshot, StateError> {
+        snapshot_from_config(config)
+    }
+
+    pub fn apply_with_audit(
+        &mut self,
+        config: &NodeConfig,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        let snapshot = snapshot_from_config(config)?;
+        let stored = snapshot_to_stored(&snapshot)?;
+        let transaction = self.connection.transaction()?;
+        replace_database(&transaction, &stored)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
 
     /// Load the current configuration from SQLite and revalidate it.
     pub fn load(&self) -> Result<Snapshot, StateError> {
@@ -897,6 +915,22 @@ impl State {
             "INSERT INTO engines (version, host_root, cage_executable, sha256) VALUES (?1, ?2, ?3, ?4)",
             params![engine.version, engine.host_root.to_string_lossy(), engine.cage_executable.to_string_lossy(), engine.sha256],
         )?;
+        Ok(engine.clone())
+    }
+    pub fn register_engine_with_audit(
+        &mut self,
+        engine: &EngineRecord,
+        audit: &AuditContext,
+    ) -> Result<EngineRecord, StateError> {
+        validate_audit_context(audit)?;
+        validate_engine(engine)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO engines (version, host_root, cage_executable, sha256) VALUES (?1, ?2, ?3, ?4)",
+            params![engine.version, engine.host_root.to_string_lossy(), engine.cage_executable.to_string_lossy(), engine.sha256],
+        )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
         Ok(engine.clone())
     }
 

@@ -2,6 +2,9 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::deploy::DeployRequest;
+use crate::state::NodeConfig;
+
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_LOG_CHUNK_BYTES: u32 = 48 * 1024;
@@ -40,6 +43,15 @@ pub enum AdminCommand {
     },
     GetDeployment {
         deployment: String,
+    },
+    ApplyConfig(NodeConfig),
+    RegisterEngine {
+        version: String,
+        host_root: std::path::PathBuf,
+        cage_executable: std::path::PathBuf,
+    },
+    Deploy {
+        request: DeployRequest,
     },
     MapDomain {
         app: String,
@@ -145,6 +157,20 @@ pub enum AdminData {
     DomainMapped {
         app: String,
         domain: String,
+    },
+    ConfigApplied {
+        listen: String,
+        app_count: usize,
+    },
+    EngineRegistered {
+        version: String,
+        sha256: String,
+    },
+    DeploymentActivated {
+        app: String,
+        deployment_id: String,
+        artifact_hash: String,
+        engine_version: String,
     },
     Activated {
         app: String,
@@ -294,6 +320,34 @@ mod tests {
         write_frame(&mut frame, &request).unwrap();
         assert_eq!(
             read_frame::<AdminRequest>(&mut frame.as_slice()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn deploy_command_uses_the_nested_request_contract() {
+        let request = AdminRequest {
+            version: ADMIN_PROTOCOL_VERSION,
+            actor: Some("local:operator".into()),
+            request_id: "0123456789abcdef0123456789abcdef".into(),
+            command: AdminCommand::Deploy {
+                request: DeployRequest::new(
+                    "/srv/source",
+                    "hello",
+                    "hello.apps.test",
+                    "1.3.14",
+                    "src/index.ts",
+                    "/var/lib/cygnus/artifacts",
+                    "/run/cygnus/hello.sock",
+                ),
+            },
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["command"]["type"], "deploy");
+        assert_eq!(encoded["command"]["request"]["app"], "hello");
+        assert!(encoded["command"].get("app").is_none());
+        assert_eq!(
+            serde_json::from_value::<AdminRequest>(encoded).unwrap(),
             request
         );
     }

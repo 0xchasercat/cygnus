@@ -30,11 +30,15 @@
 
   onMount(async () => {
     try {
-      const response = await fetch('/healthz', { headers: { accept: 'application/json' } });
+      const response = await fetch('/healthz', { headers: { accept: 'application/json' }, credentials: 'same-origin' });
       const health = await response.json();
-      dataMode = response.ok && health.mode === 'live' ? 'live' : 'preview';
+      // A configured bridge is live even when the operator session is absent;
+      // LiveConsole owns the locked/sign-in state instead of falling back to fixtures.
+      dataMode = health.mode === 'live' ? 'live' : 'preview';
     } catch {
-      dataMode = 'preview';
+      // If health is temporarily unreachable, keep the authenticated bridge UX
+      // rather than silently showing stale preview data.
+      dataMode = 'live';
     }
   });
 

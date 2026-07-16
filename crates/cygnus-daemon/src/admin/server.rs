@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use super::protocol::{
     ADMIN_PROTOCOL_VERSION, AdminCommand, AdminErrorCode, AdminRequest, AdminResponse,
-    MAX_LOG_CHUNK_BYTES, read_frame, write_frame,
+    MAX_ADMIN_FRAME_BYTES, MAX_LOG_CHUNK_BYTES, read_frame, write_frame,
 };
+use crate::state::NodeConfig;
 
 /// The listener through which an admin request arrived.
 ///
@@ -322,6 +323,9 @@ impl AdminServer {
                 match binding.listener.accept() {
                     Ok((stream, _)) => {
                         accepted = true;
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let _ = stream.set_read_timeout(Some(ADMIN_IO_TIMEOUT));
                         let _ = stream.set_write_timeout(Some(ADMIN_IO_TIMEOUT));
                         if peer_uid_matches(&stream)? {
@@ -462,6 +466,41 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         AdminCommand::GetDeployment { deployment } => {
             validate_text(deployment, MAX_ADMIN_DEPLOYMENT_BYTES, "deployment")?;
         }
+        AdminCommand::ApplyConfig(config) => validate_node_config(config)?,
+        AdminCommand::RegisterEngine {
+            version,
+            host_root,
+            cage_executable,
+        } => {
+            validate_text(version, MAX_ADMIN_APP_BYTES, "engine version")?;
+            validate_path(host_root, MAX_ADMIN_DEPLOYMENT_BYTES, "engine host root")?;
+            validate_path(
+                cage_executable,
+                MAX_ADMIN_DEPLOYMENT_BYTES,
+                "engine cage executable",
+            )?;
+        }
+        AdminCommand::Deploy { request } => {
+            validate_text(&request.app, MAX_ADMIN_APP_BYTES, "app")?;
+            validate_text(&request.domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            validate_text(
+                &request.engine_version,
+                MAX_ADMIN_APP_BYTES,
+                "engine version",
+            )?;
+            validate_path(
+                &request.source_dir,
+                MAX_ADMIN_DEPLOYMENT_BYTES,
+                "source directory",
+            )?;
+            validate_path(&request.entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            validate_path(
+                &request.artifact_root,
+                MAX_ADMIN_DEPLOYMENT_BYTES,
+                "artifact root",
+            )?;
+            validate_path(&request.upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
+        }
         AdminCommand::MapDomain { app, domain } => {
             validate_text(app, MAX_ADMIN_APP_BYTES, "app")?;
             validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
@@ -494,6 +533,13 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
 }
 
 fn authorize_actor(role: AdminRole, request: &AdminRequest) -> Result<(), String> {
+    let host_only = matches!(
+        request.command,
+        AdminCommand::ApplyConfig(_) | AdminCommand::RegisterEngine { .. }
+    );
+    if host_only && role != AdminRole::Host {
+        return Err("command is restricted to the host admin listener".into());
+    }
     match (role, request.actor.as_deref()) {
         (AdminRole::Host, None) => Ok(()),
         (AdminRole::Host, Some(_)) => Err("host admin requests must not supply an actor".into()),
@@ -537,6 +583,28 @@ fn validate_text(value: &str, max_bytes: usize, field: &str) -> Result<(), Strin
     }
     if value.chars().any(|character| character.is_control()) {
         return Err(format!("{field} contains control characters"));
+    }
+    Ok(())
+}
+fn validate_path(path: &Path, max_bytes: usize, field: &str) -> Result<(), String> {
+    validate_text(&path.to_string_lossy(), max_bytes, field)
+}
+
+fn validate_node_config(config: &NodeConfig) -> Result<(), String> {
+    let encoded = serde_json::to_vec(config).map_err(|_| "config cannot be encoded")?;
+    if encoded.len() > MAX_ADMIN_FRAME_BYTES {
+        return Err(format!("config exceeds {MAX_ADMIN_FRAME_BYTES} bytes"));
+    }
+    if config.apps.len() > 256 {
+        return Err("config contains too many apps".into());
+    }
+    for app in &config.apps {
+        validate_text(&app.name, MAX_ADMIN_APP_BYTES, "app")?;
+        validate_path(&app.upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
+        validate_text(&app.command, MAX_ADMIN_DEPLOYMENT_BYTES, "command")?;
+        for domain in &app.domains {
+            validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+        }
     }
     Ok(())
 }
@@ -758,6 +826,20 @@ mod tests {
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.actor = Some("github:user-1".into());
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_ok());
+        tenant.command = AdminCommand::Deploy {
+            request: crate::deploy::DeployRequest::new(
+                "/srv/source",
+                "hello",
+                "hello.apps.test",
+                "1.3.14",
+                "src/index.ts",
+                "/var/lib/cygnus/artifacts",
+                "/run/cygnus/hello.sock",
+            ),
+        };
+        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_ok());
+        tenant.command = AdminCommand::ApplyConfig(NodeConfig::default());
+        assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.actor = Some("bad actor".into());
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
     }

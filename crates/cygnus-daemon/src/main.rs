@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -21,7 +21,10 @@ use cygnus_daemon::admin::{
     AdminMutationError, AdminMutationHandler, AdminRole, AdminServer, DEFAULT_HOST_ADMIN_SOCKET,
     DEFAULT_TENANT_ADMIN_SOCKET, StateAdminHandler,
 };
-use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
+use cygnus_daemon::deploy::{
+    ActivationPreparation, DeployError, DeployRequest, deploy_with_audit_and_prepare,
+    register_engine_with_audit,
+};
 use cygnus_daemon::edge::EdgeConfig;
 use cygnus_daemon::state::{
     AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State,
@@ -55,53 +58,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Serve the apps and domains currently stored in the state database.
-    Serve,
-    /// Validate and atomically apply a complete JSON node configuration.
-    Apply {
-        /// JSON configuration to import into the state database.
-        config: PathBuf,
-    },
-    /// Register an operator-trusted Bun engine.
-    Engine {
-        #[command(subcommand)]
-        command: EngineCommand,
-    },
-    /// Build source and activate the first app.
-    Deploy {
-        /// Source directory (canonicalized and copied before building).
-        #[arg(long = "source-dir", alias = "source")]
-        source_dir: PathBuf,
-        /// App name.
+    Serve {
         #[arg(long)]
-        app: String,
-        /// Hostname route.
-        #[arg(long)]
-        domain: String,
-        /// Registered engine version.
-        #[arg(long)]
-        engine_version: String,
-        /// Relative source entry point.
-        #[arg(long, default_value = "index.ts")]
-        entry: PathBuf,
-        /// Content-addressed artifact root.
-        #[arg(long)]
-        artifact_root: PathBuf,
-        /// Host upstream Unix socket.
-        #[arg(long)]
-        upstream: PathBuf,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum EngineCommand {
-    /// Register one Bun executable and its content hash.
-    Register {
-        #[arg(long)]
-        version: String,
-        #[arg(long)]
-        host_root: PathBuf,
-        #[arg(long)]
-        cage_executable: PathBuf,
+        initial_config: Option<PathBuf>,
     },
 }
 
@@ -115,67 +74,53 @@ fn main() -> ExitCode {
     }
 }
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve(&cli.state, &cli.admin_socket, &cli.tenant_admin_socket),
-        Command::Apply { config } => apply(&cli.state, &config),
-        Command::Engine { command } => engine_command(&cli.state, command),
-        Command::Deploy {
-            source_dir,
-            app,
-            domain,
-            engine_version,
-            entry,
-            artifact_root,
-            upstream,
-        } => deploy_command(
-            &cli.state,
-            DeployRequest::new(
-                source_dir,
-                app,
-                domain,
-                engine_version,
-                entry,
-                artifact_root,
-                upstream,
-            ),
-        ),
+    match cli.command.unwrap_or(Command::Serve {
+        initial_config: None,
+    }) {
+        Command::Serve { initial_config } => {
+            if let Some(path) = initial_config {
+                apply_initial_config(&cli.state, &path)?;
+            }
+            serve(&cli.state, &cli.admin_socket, &cli.tenant_admin_socket)
+        }
     }
 }
 
-fn engine_command(state_path: &Path, command: EngineCommand) -> Result<(), Box<dyn Error>> {
-    let EngineCommand::Register {
-        version,
-        host_root,
-        cage_executable,
-    } = command;
-    let mut state = State::open(state_path)?;
-    let engine = register_engine(&mut state, version, host_root, cage_executable)?;
-    println!("registered engine {} ({})", engine.version, engine.sha256);
-    Ok(())
-}
-
-fn deploy_command(state_path: &Path, request: DeployRequest) -> Result<(), Box<dyn Error>> {
-    let mut state = State::open(state_path)?;
-    let result = deploy(&mut state, request)?;
-    println!(
-        "activated deployment {} artifact {}",
-        result.deployment_id, result.artifact_hash
-    );
-    Ok(())
-}
-
-fn apply(state_path: &Path, config_path: &Path) -> Result<(), Box<dyn Error>> {
+fn apply_initial_config(state_path: &Path, config_path: &Path) -> Result<bool, Box<dyn Error>> {
+    if state_path.exists() {
+        return Ok(false);
+    }
     let bytes = fs::read(config_path)?;
     let config: NodeConfig = serde_json::from_slice(&bytes)?;
-    let mut state = State::open(state_path)?;
-    state.apply(&config)?;
-    println!(
-        "applied {} app(s) to {} (listen {})",
-        config.apps.len(),
-        state_path.display(),
-        config.listen
-    );
-    Ok(())
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let audit = AuditContext {
+        endpoint_role: AuditEndpointRole::Host,
+        peer_uid: Some(unsafe { libc::geteuid() }),
+        peer_gid: Some(unsafe { libc::getegid() }),
+        peer_pid: Some(std::process::id()),
+        actor_subject: Some("system:initial-config".into()),
+        request_id: digest[..32].to_owned(),
+        command_kind: "initial_config".into(),
+        request_digest: digest,
+    };
+    let result = (|| -> Result<(), StateError> {
+        let mut state = State::open(state_path)?;
+        state.apply_with_audit(&config, &audit)
+    })();
+    if let Err(error) = result {
+        remove_sqlite_files(state_path);
+        return Err(Box::new(error));
+    }
+    Ok(true)
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
 }
 
 struct LiveAdminMutations {
@@ -192,6 +137,13 @@ impl AdminMutationHandler for LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         match mutation {
+            AdminMutation::ApplyConfig(config) => self.apply_config(&config, audit),
+            AdminMutation::RegisterEngine {
+                version,
+                host_root,
+                cage_executable,
+            } => self.register_engine(version, host_root, cage_executable, audit),
+            AdminMutation::Deploy(request) => self.deploy(request, audit),
             AdminMutation::MapDomain { app, domain } => self.map_domain(&app, &domain, audit),
             AdminMutation::Rollback {
                 app,
@@ -199,6 +151,193 @@ impl AdminMutationHandler for LiveAdminMutations {
                 expected_active_artifact,
             } => self.rollback(&app, &deployment, &expected_active_artifact, audit),
         }
+    }
+}
+impl LiveAdminMutations {
+    fn apply_config(
+        &self,
+        config: &NodeConfig,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let current = state.load().map_err(map_admin_state_error)?;
+        let desired = state.preview(config).map_err(map_admin_state_error)?;
+        if current.listen != desired.listen || current.edge != desired.edge {
+            return Err(AdminMutationError::new(
+                AdminErrorCode::Conflict,
+                "listener and public-edge changes require daemon restart",
+            ));
+        }
+
+        let current_apps = current
+            .apps
+            .iter()
+            .map(|app| (app.name.as_str(), app))
+            .collect::<BTreeMap<_, _>>();
+        let desired_apps = desired
+            .apps
+            .iter()
+            .map(|app| (app.name.as_str(), app))
+            .collect::<BTreeMap<_, _>>();
+        for (name, candidate) in &desired_apps {
+            if let Some(existing) = current_apps.get(name)
+                && (existing.tenant_admin != candidate.tenant_admin
+                    || existing.upstream != candidate.upstream
+                    || existing.spec != candidate.spec
+                    || existing.lifecycle != candidate.lifecycle)
+            {
+                return Err(AdminMutationError::new(
+                    AdminErrorCode::Conflict,
+                    format!(
+                        "runtime changes for app {name:?} require a deployment or daemon restart"
+                    ),
+                ));
+            }
+        }
+
+        let mut added = Vec::new();
+        for (name, candidate) in &desired_apps {
+            if current_apps.contains_key(name) {
+                continue;
+            }
+            let mut candidate = (*candidate).clone();
+            configure_tenant_admin(&mut candidate, &self.tenant_admin_socket).map_err(|error| {
+                AdminMutationError::new(AdminErrorCode::Conflict, error.to_string())
+            })?;
+            let key = candidate.spec.name.clone();
+            self.supervisor.register(
+                key.clone(),
+                candidate.spec.clone(),
+                candidate.lifecycle.clone(),
+            );
+            added.push(key.clone());
+            if candidate.lifecycle.min_instances > 0
+                && let Err(error) = self.supervisor.acquire(&key)
+            {
+                for added_key in added.drain(..) {
+                    let _ = self.supervisor.remove(&added_key);
+                }
+                return Err(AdminMutationError::new(
+                    AdminErrorCode::Conflict,
+                    format!("pinned app {name:?} did not become ready: {error:?}"),
+                ));
+            }
+        }
+
+        if let Err(error) = state.apply_with_audit(config, audit) {
+            for key in added {
+                let _ = self.supervisor.remove(&key);
+            }
+            return Err(map_admin_state_error(error));
+        }
+        let retired = self.router.install(route_table(&desired));
+        let removed = current_apps
+            .keys()
+            .filter(|name| !desired_apps.contains_key(**name))
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            let supervisor = Arc::clone(&self.supervisor);
+            thread::spawn(move || {
+                while !retired.is_quiescent() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                for key in removed {
+                    if let Err(error) = supervisor.remove(&key) {
+                        eprintln!("cygnus-daemon: retired runtime {key:?} did not stop: {error}");
+                    }
+                }
+            });
+        }
+        Ok(AdminData::ConfigApplied {
+            listen: config.listen.to_string(),
+            app_count: config.apps.len(),
+        })
+    }
+
+    fn register_engine(
+        &self,
+        version: String,
+        host_root: PathBuf,
+        cage_executable: PathBuf,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let engine =
+            register_engine_with_audit(&mut state, version, host_root, cage_executable, audit)
+                .map_err(map_deploy_error)?;
+        Ok(AdminData::EngineRegistered {
+            version: engine.version,
+            sha256: engine.sha256,
+        })
+    }
+
+    fn deploy(
+        &self,
+        request: DeployRequest,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let supervisor = Arc::clone(&self.supervisor);
+        let tenant_socket = self.tenant_admin_socket.clone();
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let previous_runtime_key = state
+            .load()
+            .map_err(map_admin_state_error)?
+            .apps
+            .into_iter()
+            .find(|app| app.name == request.app)
+            .map(|app| app.spec.name);
+        let previous_for_prepare = previous_runtime_key.clone();
+        let result = deploy_with_audit_and_prepare(&mut state, request, audit, move |candidate| {
+            let mut candidate = candidate.clone();
+            configure_tenant_admin(&mut candidate, &tenant_socket)
+                .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
+            let key = candidate.spec.name.clone();
+            if previous_for_prepare.as_deref() == Some(key.as_str()) {
+                return Ok(ActivationPreparation::new(|| {}));
+            }
+            supervisor.register(
+                key.clone(),
+                candidate.spec.clone(),
+                candidate.lifecycle.clone(),
+            );
+            supervisor
+                .acquire(&key)
+                .map_err(|error| DeployError::ActivationFailed {
+                    id: key.clone(),
+                    detail: format!("{error:?}"),
+                })?;
+            let cleanup = Arc::clone(&supervisor);
+            Ok(ActivationPreparation::new(move || {
+                let _ = cleanup.remove(&key);
+            }))
+        })
+        .map_err(map_deploy_error)?;
+        let snapshot = State::open(&self.state_path)
+            .map_err(map_admin_state_error)?
+            .load()
+            .map_err(map_admin_state_error)?;
+        let retired = self.router.install(route_table(&snapshot));
+        let new_runtime_key = format!("r-{}", result.artifact_hash);
+        if let Some(previous) = previous_runtime_key
+            && previous != new_runtime_key
+        {
+            let supervisor = Arc::clone(&self.supervisor);
+            thread::spawn(move || {
+                while !retired.is_quiescent() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if let Err(error) = supervisor.remove(&previous) {
+                    eprintln!("cygnus-daemon: retired runtime {previous:?} did not stop: {error}");
+                }
+            });
+        }
+        Ok(AdminData::DeploymentActivated {
+            app: result.deployment.app,
+            deployment_id: result.deployment_id,
+            artifact_hash: result.artifact_hash,
+            engine_version: result.deployment.engine_version,
+        })
     }
 }
 
@@ -313,12 +452,33 @@ impl LiveAdminMutations {
     }
 }
 
+fn map_deploy_error(error: DeployError) -> AdminMutationError {
+    match error {
+        DeployError::State(error) => map_admin_state_error(error),
+        DeployError::InvalidInput(message) => {
+            AdminMutationError::new(AdminErrorCode::Validation, message)
+        }
+        DeployError::ActivationFailed { detail, .. } => {
+            AdminMutationError::new(AdminErrorCode::Conflict, detail)
+        }
+        DeployError::BuildFailed { detail, .. } => {
+            AdminMutationError::new(AdminErrorCode::Validation, detail)
+        }
+        DeployError::Io(error) => {
+            AdminMutationError::new(AdminErrorCode::Internal, error.to_string())
+        }
+        DeployError::Json(error) => {
+            AdminMutationError::new(AdminErrorCode::Validation, error.to_string())
+        }
+    }
+}
+
 fn map_admin_state_error(error: StateError) -> AdminMutationError {
     let code = match error {
         StateError::AppNotFound(_) => AdminErrorCode::NotFound,
-        StateError::DomainConflict { .. } | StateError::ActivationConflict { .. } => {
-            AdminErrorCode::Conflict
-        }
+        StateError::DomainConflict { .. }
+        | StateError::ActivationConflict { .. }
+        | StateError::DestructiveApply => AdminErrorCode::Conflict,
         StateError::InvalidConfig(_)
         | StateError::InvalidRecord { .. }
         | StateError::InvalidDeploymentTransition { .. }
@@ -778,6 +938,64 @@ mod tests {
             "cygnus-daemon-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn initial_config_applies_once_with_real_audit_provenance() {
+        let directory = unique_dir("initial-config");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = directory.join("state.db");
+        let config_path = directory.join("node.json");
+        let mut config = NodeConfig::default();
+        config.listen = "127.0.0.1:3300".parse().unwrap();
+        let bytes = serde_json::to_vec(&config).unwrap();
+        fs::write(&config_path, &bytes).unwrap();
+
+        assert!(apply_initial_config(&state_path, &config_path).unwrap());
+        let state = State::open(&state_path).unwrap();
+        assert_eq!(state.load().unwrap().listen, config.listen);
+        let audit = state.audit_records().unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit[0].actor_subject.as_deref(),
+            Some("system:initial-config")
+        );
+        assert_eq!(
+            audit[0].request_digest,
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        drop(state);
+
+        config.listen = "127.0.0.1:4400".parse().unwrap();
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!apply_initial_config(&state_path, &config_path).unwrap());
+        assert_eq!(
+            State::open(&state_path).unwrap().load().unwrap().listen,
+            "127.0.0.1:3300".parse().unwrap()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejected_initial_config_leaves_no_database() {
+        let directory = unique_dir("invalid-initial-config");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = directory.join("state.db");
+        let config_path = directory.join("node.json");
+        let mut config = NodeConfig::default();
+        config.apps.push(cygnus_daemon::state::AppConfig {
+            name: String::new(),
+            upstream: directory.join("app.sock"),
+            command: "/bin/true".into(),
+            ..Default::default()
+        });
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        assert!(apply_initial_config(&state_path, &config_path).is_err());
+        assert!(!state_path.exists());
+        assert!(!state_path.with_extension("db-wal").exists());
+        assert!(!state_path.with_extension("db-shm").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

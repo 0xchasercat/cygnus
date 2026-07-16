@@ -12,18 +12,19 @@ export class AdminProtocolError extends Error {
   }
 }
 
-export function adminRequest(socketPath, command, actor = "tenant-0") {
+export function adminRequest(socketPath, command, actor) {
   if (typeof socketPath !== "string" || !socketPath.startsWith("/")) {
     return Promise.reject(new AdminProtocolError("admin socket path must be absolute"));
   }
   const requestId = randomBytes(16).toString("hex");
+  const envelope = {
+    version: ADMIN_PROTOCOL_VERSION,
+    request_id: requestId,
+    command,
+  };
+  if (actor !== undefined) envelope.actor = actor;
   const payload = Buffer.from(
-    JSON.stringify({
-      version: ADMIN_PROTOCOL_VERSION,
-      request_id: requestId,
-      actor,
-      command,
-    }),
+    JSON.stringify(envelope),
     "utf8",
   );
   if (payload.length === 0 || payload.length > MAX_ADMIN_FRAME_BYTES) {

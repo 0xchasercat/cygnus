@@ -11,6 +11,8 @@ use cygnus_daemon::admin::{
     ADMIN_PROTOCOL_VERSION, AdminClient, AdminCommand, AdminData, AdminRequest, AdminResponse,
     DEFAULT_HOST_ADMIN_SOCKET, LogStream, MAX_LOG_CHUNK_BYTES,
 };
+use cygnus_daemon::deploy::DeployRequest;
+use cygnus_daemon::state::NodeConfig;
 
 #[derive(Debug, Parser)]
 #[command(name = "cygnusctl", about = "Operate the local Cygnus daemon")]
@@ -25,6 +27,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Apply {
+        config: PathBuf,
+    },
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
+    },
+    Deploy {
+        #[arg(long = "source-dir", alias = "source")]
+        source_dir: PathBuf,
+        #[arg(long)]
+        app: String,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        engine_version: String,
+        #[arg(long, default_value = "index.ts")]
+        entry: PathBuf,
+        #[arg(long)]
+        artifact_root: PathBuf,
+        #[arg(long)]
+        upstream: PathBuf,
+    },
     /// Check protocol and daemon availability.
     Health,
     /// Show node configuration status.
@@ -37,7 +62,9 @@ enum Command {
         limit: u16,
     },
     /// Show one registered app.
-    App { app: String },
+    App {
+        app: String,
+    },
     /// List one page of deployments.
     Deployments {
         #[arg(long)]
@@ -48,9 +75,14 @@ enum Command {
         limit: u16,
     },
     /// Show one deployment.
-    Deployment { deployment: String },
+    Deployment {
+        deployment: String,
+    },
     /// Add a hostname route to an app.
-    MapDomain { app: String, domain: String },
+    MapDomain {
+        app: String,
+        domain: String,
+    },
     /// Atomically activate a retained sealed deployment.
     Rollback {
         app: String,
@@ -65,6 +97,17 @@ enum Command {
         stream: StreamArg,
         #[arg(long, default_value_t = 0)]
         offset: u64,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum EngineCommand {
+    Register {
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        host_root: PathBuf,
+        #[arg(long)]
+        cage_executable: PathBuf,
     },
 }
 
@@ -96,6 +139,47 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let client = AdminClient::new(cli.admin_socket);
     match cli.command {
+        Command::Apply { config } => {
+            let config: NodeConfig = serde_json::from_slice(&std::fs::read(config)?)?;
+            print_data(call(&client, AdminCommand::ApplyConfig(config))?)
+        }
+        Command::Engine { command } => {
+            let EngineCommand::Register {
+                version,
+                host_root,
+                cage_executable,
+            } = command;
+            print_data(call(
+                &client,
+                AdminCommand::RegisterEngine {
+                    version,
+                    host_root,
+                    cage_executable,
+                },
+            )?)
+        }
+        Command::Deploy {
+            source_dir,
+            app,
+            domain,
+            engine_version,
+            entry,
+            artifact_root,
+            upstream,
+        } => print_data(call(
+            &client,
+            AdminCommand::Deploy {
+                request: DeployRequest::new(
+                    source_dir,
+                    app,
+                    domain,
+                    engine_version,
+                    entry,
+                    artifact_root,
+                    upstream,
+                ),
+            },
+        )?),
         Command::Health => print_data(call(&client, AdminCommand::Health)?),
         Command::Status => print_data(call(&client, AdminCommand::Status)?),
         Command::Apps { cursor, limit } => {
