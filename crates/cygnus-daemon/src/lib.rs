@@ -16,6 +16,7 @@ pub mod admin;
 pub mod deploy;
 pub mod edge;
 pub mod state;
+pub mod tls;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -25,8 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use crate::tls::{TlsServer, relay_tls};
 use cygnus_cage::Cage;
-use cygnus_router::{HeadParse, RequestHead, Route, Router, parse_request_head};
+use cygnus_router::{HeadParse, RequestHead, Route, Router, normalize_host, parse_request_head};
 use cygnus_supervisor::{AcquireError, Supervisor};
 
 /// How long a client has to send a complete request head before the connection
@@ -40,6 +42,8 @@ pub enum Status {
     BadRequest,
     /// 404 — no route matched the host.
     NotFound,
+    /// 421 — TLS SNI and HTTP Host disagree.
+    MisdirectedRequest,
     /// 502 — the app booted but its socket could not be reached.
     BadGateway,
     /// 503 — the app is crash-looping or backing off; try again later.
@@ -55,6 +59,9 @@ pub fn error_response(status: Status) -> &'static [u8] {
         }
         Status::NotFound => {
             b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+        }
+        Status::MisdirectedRequest => {
+            b"HTTP/1.1 421 Misdirected Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
         }
         Status::BadGateway => {
             b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
@@ -89,6 +96,19 @@ pub fn read_head<R: Read>(client: &mut R) -> Result<(RequestHead, Vec<u8>), Stat
 pub fn route_request(head: &RequestHead, router: &Router) -> Result<Arc<Route>, Status> {
     let host = head.host.as_deref().ok_or(Status::BadRequest)?;
     router.resolve(host).ok_or(Status::NotFound)
+}
+
+/// Route HTTPS by SNI and reject domain-fronted Host headers.
+pub fn route_tls_request(
+    head: &RequestHead,
+    server_name: &str,
+    router: &Router,
+) -> Result<Arc<Route>, Status> {
+    let host = head.host.as_deref().ok_or(Status::BadRequest)?;
+    if normalize_host(host) != normalize_host(server_name) {
+        return Err(Status::MisdirectedRequest);
+    }
+    router.resolve(server_name).ok_or(Status::NotFound)
 }
 
 /// Map a supervisor acquire failure to the status the client should see.
@@ -148,6 +168,88 @@ impl Frontend {
         }
         Ok(())
     }
+    /// Accept HTTPS connections until shutdown, selecting certificates by SNI.
+    pub fn serve_tls_until(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: TlsServer,
+        shutdown: &AtomicBool,
+    ) -> io::Result<()> {
+        listener.set_nonblocking(true)?;
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    let front = Arc::clone(&self);
+                    let tls = tls.clone();
+                    thread::spawn(move || front.serve_tls_connection(client, &tls));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn serve_tls_connection(&self, client: TcpStream, tls: &TlsServer) {
+        let _ = client.set_read_timeout(Some(HEAD_READ_TIMEOUT));
+        let connection = match tls.connection() {
+            Ok(connection) => connection,
+            Err(_) => return,
+        };
+        let mut client = rustls::StreamOwned::new(connection, client);
+        let (head, buffered) = match read_head(&mut client) {
+            Ok(routed) => routed,
+            Err(status) => {
+                let _ = client.write_all(error_response(status));
+                let _ = client.flush();
+                return;
+            }
+        };
+        let server_name = match client.conn.server_name() {
+            Some(server_name) => server_name.to_owned(),
+            None => {
+                let _ = client.write_all(error_response(Status::BadRequest));
+                let _ = client.flush();
+                return;
+            }
+        };
+        let route = match route_tls_request(&head, &server_name, &self.router) {
+            Ok(route) => route,
+            Err(status) => {
+                let _ = client.write_all(error_response(status));
+                let _ = client.flush();
+                return;
+            }
+        };
+        if let Err(error) = self.supervisor.acquire(&route.app) {
+            eprintln!(
+                "cygnus-daemon: app {:?} acquire failed: {error:?}",
+                route.app
+            );
+            let _ = client.write_all(error_response(acquire_status(&error)));
+            let _ = client.flush();
+            return;
+        }
+        let upstream = match UnixStream::connect(&route.upstream) {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                let _ = client.write_all(error_response(Status::BadGateway));
+                let _ = client.flush();
+                return;
+            }
+        };
+        if (&upstream).write_all(&buffered).is_err() {
+            let _ = client.write_all(error_response(Status::BadGateway));
+            let _ = client.flush();
+            return;
+        }
+        let (connection, client) = client.into_parts();
+        let _ = client.set_read_timeout(None);
+        let _ = relay_tls(connection, client, upstream);
+    }
 
     /// Serve one accepted client connection end to end on the current thread.
     /// This is the same path [`Self::serve`] dispatches to its workers.
@@ -190,8 +292,7 @@ impl Frontend {
     }
 
     /// Read and route the request head, returning the head, the bytes read, and
-    /// the matched route.
-    fn route(&self, client: &mut TcpStream) -> Result<(RequestHead, Vec<u8>, Arc<Route>), Status> {
+    fn route<R: Read>(&self, client: &mut R) -> Result<(RequestHead, Vec<u8>, Arc<Route>), Status> {
         let (head, buffered) = read_head(client)?;
         let route = route_request(&head, &self.router)?;
         Ok((head, buffered, route))
@@ -313,6 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn tls_routing_rejects_domain_fronting() {
+        let router = router_with("api.example.com", "api");
+        let head = RequestHead {
+            method: "GET".into(),
+            target: "/".into(),
+            host: Some("API.EXAMPLE.COM:443".into()),
+            head_len: 0,
+        };
+        assert_eq!(
+            route_tls_request(&head, "api.example.com", &router)
+                .unwrap()
+                .app,
+            "api"
+        );
+        assert_eq!(
+            route_tls_request(&head, "other.example.com", &router),
+            Err(Status::MisdirectedRequest)
+        );
+    }
+
+    #[test]
     fn acquire_failures_map_to_client_statuses() {
         assert_eq!(acquire_status(&AcquireError::Unknown), Status::NotFound);
         assert_eq!(
@@ -352,5 +474,6 @@ mod tests {
         assert!(error_response(Status::Unavailable).starts_with(b"HTTP/1.1 503"));
         assert!(error_response(Status::BadGateway).starts_with(b"HTTP/1.1 502"));
         assert!(error_response(Status::BadRequest).starts_with(b"HTTP/1.1 400"));
+        assert!(error_response(Status::MisdirectedRequest).starts_with(b"HTTP/1.1 421"));
     }
 }

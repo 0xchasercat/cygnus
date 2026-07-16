@@ -23,6 +23,7 @@ use cygnus_daemon::deploy::{DeployRequest, deploy, register_engine};
 use cygnus_daemon::state::{
     AuditContext, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State, StateError,
 };
+use cygnus_daemon::tls::TlsServer;
 use cygnus_router::{Route, RouteTable, Router};
 use cygnus_supervisor::{LifecycleState, Supervisor};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -355,6 +356,15 @@ fn serve(
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let state = State::open(state_path)?;
     let mut snapshot = state.load()?;
+    let tls = if let Some(https_listen) = snapshot.edge.https_listen {
+        let certificates = state.certificates()?;
+        Some((
+            TcpListener::bind(https_listen)?,
+            TlsServer::from_certificates(&certificates)?,
+        ))
+    } else {
+        None
+    };
     drop(state);
     let listener = TcpListener::bind(snapshot.listen)?;
     if admin_socket == tenant_admin_socket {
@@ -389,6 +399,20 @@ fn serve(
 
     spawn_reaper(Arc::downgrade(&supervisor));
     let frontend = Arc::new(Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)));
+    let tls_thread = tls.map(|(tls_listener, tls)| {
+        let tls_address = local_addr(&tls_listener);
+        let tls_frontend = Arc::clone(&frontend);
+        let tls_shutdown = Arc::clone(&shutdown);
+        let tls_failure = Arc::clone(&shutdown);
+        eprintln!("cygnus-daemon: HTTPS listening on {tls_address}");
+        thread::spawn(move || {
+            let result = tls_frontend.serve_tls_until(tls_listener, tls, &tls_shutdown);
+            if result.is_err() {
+                tls_failure.store(true, Ordering::Release);
+            }
+            result
+        })
+    });
     let lifecycle_supervisor = Arc::clone(&supervisor);
     let lifecycle_state_path = state_path.to_owned();
     let mutations: Arc<dyn AdminMutationHandler> = Arc::new(LiveAdminMutations {
@@ -432,8 +456,18 @@ fn serve(
     let admin_result = admin_thread
         .join()
         .map_err(|_| io::Error::other("admin server thread panicked"))?;
+    let tls_result = tls_thread
+        .map(|thread| {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("TLS server thread panicked"))
+        })
+        .transpose()?;
     for (app, error) in supervisor.shutdown_all() {
         eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
+    }
+    if let Some(result) = tls_result {
+        result?;
     }
     serve_result?;
     admin_result?;
@@ -717,6 +751,68 @@ mod tests {
         assert!(response.starts_with(b"HTTP/1.1 200"));
         assert!(
             response
+                .windows(b"overlay request reached the cage".len())
+                .any(|window| window == b"overlay request reached the cage")
+        );
+
+        use cygnus_daemon::edge::CertificateRecord;
+        use rcgen::{CertifiedKey as GeneratedKey, generate_simple_self_signed};
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+        use std::os::unix::fs::PermissionsExt;
+
+        let certificate_directory = directory.join("tls");
+        fs::create_dir(&certificate_directory).unwrap();
+        fs::set_permissions(&certificate_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let GeneratedKey { cert, signing_key } =
+            generate_simple_self_signed(["overlay.localhost".to_owned()]).unwrap();
+        let certificate_path = certificate_directory.join("fullchain.pem");
+        let private_key_path = certificate_directory.join("key.pem");
+        fs::write(&certificate_path, cert.pem()).unwrap();
+        fs::write(&private_key_path, signing_key.serialize_pem()).unwrap();
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let tls = TlsServer::from_certificates(&[CertificateRecord {
+            id: "overlay-test".into(),
+            domains: vec!["overlay.localhost".into()],
+            generation: "a".repeat(64),
+            certificate_path,
+            private_key_path,
+            not_after_unix: 4_102_444_800,
+            installed_at: "test".into(),
+        }])
+        .unwrap();
+        let tls_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tls_address = tls_listener.local_addr().unwrap();
+        let tls_frontend = Arc::clone(&frontend);
+        let tls_worker = thread::spawn(move || {
+            let (client, _) = tls_listener.accept().unwrap();
+            tls_frontend.serve_tls_connection(client, &tls);
+        });
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connection = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("overlay.localhost".to_owned()).unwrap(),
+        )
+        .unwrap();
+        let mut tls_client = StreamOwned::new(
+            connection,
+            TcpStream::connect(tls_address).expect("connect TLS front"),
+        );
+        tls_client
+            .write_all(b"GET / HTTP/1.1\r\nHost: overlay.localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        tls_client.flush().unwrap();
+        let mut tls_response = Vec::new();
+        tls_client.read_to_end(&mut tls_response).unwrap();
+        tls_worker.join().unwrap();
+        assert!(tls_response.starts_with(b"HTTP/1.1 200"));
+        assert!(
+            tls_response
                 .windows(b"overlay request reached the cage".len())
                 .any(|window| window == b"overlay request reached the cage")
         );
