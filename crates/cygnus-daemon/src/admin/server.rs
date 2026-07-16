@@ -572,11 +572,11 @@ fn peer_credentials(stream: &UnixStream) -> io::Result<AdminPeerCredentials> {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
-        return Ok(AdminPeerCredentials {
+        Ok(AdminPeerCredentials {
             uid: Some(credentials.uid),
             gid: Some(credentials.gid),
             pid: u32::try_from(credentials.pid).ok(),
-        });
+        })
     }
 
     #[cfg(any(
