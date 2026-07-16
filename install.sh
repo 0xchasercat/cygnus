@@ -500,6 +500,10 @@ ensure_dir "$state_dir/artifacts" 0700
 ensure_dir "$state_dir/logs" 0700
 atomic_install_dir "$console_stage" "$console_root"
 atomic_install_dir "$secret_stage" "$secret_root" secrets
+# Enforce least-privilege modes on the secret lowerdir regardless of how cp
+# handled them (GNU cp without -p, umask, container filesystems, etc.).
+find "$secret_root" -type d -exec chmod 0700 {} +
+find "$secret_root" -type f -exec chmod 0600 {} +
 ensure_dir "$state_dir/engines" 0700
 for name in "${binaries[@]}"; do atomic_copy "$stage/$name" "$prefix/$name" 0755; done
 
