@@ -124,17 +124,18 @@ impl DeployRequest {
     }
 }
 
+/// Fully defaulted deployment target suitable for durable queue construction.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedDeployRequest {
-    source_dir: PathBuf,
-    app: String,
-    domain: String,
-    engine_version: String,
-    entry: PathBuf,
-    artifact_root: PathBuf,
-    upstream: PathBuf,
-    deployment_id: Option<String>,
-    source: DeploymentSource,
+pub struct ResolvedDeployRequest {
+    pub source_dir: PathBuf,
+    pub app: String,
+    pub domain: String,
+    pub engine_version: String,
+    pub entry: PathBuf,
+    pub artifact_root: PathBuf,
+    pub upstream: PathBuf,
+    pub deployment_id: Option<String>,
+    pub source: DeploymentSource,
 }
 
 /// Result of a successful deployment.
@@ -336,7 +337,9 @@ pub fn deploy_with_audit(
     })
 }
 
-fn resolve_deploy_request(
+/// Resolve operator-selectable target fields through daemon state without
+/// accepting caller-controlled artifact or upstream defaults.
+pub fn resolve_deploy_request(
     state: &State,
     request: DeployRequest,
 ) -> Result<ResolvedDeployRequest, DeployError> {
@@ -385,6 +388,13 @@ fn resolve_deploy_request(
     let upstream = request
         .upstream
         .unwrap_or_else(|| state.deployment_upstream(&request.app));
+    validate_entry(&entry)?;
+    validate_upstream(&upstream)?;
+    if state.engine(&engine_version)?.is_none() {
+        return Err(DeployError::InvalidInput(format!(
+            "engine {engine_version:?} is not registered"
+        )));
+    }
     Ok(ResolvedDeployRequest {
         source_dir: request.source_dir,
         app: request.app,
@@ -1101,7 +1111,31 @@ fn write_control_asset(path: &Path, bytes: &[u8]) -> Result<(), DeployError> {
     Ok(())
 }
 
-fn canonical_source_root(path: &Path) -> Result<PathBuf, DeployError> {
+/// Safely extract a finalized upload archive into an empty daemon workspace.
+/// Links, special files, traversal, and expanded archives above the shared
+/// extraction bound are rejected by the same intake used for GitHub tarballs.
+pub fn extract_deploy_archive(archive_path: &Path, destination: &Path) -> Result<(), DeployError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(archive_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > upload::MAX_UPLOAD_BYTES
+    {
+        return Err(DeployError::InvalidInput(
+            "deployment archive must be a regular file between 1 byte and 64 MiB".into(),
+        ));
+    }
+    crate::github::safe_extract_archive_reader(file, destination).map_err(|error| {
+        DeployError::InvalidInput(format!("deployment archive is unsafe: {error}"))
+    })
+}
+
+/// Canonicalize and validate a host-provided source directory before it is
+/// captured in a durable CLI deployment job.
+pub fn canonical_source_root(path: &Path) -> Result<PathBuf, DeployError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         DeployError::InvalidInput(format!(
             "source root {} is unavailable: {error}",
@@ -1784,7 +1818,8 @@ fn slash_path(path: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
-fn new_deployment_id() -> String {
+/// Allocate an opaque local deployment or deployment-job identifier.
+pub fn new_deployment_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

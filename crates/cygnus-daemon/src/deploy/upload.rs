@@ -30,7 +30,8 @@ pub const MAX_UPLOAD_CHUNK_BYTES: usize = 48 * 1024;
 /// Incomplete uploads idle for this long are expired.
 pub const UPLOAD_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
-const MAX_UPLOAD_CHUNK_BASE64_CHARS: usize = MAX_UPLOAD_CHUNK_BYTES.div_ceil(3) * 4;
+/// Wire-safe encoded chunk bound, leaving one KiB for the admin JSON envelope.
+pub const MAX_UPLOAD_CHUNK_BASE64_CHARS: usize = 63 * 1024;
 const UPLOAD_DIRECTORY: &str = "deploy-uploads";
 const UPLOAD_ID_BYTES: usize = 32;
 const UPLOAD_ID_HEX_LEN: usize = UPLOAD_ID_BYTES * 2;
@@ -194,6 +195,14 @@ impl UploadManager {
         Ok(upload_id)
     }
 
+    /// Decode and append one base64 chunk at the session's next byte offset.
+    ///
+    /// This is the wire-protocol operation: upload chunks are strictly serial and
+    /// the daemon, rather than the client, owns the current offset.
+    pub fn append_next(&self, upload_id: &str, chunk_base64: &str) -> Result<u64, UploadError> {
+        self.append_at(upload_id, None, chunk_base64)
+    }
+
     /// Decode and append one base64 chunk at the exact expected byte offset.
     ///
     /// Invalid base64, an incorrect offset, overflow beyond `total_bytes`, or a
@@ -202,6 +211,15 @@ impl UploadManager {
         &self,
         upload_id: &str,
         offset: u64,
+        chunk_base64: &str,
+    ) -> Result<u64, UploadError> {
+        self.append_at(upload_id, Some(offset), chunk_base64)
+    }
+
+    fn append_at(
+        &self,
+        upload_id: &str,
+        offset: Option<u64>,
         chunk_base64: &str,
     ) -> Result<u64, UploadError> {
         validate_upload_id(upload_id)?;
@@ -227,7 +245,9 @@ impl UploadManager {
         let Some(session) = state.active.get(upload_id) else {
             return Err(UploadError::NotFound);
         };
-        if offset != session.received {
+        if let Some(offset) = offset
+            && offset != session.received
+        {
             let expected = session.received;
             remove_active(&mut state, upload_id);
             return Err(UploadError::OutOfOrder {
@@ -655,6 +675,26 @@ mod tests {
             manager.finish(&upload_id),
             Err(UploadError::NotFound)
         ));
+    }
+
+    #[test]
+    fn append_next_owns_the_wire_offset() {
+        let root = TestRoot::new("append-next");
+        let manager = UploadManager::new(&root.0).unwrap();
+        let upload_id = manager.begin(metadata(), 4).unwrap();
+        assert_eq!(
+            manager
+                .append_next(&upload_id, &BASE64.encode(b"ab"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            manager
+                .append_next(&upload_id, &BASE64.encode(b"cd"))
+                .unwrap(),
+            4
+        );
+        assert_eq!(manager.finish(&upload_id).unwrap().digest.len(), 64);
     }
 
     #[test]

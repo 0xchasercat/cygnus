@@ -2282,6 +2282,74 @@ impl State {
         Ok(true)
     }
 
+    /// Atomically precreate a building deployment and enqueue the job that will
+    /// resume it. The local deployment id is persisted while the job is queued.
+    /// Repeating the same job id is idempotent and never creates another
+    /// deployment row.
+    pub fn enqueue_preassigned_deployment(
+        &mut self,
+        deployment: &DeploymentInput,
+        job: &DeployJobSpec,
+    ) -> Result<bool, StateError> {
+        validate_deployment_input(deployment)?;
+        validate_deploy_job_spec(job)?;
+        let deployment_source = match deployment.source.kind {
+            DeploymentSourceKind::GitHub => DeployJobSource::GitHub,
+            DeploymentSourceKind::Upload => DeployJobSource::Upload,
+            DeploymentSourceKind::Cli => DeployJobSource::Cli,
+        };
+        if deployment.app != job.app
+            || deployment.engine_version != job.engine_version
+            || deployment_source != job.source
+        {
+            return Err(StateError::InvalidRecord {
+                kind: "deploy job",
+                detail: "job target does not match its preassigned deployment".into(),
+            });
+        }
+        if self.engine(&deployment.engine_version)?.is_none() {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("engine {:?} is not registered", deployment.engine_version),
+            });
+        }
+
+        let transaction = self.connection.transaction()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM deploy_jobs WHERE id = ?1",
+                [&job.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO deployments
+             (id, app, source_hash, engine_version, source_kind, source_branch, source_commit, status, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'building', NULL)",
+            params![
+                deployment.id,
+                deployment.app,
+                deployment.source_hash,
+                deployment.engine_version,
+                deployment_source_kind_name(deployment.source.kind),
+                deployment.source.branch,
+                deployment.source.commit,
+            ],
+        )?;
+        enqueue_deploy_job_tx(&transaction, job)?;
+        transaction.execute(
+            "UPDATE deploy_jobs SET deployment_id = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status = 'queued'",
+            params![job.id, deployment.id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Enqueue one source-neutral deployment. Duplicate ids are idempotent.
     pub fn enqueue_deploy_job(&mut self, job: &DeployJobSpec) -> Result<bool, StateError> {
         validate_deploy_job_spec(job)?;
@@ -2448,6 +2516,14 @@ impl State {
         self.retry_deploy_job_inner(id, None)
     }
 
+    pub fn retry_deploy_job_with_audit(
+        &mut self,
+        id: &str,
+        audit: &AuditContext,
+    ) -> Result<DeployJob, StateError> {
+        self.retry_deploy_job_inner(id, Some(audit))
+    }
+
     fn retry_deploy_job_inner(
         &mut self,
         id: &str,
@@ -2468,6 +2544,12 @@ impl State {
                 detail: format!("job {id:?} cannot be retried"),
             });
         }
+        transaction.execute(
+            "UPDATE deployments SET status = 'building', error = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = (SELECT deployment_id FROM deploy_jobs WHERE id = ?1)
+               AND status = 'failed' AND artifact_hash IS NULL",
+            [id],
+        )?;
         if let Some(audit) = audit {
             append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         }

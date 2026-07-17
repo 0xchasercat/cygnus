@@ -1,5 +1,6 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,13 +12,16 @@ use super::{
     DeploymentView, EngineView, GitHubJobView, MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES,
     MemoryView, NodeView,
 };
-use crate::deploy::DeployRequest;
+use crate::deploy::upload::{UploadError, UploadManager, UploadMetadata};
+use crate::deploy::{
+    DeployError, DeployRequest, canonical_source_root, new_deployment_id, resolve_deploy_request,
+};
 use crate::github::{GitHubError, GitHubManager};
 use crate::metrics::MetricsHub;
 use crate::state::{
-    AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentSource,
-    DeploymentStatus, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, LoadedApp, NodeConfig,
-    State, StateError,
+    AuditContext, AuditEndpointRole, AuditOutcome, DeployJob, DeployJobSource, DeployJobSpec,
+    DeployJobStatus, DeploymentInput, DeploymentRecord, DeploymentSource, DeploymentStatus,
+    GitHubJobKind, LoadedApp, NodeConfig, State, StateError,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -82,6 +86,7 @@ pub struct StateAdminHandler {
     metrics: MetricsHub,
     started_at: Instant,
     runtime_logs_root: PathBuf,
+    uploads: UploadManager,
 }
 
 impl StateAdminHandler {
@@ -90,20 +95,34 @@ impl StateAdminHandler {
         lifecycle: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
         mutations: Arc<dyn AdminMutationHandler>,
     ) -> Self {
+        let state_path = state_path.into();
+        let state_root = state_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let state_root = fs::canonicalize(state_root).unwrap_or_else(|_| state_root.to_path_buf());
+        let uploads = UploadManager::new(&state_root)
+            .unwrap_or_else(|error| panic!("could not initialize deployment uploads: {error}"));
         Self {
-            state_path: state_path.into(),
+            state_path,
             lifecycle: Arc::new(lifecycle),
             mutations,
             github: None,
             metrics: MetricsHub::new(),
             started_at: Instant::now(),
             runtime_logs_root: PathBuf::from(DEFAULT_RUNTIME_LOGS_ROOT),
+            uploads,
         }
     }
 
     pub fn with_github(mut self, github: Arc<GitHubManager>) -> Self {
         self.github = Some(github);
         self
+    }
+
+    /// Clone the handler-owned upload spool handle for the deployment worker.
+    pub fn upload_manager(&self) -> UploadManager {
+        self.uploads.clone()
     }
 
     pub fn with_metrics(mut self, metrics: MetricsHub) -> Self {
@@ -249,6 +268,48 @@ impl StateAdminHandler {
                     "deploy",
                 )
             }
+            AdminCommand::DeployUploadBegin {
+                app,
+                domain,
+                engine_version,
+                entry,
+                total_bytes,
+            } => {
+                let upload_id = self
+                    .uploads
+                    .begin(
+                        UploadMetadata {
+                            app,
+                            domain,
+                            engine_version,
+                            entry,
+                        },
+                        total_bytes,
+                    )
+                    .map_err(upload_fault)?;
+                Ok(AdminData::DeployUploadBegun { upload_id })
+            }
+            AdminCommand::DeployUploadChunk {
+                upload_id,
+                chunk_base64,
+            } => {
+                let received_bytes = self
+                    .uploads
+                    .append_next(&upload_id, &chunk_base64)
+                    .map_err(upload_fault)?;
+                Ok(AdminData::DeployUploadChunked {
+                    upload_id,
+                    received_bytes,
+                })
+            }
+            AdminCommand::DeployUploadFinish { upload_id } => self.finish_upload(&upload_id),
+            AdminCommand::DeployStart {
+                request: mut deployment,
+            } => {
+                deployment.source = DeploymentSource::cli();
+                deployment.deployment_id = None;
+                self.start_deploy(deployment)
+            }
             AdminCommand::MapDomain { app, domain } => self.mutate(
                 role,
                 peer,
@@ -350,10 +411,10 @@ impl StateAdminHandler {
                 })
             }
             AdminCommand::ListDeployJobs { cursor, limit } => {
-                let github = self.github_manager()?;
-                let jobs = github
-                    .list_jobs(limit, cursor.as_deref())
-                    .map_err(github_fault)?;
+                let state = self.open_state()?;
+                let jobs = state
+                    .deploy_jobs(limit, cursor.as_deref())
+                    .map_err(map_state_query_error)?;
                 let next_cursor = (jobs.len() == usize::from(limit))
                     .then(|| jobs.last().map(|job| job.id.clone()))
                     .flatten();
@@ -363,10 +424,14 @@ impl StateAdminHandler {
                 })
             }
             AdminCommand::RetryDeployJob { job_id } => {
-                let github = self.github_manager()?;
                 let audit = self.request_audit(role, peer, request, "retry_deploy_job")?;
-                let job = github.retry_job(&job_id, &audit).map_err(github_fault)?;
-                Ok(AdminData::DeployJobRetried { job: job_view(job) })
+                let mut state = self.open_state()?;
+                let job = state
+                    .retry_deploy_job_with_audit(&job_id, &audit)
+                    .map_err(map_state_query_error)?;
+                Ok(AdminData::DeployJobRetried {
+                    job: Box::new(job_view(job)),
+                })
             }
             AdminCommand::ReadLog {
                 deployment,
@@ -391,6 +456,118 @@ impl StateAdminHandler {
                 })
             }
         }
+    }
+
+    fn finish_upload(&self, upload_id: &str) -> Result<AdminData, HandlerFault> {
+        if !valid_upload_id(upload_id) {
+            return Err(HandlerFault::validation("upload id is invalid"));
+        }
+        let job_id = format!("upload-{upload_id}");
+        let mut state = self.open_state()?;
+        if let Some(job) = state.deploy_job(&job_id).map_err(map_state_query_error)? {
+            return finished_upload_data(job);
+        }
+        let upload = self.uploads.finish(upload_id).map_err(upload_fault)?;
+
+        let request = DeployRequest {
+            source_dir: upload.archive_path.clone(),
+            app: upload.metadata.app,
+            domain: upload.metadata.domain,
+            engine_version: upload.metadata.engine_version,
+            entry: upload.metadata.entry,
+            artifact_root: None,
+            upstream: None,
+            deployment_id: None,
+            source: DeploymentSource::upload(),
+        };
+        let target = resolve_deploy_request(&state, request).map_err(deploy_fault)?;
+        let deployment_id = new_deployment_id();
+        let deployment = DeploymentInput {
+            id: deployment_id.clone(),
+            app: target.app.clone(),
+            source_hash: upload.digest.clone(),
+            engine_version: target.engine_version.clone(),
+            source: DeploymentSource::upload(),
+        };
+        let job = DeployJobSpec {
+            id: job_id.clone(),
+            key: upload_id.to_owned(),
+            source: DeployJobSource::Upload,
+            source_path: upload.archive_path,
+            source_ref: upload.digest,
+            app: target.app,
+            domain: target.domain,
+            engine_version: target.engine_version,
+            entry: target.entry,
+            artifact_root: target.artifact_root,
+            upstream: target.upstream,
+            branch: None,
+            commit: None,
+            installation_id: None,
+            repository_id: None,
+            owner: None,
+            name: None,
+            environment: None,
+            kind: None,
+            pull_request: None,
+        };
+        state
+            .enqueue_preassigned_deployment(&deployment, &job)
+            .map_err(map_state_query_error)?;
+        let job = state
+            .deploy_job(&job_id)
+            .map_err(map_state_query_error)?
+            .ok_or_else(|| HandlerFault::internal("queued upload job disappeared"))?;
+        finished_upload_data(job)
+    }
+
+    fn start_deploy(&self, request: DeployRequest) -> Result<AdminData, HandlerFault> {
+        let mut state = self.open_state()?;
+        let mut target = resolve_deploy_request(&state, request).map_err(deploy_fault)?;
+        target.source_dir = canonical_source_root(&target.source_dir).map_err(deploy_fault)?;
+        let deployment_id = new_deployment_id();
+        let job_id = new_deployment_id();
+        let mut hasher = Sha256::new();
+        hasher.update(target.source_dir.as_os_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(job_id.as_bytes());
+        let source_ref = format!("{:x}", hasher.finalize());
+        let deployment = DeploymentInput {
+            id: deployment_id.clone(),
+            app: target.app.clone(),
+            source_hash: source_ref.clone(),
+            engine_version: target.engine_version.clone(),
+            source: DeploymentSource::cli(),
+        };
+        let job = DeployJobSpec {
+            id: job_id.clone(),
+            key: target.app.clone(),
+            source: DeployJobSource::Cli,
+            source_path: target.source_dir,
+            source_ref,
+            app: target.app,
+            domain: target.domain,
+            engine_version: target.engine_version,
+            entry: target.entry,
+            artifact_root: target.artifact_root,
+            upstream: target.upstream,
+            branch: None,
+            commit: None,
+            installation_id: None,
+            repository_id: None,
+            owner: None,
+            name: None,
+            environment: None,
+            kind: None,
+            pull_request: None,
+        };
+        state
+            .enqueue_preassigned_deployment(&deployment, &job)
+            .map_err(map_state_query_error)?;
+        Ok(AdminData::DeployStarted {
+            deployment_id,
+            job_id,
+        })
     }
 
     fn status(&self) -> Result<AdminData, HandlerFault> {
@@ -560,6 +737,48 @@ impl StateAdminHandler {
     }
 }
 
+fn valid_upload_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn finished_upload_data(job: DeployJob) -> Result<AdminData, HandlerFault> {
+    let deployment_id = job
+        .deployment_id
+        .ok_or_else(|| HandlerFault::internal("upload job has no local deployment id"))?;
+    Ok(AdminData::DeployUploadFinished {
+        deployment_id,
+        job_id: job.id,
+    })
+}
+
+fn deploy_fault(error: DeployError) -> HandlerFault {
+    match error {
+        DeployError::InvalidInput(message) => HandlerFault::validation(message),
+        DeployError::State(StateError::InvalidRecord { detail, .. }) => {
+            HandlerFault::validation(detail)
+        }
+        error => HandlerFault::internal(error),
+    }
+}
+
+fn upload_fault(error: UploadError) -> HandlerFault {
+    match error {
+        UploadError::InvalidInput(message) => HandlerFault::validation(message),
+        UploadError::NotFound => HandlerFault::not_found("upload session does not exist"),
+        error @ (UploadError::Capacity | UploadError::OutOfOrder { .. }) => HandlerFault {
+            code: AdminErrorCode::Conflict,
+            message: error.to_string(),
+        },
+        error @ (UploadError::Overflow | UploadError::Incomplete { .. }) => {
+            HandlerFault::validation(error.to_string())
+        }
+        error @ UploadError::Io(_) => HandlerFault::internal(error),
+    }
+}
+
 fn admin_error_name(code: AdminErrorCode) -> &'static str {
     match code {
         AdminErrorCode::InvalidRequest => "invalid_request",
@@ -596,35 +815,41 @@ fn app_page_start(apps: &[LoadedApp], cursor: Option<&str>) -> Result<usize, Han
         .map(|position| position + 1)
         .ok_or_else(|| HandlerFault::not_found("app cursor does not exist"))
 }
-fn job_view(job: GitHubDeployJob) -> GitHubJobView {
+fn job_view(job: DeployJob) -> GitHubJobView {
     GitHubJobView {
         id: bounded_text(job.id, 128),
         key: bounded_text(job.key, 128),
+        source: job.source,
+        source_ref: bounded_text(job.source_ref, 128),
+        app: bounded_text(job.app, 128),
         installation_id: job.installation_id,
         repository_id: job.repository_id,
-        owner: bounded_text(job.owner, 128),
-        name: bounded_text(job.name, 128),
-        environment: bounded_text(job.environment, 128),
-        kind: match job.kind {
-            GitHubJobKind::Production => "production",
-            GitHubJobKind::Preview => "preview",
-        }
-        .into(),
+        owner: job.owner.map(|value| bounded_text(value, 128)),
+        name: job.name.map(|value| bounded_text(value, 128)),
+        environment: job.environment.map(|value| bounded_text(value, 128)),
+        kind: job.kind.map(|kind| {
+            match kind {
+                GitHubJobKind::Production => "production",
+                GitHubJobKind::Preview => "preview",
+            }
+            .into()
+        }),
         pull_request: job.pull_request,
-        sha: bounded_text(job.sha, 128),
+        sha: job.commit.map(|value| bounded_text(value, 128)),
         status: match job.status {
-            GitHubDeployJobStatus::Queued => "queued",
-            GitHubDeployJobStatus::Running => "running",
-            GitHubDeployJobStatus::Succeeded => "succeeded",
-            GitHubDeployJobStatus::Failed => "failed",
-            GitHubDeployJobStatus::Retry => "retry",
-            GitHubDeployJobStatus::Cancelled => "cancelled",
+            DeployJobStatus::Queued => "queued",
+            DeployJobStatus::Running => "running",
+            DeployJobStatus::Succeeded => "succeeded",
+            DeployJobStatus::Failed => "failed",
+            DeployJobStatus::Retry => "retry",
+            DeployJobStatus::Cancelled => "cancelled",
         }
         .into(),
         attempts: job.attempts,
         next_attempt_at: bounded_text(job.next_attempt_at, 64),
         error: job.error.as_deref().map(redact_public_error),
         check_run_id: job.check_run_id,
+        github_deployment_id: job.github_deployment_id,
         deployment_id: job.deployment_id,
         created_at: bounded_text(job.created_at, 64),
         updated_at: bounded_text(job.updated_at, 64),
@@ -834,8 +1059,8 @@ impl HandlerFault {
 mod tests {
     use super::*;
     use crate::state::{AppConfig, NodeConfig};
-    use std::fs;
     use std::net::SocketAddr;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct UnusedMutations;
@@ -886,6 +1111,172 @@ mod tests {
             actor: None,
             command,
         }
+    }
+
+    fn state_with_engine(label: &str) -> (PathBuf, PathBuf) {
+        let root = state_path().with_extension(label);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.db");
+        let engine_root = root.join("engine");
+        fs::create_dir_all(engine_root.join("bin")).unwrap();
+        let executable = engine_root.join("bin/bun");
+        fs::write(&executable, b"bun").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut state = State::open(&path).unwrap();
+        state
+            .register_engine(&crate::state::EngineRecord {
+                version: "bun".into(),
+                host_root: fs::canonicalize(&engine_root).unwrap(),
+                cage_executable: "/bin/bun".into(),
+                sha256: format!("{:x}", Sha256::digest(b"bun")),
+                is_default: true,
+            })
+            .unwrap();
+        (root, path)
+    }
+
+    #[test]
+    fn upload_handler_appends_implicitly_and_finish_is_deduplicated() {
+        let (root, path) = state_with_engine("upload-dedupe");
+        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations());
+        let response = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::DeployUploadBegin {
+                app: "hello".into(),
+                domain: Some("hello.example".into()),
+                engine_version: None,
+                entry: None,
+                total_bytes: 4,
+            }),
+        );
+        let AdminResponse::Ok { data, .. } = response else {
+            panic!("unexpected begin response");
+        };
+        let AdminData::DeployUploadBegun { upload_id } = *data else {
+            panic!("unexpected begin data");
+        };
+
+        let chunk = |bytes: &[u8]| {
+            let response = handler.handle(
+                AdminRole::TenantZero,
+                AdminPeerCredentials::default(),
+                request(AdminCommand::DeployUploadChunk {
+                    upload_id: upload_id.clone(),
+                    chunk_base64: BASE64_STANDARD.encode(bytes),
+                }),
+            );
+            let AdminResponse::Ok { data, .. } = response else {
+                panic!("unexpected chunk response");
+            };
+            let AdminData::DeployUploadChunked { received_bytes, .. } = *data else {
+                panic!("unexpected chunk data");
+            };
+            received_bytes
+        };
+        assert_eq!(chunk(b"ab"), 2);
+        assert_eq!(chunk(b"cd"), 4);
+
+        let finish = || {
+            let response = handler.handle(
+                AdminRole::TenantZero,
+                AdminPeerCredentials::default(),
+                request(AdminCommand::DeployUploadFinish {
+                    upload_id: upload_id.clone(),
+                }),
+            );
+            let AdminResponse::Ok { data, .. } = response else {
+                panic!("unexpected finish response");
+            };
+            let AdminData::DeployUploadFinished {
+                deployment_id,
+                job_id,
+            } = *data
+            else {
+                panic!("unexpected finish data");
+            };
+            (deployment_id, job_id)
+        };
+        let first = finish();
+        let second = finish();
+        assert_eq!(first, second);
+
+        let state = State::open(&path).unwrap();
+        assert_eq!(state.deploy_jobs(10, None).unwrap().len(), 1);
+        assert_eq!(state.deployments(None, None, 10).unwrap().len(), 1);
+        let job = state.deploy_job(&first.1).unwrap().unwrap();
+        assert_eq!(job.deployment_id.as_deref(), Some(first.0.as_str()));
+        assert_eq!(job.status, DeployJobStatus::Queued);
+        assert_eq!(job.source, DeployJobSource::Upload);
+        drop(state);
+        let listed = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::ListDeployJobs {
+                cursor: None,
+                limit: 10,
+            }),
+        );
+        let AdminResponse::Ok { data, .. } = listed else {
+            panic!("unexpected list response");
+        };
+        let AdminData::DeployJobs { jobs, .. } = *data else {
+            panic!("unexpected list data");
+        };
+        assert_eq!(jobs[0].source, DeployJobSource::Upload);
+        assert_eq!(jobs[0].deployment_id.as_deref(), Some(first.0.as_str()));
+        assert!(jobs[0].installation_id.is_none());
+        assert!(jobs[0].github_deployment_id.is_none());
+        drop(handler);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deploy_start_precreates_cli_deployment_and_queued_job() {
+        let (root, path) = state_with_engine("deploy-start");
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("index.ts"), b"export default 1").unwrap();
+        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations());
+        let response = handler.handle(
+            AdminRole::Host,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::DeployStart {
+                request: DeployRequest {
+                    source_dir: source.clone(),
+                    app: "hello".into(),
+                    domain: Some("hello.example".into()),
+                    engine_version: None,
+                    entry: None,
+                    artifact_root: None,
+                    upstream: None,
+                    deployment_id: None,
+                    source: DeploymentSource::upload(),
+                },
+            }),
+        );
+        let AdminResponse::Ok { data, .. } = response else {
+            panic!("unexpected start response");
+        };
+        let AdminData::DeployStarted {
+            deployment_id,
+            job_id,
+        } = *data
+        else {
+            panic!("unexpected start data");
+        };
+        let state = State::open(&path).unwrap();
+        let deployment = state.deployment(&deployment_id).unwrap().unwrap();
+        let job = state.deploy_job(&job_id).unwrap().unwrap();
+        assert_eq!(deployment.source, DeploymentSource::cli());
+        assert_eq!(deployment.status, DeploymentStatus::Building);
+        assert_eq!(job.source, DeployJobSource::Cli);
+        assert_eq!(job.status, DeployJobStatus::Queued);
+        assert_eq!(job.deployment_id.as_deref(), Some(deployment_id.as_str()));
+        assert_eq!(job.source_path, fs::canonicalize(source).unwrap());
+        drop(state);
+        drop(handler);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
