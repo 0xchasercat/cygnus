@@ -371,6 +371,10 @@ impl Frontend {
             }
         };
         if let Err(error) = self.supervisor.acquire(&route.app) {
+            eprintln!(
+                "cygnus-daemon: app {app:?} is unavailable: {error:?}",
+                app = route.app
+            );
             reject(
                 &mut client,
                 &mut span,
@@ -468,6 +472,10 @@ impl Frontend {
             }
         };
         if let Err(error) = self.supervisor.acquire(&route.app) {
+            eprintln!(
+                "cygnus-daemon: app {app:?} is unavailable: {error:?}",
+                app = route.app
+            );
             reject(
                 &mut client,
                 &mut span,
