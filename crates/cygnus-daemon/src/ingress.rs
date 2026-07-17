@@ -539,6 +539,7 @@ impl Drop for RequestSpan {
             protocol: self.protocol.to_owned(),
             bytes_in: self.bytes_from_client,
             bytes_out: self.bytes_to_client,
+            outcome: self.outcome.to_owned(),
         });
 
         let event = self.event();
@@ -666,6 +667,7 @@ mod tests {
         assert!(request.cold);
         assert_eq!(request.bytes_in, 74);
         assert_eq!(request.bytes_out, 20);
+        assert_eq!(request.outcome, "proxied");
     }
 
     #[test]

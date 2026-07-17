@@ -46,6 +46,8 @@ pub struct RequestRecord {
     pub protocol: String,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    #[serde(skip)]
+    pub(crate) outcome: String,
 }
 
 /// One operator-visible lifecycle or security event.
@@ -544,6 +546,7 @@ mod tests {
             protocol: "http/1.1".into(),
             bytes_in: 10,
             bytes_out: 20,
+            outcome: "proxied".into(),
         }
     }
 

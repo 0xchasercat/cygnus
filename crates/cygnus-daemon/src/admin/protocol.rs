@@ -628,6 +628,7 @@ mod tests {
                 protocol: "http/1.1".into(),
                 bytes_in: 2,
                 bytes_out: 3,
+                outcome: "proxied".into(),
             }],
         })
         .unwrap();
