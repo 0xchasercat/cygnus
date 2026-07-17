@@ -29,7 +29,7 @@ export async function api(path, options = {}) {
     let message = err?.message || `Request failed (${status})`;
     // Surface the rate-limit wait so the login screen can quote it.
     if (status === 429 && retryAfter && /^\d+$/.test(retryAfter)) {
-      message = `too many attempts — retry in ${retryAfter}s`;
+      message = `Too many attempts — retry in ${retryAfter}s`;
     }
     throw new ApiError(message, status, err?.code);
   }

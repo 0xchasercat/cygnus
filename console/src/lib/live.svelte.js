@@ -42,7 +42,14 @@ class Store {
     if (this.#booted) return;
     this.#booted = true;
     try {
-      const health = await api('/healthz');
+      // /healthz is unwrapped — a flat {ok, service, mode, ...} object, NOT the
+      // {ok, data} envelope the /api/v1/* routes use — so fetch it raw rather
+      // than through api() (which would return envelope.data === undefined).
+      const response = await fetch('/healthz', {
+        headers: { accept: 'application/json' },
+        credentials: 'same-origin',
+      });
+      const health = await response.json();
       if (health?.mode !== 'live') {
         this.seedPreview();
         return;
