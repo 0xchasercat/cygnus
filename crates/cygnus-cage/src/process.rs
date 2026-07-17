@@ -6,6 +6,7 @@
 //! specification are validated but not enforced. The Linux backend is where
 //! the isolation lives.
 
+use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -34,6 +35,15 @@ impl Cage {
     /// Boot the target as an unisolated child process.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
         Self::boot_inner(spec, None, None)
+    }
+
+    /// Boot the target with its standard output and standard error connected
+    /// to caller-opened files.
+    ///
+    /// The cage takes ownership of both files. It does not open, create, or
+    /// otherwise interpret paths for process output.
+    pub fn boot_with_output(spec: CageSpec, stdout: File, stderr: File) -> Result<Self, CageError> {
+        Self::boot_inner(spec, Some(stdout.into()), Some(stderr.into()))
     }
 
     /// Boot the target with its standard streams connected to the supplied
@@ -244,12 +254,52 @@ fn retry_socket_error(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs::{self, OpenOptions};
     use std::thread;
 
     fn shell_spec(script: &str) -> CageSpec {
         let mut spec = CageSpec::new("portable-test", "/bin/sh");
         spec.args = vec![OsString::from("-c"), OsString::from(script)];
         spec
+    }
+
+    #[test]
+    fn boot_with_output_routes_the_child_streams_to_owned_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "cygnus-cage-output-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        fs::create_dir(&directory).expect("create output directory");
+        let stdout_path = directory.join("stdout");
+        let stderr_path = directory.join("stderr");
+        let stdout = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stdout_path)
+            .expect("open stdout");
+        let stderr = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stderr_path)
+            .expect("open stderr");
+
+        let mut cage = Cage::boot_with_output(
+            shell_spec("printf stdout; printf stderr >&2"),
+            stdout,
+            stderr,
+        )
+        .expect("boot cage with output");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cage.try_status().expect("poll output cage") == InstanceStatus::Running {
+            assert!(Instant::now() < deadline, "child did not exit");
+            thread::sleep(POLL_INTERVAL);
+        }
+        cage.teardown().expect("teardown output cage");
+
+        assert_eq!(fs::read(stdout_path).expect("read stdout"), b"stdout");
+        assert_eq!(fs::read(stderr_path).expect("read stderr"), b"stderr");
+        fs::remove_dir_all(directory).expect("remove output directory");
     }
 
     #[test]

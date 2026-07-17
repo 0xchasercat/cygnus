@@ -190,6 +190,7 @@ pub fn register_engine(
         host_root,
         cage_executable,
         sha256: sha256_file(&executable)?,
+        is_default: false,
     };
     Ok(state.register_engine(&record)?)
 }
@@ -199,6 +200,7 @@ pub fn register_engine_with_audit(
     version: impl Into<String>,
     host_root: impl AsRef<Path>,
     cage_executable: impl AsRef<Path>,
+    is_default: bool,
     audit: &AuditContext,
 ) -> Result<EngineRecord, DeployError> {
     let version = version.into();
@@ -227,6 +229,7 @@ pub fn register_engine_with_audit(
         host_root,
         cage_executable,
         sha256: sha256_file(&executable)?,
+        is_default,
     };
     Ok(state.register_engine_with_audit(&record, audit)?)
 }
@@ -1840,6 +1843,7 @@ mod tests {
             host_root: PathBuf::from("/engine"),
             cage_executable: PathBuf::from("/usr/local/bin/bun"),
             sha256: "0".repeat(64),
+            is_default: false,
         };
         let job = build_job(
             &engine,

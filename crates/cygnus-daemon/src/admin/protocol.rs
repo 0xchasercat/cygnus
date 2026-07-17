@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::deploy::DeployRequest;
+use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
 pub use crate::github::{
     GitHubInstallationRepositoryView, GitHubManifestMetadata, GitHubRepositoryInput,
     GitHubRepositoryView,
@@ -28,6 +29,23 @@ pub struct AdminRequest {
 pub enum AdminCommand {
     Health,
     Status,
+    GetMetrics,
+    ListRequests {
+        #[serde(default = "default_metrics_list_limit")]
+        limit: u16,
+    },
+    ListEvents {
+        #[serde(default = "default_metrics_list_limit")]
+        limit: u16,
+    },
+    ReadAppLog {
+        app: String,
+        stream: LogStream,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default = "default_log_limit")]
+        limit: u32,
+    },
     ListApps {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
@@ -53,6 +71,8 @@ pub enum AdminCommand {
         version: String,
         host_root: std::path::PathBuf,
         cage_executable: std::path::PathBuf,
+        #[serde(default, rename = "default")]
+        is_default: bool,
     },
     Deploy {
         request: DeployRequest,
@@ -122,6 +142,10 @@ const fn default_list_limit() -> u16 {
     50
 }
 
+const fn default_metrics_list_limit() -> u16 {
+    100
+}
+
 const fn default_log_limit() -> u32 {
     16 * 1024
 }
@@ -134,15 +158,22 @@ pub enum LogStream {
 }
 
 impl LogStream {
-    pub fn filename(self) -> &'static str {
+    pub fn build_filename(self) -> &'static str {
         match self {
             Self::Stdout => "build.stdout.log",
             Self::Stderr => "build.stderr.log",
         }
     }
+
+    pub fn app_filename(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout.log",
+            Self::Stderr => "stderr.log",
+        }
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminResponse {
     Ok {
@@ -182,7 +213,7 @@ impl AdminResponse {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminData {
     Health {
@@ -191,6 +222,24 @@ pub enum AdminData {
     },
     Status {
         node: NodeView,
+    },
+    Metrics {
+        #[serde(flatten)]
+        metrics: MetricsSnapshot,
+    },
+    Requests {
+        requests: Vec<RequestRecord>,
+    },
+    Events {
+        events: Vec<EventRecord>,
+    },
+    AppLog {
+        app: String,
+        stream: LogStream,
+        offset: u64,
+        next_offset: u64,
+        eof: bool,
+        data_base64: String,
     },
     Apps {
         apps: Vec<AppView>,
@@ -287,6 +336,39 @@ pub struct NodeView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps_domain: Option<String>,
     pub app_count: usize,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub isolation: String,
+    pub warm_count: usize,
+    pub engines: Vec<EngineView>,
+    pub certificates: Vec<CertificateView>,
+    pub memory: MemoryView,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineView {
+    pub version: String,
+    pub sha256: String,
+    #[serde(rename = "default")]
+    pub is_default: bool,
+    pub apps: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificateView {
+    pub domain: String,
+    pub kind: String,
+    pub ok: bool,
+    pub expires_unix: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryView {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -510,6 +592,170 @@ mod tests {
         .unwrap();
         assert!(configured["repository"].get("artifact_root").is_none());
         assert!(configured["repository"].get("upstream").is_none());
+    }
+
+    #[test]
+    fn observability_data_uses_exact_flat_field_names() {
+        let metrics = serde_json::to_value(AdminData::Metrics {
+            metrics: MetricsSnapshot::default(),
+        })
+        .unwrap();
+        assert_eq!(metrics["kind"], "metrics");
+        assert!(metrics.get("metrics").is_none());
+        assert!(metrics.get("window_seconds").is_some());
+        assert!(metrics.get("totals").is_some());
+        assert!(metrics.get("series").is_some());
+        assert!(metrics.get("boot_phases").is_some());
+        assert!(metrics.get("apps").is_some());
+        assert_eq!(
+            serde_json::from_value::<AdminData>(metrics.clone()).unwrap(),
+            AdminData::Metrics {
+                metrics: MetricsSnapshot::default()
+            }
+        );
+
+        let requests = serde_json::to_value(AdminData::Requests {
+            requests: vec![RequestRecord {
+                time_ms: 1,
+                request_id: "req".into(),
+                method: "GET".into(),
+                host: "app.example".into(),
+                app: "app".into(),
+                path: "/".into(),
+                status: 200,
+                duration_ms: 1.5,
+                cold: false,
+                protocol: "http/1.1".into(),
+                bytes_in: 2,
+                bytes_out: 3,
+            }],
+        })
+        .unwrap();
+        assert_eq!(requests["kind"], "requests");
+        assert_eq!(
+            requests["requests"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "app",
+                "bytes_in",
+                "bytes_out",
+                "cold",
+                "duration_ms",
+                "host",
+                "method",
+                "path",
+                "protocol",
+                "request_id",
+                "status",
+                "time_ms",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+
+        let events = serde_json::to_value(AdminData::Events {
+            events: vec![EventRecord {
+                time_ms: 1,
+                r#type: "boot".into(),
+                app: Some("app".into()),
+                message: "ready".into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(events["kind"], "events");
+        assert!(events["events"][0].get("type").is_some());
+        assert!(events["events"][0].get("r#type").is_none());
+
+        let app_log = serde_json::to_value(AdminData::AppLog {
+            app: "api".into(),
+            stream: LogStream::Stdout,
+            offset: 2,
+            next_offset: 5,
+            eof: false,
+            data_base64: "Y2Rl".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            app_log
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "app",
+                "data_base64",
+                "eof",
+                "kind",
+                "next_offset",
+                "offset",
+                "stream",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+    }
+
+    #[test]
+    fn observability_command_defaults_and_engine_default_wire_name_are_stable() {
+        let parse = |command| {
+            serde_json::from_value::<AdminRequest>(serde_json::json!({
+                "version": 1,
+                "request_id": "0123456789abcdef0123456789abcdef",
+                "command": command,
+            }))
+            .unwrap()
+            .command
+        };
+        assert_eq!(
+            parse(serde_json::json!({"type": "list_requests"})),
+            AdminCommand::ListRequests { limit: 100 }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type": "list_events"})),
+            AdminCommand::ListEvents { limit: 100 }
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "type": "read_app_log",
+                "app": "api",
+                "stream": "stdout"
+            })),
+            AdminCommand::ReadAppLog {
+                app: "api".into(),
+                stream: LogStream::Stdout,
+                offset: 0,
+                limit: 16 * 1024,
+            }
+        );
+        let engine = parse(serde_json::json!({
+            "type": "register_engine",
+            "version": "1",
+            "host_root": "/engine",
+            "cage_executable": "/bin/bun"
+        }));
+        assert!(matches!(
+            engine,
+            AdminCommand::RegisterEngine {
+                is_default: false,
+                ..
+            }
+        ));
+        let encoded = serde_json::to_value(AdminCommand::RegisterEngine {
+            version: "1".into(),
+            host_root: "/engine".into(),
+            cage_executable: "/bin/bun".into(),
+            is_default: true,
+        })
+        .unwrap();
+        assert_eq!(encoded["default"], true);
+        assert!(encoded.get("is_default").is_none());
     }
 
     #[test]

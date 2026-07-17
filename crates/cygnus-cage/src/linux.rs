@@ -1,5 +1,5 @@
 use std::ffi::{CString, OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -58,6 +58,15 @@ impl Cage {
     /// an optional seccomp filter installed immediately before `execve`.
     pub fn boot(spec: CageSpec) -> Result<Self, CageError> {
         Self::boot_inner(spec, None, None)
+    }
+
+    /// Boot the target with its standard output and standard error connected
+    /// to caller-opened files.
+    ///
+    /// The cage takes ownership of both files. It does not open, create, or
+    /// otherwise interpret paths for process output.
+    pub fn boot_with_output(spec: CageSpec, stdout: File, stderr: File) -> Result<Self, CageError> {
+        Self::boot_inner(spec, Some((stdout.into(), stderr.into())), None)
     }
 
     pub(crate) fn boot_with_capture(
@@ -1148,6 +1157,56 @@ impl Drop for BootGuard {
 mod tests {
     use super::*;
     use crate::DomainEgressRule;
+    use nix::unistd::{ForkResult, fork};
+    use std::io::Read;
+
+    #[test]
+    fn redirects_standard_output_and_error_to_owned_descriptors() {
+        let (stdout_read, stdout_write) = pipe2(OFlag::O_CLOEXEC).expect("stdout pipe");
+        let (stderr_read, stderr_write) = pipe2(OFlag::O_CLOEXEC).expect("stderr pipe");
+
+        // SAFETY: the child performs only descriptor operations, writes fixed
+        // byte strings, and exits immediately without returning to the harness.
+        match unsafe { fork() }.expect("fork output probe") {
+            ForkResult::Child => {
+                drop(stdout_read);
+                drop(stderr_read);
+                // SAFETY: both descriptors are owned by this child and become
+                // its standard streams for the remainder of its short life.
+                let result = unsafe { redirect_output(stdout_write, stderr_write) };
+                if result.is_err() {
+                    unsafe { nix::libc::_exit(1) };
+                }
+                unsafe {
+                    nix::libc::write(nix::libc::STDOUT_FILENO, c"stdout".as_ptr().cast(), 6);
+                    nix::libc::write(nix::libc::STDERR_FILENO, c"stderr".as_ptr().cast(), 6);
+                    nix::libc::_exit(0);
+                }
+            }
+            ForkResult::Parent { child } => {
+                drop(stdout_write);
+                drop(stderr_write);
+                let status = waitpid(child, None).expect("reap output probe");
+                assert_eq!(status, WaitStatus::Exited(child, 0));
+
+                let mut stdout = Vec::new();
+                File::from(stdout_read)
+                    .read_to_end(&mut stdout)
+                    .expect("read stdout");
+                let mut stderr = Vec::new();
+                File::from(stderr_read)
+                    .read_to_end(&mut stderr)
+                    .expect("read stderr");
+                assert_eq!(stdout, b"stdout");
+                assert_eq!(stderr, b"stderr");
+            }
+        }
+    }
+
+    #[test]
+    fn public_output_boot_accepts_owned_files() {
+        let _: fn(CageSpec, File, File) -> Result<Cage, CageError> = Cage::boot_with_output;
+    }
 
     #[test]
     fn cgroup_path_is_confined_to_the_cygnus_subtree() {

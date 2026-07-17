@@ -51,6 +51,7 @@ pub const MAX_ADMIN_APP_BYTES: usize = 128;
 pub const MAX_ADMIN_DOMAIN_BYTES: usize = 253;
 pub const MAX_ADMIN_DEPLOYMENT_BYTES: usize = 128;
 pub const MAX_ADMIN_LIST_LIMIT: u16 = 50;
+pub const MAX_ADMIN_METRICS_LIST_LIMIT: u16 = 500;
 
 /// Prepare a daemon-owned admin socket path.
 ///
@@ -446,7 +447,22 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         validate_actor(actor)?;
     }
     match &request.command {
-        AdminCommand::Health | AdminCommand::Status => {}
+        AdminCommand::Health | AdminCommand::Status | AdminCommand::GetMetrics => {}
+        AdminCommand::ListRequests { limit } | AdminCommand::ListEvents { limit } => {
+            if !(1..=MAX_ADMIN_METRICS_LIST_LIMIT).contains(limit) {
+                return Err(format!(
+                    "metrics list limit must be between 1 and {MAX_ADMIN_METRICS_LIST_LIMIT}"
+                ));
+            }
+        }
+        AdminCommand::ReadAppLog { app, limit, .. } => {
+            validate_app_name(app)?;
+            if !(1..=MAX_LOG_CHUNK_BYTES).contains(limit) {
+                return Err(format!(
+                    "log limit must be between 1 and {MAX_LOG_CHUNK_BYTES}"
+                ));
+            }
+        }
         AdminCommand::ListApps { cursor, limit } => {
             if let Some(cursor) = cursor.as_deref() {
                 validate_text(cursor, MAX_ADMIN_DEPLOYMENT_BYTES, "cursor")?;
@@ -471,6 +487,7 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             version,
             host_root,
             cage_executable,
+            ..
         } => {
             validate_text(version, MAX_ADMIN_APP_BYTES, "engine version")?;
             validate_path(host_root, MAX_ADMIN_DEPLOYMENT_BYTES, "engine host root")?;
@@ -628,6 +645,23 @@ fn validate_actor(actor: &str) -> Result<(), String> {
         })
     {
         return Err("actor contains unsupported characters".into());
+    }
+    Ok(())
+}
+
+fn validate_app_name(app: &str) -> Result<(), String> {
+    if app.is_empty() || app.len() > MAX_ADMIN_APP_BYTES {
+        return Err(format!(
+            "app name must be between 1 and {MAX_ADMIN_APP_BYTES} bytes"
+        ));
+    }
+    let mut bytes = app.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("app name contains unsupported characters".into());
     }
     Ok(())
 }
@@ -909,6 +943,48 @@ mod tests {
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.actor = Some("bad actor".into());
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
+    }
+
+    #[test]
+    fn observability_commands_validate_bounds_and_allow_both_roles() {
+        for command in [
+            AdminCommand::GetMetrics,
+            AdminCommand::ListRequests { limit: 500 },
+            AdminCommand::ListEvents { limit: 500 },
+            AdminCommand::ReadAppLog {
+                app: "api-1_test.example".into(),
+                stream: super::super::protocol::LogStream::Stdout,
+                offset: 0,
+                limit: MAX_LOG_CHUNK_BYTES,
+            },
+        ] {
+            let mut request = request();
+            request.command = command;
+            assert!(authorize_actor(AdminRole::Host, &request).is_ok());
+            assert!(validate_request(&request).is_ok());
+            request.actor = Some("tenant:operator".into());
+            assert!(authorize_actor(AdminRole::TenantZero, &request).is_ok());
+        }
+
+        let mut invalid = request();
+        invalid.command = AdminCommand::ListRequests { limit: 501 };
+        assert!(validate_request(&invalid).is_err());
+        invalid.command = AdminCommand::ListEvents { limit: 0 };
+        assert!(validate_request(&invalid).is_err());
+        invalid.command = AdminCommand::ReadAppLog {
+            app: "../escape".into(),
+            stream: super::super::protocol::LogStream::Stderr,
+            offset: 0,
+            limit: 1,
+        };
+        assert!(validate_request(&invalid).is_err());
+        invalid.command = AdminCommand::ReadAppLog {
+            app: "api".into(),
+            stream: super::super::protocol::LogStream::Stderr,
+            offset: 0,
+            limit: MAX_LOG_CHUNK_BYTES + 1,
+        };
+        assert!(validate_request(&invalid).is_err());
     }
 
     #[test]
