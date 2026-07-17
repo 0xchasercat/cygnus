@@ -26,8 +26,9 @@ use thiserror::Error;
 
 use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare};
 use crate::state::{
-    AuditContext, GitHubAppRecord, GitHubAppSecrets, GitHubDelivery, GitHubDeployJob,
-    GitHubDeployJobStatus, GitHubJobKind, GitHubJobSpec, GitHubRepositoryConfig, State, StateError,
+    AuditContext, DeployJobSource, DeployJobSpec, GitHubAppRecord, GitHubAppSecrets,
+    GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, GitHubRepositoryConfig,
+    State, StateError,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -872,7 +873,7 @@ impl GitHubManager {
                     }
                 }
             }
-            let accepted = state.accept_github_delivery(
+            let accepted = state.accept_github_delivery_jobs(
                 &GitHubDelivery {
                     delivery_id: session.delivery_id.clone(),
                     event: session.event.clone(),
@@ -1009,7 +1010,7 @@ fn derive_event_jobs(
     event: &str,
     action: Option<&str>,
     value: &Value,
-) -> Result<Vec<GitHubJobSpec>, GitHubError> {
+) -> Result<Vec<DeployJobSpec>, GitHubError> {
     match event {
         "push" => derive_push_job(state, value),
         "pull_request" => derive_pull_request_job(state, action, value),
@@ -1019,7 +1020,7 @@ fn derive_event_jobs(
     }
 }
 
-fn derive_push_job(state: &State, value: &Value) -> Result<Vec<GitHubJobSpec>, GitHubError> {
+fn derive_push_job(state: &State, value: &Value) -> Result<Vec<DeployJobSpec>, GitHubError> {
     if value
         .get("deleted")
         .and_then(Value::as_bool)
@@ -1058,17 +1059,27 @@ fn derive_push_job(state: &State, value: &Value) -> Result<Vec<GitHubJobSpec>, G
         .and_then(|o| o.get("login"))
         .and_then(Value::as_str)
         .unwrap_or(&config.owner);
-    Ok(vec![GitHubJobSpec {
+    Ok(vec![DeployJobSpec {
         id: job_id("production", installation_id, repository_id, None, sha),
         key: format!("{installation_id}:{repository_id}:production"),
-        installation_id,
-        repository_id,
-        owner: owner.to_owned(),
-        name: config.name,
-        environment: "production".into(),
-        kind: GitHubJobKind::Production,
+        source: DeployJobSource::GitHub,
+        source_path: PathBuf::from(format!("{owner}/{}", config.name)),
+        source_ref: sha.to_owned(),
+        app: config.app,
+        domain: config.domain,
+        engine_version: config.engine_version,
+        entry: config.entry,
+        artifact_root: config.artifact_root,
+        upstream: config.upstream,
+        branch: Some(config.branch),
+        commit: Some(sha.to_owned()),
+        installation_id: Some(installation_id),
+        repository_id: Some(repository_id),
+        owner: Some(owner.to_owned()),
+        name: Some(config.name),
+        environment: Some("production".into()),
+        kind: Some(GitHubJobKind::Production),
         pull_request: None,
-        sha: sha.to_owned(),
     }])
 }
 
@@ -1076,7 +1087,7 @@ fn derive_pull_request_job(
     state: &State,
     action: Option<&str>,
     value: &Value,
-) -> Result<Vec<GitHubJobSpec>, GitHubError> {
+) -> Result<Vec<DeployJobSpec>, GitHubError> {
     let Some(action) = action else {
         return Ok(Vec::new());
     };
@@ -1120,17 +1131,27 @@ fn derive_pull_request_job(
     if head_repo_id != repository_id || base_ref != config.branch {
         return Ok(Vec::new());
     }
-    Ok(vec![GitHubJobSpec {
+    Ok(vec![DeployJobSpec {
         id: job_id("preview", installation_id, repository_id, Some(number), sha),
         key: format!("{installation_id}:{repository_id}:pr:{number}"),
-        installation_id,
-        repository_id,
-        owner: config.owner,
-        name: config.name,
-        environment: format!("pr-{number}"),
-        kind: GitHubJobKind::Preview,
+        source: DeployJobSource::GitHub,
+        source_path: PathBuf::from(format!("{}/{}", config.owner, config.name)),
+        source_ref: sha.to_owned(),
+        app: config.app,
+        domain: config.domain,
+        engine_version: config.engine_version,
+        entry: config.entry,
+        artifact_root: config.artifact_root,
+        upstream: config.upstream,
+        branch: Some(config.branch),
+        commit: Some(sha.to_owned()),
+        installation_id: Some(installation_id),
+        repository_id: Some(repository_id),
+        owner: Some(config.owner),
+        name: Some(config.name),
+        environment: Some(format!("pr-{number}")),
+        kind: Some(GitHubJobKind::Preview),
         pull_request: Some(number),
-        sha: sha.to_owned(),
     }])
 }
 
@@ -1169,7 +1190,20 @@ fn http_status(operation: &str, status: u16, _body: &[u8]) -> GitHubError {
 }
 
 /// Extract a GitHub tarball without allowing traversal, links, or device nodes.
-pub fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(), GitHubError> {
+pub(crate) fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(), GitHubError> {
+    safe_extract_archive_reader(bytes, destination)
+}
+
+/// Reader-friendly archive entry point shared by GitHub, upload, and CLI ingestion.
+pub(crate) fn safe_extract_archive_reader<R: Read>(
+    mut reader: R,
+    destination: &Path,
+) -> Result<(), GitHubError> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_ARCHIVE_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_ARCHIVE_BODY_BYTES {
         return Err(GitHubError::UnsafeArchive(
             "archive body exceeds 256 MiB".into(),
@@ -1177,9 +1211,9 @@ pub fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(), GitH
     }
     fs::create_dir_all(destination)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
-        extract_tar(GzDecoder::new(bytes), destination)
+        extract_tar(GzDecoder::new(bytes.as_slice()), destination)
     } else {
-        extract_tar(bytes, destination)
+        extract_tar(bytes.as_slice(), destination)
     }
 }
 
@@ -1620,10 +1654,13 @@ impl GitHubWorker {
         let result = (|| {
             safe_extract_archive(&response.body, &workspace)?;
             let audit = worker_audit(job);
-            self.executor
+            let deployment_id = self
+                .executor
                 .deploy(state, job, &config, &workspace, &audit)
                 .map(|result| result.deployment_id)
-                .map_err(|error| GitHubError::Deploy(error.to_string()))
+                .map_err(|error| GitHubError::Deploy(error.to_string()))?;
+            state.attach_deployment_id(&job.id, &deployment_id)?;
+            Ok(deployment_id)
         })();
         let _ = fs::remove_dir_all(&workspace);
         result
