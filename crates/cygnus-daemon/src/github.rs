@@ -26,9 +26,9 @@ use thiserror::Error;
 
 use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare};
 use crate::state::{
-    AuditContext, DeployJobSource, DeployJobSpec, GitHubAppRecord, GitHubAppSecrets,
-    GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, GitHubRepositoryConfig,
-    State, StateError,
+    AuditContext, DeployJobSource, DeployJobSpec, DeploymentSource, GitHubAppRecord,
+    GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind,
+    GitHubRepositoryConfig, State, StateError,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -122,9 +122,12 @@ pub struct GitHubRepositoryInput {
     pub name: String,
     pub branch: String,
     pub app: String,
-    pub domain: String,
-    pub engine_version: String,
-    pub entry: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -167,26 +170,6 @@ pub struct GitHubInstallationRepositoryView {
     pub full_name: String,
     pub default_branch: String,
     pub private: bool,
-}
-
-impl From<GitHubRepositoryInput> for GitHubRepositoryConfig {
-    fn from(value: GitHubRepositoryInput) -> Self {
-        let state_root = Path::new("/var/lib/cygnus");
-        let app = value.app.clone();
-        Self {
-            installation_id: value.installation_id,
-            repository_id: value.repository_id,
-            owner: value.owner,
-            name: value.name,
-            branch: value.branch,
-            app,
-            domain: value.domain,
-            engine_version: value.engine_version,
-            entry: value.entry,
-            artifact_root: state_root.join("github-artifacts").join(&value.app),
-            upstream: state_root.join("github-upstreams").join(&value.app),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -436,8 +419,10 @@ impl GitHubManager {
                 "app name is not a safe path component".into(),
             ));
         }
-        if input.entry.is_absolute()
-            || input.entry.components().any(|component| {
+        let mut state = State::open(&self.state_path)?;
+        let entry = input.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
+        if entry.is_absolute()
+            || entry.components().any(|component| {
                 matches!(
                     component,
                     Component::ParentDir | Component::RootDir | Component::Prefix(_)
@@ -448,11 +433,29 @@ impl GitHubManager {
                 "entry must be a relative path inside the repository".into(),
             ));
         }
-        let state_root = self
-            .state_path
-            .parent()
-            .unwrap_or_else(|| Path::new("/var/lib/cygnus"));
         let app = input.app.clone();
+        let domain = match input.domain {
+            Some(domain) if !domain.trim().is_empty() => domain,
+            _ => {
+                let apps_domain = state.load()?.edge.apps_domain.ok_or_else(|| {
+                    GitHubError::InvalidInput(
+                        "domain was omitted and edge.apps_domain is not configured".into(),
+                    )
+                })?;
+                format!("{app}.{apps_domain}")
+            }
+        };
+        let engine_version = match input.engine_version {
+            Some(version) if !version.trim().is_empty() => version,
+            _ => state
+                .default_engine()?
+                .map(|engine| engine.version)
+                .ok_or_else(|| {
+                    GitHubError::InvalidInput(
+                        "engine_version was omitted and no default engine is registered".into(),
+                    )
+                })?,
+        };
         let config = GitHubRepositoryConfig {
             installation_id: input.installation_id,
             repository_id: input.repository_id,
@@ -460,13 +463,12 @@ impl GitHubManager {
             name: input.name,
             branch: input.branch,
             app: app.clone(),
-            domain: input.domain,
-            engine_version: input.engine_version,
-            entry: input.entry,
-            artifact_root: state_root.join("github-artifacts").join(&app),
-            upstream: state_root.join("github-upstreams").join(&app),
+            domain,
+            engine_version,
+            entry,
+            artifact_root: state.deployment_artifact_root(&app),
+            upstream: state.deployment_upstream(&app),
         };
-        let mut state = State::open(&self.state_path)?;
         state.configure_github_repository_with_audit(&config, audit)?;
         Ok(config.into())
     }
@@ -1330,7 +1332,7 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
     fn deploy(
         &self,
         state: &mut State,
-        _job: &GitHubDeployJob,
+        job: &GitHubDeployJob,
         config: &GitHubRepositoryConfig,
         source: &Path,
         audit: &AuditContext,
@@ -1345,7 +1347,11 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
                 &config.entry,
                 &config.artifact_root,
                 &config.upstream,
-            ),
+            )
+            .with_source(DeploymentSource::github(
+                Some(config.branch.clone()),
+                Some(job.sha.clone()),
+            )),
             audit,
             |_| Ok(crate::deploy::ActivationPreparation::new(|| {})),
         )
@@ -1640,13 +1646,7 @@ impl GitHubWorker {
                 &response.body,
             ));
         }
-        let workspace = self
-            .manager
-            .state_path
-            .parent()
-            .unwrap_or_else(|| Path::new("/var/lib/cygnus"))
-            .join("github-work")
-            .join(&job.id);
+        let workspace = state.state_root().join("github-work").join(&job.id);
         if workspace.exists() {
             fs::remove_dir_all(&workspace)?;
         }

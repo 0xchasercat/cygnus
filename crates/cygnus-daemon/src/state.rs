@@ -30,7 +30,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const SHA256_HEX_LEN: usize = 64;
 const NODE_KEY_LEN: usize = 32;
@@ -73,6 +73,48 @@ pub struct EngineStatus {
     pub app_count: u32,
 }
 
+/// The system that supplied a deployment.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentSourceKind {
+    GitHub,
+    Upload,
+    #[default]
+    Cli,
+}
+
+/// Typed deployment provenance persisted with every deployment.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentSource {
+    pub kind: DeploymentSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl DeploymentSource {
+    pub fn cli() -> Self {
+        Self::default()
+    }
+
+    pub fn upload() -> Self {
+        Self {
+            kind: DeploymentSourceKind::Upload,
+            ..Self::default()
+        }
+    }
+
+    pub fn github(branch: Option<String>, commit: Option<String>) -> Self {
+        Self {
+            kind: DeploymentSourceKind::GitHub,
+            branch,
+            commit,
+        }
+    }
+}
+
 /// A deployment identity accepted from the caller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeploymentInput {
@@ -80,6 +122,8 @@ pub struct DeploymentInput {
     pub app: String,
     pub source_hash: String,
     pub engine_version: String,
+    #[serde(default)]
+    pub source: DeploymentSource,
 }
 
 /// Build output submitted when sealing a deployment.
@@ -111,10 +155,12 @@ pub struct DeploymentRecord {
     pub app: String,
     pub source_hash: String,
     pub engine_version: String,
+    pub source: DeploymentSource,
     pub artifact_hash: Option<String>,
     pub status: DeploymentStatus,
     pub error: Option<String>,
     pub created_at: String,
+    pub created_ms: i64,
     pub updated_at: String,
     pub log_path: Option<PathBuf>,
 }
@@ -792,6 +838,7 @@ pub struct State {
     connection: Connection,
     certificate_store: CertificateStore,
     node_key: [u8; NODE_KEY_LEN],
+    state_root: PathBuf,
 }
 
 impl State {
@@ -804,6 +851,13 @@ impl State {
         {
             fs::create_dir_all(parent)?;
         }
+        let state_root = match path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(parent) => fs::canonicalize(parent)?,
+            None => fs::canonicalize(".")?,
+        };
         let node_key = load_node_key(path)?;
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -836,6 +890,7 @@ impl State {
                 4 => migrate_v4_to_v5(&transaction, &node_key)?,
                 5 => migrate_v5_to_v6(&transaction)?,
                 6 => migrate_v6_to_v7(&transaction)?,
+                7 => migrate_v7_to_v8(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -848,7 +903,23 @@ impl State {
             connection,
             certificate_store,
             node_key,
+            state_root,
         })
+    }
+
+    /// Canonical parent directory that owns daemon state and deployment data.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// Daemon-owned artifact root for an app deployment.
+    pub fn deployment_artifact_root(&self, app: &str) -> PathBuf {
+        self.state_root.join("artifacts").join(app)
+    }
+
+    /// Daemon-owned upstream base for an app deployment.
+    pub fn deployment_upstream(&self, app: &str) -> PathBuf {
+        self.state_root.join("upstreams").join(app)
     }
 
     /// Validate and atomically replace the complete persisted configuration.
@@ -1202,6 +1273,19 @@ impl State {
             .map_err(StateError::from)
     }
 
+    /// Return the operator-selected default engine, if one is registered.
+    pub fn default_engine(&self) -> Result<Option<EngineRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT version, host_root, cage_executable, sha256, is_default
+                 FROM engines WHERE is_default = 1",
+                [],
+                engine_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
     /// List registered engines in stable version order with active app counts.
     pub fn engines(&self) -> Result<Vec<EngineStatus>, StateError> {
         let mut statement = self.connection.prepare(
@@ -1259,12 +1343,66 @@ impl State {
             });
         }
         self.connection.execute(
-            "INSERT INTO deployments (id, app, source_hash, engine_version, status, error) VALUES (?1, ?2, ?3, ?4, 'building', NULL)",
-            params![input.id, input.app, input.source_hash, input.engine_version],
+            "INSERT INTO deployments
+             (id, app, source_hash, engine_version, source_kind, source_branch, source_commit, status, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'building', NULL)",
+            params![
+                input.id,
+                input.app,
+                input.source_hash,
+                input.engine_version,
+                deployment_source_kind_name(input.source.kind),
+                input.source.branch,
+                input.source.commit,
+            ],
         )?;
         self.deployment(&input.id)?.ok_or_else(|| {
             StateError::IncompleteState(format!(
                 "deployment {:?} disappeared after insert",
+                input.id
+            ))
+        })
+    }
+
+    /// Resume a preassigned building deployment and replace its provisional
+    /// source hash with the hash computed during trusted source intake.
+    pub fn resume_building_deployment(
+        &mut self,
+        input: &DeploymentInput,
+    ) -> Result<DeploymentRecord, StateError> {
+        validate_deployment_input(input)?;
+        let current = self
+            .deployment(&input.id)?
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("preassigned deployment {:?} does not exist", input.id),
+            })?;
+        if current.status != DeploymentStatus::Building {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("preassigned deployment {:?} is not building", input.id),
+            });
+        }
+        if current.app != input.app
+            || current.engine_version != input.engine_version
+            || current.source != input.source
+        {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!(
+                    "preassigned deployment {:?} does not match app, engine, or source provenance",
+                    input.id
+                ),
+            });
+        }
+        self.connection.execute(
+            "UPDATE deployments SET source_hash = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status = 'building'",
+            params![input.id, input.source_hash],
+        )?;
+        self.deployment(&input.id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "deployment {:?} disappeared after source intake",
                 input.id
             ))
         })
@@ -1380,11 +1518,17 @@ impl State {
     }
 
     pub fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>, StateError> {
-        self.connection.query_row(
-            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path FROM deployments WHERE id = ?1",
-            [id],
-            deployment_from_row,
-        ).optional().map_err(StateError::from)
+        self.connection
+            .query_row(
+                "SELECT id, app, source_hash, engine_version, artifact_hash, status, error,
+                    created_at, unixepoch(created_at) * 1000, updated_at, log_path,
+                    source_kind, source_branch, source_commit
+             FROM deployments WHERE id = ?1",
+                [id],
+                deployment_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
     }
 
     /// List newest deployments, optionally scoped to one app.
@@ -1424,7 +1568,7 @@ impl State {
             None
         };
 
-        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path";
+        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, unixepoch(created_at) * 1000, updated_at, log_path, source_kind, source_branch, source_commit";
         let mut deployments = Vec::new();
         match (app, before) {
             (Some(app), Some(before)) => {
@@ -2200,6 +2344,13 @@ impl State {
         self.claim_deploy_job_inner(None)
     }
 
+    pub fn claim_deploy_job_for_source(
+        &mut self,
+        source: DeployJobSource,
+    ) -> Result<Option<DeployJob>, StateError> {
+        self.claim_deploy_job_inner(Some(source))
+    }
+
     fn claim_deploy_job_inner(
         &mut self,
         source: Option<DeployJobSource>,
@@ -2364,7 +2515,7 @@ impl State {
     }
 
     pub fn claim_github_job(&mut self) -> Result<Option<GitHubDeployJob>, StateError> {
-        self.claim_deploy_job_inner(Some(DeployJobSource::GitHub))?
+        self.claim_deploy_job_for_source(DeployJobSource::GitHub)?
             .map(GitHubDeployJob::try_from)
             .transpose()
     }
@@ -2681,8 +2832,23 @@ fn validate_github_repository(config: &GitHubRepositoryConfig) -> Result<(), Sta
     ] {
         github_text(value, field)?;
     }
+    if config.entry.as_os_str().is_empty()
+        || config.entry.is_absolute()
+        || config.entry.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "github repository",
+            detail: "entry must be a nonempty relative path without traversal".into(),
+        });
+    }
     for (path, field) in [
-        (&config.entry, "entry"),
         (&config.artifact_root, "artifact root"),
         (&config.upstream, "upstream"),
     ] {
@@ -2750,8 +2916,23 @@ fn validate_deploy_job_spec(job: &DeployJobSpec) -> Result<(), StateError> {
             detail: "source path must be nonempty and bounded".into(),
         });
     }
+    if job.entry.as_os_str().is_empty()
+        || job.entry.is_absolute()
+        || job.entry.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "deploy job",
+            detail: "entry must be a nonempty relative path without traversal".into(),
+        });
+    }
     for (path, field) in [
-        (&job.entry, "entry"),
         (&job.artifact_root, "artifact root"),
         (&job.upstream, "upstream"),
     ] {
@@ -3238,6 +3419,18 @@ fn migrate_v6_to_v7(connection: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn migrate_v7_to_v8(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "ALTER TABLE deployments
+             ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'cli'
+             CHECK (source_kind IN ('github', 'upload', 'cli'));
+         ALTER TABLE deployments ADD COLUMN source_branch TEXT;
+         ALTER TABLE deployments ADD COLUMN source_commit TEXT;
+         UPDATE deployments SET source_kind = 'cli';",
+    )?;
+    Ok(())
+}
+
 fn register_engine_tx(
     transaction: &Transaction<'_>,
     engine: &EngineRecord,
@@ -3414,6 +3607,21 @@ fn validate_deployment_input(input: &DeploymentInput) -> Result<(), StateError> 
             kind: "deployment",
             detail: "engine version must be nonempty".into(),
         });
+    }
+    for (value, field) in [
+        (input.source.branch.as_deref(), "source branch"),
+        (input.source.commit.as_deref(), "source commit"),
+    ] {
+        if value.is_some_and(|value| {
+            value.trim().is_empty()
+                || value.len() > MAX_GITHUB_TEXT_LEN
+                || value.chars().any(char::is_control)
+        }) {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("{field} must be nonempty, printable, and bounded"),
+            });
+        }
     }
     Ok(())
 }
@@ -3785,6 +3993,23 @@ fn parse_status(status: &str) -> Result<DeploymentStatus, String> {
     }
 }
 
+fn deployment_source_kind_name(kind: DeploymentSourceKind) -> &'static str {
+    match kind {
+        DeploymentSourceKind::GitHub => "github",
+        DeploymentSourceKind::Upload => "upload",
+        DeploymentSourceKind::Cli => "cli",
+    }
+}
+
+fn parse_deployment_source_kind(value: &str) -> Result<DeploymentSourceKind, String> {
+    match value {
+        "github" => Ok(DeploymentSourceKind::GitHub),
+        "upload" => Ok(DeploymentSourceKind::Upload),
+        "cli" => Ok(DeploymentSourceKind::Cli),
+        other => Err(format!("unknown deployment source kind {other:?}")),
+    }
+}
+
 fn ensure_transition(
     id: &str,
     from: DeploymentStatus,
@@ -3825,7 +4050,10 @@ fn query_deployment_tx(
 ) -> Result<Option<DeploymentRecord>, StateError> {
     transaction
         .query_row(
-            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path FROM deployments WHERE id = ?1",
+            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error,
+                    created_at, unixepoch(created_at) * 1000, updated_at, log_path,
+                    source_kind, source_branch, source_commit
+             FROM deployments WHERE id = ?1",
             [id],
             deployment_from_row,
         )
@@ -3842,17 +4070,31 @@ fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusq
             Box::new(std::io::Error::other(error)),
         )
     })?;
+    let source_kind: String = row.get(11)?;
+    let source_kind = parse_deployment_source_kind(&source_kind).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error)),
+        )
+    })?;
     Ok(DeploymentRecord {
         id: row.get(0)?,
         app: row.get(1)?,
         source_hash: row.get(2)?,
         engine_version: row.get(3)?,
+        source: DeploymentSource {
+            kind: source_kind,
+            branch: row.get(12)?,
+            commit: row.get(13)?,
+        },
         artifact_hash: row.get(4)?,
         status,
         error: row.get(6)?,
         created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-        log_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+        created_ms: row.get(8)?,
+        updated_at: row.get(9)?,
+        log_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
     })
 }
 
@@ -5079,6 +5321,7 @@ mod tests {
                     app: app.into(),
                     source_hash: source_hash.clone(),
                     engine_version: engine.version.clone(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
         }
@@ -5123,6 +5366,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source_hash.clone(),
                     engine_version: engine.version.clone(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state.seal_deployment(id, &artifact).unwrap();
@@ -5169,6 +5413,41 @@ mod tests {
     }
 
     #[test]
+    fn deployment_provenance_round_trips_and_preassigned_builds_resume() {
+        let path = temp_db("deployment-provenance");
+        let mut state = State::open(&path).unwrap();
+        let engine = register_test_engine(&mut state, "bun");
+        let source =
+            DeploymentSource::github(Some("main".into()), Some("a".repeat(SHA256_HEX_LEN)));
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "preassigned".into(),
+                app: "api".into(),
+                source_hash: "b".repeat(SHA256_HEX_LEN),
+                engine_version: engine.version.clone(),
+                source: source.clone(),
+            })
+            .unwrap();
+
+        let resumed = state
+            .resume_building_deployment(&DeploymentInput {
+                id: "preassigned".into(),
+                app: "api".into(),
+                source_hash: "c".repeat(SHA256_HEX_LEN),
+                engine_version: engine.version,
+                source: source.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(resumed.source_hash, "c".repeat(SHA256_HEX_LEN));
+        assert_eq!(resumed.source, source);
+        assert!(resumed.created_ms > 0);
+        assert_eq!(state.deployments(None, None, 1).unwrap(), [resumed]);
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn artifact_deployment_round_trip_and_activation_are_atomic() {
         let path = temp_db("activation");
         let mut state = State::open(&path).expect("open state");
@@ -5187,6 +5466,7 @@ mod tests {
             app: "api".into(),
             source_hash: source_hash.clone(),
             engine_version: engine.version.clone(),
+            source: DeploymentSource::cli(),
         };
         assert_eq!(
             state.begin_deployment(&input).unwrap().status,
@@ -5260,6 +5540,7 @@ mod tests {
                 app: "worker".into(),
                 source_hash: second_source_hash.clone(),
                 engine_version: engine.version.clone(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         state
@@ -5376,6 +5657,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source.clone(),
                     engine_version: "bun".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state.seal_deployment(id, &artifact).unwrap();
@@ -5390,6 +5672,7 @@ mod tests {
                 app: "other".into(),
                 source_hash: source.clone(),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let mut foreign = artifact.clone();
@@ -5404,6 +5687,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "d".repeat(64),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let mut mismatch = artifact;
@@ -5442,6 +5726,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source.clone(),
                     engine_version: "bun".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state
@@ -5516,6 +5801,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source.clone(),
                     engine_version: "bun".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state
@@ -5634,6 +5920,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "b".repeat(64),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         state
@@ -5673,6 +5960,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: source.clone(),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let mut artifact = artifact_input(
@@ -5734,7 +6022,8 @@ mod tests {
                     id: "".into(),
                     app: "api".into(),
                     source_hash: "e".repeat(64),
-                    engine_version: "1".into()
+                    engine_version: "1".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .is_err()
         );
@@ -5744,6 +6033,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "e".repeat(64),
                 engine_version: "1".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         state.mark_deployment_failed("dep", "build failed").unwrap();
@@ -5968,7 +6258,7 @@ mod tests {
             app: "site".into(),
             domain: "site.example.com".into(),
             engine_version: "bun".into(),
-            entry: "/app/index.js".into(),
+            entry: "index.ts".into(),
             artifact_root: "/var/lib/cygnus/artifacts/site".into(),
             upstream: "/run/cygnus/site.sock".into(),
         }
@@ -6206,7 +6496,7 @@ mod tests {
             app: "site".into(),
             domain: "site.example.com".into(),
             engine_version: "bun".into(),
-            entry: "/app/index.js".into(),
+            entry: "index.ts".into(),
             artifact_root: "/var/lib/cygnus/artifacts/site".into(),
             upstream: "/run/cygnus/site.sock".into(),
             branch: None,

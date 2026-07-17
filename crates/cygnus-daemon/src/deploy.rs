@@ -34,7 +34,7 @@ use thiserror::Error;
 
 use crate::state::{
     AppConfig, ArtifactInput, AuditContext, AuditEndpointRole, DeploymentInput, DeploymentRecord,
-    EngineRecord, LoadedApp, RootfsConfig, SeccompMode, State, StateError,
+    DeploymentSource, EngineRecord, LoadedApp, RootfsConfig, SeccompMode, State, StateError,
 };
 use publish::PublishDir;
 
@@ -74,11 +74,20 @@ struct BuildPlan {
 pub struct DeployRequest {
     pub source_dir: PathBuf,
     pub app: String,
-    pub domain: String,
-    pub engine_version: String,
-    pub entry: PathBuf,
-    pub artifact_root: PathBuf,
-    pub upstream: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<PathBuf>,
+    #[serde(skip)]
+    pub deployment_id: Option<String>,
+    #[serde(skip)]
+    pub source: DeploymentSource,
 }
 
 impl DeployRequest {
@@ -94,13 +103,38 @@ impl DeployRequest {
         Self {
             source_dir: source_dir.into(),
             app: app.into(),
-            domain: domain.into(),
-            engine_version: engine_version.into(),
-            entry: entry.into(),
-            artifact_root: artifact_root.into(),
-            upstream: upstream.into(),
+            domain: Some(domain.into()),
+            engine_version: Some(engine_version.into()),
+            entry: Some(entry.into()),
+            artifact_root: Some(artifact_root.into()),
+            upstream: Some(upstream.into()),
+            deployment_id: None,
+            source: DeploymentSource::cli(),
         }
     }
+
+    pub fn with_deployment_id(mut self, deployment_id: impl Into<String>) -> Self {
+        self.deployment_id = Some(deployment_id.into());
+        self
+    }
+
+    pub fn with_source(mut self, source: DeploymentSource) -> Self {
+        self.source = source;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedDeployRequest {
+    source_dir: PathBuf,
+    app: String,
+    domain: String,
+    engine_version: String,
+    entry: PathBuf,
+    artifact_root: PathBuf,
+    upstream: PathBuf,
+    deployment_id: Option<String>,
+    source: DeploymentSource,
 }
 
 /// Result of a successful deployment.
@@ -302,6 +336,78 @@ pub fn deploy_with_audit(
     })
 }
 
+fn resolve_deploy_request(
+    state: &State,
+    request: DeployRequest,
+) -> Result<ResolvedDeployRequest, DeployError> {
+    if request.app.trim().is_empty() || !safe_app_component(&request.app) {
+        return Err(DeployError::InvalidInput(
+            "app must be a nonempty safe path component".into(),
+        ));
+    }
+    if request.deployment_id.as_deref().is_some_and(|id| {
+        id.is_empty()
+            || matches!(id, "." | "..")
+            || id.as_bytes().contains(&0)
+            || id.contains('/')
+            || id.contains('\\')
+    }) {
+        return Err(DeployError::InvalidInput(
+            "preassigned deployment_id must be a safe path component".into(),
+        ));
+    }
+    let engine_version = match request.engine_version {
+        Some(version) if !version.trim().is_empty() => version,
+        _ => state
+            .default_engine()?
+            .map(|engine| engine.version)
+            .ok_or_else(|| {
+                DeployError::InvalidInput(
+                    "engine_version was omitted and no default engine is registered".into(),
+                )
+            })?,
+    };
+    let domain = match request.domain {
+        Some(domain) if !domain.trim().is_empty() => domain,
+        _ => {
+            let apps_domain = state.load()?.edge.apps_domain.ok_or_else(|| {
+                DeployError::InvalidInput(
+                    "domain was omitted and edge.apps_domain is not configured".into(),
+                )
+            })?;
+            format!("{}.{}", request.app, apps_domain)
+        }
+    };
+    let entry = request.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
+    let artifact_root = request
+        .artifact_root
+        .unwrap_or_else(|| state.deployment_artifact_root(&request.app));
+    let upstream = request
+        .upstream
+        .unwrap_or_else(|| state.deployment_upstream(&request.app));
+    Ok(ResolvedDeployRequest {
+        source_dir: request.source_dir,
+        app: request.app,
+        domain,
+        engine_version,
+        entry,
+        artifact_root,
+        upstream,
+        deployment_id: request.deployment_id,
+        source: request.source,
+    })
+}
+
+fn safe_app_component(value: &str) -> bool {
+    value != "."
+        && value != ".."
+        && !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 pub fn deploy_with_audit_and_prepare<F>(
     state: &mut State,
     request: DeployRequest,
@@ -311,12 +417,8 @@ pub fn deploy_with_audit_and_prepare<F>(
 where
     F: FnMut(&LoadedApp) -> Result<ActivationPreparation, DeployError>,
 {
+    let request = resolve_deploy_request(state, request)?;
     validate_entry(&request.entry)?;
-    if request.app.trim().is_empty() || request.domain.trim().is_empty() {
-        return Err(DeployError::InvalidInput(
-            "app and domain must be nonempty".into(),
-        ));
-    }
     validate_upstream(&request.upstream)?;
     let expected_active_artifact = state
         .active_deployment(&request.app)?
@@ -331,7 +433,13 @@ where
     let source_root = canonical_source_root(&request.source_dir)?;
     let artifact_root = prepare_artifact_root(&request.artifact_root)?;
     let entry = request.entry.clone();
-    let deployment_id = new_deployment_id();
+    let deployment_id = request
+        .deployment_id
+        .clone()
+        .unwrap_or_else(new_deployment_id);
+    if request.deployment_id.is_some() {
+        remove_work(&artifact_root, &deployment_id)?;
+    }
     let workspace = artifact_root
         .join(WORKSPACE_REL)
         .join(&deployment_id)
@@ -362,8 +470,14 @@ where
         app: request.app.clone(),
         source_hash: source_hash.clone(),
         engine_version: request.engine_version.clone(),
+        source: request.source.clone(),
     };
-    if let Err(error) = state.begin_deployment(&input) {
+    let deployment_started = if request.deployment_id.is_some() {
+        state.resume_building_deployment(&input)
+    } else {
+        state.begin_deployment(&input)
+    };
+    if let Err(error) = deployment_started {
         let _ = remove_work(&artifact_root, &deployment_id);
         return Err(error.into());
     }
@@ -680,7 +794,7 @@ fn build_job(
 }
 
 fn runtime_config(
-    request: &DeployRequest,
+    request: &ResolvedDeployRequest,
     engine: &EngineRecord,
     artifact_path: &Path,
     generated_relative: &str,
@@ -756,18 +870,7 @@ fn runtime_config(
 
 fn deploy_request_digest(request: &DeployRequest) -> String {
     let mut hasher = Sha256::new();
-    for value in [
-        request.source_dir.as_os_str(),
-        OsStr::new(&request.app),
-        OsStr::new(&request.domain),
-        OsStr::new(&request.engine_version),
-        request.entry.as_os_str(),
-        request.artifact_root.as_os_str(),
-        request.upstream.as_os_str(),
-    ] {
-        hasher.update(value.as_bytes());
-        hasher.update([0]);
-    }
+    hasher.update(serde_json::to_vec(request).expect("DeployRequest serialization is infallible"));
     hex_digest(hasher)
 }
 
@@ -1744,6 +1847,48 @@ mod tests {
     }
 
     #[test]
+    fn omitted_server_owned_fields_resolve_from_state() {
+        let root = temp_dir("server-defaults");
+        let mut state = State::open(root.join("state.db")).unwrap();
+        state
+            .apply(&crate::state::NodeConfig {
+                edge: crate::edge::EdgeConfig {
+                    apps_domain: Some("apps.example.com".into()),
+                    ..crate::edge::EdgeConfig::default()
+                },
+                ..crate::state::NodeConfig::default()
+            })
+            .unwrap();
+        register_engine(
+            &mut state,
+            "bun-default",
+            "/",
+            fs::canonicalize("/bin/sh").unwrap(),
+        )
+        .unwrap();
+        let request: DeployRequest = serde_json::from_value(serde_json::json!({
+            "source_dir": root,
+            "app": "hello"
+        }))
+        .unwrap();
+
+        let resolved = resolve_deploy_request(&state, request).unwrap();
+
+        assert_eq!(resolved.domain, "hello.apps.example.com");
+        assert_eq!(resolved.engine_version, "bun-default");
+        assert_eq!(resolved.entry, PathBuf::from("index.ts"));
+        assert_eq!(
+            resolved.artifact_root,
+            state.state_root().join("artifacts/hello")
+        );
+        assert_eq!(
+            resolved.upstream,
+            state.state_root().join("upstreams/hello")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn intake_hash_and_copy_are_deterministic() {
         let parent = temp_dir("copy");
         let root = parent.join("source");
@@ -2063,6 +2208,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "b".repeat(64),
                 engine_version: "shell".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let logs = artifacts.join("logs/dep-success");
@@ -2110,6 +2256,7 @@ mod tests {
                 app: "live-app".into(),
                 source_hash: "b".repeat(64),
                 engine_version: "fixture".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let logs = artifacts.join(LOG_REL).join(&id);
@@ -2213,6 +2360,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "b".repeat(64),
                 engine_version: "shell".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let logs = artifacts.join("logs/dep-cleanup");

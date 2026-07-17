@@ -15,9 +15,9 @@ use crate::deploy::DeployRequest;
 use crate::github::{GitHubError, GitHubManager};
 use crate::metrics::MetricsHub;
 use crate::state::{
-    AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentStatus,
-    GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, LoadedApp, NodeConfig, State,
-    StateError,
+    AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentSource,
+    DeploymentStatus, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, LoadedApp, NodeConfig,
+    State, StateError,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -237,14 +237,18 @@ impl StateAdminHandler {
                 "register_engine",
             ),
             AdminCommand::Deploy {
-                request: deployment,
-            } => self.mutate(
-                role,
-                peer,
-                request,
-                AdminMutation::Deploy(deployment),
-                "deploy",
-            ),
+                request: mut deployment,
+            } => {
+                deployment.source = DeploymentSource::cli();
+                deployment.deployment_id = None;
+                self.mutate(
+                    role,
+                    peer,
+                    request,
+                    AdminMutation::Deploy(deployment),
+                    "deploy",
+                )
+            }
             AdminCommand::MapDomain { app, domain } => self.mutate(
                 role,
                 peer,
@@ -678,6 +682,8 @@ fn deployment_view(deployment: DeploymentRecord, role: AdminRole) -> DeploymentV
         app: deployment.app,
         source_hash: deployment.source_hash,
         engine_version: deployment.engine_version,
+        created_ms: deployment.created_ms,
+        source: deployment.source,
         artifact_hash: deployment.artifact_hash,
         status: deployment_status_name(deployment.status).into(),
         error: matches!(role, AdminRole::Host)

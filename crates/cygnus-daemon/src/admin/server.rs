@@ -499,24 +499,26 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         }
         AdminCommand::Deploy { request } => {
             validate_text(&request.app, MAX_ADMIN_APP_BYTES, "app")?;
-            validate_text(&request.domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
-            validate_text(
-                &request.engine_version,
-                MAX_ADMIN_APP_BYTES,
-                "engine version",
-            )?;
+            if let Some(domain) = request.domain.as_deref() {
+                validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            }
+            if let Some(engine_version) = request.engine_version.as_deref() {
+                validate_text(engine_version, MAX_ADMIN_APP_BYTES, "engine version")?;
+            }
             validate_path(
                 &request.source_dir,
                 MAX_ADMIN_DEPLOYMENT_BYTES,
                 "source directory",
             )?;
-            validate_path(&request.entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
-            validate_path(
-                &request.artifact_root,
-                MAX_ADMIN_DEPLOYMENT_BYTES,
-                "artifact root",
-            )?;
-            validate_path(&request.upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
+            if let Some(entry) = request.entry.as_deref() {
+                validate_path(entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            }
+            if let Some(artifact_root) = request.artifact_root.as_deref() {
+                validate_path(artifact_root, MAX_ADMIN_DEPLOYMENT_BYTES, "artifact root")?;
+            }
+            if let Some(upstream) = request.upstream.as_deref() {
+                validate_path(upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
+            }
         }
         AdminCommand::MapDomain { app, domain } => {
             validate_text(app, MAX_ADMIN_APP_BYTES, "app")?;
@@ -535,13 +537,15 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             validate_text(&repository.name, MAX_ADMIN_APP_BYTES, "repository name")?;
             validate_text(&repository.branch, MAX_ADMIN_APP_BYTES, "repository branch")?;
             validate_text(&repository.app, MAX_ADMIN_APP_BYTES, "app")?;
-            validate_text(&repository.domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
-            validate_text(
-                &repository.engine_version,
-                MAX_ADMIN_APP_BYTES,
-                "engine version",
-            )?;
-            validate_path(&repository.entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            if let Some(domain) = repository.domain.as_deref() {
+                validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            }
+            if let Some(engine_version) = repository.engine_version.as_deref() {
+                validate_text(engine_version, MAX_ADMIN_APP_BYTES, "engine version")?;
+            }
+            if let Some(entry) = repository.entry.as_deref() {
+                validate_path(entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            }
             if repository.installation_id <= 0 || repository.repository_id <= 0 {
                 return Err("installation and repository ids must be positive".into());
             }

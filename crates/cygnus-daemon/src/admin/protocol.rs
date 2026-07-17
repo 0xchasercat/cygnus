@@ -8,7 +8,7 @@ pub use crate::github::{
     GitHubRepositoryView,
 };
 use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
-use crate::state::NodeConfig;
+use crate::state::{DeploymentSource, NodeConfig};
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
@@ -401,6 +401,8 @@ pub struct DeploymentView {
     pub app: String,
     pub source_hash: String,
     pub engine_version: String,
+    pub created_ms: i64,
+    pub source: DeploymentSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
     pub status: String,
@@ -773,6 +775,33 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn deployment_view_uses_exact_nested_source_shape() {
+        let view = DeploymentView {
+            id: "deploy-1".into(),
+            app: "hello".into(),
+            source_hash: "a".repeat(64),
+            engine_version: "bun".into(),
+            created_ms: 1_700_000_000_000,
+            source: DeploymentSource::github(Some("main".into()), Some("b".repeat(64))),
+            artifact_hash: None,
+            status: "building".into(),
+            error: None,
+        };
+
+        let encoded = serde_json::to_value(view).unwrap();
+
+        assert_eq!(encoded["created_ms"], 1_700_000_000_000_i64);
+        assert_eq!(
+            encoded["source"],
+            serde_json::json!({
+                "kind": "github",
+                "branch": "main",
+                "commit": "b".repeat(64)
+            })
         );
     }
 
