@@ -1,16 +1,44 @@
 <script>
   import { ui, go } from '../stores.svelte.js';
-  import { apps, tenant0 } from '../data.js';
+  import { store } from '../live.svelte.js';
   import Icon from './Icon.svelte';
   import SwanMark from './SwanMark.svelte';
 
-  const app = $derived(apps.find((a) => a.id === ui.appId));
+  const app = $derived(store.appByName(ui.appId) ?? store.apps.find((a) => a.name === ui.appId) ?? null);
 
   const crumb = $derived.by(() => {
     if (ui.screen === 'app' && app) return [{ t: app.name }];
     if (ui.screen === 'deploy' && app)
-      return [{ t: app.name, go: () => go('app', { appId: app.id }) }, { t: ui.deployId }];
+      return [{ t: app.name, go: () => go('app', { appId: app.name }) }, { t: ui.deployId }];
     return null;
+  });
+
+  const tenantLine = $derived.by(() => {
+    if (store.mode === 'live') {
+      const host = store.node?.apps_domain ?? store.node?.listen ?? '—';
+      return { id: 'tenant zero', mid: 'live', tail: host, live: true };
+    }
+    return { id: 'tenant zero', mid: 'preview', tail: 'cygnus 0.9.2', live: false };
+  });
+
+  let menuOpen = $state(false);
+
+  function toggleMenu(e) {
+    e.stopPropagation();
+    menuOpen = !menuOpen;
+  }
+  function closeMenu() {
+    menuOpen = false;
+  }
+  async function signOut() {
+    menuOpen = false;
+    await store.signOut();
+  }
+  $effect(() => {
+    if (menuOpen) {
+      window.addEventListener('click', closeMenu, { once: true });
+      return () => window.removeEventListener('click', closeMenu);
+    }
   });
 </script>
 
@@ -45,15 +73,35 @@
         <span>Search the node</span>
         <kbd>⌘K</kbd>
       </button>
-      <span class="avatar" title="chase · owner">C</span>
+      <button class="avatar" onclick={toggleMenu} aria-haspopup="menu" aria-expanded={menuOpen} title="operator">
+        <span class="av-t">OP</span>
+      </button>
+      {#if menuOpen}
+        <div class="popover" role="menu" onclick={(e) => e.stopPropagation()}>
+          <div class="pop-head">
+            <span class="pop-label mono">operator</span>
+          </div>
+          {#if store.mode === 'live'}
+            <button class="pop-item" role="menuitem" onclick={signOut}>
+              <Icon name="x" size={13} /> Sign out
+            </button>
+          {:else}
+            <span class="pop-empty">preview dataset · no session</span>
+          {/if}
+        </div>
+      {/if}
     </div>
   </div>
-  <div class="tenant-status" role="status" aria-label="Tenant 0 preview dataset; daemon bridge offline">
-    <span class="led preview" aria-hidden="true"></span>
-    <span class="tenant-id num">{tenant0.id}</span>
-    <span>{tenant0.dataSourceLabel}</span>
+  <div class="tenant-status" role="status" aria-label="Tenant status">
+    <span class="led {tenantLine.live ? (store.connected ? 'live' : 'build') : 'preview'} breathe" aria-hidden="true"></span>
+    <span class="tenant-id num">{tenantLine.id}</span>
+    <span>{tenantLine.mid}</span>
     <span class="divider" aria-hidden="true">·</span>
-    <span>daemon bridge {tenant0.daemonBridge}</span>
+    <span>{tenantLine.tail}</span>
+    {#if store.mode === 'live' && !store.connected}
+      <span class="divider" aria-hidden="true">·</span>
+      <span class="amber">reconnecting…</span>
+    {/if}
   </div>
 </header>
 
@@ -160,11 +208,64 @@
     border-radius: 50%;
     background: linear-gradient(135deg, var(--cobalt), var(--violet));
     color: #fff;
-    font-size: 12px;
-    font-weight: 700;
     display: grid;
     place-items: center;
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25), var(--shadow-card);
     margin-left: 2px;
   }
+  .av-t {
+    font-size: 9.5px;
+    font-weight: 700;
+    font-family: var(--mono);
+    letter-spacing: 0.06em;
+  }
+  .popover {
+    position: absolute;
+    top: calc(50% + 22px);
+    right: 0;
+    min-width: 168px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: var(--shadow-pop);
+    padding: 6px;
+    z-index: 80;
+    animation: pop-in 0.14s ease both;
+  }
+  @keyframes pop-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  }
+  .pop-head {
+    padding: 7px 9px 6px;
+    border-bottom: 1px solid var(--line-2);
+    margin-bottom: 5px;
+  }
+  .pop-label {
+    font-size: 10px;
+    color: var(--ink-3);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .pop-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 9px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink);
+    text-align: left;
+  }
+  .pop-item:hover { background: var(--surface-3); }
+  .pop-empty {
+    display: block;
+    padding: 8px 9px;
+    font-size: 11px;
+    color: var(--ink-4);
+    font-family: var(--mono);
+  }
+  .amber { color: var(--amber); }
+  .right { position: relative; }
 </style>
