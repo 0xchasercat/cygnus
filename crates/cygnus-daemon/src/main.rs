@@ -73,6 +73,18 @@ fn logical_app(runtime_apps: &RuntimeApps, runtime_key: &str) -> String {
         .unwrap_or_else(|| runtime_key.to_owned())
 }
 
+fn insert_runtime_app(
+    runtime_apps: &RuntimeApps,
+    metrics: &MetricsHub,
+    runtime_key: &str,
+    logical_app: &str,
+) {
+    runtime_apps
+        .write()
+        .insert(runtime_key.to_owned(), logical_app.to_owned());
+    metrics.set_app_alias(runtime_key, logical_app);
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cygnus-daemon", about = "Run the Cygnus request plane")]
 struct Cli {
@@ -191,9 +203,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         previous_runtime_key: Option<&str>,
     ) -> Result<ActivationPreparation, DeployError> {
         let key = candidate.spec.name.clone();
-        self.runtime_apps
-            .write()
-            .insert(key.clone(), candidate.name.clone());
+        insert_runtime_app(&self.runtime_apps, &self.metrics, &key, &candidate.name);
         if previous_runtime_key == Some(key.as_str()) {
             return Ok(ActivationPreparation::new(|| {}));
         }
@@ -421,9 +431,7 @@ impl LiveAdminMutations {
                 AdminMutationError::new(AdminErrorCode::Conflict, error.to_string())
             })?;
             let key = candidate.spec.name.clone();
-            self.runtime_apps
-                .write()
-                .insert(key.clone(), candidate.name.clone());
+            insert_runtime_app(&self.runtime_apps, &self.metrics, &key, &candidate.name);
             self.supervisor.register(
                 key.clone(),
                 candidate.spec.clone(),
@@ -609,9 +617,7 @@ impl LiveAdminMutations {
         *current = plan.candidate.clone();
         let routes = route_table(&snapshot);
         let runtime_changed = plan.previous_runtime_key.as_deref() != Some(&plan.runtime_key);
-        self.runtime_apps
-            .write()
-            .insert(plan.runtime_key.clone(), app.to_owned());
+        insert_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key, app);
         if runtime_changed {
             self.supervisor.register(
                 plan.runtime_key.clone(),
@@ -798,7 +804,14 @@ fn serve(
         configure_tenant_admin(app, tenant_admin_socket)?;
     }
     for app in snapshot.apps {
-        install_app(&supervisor, &runtime_apps, &mut routes, &mut pinned, app);
+        install_app(
+            &supervisor,
+            &runtime_apps,
+            &metrics,
+            &mut routes,
+            &mut pinned,
+            app,
+        );
     }
     drop(router.install(routes));
 
@@ -1133,6 +1146,7 @@ fn configure_tenant_admin(app: &mut LoadedApp, socket: &Path) -> Result<(), Box<
 fn install_app(
     supervisor: &Supervisor<Cage>,
     runtime_apps: &RuntimeApps,
+    metrics: &MetricsHub,
     routes: &mut RouteTable,
     pinned: &mut Vec<String>,
     app: LoadedApp,
@@ -1147,7 +1161,7 @@ fn install_app(
     } = app;
 
     let runtime_key = spec.name.clone();
-    runtime_apps.write().insert(runtime_key.clone(), name);
+    insert_runtime_app(runtime_apps, metrics, &runtime_key, &name);
     if lifecycle.min_instances >= 1 {
         pinned.push(runtime_key.clone());
     }
@@ -1711,10 +1725,18 @@ mod tests {
 
         let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
         let runtime_apps = Arc::new(parking_lot::RwLock::new(BTreeMap::new()));
+        let metrics = MetricsHub::new();
         let mut routes = RouteTable::new();
         let mut pinned = Vec::new();
         for app in snapshot.apps {
-            install_app(&supervisor, &runtime_apps, &mut routes, &mut pinned, app);
+            install_app(
+                &supervisor,
+                &runtime_apps,
+                &metrics,
+                &mut routes,
+                &mut pinned,
+                app,
+            );
         }
         let frontend = Arc::new(Frontend::new(
             Arc::new(Router::new(routes)),

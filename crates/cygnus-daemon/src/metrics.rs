@@ -168,6 +168,7 @@ struct Inner {
     boots: VecDeque<BootRecord>,
     events: VecDeque<EventRecord>,
     buckets: VecDeque<MinuteBucket>,
+    app_aliases: BTreeMap<String, String>,
 }
 
 /// Cloneable, bounded telemetry storage shared by edge and control-plane workers.
@@ -182,6 +183,12 @@ impl MetricsHub {
         Self::default()
     }
 
+    pub fn set_app_alias(&self, runtime_key: impl Into<String>, logical_app: impl Into<String>) {
+        self.lock()
+            .app_aliases
+            .insert(runtime_key.into(), logical_app.into());
+    }
+
     /// Record a completed request. The path is truncated to at most 200 bytes at
     /// a valid UTF-8 boundary before the single metrics lock is acquired.
     pub fn record_request(&self, mut request: RequestRecord) {
@@ -192,6 +199,9 @@ impl MetricsHub {
         let is_error = request.status >= 500;
         let latency = to_f32_ms(request.duration_ms);
         let mut inner = self.lock();
+        if let Some(logical_app) = inner.app_aliases.get(&request.app) {
+            request.app.clone_from(logical_app);
+        }
         roll_buckets(&mut inner.buckets, minute);
         if let Some(bucket) = bucket_mut(&mut inner.buckets, minute) {
             bucket.requests = bucket.requests.saturating_add(1);
@@ -706,6 +716,20 @@ mod tests {
                 "message": "ready",
             })
         );
+    }
+
+    #[test]
+    fn request_app_aliases_replace_runtime_keys() {
+        let hub = MetricsHub::new();
+        let now = 20_000 * MILLIS_PER_MINUTE + 10;
+        hub.set_app_alias("r-deadbeef", "checkout");
+        let mut sample = request(1, now, 1.0);
+        sample.app = "r-deadbeef".into();
+
+        hub.record_request(sample);
+
+        assert_eq!(hub.list_requests(1)[0].app, "checkout");
+        assert_eq!(hub.snapshot_at(now).apps[0].app, "checkout");
     }
 
     #[test]
