@@ -1,9 +1,31 @@
 <script>
   // A light terminal, done properly — porcelain well, mono, quiet timestamps.
-  let { lines = [], building = false, maxHeight = '460px' } = $props();
+  // Autoscrolls to the bottom while following live logs, but only if the
+  // viewer is already parked at the bottom (so scrolling up to read history
+  // isn't yanked away by new lines).
+  let { lines = [], building = false, maxHeight = '460px', follow = true } = $props();
+
+  let el = $state();
+  let atBottom = true;
+
+  function onScroll() {
+    if (!el) return;
+    atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  }
+
+  $effect(() => {
+    // track line count + building so new output triggers a stick-to-bottom.
+    lines.length;
+    building;
+    if (el && follow && atBottom) {
+      queueMicrotask(() => {
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    }
+  });
 </script>
 
-<div class="term" style="max-height:{maxHeight}">
+<div class="term" bind:this={el} style="max-height:{maxHeight}" onscroll={onScroll}>
   {#each lines as l}
     <div class="line {l.kind}">
       <span class="t num">{l.t}s</span>

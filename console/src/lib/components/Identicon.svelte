@@ -1,5 +1,5 @@
 <script>
-  import { identicon } from '../data.js';
+  import { identicon } from '../identicon.js';
 
   let { name, size = 36 } = $props();
   const c = $derived(identicon(name));

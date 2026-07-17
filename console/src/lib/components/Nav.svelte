@@ -1,6 +1,6 @@
 <script>
   import { ui, go } from '../stores.svelte.js';
-  import { deploys } from '../data.js';
+  import { store } from '../live.svelte.js';
   import Icon from './Icon.svelte';
 
   // fleet on the left · machine on the right · shipping in the middle
@@ -19,7 +19,7 @@
     ['app', 'deploy'].includes(ui.screen) ? 'overview' : ui.screen
   );
 
-  const building = $derived(deploys.some((d) => d.status === 'building'));
+  const building = $derived(store.deployments.some((d) => d.status === 'building'));
 </script>
 
 <div class="dock">
