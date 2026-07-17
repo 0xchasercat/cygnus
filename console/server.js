@@ -162,6 +162,7 @@ export async function handleApi(request, url) {
   if (!command) return apiError(404, "not_found", "API route not found");
 
   try {
+    const { data, requestId } = await adminRequest(adminSocketPath, command, ACTOR_SUBJECT);
     const publicData = path.startsWith("/api/v1/github/") ? sanitizeGithubData(data) : data;
     return jsonResponse({ ok: true, data: publicData, requestId }, request.method === "HEAD");
   } catch (error) {

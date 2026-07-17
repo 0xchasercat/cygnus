@@ -23,6 +23,8 @@
   let githubNotice = $state('');
   let repoErrors = $state({});
   let repoConfig = $state({});
+  let mapDomains = $state({});
+  let mapErrors = $state({});
 
   class ApiError extends Error {
     constructor(message, status, code) {

@@ -595,6 +595,7 @@ if [[ $console_listener =~ :([0-9]+)$ ]]; then
   [[ $console_port == 80 || $console_port == 443 ]] || console_port_suffix=":$console_port"
 fi
 log "Cygnus is installed and configured. Console URL: ${console_scheme}://cygnus.${apps_domain}${console_port_suffix}"
-log "Bootstrap token file: $secret_bootstrap_file"
+log "Bootstrap token: $bootstrap_hex"
+log "Bootstrap token file: $secret_bootstrap_file (hex-encode its 32 bytes to recover the token)"
 log "Next action: log in to the host and deploy with cygnusctl --admin-socket $admin_socket."
 if [[ -n $https_listen ]]; then log "HTTPS is configured at $https_listen; ACME/DNS provider settings are in $secrets_env."; fi
