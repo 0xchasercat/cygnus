@@ -3865,12 +3865,6 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), StateError> {
     for app in &snapshot.apps {
         if app.tenant_admin {
             tenant_admin_count += 1;
-            if app.spec.rootfs.is_none() {
-                return Err(StateError::InvalidConfig(format!(
-                    "Tenant Zero app {:?} requires a rootfs",
-                    app.name
-                )));
-            }
             if tenant_admin_count > 1 {
                 return Err(StateError::InvalidConfig(
                     "only one app may be designated as Tenant Zero".into(),
@@ -5275,15 +5269,16 @@ mod tests {
         let _ = fs::remove_file(path);
     }
     #[test]
-    fn tenant_admin_requires_one_rooted_app_and_round_trips() {
+    fn tenant_admin_allows_one_app_rooted_or_not_and_round_trips() {
         let path = temp_db("tenant-admin");
         let mut state = State::open(&path).unwrap();
         let mut input = config();
+        // A rootless Tenant Zero is a legal configuration: plain-process
+        // cages (macOS development, operator choice on Linux) have no
+        // private root, and the daemon hands them the host socket path.
         input.apps[0].tenant_admin = true;
-        assert!(matches!(
-            state.apply(&input),
-            Err(StateError::InvalidConfig(message)) if message.contains("requires a rootfs")
-        ));
+        state.apply(&input).unwrap();
+        assert!(state.load().unwrap().apps[0].tenant_admin);
 
         input.apps[0].rootfs = Some(RootfsConfig {
             lowerdirs: vec![PathBuf::from("/lower")],
