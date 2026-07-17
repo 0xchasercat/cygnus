@@ -205,7 +205,10 @@ mod tests {
             libc::SYS_kexec_load,
             libc::SYS_setns,
         ] {
-            assert!(denied_syscalls().contains(&syscall), "{syscall} should be denied");
+            assert!(
+                denied_syscalls().contains(&syscall),
+                "{syscall} should be denied"
+            );
         }
     }
 

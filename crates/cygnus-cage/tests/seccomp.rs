@@ -103,8 +103,8 @@ fn run_child(mode: &str) -> ! {
             };
             // Enforce mode denies with EPERM: the call returns -1 and never
             // reaches the kernel's mount implementation.
-            let denied_with_eperm = result == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let denied_with_eperm =
+                result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
             if denied_with_eperm {
                 process::exit(0);
             }

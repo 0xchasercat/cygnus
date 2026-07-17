@@ -283,7 +283,9 @@ mod linux_harness {
                 if errno == libc::EINTR {
                     continue;
                 }
-                return Err(format!("waitpid failed for child {child_pid}: errno {errno}"));
+                return Err(format!(
+                    "waitpid failed for child {child_pid}: errno {errno}"
+                ));
             }
             if Instant::now() >= deadline {
                 // Still alive at the deadline with no SIGSYS: a long-lived
@@ -300,9 +302,7 @@ mod linux_harness {
         if kill_result != 0 {
             let errno = last_errno();
             if errno != libc::ESRCH {
-                return Err(format!(
-                    "failed to kill child {child_pid}: errno {errno}"
-                ));
+                return Err(format!("failed to kill child {child_pid}: errno {errno}"));
             }
         }
 
@@ -358,7 +358,10 @@ mod linux_harness {
         {
             return ExitCode::from(1);
         }
-        if results.iter().any(|result| ran_under_filter(result.outcome)) {
+        if results
+            .iter()
+            .any(|result| ran_under_filter(result.outcome))
+        {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(2)
@@ -506,7 +509,10 @@ mod linux_harness {
                 outcome: Outcome::SeccompUnavailable,
             };
 
-            assert_eq!(gate_exit_code(std::slice::from_ref(&pass)), ExitCode::SUCCESS);
+            assert_eq!(
+                gate_exit_code(std::slice::from_ref(&pass)),
+                ExitCode::SUCCESS
+            );
             // A long-lived server that survived the filter is a pass.
             assert_eq!(
                 gate_exit_code(std::slice::from_ref(&survived)),

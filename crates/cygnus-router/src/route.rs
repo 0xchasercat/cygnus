@@ -157,7 +157,10 @@ mod tests {
     #[test]
     fn wildcards_match_one_label_only() {
         let table = table();
-        assert_eq!(table.resolve("blog.apps.example.com").unwrap().app, "preview");
+        assert_eq!(
+            table.resolve("blog.apps.example.com").unwrap().app,
+            "preview"
+        );
         // The apex and deeper names do not match a single-label wildcard.
         assert!(table.resolve("apps.example.com").is_none());
         assert!(table.resolve("a.b.apps.example.com").is_none());
