@@ -462,12 +462,13 @@ atomic_copy() {
   cp -- "$src" "$tmp"; chmod "$mode" "$tmp"; mv -f -- "$tmp" "$dest"
 }
 atomic_install_dir() {
-  local src=$1 dest=$2 kind=${3:-console} parent tmp old allow_replace=0
+  local src=$1 dest=$2 kind=${3:-console} parent tmp old allow_replace=0 mode=0755
+  [[ $kind == secrets ]] && mode=0700
   parent=${dest%/*}
   [[ -d $parent && ! -L $parent ]] || fail "${kind} destination parent is not a real directory: $parent"
   if [[ -e $dest ]]; then
     [[ -d $dest && ! -L $dest ]] || fail "${kind} destination is not a real directory: $dest"
-    if diff -qr "$src" "$dest" >/dev/null 2>&1; then chmod 0755 "$dest"; return; fi
+    if diff -qr "$src" "$dest" >/dev/null 2>&1; then chmod "$mode" "$dest"; return; fi
     (( reconfigure )) && allow_replace=1
     [[ $kind == secrets && $rotate_secrets -eq 1 ]] && allow_replace=1
     (( allow_replace )) || fail "existing $dest differs; re-run with $([[ $kind == secrets ]] && printf '%s' --rotate-secrets || printf '%s' --reconfigure)"
@@ -476,7 +477,7 @@ atomic_install_dir() {
   old=$parent/.$(basename "$dest").previous-$BASHPID
   rm -rf -- "$tmp" "$old"
   mkdir -p -- "$tmp"
-  chmod 0755 "$tmp"
+  chmod "$mode" "$tmp"
   cp -Rp -- "$src/." "$tmp/"
   [[ -d $tmp && ! -L $tmp ]] || fail "staged ${kind} root is invalid"
   if [[ -e $dest ]]; then

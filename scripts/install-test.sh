@@ -113,10 +113,10 @@ run_install >"$ROOT/install-output" 2>&1
 [[ -f $ROOT/etc/cygnus/node.json && -f $ROOT/etc/cygnus/secrets.env && -f $ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/bootstrap.token && -f $ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/session.key ]] || { echo 'configuration/credentials missing' >&2; exit 1; }
 [[ ! -e $ROOT/etc/cygnus/console-bootstrap.token && ! -e $ROOT/etc/cygnus/console-session.key ]] || { echo 'duplicate config-dir credentials exist' >&2; exit 1; }
 for credential in "$ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/bootstrap.token" "$ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/session.key"; do
-  [[ $(stat -f '%Lp' "$credential" 2>/dev/null || stat -c '%a' "$credential") == 600 ]] || { echo "credential is not 0600: $credential" >&2; exit 1; }
+  [[ $(stat -c '%a' "$credential" 2>/dev/null || stat -f '%Lp' "$credential") == 600 ]] || { echo "credential is not 0600: $credential" >&2; exit 1; }
   [[ $(wc -c <"$credential" | tr -d ' ') == 32 ]] || { echo "credential is not 32 bytes: $credential" >&2; exit 1; }
 done
-[[ $(stat -f '%Lp' "$ROOT/etc/cygnus/secrets.env" 2>/dev/null || stat -c '%a' "$ROOT/etc/cygnus/secrets.env") == 600 ]] || { echo 'secrets.env is not 0600' >&2; exit 1; }
+[[ $(stat -c '%a' "$ROOT/etc/cygnus/secrets.env" 2>/dev/null || stat -f '%Lp' "$ROOT/etc/cygnus/secrets.env") == 600 ]] || { echo 'secrets.env is not 0600' >&2; exit 1; }
 ! grep -q '^CYGNUS_CONSOLE_BOOTSTRAP_TOKEN=' "$ROOT/etc/cygnus/secrets.env" || { echo 'secrets.env persisted bootstrap secret' >&2; exit 1; }
 ! grep -q '^CYGNUS_CONSOLE_SESSION_KEY=' "$ROOT/etc/cygnus/secrets.env" || { echo 'secrets.env persisted session secret' >&2; exit 1; }
 python3 - "$ROOT/etc/cygnus/node.json" "$ROOT" <<'PY'
