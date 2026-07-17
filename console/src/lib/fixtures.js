@@ -352,25 +352,38 @@ const REQ_PATHS = [
   ['DELETE', '/v1/events/e_88', 'helios-api', 204],
 ];
 
-export const previewRequests = Array.from({ length: 40 }, (_, i) => {
-  const p = REQ_PATHS[i % REQ_PATHS.length];
-  const cold = i % 14 === 3;
-  const dur = cold ? 38 + (i % 5) * 6 : 3 + (i % 24);
-  return {
-    time_ms: now - i * 4000,
-    request_id: `req_${(0x1a2b + i).toString(16)}`,
-    method: p[0],
-    host: 'swan.host',
-    app: p[2],
-    path: p[1],
-    status: i % 33 === 19 ? 500 : p[3],
-    duration_ms: dur,
-    cold,
-    protocol: 'HTTP/2',
-    bytes_in: p[0] === 'GET' ? 0 : 420,
-    bytes_out: 1840 + (i % 9) * 220,
-  };
-}).sort((a, b) => b.time_ms - a.time_ms);
+// Deterministic 20-minute traffic pattern so the per-app minute sparks have
+// real shape: helios-api carries most of the load, atelier breathes with a
+// bursty retail rhythm, ledger and the rest tick along quietly.
+export const previewRequests = (() => {
+  const rows = [];
+  let seq = 0x1a2b;
+  for (let i = 0; i < 340; i++) {
+    const p = REQ_PATHS[(i * 7) % REQ_PATHS.length];
+    // Spread over ~20 minutes with a per-app wave so buckets differ.
+    const minute = (i * 13) % 20;
+    const wave = p[2] === 'helios-api' ? 1 : p[2] === 'atelier' ? Math.sin(minute / 3) ** 2 : 0.4;
+    if (((i * 31) % 100) / 100 > 0.25 + wave * 0.6) continue;
+    const withinMinute = (i * 2711) % 60_000;
+    const cold = i % 47 === 11;
+    const dur = cold ? 38 + (i % 5) * 6 : 3 + (i % 24);
+    rows.push({
+      time_ms: now - minute * 60_000 - withinMinute,
+      request_id: `req_${(seq++).toString(16)}`,
+      method: p[0],
+      host: 'swan.host',
+      app: p[2],
+      path: p[1],
+      status: i % 89 === 19 ? 500 : p[3],
+      duration_ms: dur,
+      cold,
+      protocol: 'HTTP/2',
+      bytes_in: p[0] === 'GET' ? 0 : 420,
+      bytes_out: 1840 + (i % 9) * 220,
+    });
+  }
+  return rows.sort((a, b) => b.time_ms - a.time_ms);
+})();
 
 export const previewGithub = {
   configured: true,
