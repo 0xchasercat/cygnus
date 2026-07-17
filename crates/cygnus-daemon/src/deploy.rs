@@ -5,6 +5,7 @@
 //! path, and the only host path it can publish is the bounded output mount.
 
 mod publish;
+pub mod upload;
 
 use std::collections::BTreeMap;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
