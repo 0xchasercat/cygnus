@@ -1129,16 +1129,28 @@ fn configure_tenant_admin(app: &mut LoadedApp, socket: &Path) -> Result<(), Box<
     if !app.tenant_admin {
         return Ok(());
     }
-    let parent = socket
-        .parent()
-        .ok_or("Tenant Zero admin socket has no parent directory")?;
-    app.spec.admin_socket = Some(AdminSocketSpec::new(parent));
-    app.spec.env.insert(
-        "CYGNUS_ADMIN_SOCKET".into(),
-        PathBuf::from(ADMIN_CAGE_DIR)
-            .join(ADMIN_SOCKET_FILENAME)
-            .into_os_string(),
-    );
+    if app.spec.rootfs.is_some() {
+        // Rooted cages see the socket through a read-only bind mount at the
+        // fixed in-cage path; the host location never leaks into the cage.
+        let parent = socket
+            .parent()
+            .ok_or("Tenant Zero admin socket has no parent directory")?;
+        app.spec.admin_socket = Some(AdminSocketSpec::new(parent));
+        app.spec.env.insert(
+            "CYGNUS_ADMIN_SOCKET".into(),
+            PathBuf::from(ADMIN_CAGE_DIR)
+                .join(ADMIN_SOCKET_FILENAME)
+                .into_os_string(),
+        );
+    } else {
+        // Without a private root there is no bind mount to hide behind — the
+        // app shares the host view (plain-process cages, macOS development).
+        // Hand it the host socket path directly; the daemon still enforces
+        // peer-credential checks on every connection.
+        app.spec
+            .env
+            .insert("CYGNUS_ADMIN_SOCKET".into(), socket.as_os_str().to_owned());
+    }
     app.spec.validate()?;
     Ok(())
 }
