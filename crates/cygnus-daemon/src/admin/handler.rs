@@ -3,14 +3,17 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::{
     ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode, AdminHandler,
-    AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppView, DeploymentView,
-    GitHubJobView, MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES, NodeView,
+    AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppView, CertificateView,
+    DeploymentView, EngineView, GitHubJobView, MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES,
+    MemoryView, NodeView,
 };
 use crate::deploy::DeployRequest;
 use crate::github::{GitHubError, GitHubManager};
+use crate::metrics::MetricsHub;
 use crate::state::{
     AuditContext, AuditEndpointRole, AuditOutcome, DeploymentRecord, DeploymentStatus,
     GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind, LoadedApp, NodeConfig, State,
@@ -22,6 +25,7 @@ use cygnus_cage::EgressMode;
 use sha2::{Digest, Sha256};
 
 const APP_PAGE_QUERY_LIMIT: usize = 50;
+const DEFAULT_RUNTIME_LOGS_ROOT: &str = "/var/log/cygnus/apps";
 
 type LifecycleLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
@@ -32,6 +36,7 @@ pub enum AdminMutation {
         version: String,
         host_root: std::path::PathBuf,
         cage_executable: std::path::PathBuf,
+        is_default: bool,
     },
     Deploy(DeployRequest),
     MapDomain {
@@ -74,6 +79,9 @@ pub struct StateAdminHandler {
     lifecycle: Arc<LifecycleLookup>,
     mutations: Arc<dyn AdminMutationHandler>,
     github: Option<Arc<GitHubManager>>,
+    metrics: MetricsHub,
+    started_at: Instant,
+    runtime_logs_root: PathBuf,
 }
 
 impl StateAdminHandler {
@@ -87,11 +95,24 @@ impl StateAdminHandler {
             lifecycle: Arc::new(lifecycle),
             mutations,
             github: None,
+            metrics: MetricsHub::new(),
+            started_at: Instant::now(),
+            runtime_logs_root: PathBuf::from(DEFAULT_RUNTIME_LOGS_ROOT),
         }
     }
 
     pub fn with_github(mut self, github: Arc<GitHubManager>) -> Self {
         self.github = Some(github);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: MetricsHub) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn with_runtime_logs(mut self, runtime_logs_root: impl Into<PathBuf>) -> Self {
+        self.runtime_logs_root = runtime_logs_root.into();
         self
     }
 
@@ -106,16 +127,34 @@ impl StateAdminHandler {
                 service: "cygnus-daemon".into(),
                 isolation: cygnus_cage::ISOLATION.into(),
             }),
-            AdminCommand::Status => {
-                let state = self.open_state()?;
-                let snapshot = state.load().map_err(HandlerFault::internal)?;
-                Ok(AdminData::Status {
-                    node: NodeView {
-                        listen: snapshot.listen.to_string(),
-                        https_listen: snapshot.edge.https_listen.map(|value| value.to_string()),
-                        apps_domain: snapshot.edge.apps_domain,
-                        app_count: snapshot.apps.len(),
-                    },
+            AdminCommand::Status => self.status(),
+            AdminCommand::GetMetrics => Ok(AdminData::Metrics {
+                metrics: self.metrics.metrics(),
+            }),
+            AdminCommand::ListRequests { limit } => Ok(AdminData::Requests {
+                requests: self.metrics.list_requests(usize::from(limit)),
+            }),
+            AdminCommand::ListEvents { limit } => Ok(AdminData::Events {
+                events: self.metrics.list_events(usize::from(limit)),
+            }),
+            AdminCommand::ReadAppLog {
+                app,
+                stream,
+                offset,
+                limit,
+            } => {
+                let path = self
+                    .runtime_logs_root
+                    .join(&app)
+                    .join(stream.app_filename());
+                let (bytes, next_offset, eof) = read_log_chunk(&path, offset, limit, "app log")?;
+                Ok(AdminData::AppLog {
+                    app,
+                    stream,
+                    offset,
+                    next_offset,
+                    eof,
+                    data_base64: BASE64_STANDARD.encode(bytes),
                 })
             }
             AdminCommand::ListApps { cursor, limit } => {
@@ -184,6 +223,7 @@ impl StateAdminHandler {
                 version,
                 host_root,
                 cage_executable,
+                is_default,
             } => self.mutate(
                 role,
                 peer,
@@ -192,6 +232,7 @@ impl StateAdminHandler {
                     version,
                     host_root,
                     cage_executable,
+                    is_default,
                 },
                 "register_engine",
             ),
@@ -334,8 +375,8 @@ impl StateAdminHandler {
                     .deployment_logs_dir(&deployment)
                     .map_err(HandlerFault::internal)?
                     .ok_or_else(|| HandlerFault::not_found("deployment logs are unavailable"))?;
-                let path = directory.join(stream.filename());
-                let (bytes, next_offset, eof) = read_log_chunk(&path, offset, limit)?;
+                let path = directory.join(stream.build_filename());
+                let (bytes, next_offset, eof) = read_log_chunk(&path, offset, limit, "build log")?;
                 Ok(AdminData::Log {
                     deployment,
                     stream,
@@ -346,6 +387,67 @@ impl StateAdminHandler {
                 })
             }
         }
+    }
+
+    fn status(&self) -> Result<AdminData, HandlerFault> {
+        let state = self.open_state()?;
+        let snapshot = state.load().map_err(HandlerFault::internal)?;
+        let engines = state
+            .engines()
+            .map_err(HandlerFault::internal)?
+            .into_iter()
+            .map(|status| EngineView {
+                version: status.engine.version,
+                sha256: status.engine.sha256,
+                is_default: status.engine.is_default,
+                apps: status.app_count,
+            })
+            .collect();
+        let now = unix_seconds();
+        let acme = snapshot.edge.acme.as_ref();
+        let mut certificates = Vec::new();
+        for certificate in state.certificates().map_err(HandlerFault::internal)? {
+            let ok = certificate.not_after_unix > now
+                && certificate.certificate_path.is_file()
+                && certificate.private_key_path.is_file();
+            for domain in certificate.domains {
+                let kind = if domain.starts_with("*.") {
+                    "wildcard"
+                } else if acme.is_some_and(|config| config.dns_provider.is_some()) {
+                    "acme_dns01"
+                } else if acme.is_some() {
+                    "acme_http01"
+                } else {
+                    "manual"
+                };
+                certificates.push(CertificateView {
+                    domain,
+                    kind: kind.into(),
+                    ok,
+                    expires_unix: Some(certificate.not_after_unix),
+                });
+            }
+        }
+        let warm_count = snapshot
+            .apps
+            .iter()
+            .filter(|app| (self.lifecycle)(&app.name).as_deref() == Some("ready"))
+            .count();
+        Ok(AdminData::Status {
+            node: NodeView {
+                listen: snapshot.listen.to_string(),
+                https_listen: snapshot.edge.https_listen.map(|value| value.to_string()),
+                apps_domain: snapshot.edge.apps_domain,
+                app_count: snapshot.apps.len(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                uptime_seconds: self.started_at.elapsed().as_secs(),
+                isolation: cygnus_cage::ISOLATION.into(),
+                warm_count,
+                engines,
+                certificates,
+                memory: memory_view(),
+            },
+        })
     }
 
     fn mutate(
@@ -607,6 +709,7 @@ fn read_log_chunk(
     path: &Path,
     offset: u64,
     limit: u32,
+    label: &str,
 ) -> Result<(Vec<u8>, u64, bool), HandlerFault> {
     if limit == 0 || limit > MAX_LOG_CHUNK_BYTES {
         return Err(HandlerFault::validation(
@@ -618,12 +721,14 @@ fn read_log_chunk(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => HandlerFault::not_found("build log does not exist"),
+            io::ErrorKind::NotFound => HandlerFault::not_found(format!("{label} does not exist")),
             _ => HandlerFault::internal(error),
         })?;
     let metadata = file.metadata().map_err(HandlerFault::internal)?;
     if !metadata.is_file() {
-        return Err(HandlerFault::internal("build log is not a regular file"));
+        return Err(HandlerFault::internal(format!(
+            "{label} is not a regular file"
+        )));
     }
     if offset > metadata.len() {
         return Err(HandlerFault::validation(
@@ -640,6 +745,46 @@ fn read_log_chunk(
         .map_err(HandlerFault::internal)?;
     let next_offset = offset + count as u64;
     Ok((bytes, next_offset, next_offset == metadata.len()))
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn memory_view() -> MemoryView {
+    let Ok(contents) = std::fs::read_to_string("/proc/meminfo") else {
+        return MemoryView::default();
+    };
+    let mut total_bytes = 0;
+    let mut available_bytes = 0;
+    for line in contents.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let Some(value) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+        match name {
+            "MemTotal:" => total_bytes = value.saturating_mul(1024),
+            "MemAvailable:" => available_bytes = value.saturating_mul(1024),
+            _ => {}
+        }
+    }
+    MemoryView {
+        total_bytes,
+        available_bytes,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_view() -> MemoryView {
+    MemoryView::default()
 }
 
 fn map_state_query_error(error: crate::state::StateError) -> HandlerFault {
@@ -735,6 +880,99 @@ mod tests {
             actor: None,
             command,
         }
+    }
+
+    #[test]
+    fn status_includes_runtime_and_host_basics() {
+        let path = state_path();
+        let mut state = State::open(&path).unwrap();
+        state
+            .apply(&NodeConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+                edge: Default::default(),
+                apps: vec![AppConfig {
+                    name: "api".into(),
+                    upstream: "/run/cygnus/api.sock".into(),
+                    command: "/bin/true".into(),
+                    ..AppConfig::default()
+                }],
+            })
+            .unwrap();
+        drop(state);
+
+        let handler = StateAdminHandler::new(
+            &path,
+            |app| (app == "api").then(|| "ready".into()),
+            unused_mutations(),
+        );
+        let response = handler.handle(
+            AdminRole::Host,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::Status),
+        );
+        let AdminResponse::Ok { data, .. } = response else {
+            panic!("unexpected response");
+        };
+        let AdminData::Status { node } = *data else {
+            panic!("unexpected data kind");
+        };
+        assert_eq!(node.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(node.isolation, cygnus_cage::ISOLATION);
+        assert_eq!(node.app_count, 1);
+        assert_eq!(node.warm_count, 1);
+        assert!(node.engines.is_empty());
+        assert!(node.certificates.is_empty());
+        #[cfg(target_os = "linux")]
+        assert!(node.memory.total_bytes > 0);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_app_log_honors_offset_limit_and_eof() {
+        let path = state_path();
+        State::open(&path).unwrap();
+        let logs = path.with_extension("runtime-logs");
+        fs::create_dir_all(logs.join("api")).unwrap();
+        fs::write(logs.join("api/stdout.log"), b"abcdef").unwrap();
+        let handler =
+            StateAdminHandler::new(&path, |_| None, unused_mutations()).with_runtime_logs(&logs);
+
+        let read = |offset, limit| {
+            let response = handler.handle(
+                AdminRole::Host,
+                AdminPeerCredentials::default(),
+                request(AdminCommand::ReadAppLog {
+                    app: "api".into(),
+                    stream: super::super::LogStream::Stdout,
+                    offset,
+                    limit,
+                }),
+            );
+            let AdminResponse::Ok { data, .. } = response else {
+                panic!("unexpected response");
+            };
+            let AdminData::AppLog {
+                offset,
+                next_offset,
+                eof,
+                data_base64,
+                ..
+            } = *data
+            else {
+                panic!("unexpected data kind");
+            };
+            (
+                offset,
+                next_offset,
+                eof,
+                BASE64_STANDARD.decode(data_base64).unwrap(),
+            )
+        };
+        assert_eq!(read(2, 3), (2, 5, false, b"cde".to_vec()));
+        assert_eq!(read(5, 3), (5, 6, true, b"f".to_vec()));
+
+        fs::remove_dir_all(logs).unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

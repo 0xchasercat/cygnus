@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::ingress::BodyGuard;
+use crate::ingress::{BodyGuard, ResponseStatus};
 use arc_swap::ArcSwap;
 use cygnus_router::normalize_host;
 use rustls::crypto::ring::default_provider;
@@ -137,6 +137,7 @@ impl ResolvesServerCert for CertificateResolver {
 pub(crate) struct TlsRelayStats {
     pub to_upstream: u64,
     pub to_client: u64,
+    pub status: u16,
 }
 
 pub(crate) fn relay_tls(
@@ -158,6 +159,7 @@ pub(crate) fn relay_tls(
     let mut to_client_offset = 0;
     let mut buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut stats = TlsRelayStats::default();
+    let mut response_status = ResponseStatus::default();
     let mut last_progress = Instant::now();
 
     loop {
@@ -238,6 +240,8 @@ pub(crate) fn relay_tls(
                     progressed = true;
                 }
                 Ok(read) => {
+                    response_status.observe(&buffer[..read]);
+                    stats.status = response_status.status().unwrap_or_default();
                     to_client.extend_from_slice(&buffer[..read]);
                     progressed = true;
                 }
@@ -461,13 +465,15 @@ mod tests {
             stream.read_exact(&mut request).unwrap();
             relay_upstream.write_all(&request).unwrap();
             let (connection, client) = stream.into_parts();
-            relay_tls(connection, client, relay_upstream, BodyGuard::none()).unwrap();
+            relay_tls(connection, client, relay_upstream, BodyGuard::none()).unwrap()
         });
         let upstream = thread::spawn(move || {
             let mut request = [0_u8; 4];
             application.read_exact(&mut request).unwrap();
             assert_eq!(&request, b"ping");
-            application.write_all(b"pong").unwrap();
+            application
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .unwrap();
             application.shutdown(Shutdown::Write).unwrap();
         });
 
@@ -482,12 +488,13 @@ mod tests {
         let mut client = StreamOwned::new(connection, client);
         client.write_all(b"ping").unwrap();
         client.flush().unwrap();
-        let mut response = [0_u8; 4];
-        client.read_exact(&mut response).unwrap();
-        assert_eq!(&response, b"pong");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(&response, b"HTTP/1.1 204 No Content\r\n\r\n");
 
         upstream.join().unwrap();
-        server.join().unwrap();
+        let stats = server.join().unwrap();
+        assert_eq!(stats.status, 204);
         fs::remove_dir_all(directory).unwrap();
     }
 }

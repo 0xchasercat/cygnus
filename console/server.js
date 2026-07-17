@@ -129,7 +129,9 @@ export async function handleApi(request, url) {
     "/api/v1/github/manifest",
     "/api/v1/github/repositories",
   ].includes(path) || /^\/api\/v1\/github\/jobs\/[^/]+\/retry$/u.test(path);
-  const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|jobs))(?:\/[^/]+)?$/u.test(path);
+  const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|jobs))(?:\/[^/]+)?$/u.test(path)
+    || /^\/api\/v1\/(?:metrics|requests|events)$/u.test(path)
+    || /^\/api\/v1\/(?:apps|deployments)\/[^/]+\/logs$/u.test(path);
   if (mutationRoute && request.method !== "POST") return methodNotAllowed("POST");
   if (readRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
 
@@ -380,6 +382,18 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
     assertQueryKeys(url, []);
     return { type: "status" };
   }
+  if (parts.length === 3 && parts[2] === "metrics") {
+    assertQueryKeys(url, []);
+    return { type: "get_metrics" };
+  }
+  if (parts.length === 3 && parts[2] === "requests") {
+    assertQueryKeys(url, ["limit"]);
+    return { type: "list_requests", limit: observabilityLimit(url) };
+  }
+  if (parts.length === 3 && parts[2] === "events") {
+    assertQueryKeys(url, ["limit"]);
+    return { type: "list_events", limit: observabilityLimit(url) };
+  }
   if (parts.length === 3 && parts[2] === "apps") {
     assertQueryKeys(url, ["cursor", "limit"]);
     return { type: "list_apps", cursor: optionalQuery(url, "cursor"), limit: listLimit(url) };
@@ -387,6 +401,16 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
   if (parts.length === 4 && parts[2] === "apps") {
     assertQueryKeys(url, []);
     return { type: "get_app", app: safeApp(decodeSegment(parts[3], "app")) };
+  }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "logs") {
+    assertQueryKeys(url, ["stream", "offset", "limit"]);
+    return {
+      type: "read_app_log",
+      app: safeApp(decodeSegment(parts[3], "app")),
+      stream: logStream(url),
+      offset: logOffset(url),
+      limit: logLimit(url),
+    };
   }
   if (parts.length === 3 && parts[2] === "deployments") {
     assertQueryKeys(url, ["app", "cursor", "limit"]);
@@ -401,6 +425,16 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
   if (parts.length === 4 && parts[2] === "deployments") {
     assertQueryKeys(url, []);
     return { type: "get_deployment", deployment: safeDeployment(decodeSegment(parts[3], "deployment")) };
+  }
+  if (parts.length === 5 && parts[2] === "deployments" && parts[4] === "logs") {
+    assertQueryKeys(url, ["stream", "offset", "limit"]);
+    return {
+      type: "read_log",
+      deployment: safeDeployment(decodeSegment(parts[3], "deployment")),
+      stream: logStream(url),
+      offset: logOffset(url),
+      limit: logLimit(url),
+    };
   }
   if (parts.length === 4 && parts[2] === "github" && parts[3] === "status") {
     assertQueryKeys(url, []);
@@ -581,6 +615,35 @@ function listLimit(url) {
   const limit = Number(raw);
   if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new HttpInputError(422, "validation", "limit must be an integer between 1 and 50");
   return limit;
+}
+function observabilityLimit(url) {
+  return integerQuery(url, "limit", 100, 1, 500);
+}
+function logStream(url) {
+  const values = url.searchParams.getAll("stream");
+  if (values.length !== 1 || (values[0] !== "stdout" && values[0] !== "stderr")) {
+    throw new HttpInputError(422, "validation", "stream must be stdout or stderr");
+  }
+  return values[0];
+}
+function logOffset(url) {
+  return integerQuery(url, "offset", 0, 0, Number.MAX_SAFE_INTEGER);
+}
+function logLimit(url) {
+  return integerQuery(url, "limit", 16_384, 1, 49_152);
+}
+function integerQuery(url, key, defaultValue, minimum, maximum) {
+  const values = url.searchParams.getAll(key);
+  if (values.length === 0) return defaultValue;
+  const raw = values[0];
+  if (values.length !== 1 || !/^(?:0|[1-9]\d*)$/u.test(raw)) {
+    throw new HttpInputError(422, "validation", `${key} must be an integer between ${minimum} and ${maximum}`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new HttpInputError(422, "validation", `${key} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
 }
 function optionalQuery(url, key) {
   const value = url.searchParams.get(key);

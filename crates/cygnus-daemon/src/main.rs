@@ -12,6 +12,8 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod runtime_logs;
+
 use clap::{Parser, Subcommand};
 use cygnus_cage::{ADMIN_CAGE_DIR, ADMIN_SOCKET_FILENAME, AdminSocketSpec, Cage, CageSpec};
 use cygnus_daemon::Frontend;
@@ -27,6 +29,7 @@ use cygnus_daemon::deploy::{
 };
 use cygnus_daemon::edge::EdgeConfig;
 use cygnus_daemon::github::{GitHubDeployExecutor, GitHubManager, GitHubWorker};
+use cygnus_daemon::metrics::{EventRecord, MetricsHub};
 use cygnus_daemon::state::{
     AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State,
     StateError,
@@ -38,6 +41,49 @@ use sha2::{Digest, Sha256};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 const REAPER_INTERVAL: Duration = Duration::from_secs(1);
+
+type RuntimeApps = Arc<parking_lot::RwLock<BTreeMap<String, String>>>;
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn record_event(
+    metrics: &MetricsHub,
+    event_type: &str,
+    app: Option<&str>,
+    message: impl Into<String>,
+) {
+    metrics.record_event(EventRecord {
+        time_ms: unix_millis(),
+        r#type: event_type.to_owned(),
+        app: app.map(str::to_owned),
+        message: message.into(),
+    });
+}
+
+fn logical_app(runtime_apps: &RuntimeApps, runtime_key: &str) -> String {
+    runtime_apps
+        .read()
+        .get(runtime_key)
+        .cloned()
+        .unwrap_or_else(|| runtime_key.to_owned())
+}
+
+fn insert_runtime_app(
+    runtime_apps: &RuntimeApps,
+    metrics: &MetricsHub,
+    runtime_key: &str,
+    logical_app: &str,
+) {
+    runtime_apps
+        .write()
+        .insert(runtime_key.to_owned(), logical_app.to_owned());
+    metrics.set_app_alias(runtime_key, logical_app);
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "cygnus-daemon", about = "Run the Cygnus request plane")]
@@ -128,6 +174,8 @@ struct LiveDeployRuntime<I> {
     supervisor: Arc<Supervisor<I>>,
     router: Arc<Router>,
     tenant_admin_socket: PathBuf,
+    runtime_apps: RuntimeApps,
+    metrics: MetricsHub,
     gate: Arc<parking_lot::Mutex<()>>,
 }
 
@@ -136,11 +184,15 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         supervisor: Arc<Supervisor<I>>,
         router: Arc<Router>,
         tenant_admin_socket: impl Into<PathBuf>,
+        runtime_apps: RuntimeApps,
+        metrics: MetricsHub,
     ) -> Self {
         Self {
             supervisor,
             router,
             tenant_admin_socket: tenant_admin_socket.into(),
+            runtime_apps,
+            metrics,
             gate: Arc::new(parking_lot::Mutex::new(())),
         }
     }
@@ -151,6 +203,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         previous_runtime_key: Option<&str>,
     ) -> Result<ActivationPreparation, DeployError> {
         let key = candidate.spec.name.clone();
+        insert_runtime_app(&self.runtime_apps, &self.metrics, &key, &candidate.name);
         if previous_runtime_key == Some(key.as_str()) {
             return Ok(ActivationPreparation::new(|| {}));
         }
@@ -198,24 +251,47 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         audit: &AuditContext,
     ) -> Result<DeployResult, DeployError> {
         let _deployment_gate = self.gate.lock();
-        let previous_runtime_key = state
-            .load()?
-            .apps
-            .into_iter()
-            .find(|app| app.name == request.app)
-            .map(|app| app.spec.name);
-        let previous_for_prepare = previous_runtime_key.clone();
-        let tenant_socket = self.tenant_admin_socket.clone();
-        let result = deploy_with_audit_and_prepare(state, request, audit, |candidate| {
-            let mut candidate = candidate.clone();
-            configure_tenant_admin(&mut candidate, &tenant_socket)
-                .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
-            self.prepare_candidate(&candidate, previous_for_prepare.as_deref())
-        })?;
+        let app = request.app.clone();
+        let result: Result<DeployResult, DeployError> = (|| {
+            let previous_runtime_key = state
+                .load()?
+                .apps
+                .into_iter()
+                .find(|candidate| candidate.name == app)
+                .map(|candidate| candidate.spec.name);
+            let previous_for_prepare = previous_runtime_key.clone();
+            let tenant_socket = self.tenant_admin_socket.clone();
+            let result = deploy_with_audit_and_prepare(state, request, audit, |candidate| {
+                let mut candidate = candidate.clone();
+                configure_tenant_admin(&mut candidate, &tenant_socket)
+                    .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
+                self.prepare_candidate(&candidate, previous_for_prepare.as_deref())
+            })?;
 
-        let new_runtime_key = format!("r-{}", result.artifact_hash);
-        self.install_after_commit(&state.load()?, previous_runtime_key, &new_runtime_key);
-        Ok(result)
+            let new_runtime_key = format!("r-{}", result.artifact_hash);
+            self.install_after_commit(&state.load()?, previous_runtime_key, &new_runtime_key);
+            Ok(result)
+        })();
+        match result {
+            Ok(result) => {
+                record_event(
+                    &self.metrics,
+                    "deploy",
+                    Some(&app),
+                    format!("deployment {} activated", result.deployment_id),
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                record_event(
+                    &self.metrics,
+                    "deploy_failed",
+                    Some(&app),
+                    "deployment failed",
+                );
+                Err(error)
+            }
+        }
     }
 }
 
@@ -274,6 +350,8 @@ struct LiveAdminMutations {
     supervisor: Arc<Supervisor<Cage>>,
     router: Arc<Router>,
     tenant_admin_socket: PathBuf,
+    runtime_apps: RuntimeApps,
+    metrics: MetricsHub,
     runtime: Arc<LiveDeployRuntime<Cage>>,
 }
 
@@ -289,7 +367,8 @@ impl AdminMutationHandler for LiveAdminMutations {
                 version,
                 host_root,
                 cage_executable,
-            } => self.register_engine(version, host_root, cage_executable, audit),
+                is_default,
+            } => self.register_engine(version, host_root, cage_executable, is_default, audit),
             AdminMutation::Deploy(request) => self.deploy(request, audit),
             AdminMutation::MapDomain { app, domain } => self.map_domain(&app, &domain, audit),
             AdminMutation::Rollback {
@@ -352,6 +431,7 @@ impl LiveAdminMutations {
                 AdminMutationError::new(AdminErrorCode::Conflict, error.to_string())
             })?;
             let key = candidate.spec.name.clone();
+            insert_runtime_app(&self.runtime_apps, &self.metrics, &key, &candidate.name);
             self.supervisor.register(
                 key.clone(),
                 candidate.spec.clone(),
@@ -407,12 +487,25 @@ impl LiveAdminMutations {
         version: String,
         host_root: PathBuf,
         cage_executable: PathBuf,
+        is_default: bool,
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
-        let engine =
-            register_engine_with_audit(&mut state, version, host_root, cage_executable, audit)
-                .map_err(map_deploy_error)?;
+        let engine = register_engine_with_audit(
+            &mut state,
+            version,
+            host_root,
+            cage_executable,
+            is_default,
+            audit,
+        )
+        .map_err(map_deploy_error)?;
+        record_event(
+            &self.metrics,
+            "engine_registered",
+            None,
+            format!("engine {} registered", engine.version),
+        );
         Ok(AdminData::EngineRegistered {
             version: engine.version,
             sha256: engine.sha256,
@@ -424,7 +517,19 @@ impl LiveAdminMutations {
         request: DeployRequest,
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
-        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let app = request.app.clone();
+        let mut state = match State::open(&self.state_path) {
+            Ok(state) => state,
+            Err(error) => {
+                record_event(
+                    &self.metrics,
+                    "deploy_failed",
+                    Some(&app),
+                    "deployment state could not be opened",
+                );
+                return Err(map_admin_state_error(error));
+            }
+        };
         let result = self
             .runtime
             .deploy(&mut state, request, audit)
@@ -466,6 +571,12 @@ impl LiveAdminMutations {
             },
         );
         drop(self.router.install(routes));
+        record_event(
+            &self.metrics,
+            "domain_mapped",
+            Some(app),
+            format!("domain {canonical} mapped"),
+        );
         Ok(AdminData::DomainMapped {
             app: app.to_owned(),
             domain: canonical,
@@ -506,6 +617,7 @@ impl LiveAdminMutations {
         *current = plan.candidate.clone();
         let routes = route_table(&snapshot);
         let runtime_changed = plan.previous_runtime_key.as_deref() != Some(&plan.runtime_key);
+        insert_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key, app);
         if runtime_changed {
             self.supervisor.register(
                 plan.runtime_key.clone(),
@@ -538,6 +650,12 @@ impl LiveAdminMutations {
                 }
             });
         }
+        record_event(
+            &self.metrics,
+            "rollback",
+            Some(app),
+            format!("deployment {deployment} activated by rollback"),
+        );
         Ok(AdminData::Activated {
             app: app.to_owned(),
             active: ActiveDeploymentView {
@@ -637,7 +755,40 @@ fn serve(
     }
 
     let router = Arc::new(Router::new(RouteTable::new()));
-    let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
+    let metrics = MetricsHub::new();
+    let runtime_apps: RuntimeApps = Arc::new(parking_lot::RwLock::new(BTreeMap::new()));
+    let absolute_state_path = if state_path.is_absolute() {
+        state_path.to_owned()
+    } else {
+        std::env::current_dir()?.join(state_path)
+    };
+    let runtime_logs_root = absolute_state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join("logs/apps");
+    let boot_runtime_apps = Arc::clone(&runtime_apps);
+    let boot_metrics = metrics.clone();
+    let boot_logs_root = runtime_logs_root.clone();
+    let supervisor = Arc::new(Supervisor::<Cage>::new(move |spec| {
+        let app = logical_app(&boot_runtime_apps, &spec.name);
+        match runtime_logs::boot_with_logs_and_prepare(
+            spec,
+            &boot_logs_root,
+            &app,
+            prepare_upstream,
+        ) {
+            Ok(cage) => {
+                boot_metrics.record_boot(unix_millis(), &app, cage.timings());
+                record_event(&boot_metrics, "revival", Some(&app), "cage became ready");
+                Ok(cage)
+            }
+            Err(error) => {
+                eprintln!("cygnus-daemon: app {app:?} did not boot: {error}");
+                record_event(&boot_metrics, "crash", Some(&app), "cage boot failed");
+                Err(error)
+            }
+        }
+    }));
     let mut routes = RouteTable::new();
     let mut pinned = Vec::new();
     let edge = snapshot.edge.clone();
@@ -653,7 +804,14 @@ fn serve(
         configure_tenant_admin(app, tenant_admin_socket)?;
     }
     for app in snapshot.apps {
-        install_app(&supervisor, &mut routes, &mut pinned, app);
+        install_app(
+            &supervisor,
+            &runtime_apps,
+            &metrics,
+            &mut routes,
+            &mut pinned,
+            app,
+        );
     }
     drop(router.install(routes));
 
@@ -663,8 +821,14 @@ fn serve(
         }
     }
 
-    spawn_reaper(Arc::downgrade(&supervisor));
-    let frontend = Arc::new(Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)));
+    spawn_reaper(
+        Arc::downgrade(&supervisor),
+        Arc::clone(&runtime_apps),
+        metrics.clone(),
+    );
+    let frontend = Arc::new(
+        Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)).with_metrics(metrics.clone()),
+    );
     let http_address = local_addr(&listener);
     let http_frontend = Arc::clone(&frontend);
     let http_shutdown = Arc::clone(&shutdown);
@@ -683,6 +847,7 @@ fn serve(
             &edge,
             &certificate_domains,
             frontend.http01_challenges(),
+            &metrics,
         )?;
     }
     let tls = https_listener
@@ -701,6 +866,7 @@ fn serve(
             frontend.http01_challenges(),
             tls.clone(),
             Arc::clone(&shutdown),
+            metrics.clone(),
         ))
     });
     let tls_thread = tls.map(|(tls_listener, tls)| {
@@ -723,12 +889,16 @@ fn serve(
         Arc::clone(&supervisor),
         Arc::clone(&router),
         tenant_admin_socket.to_owned(),
+        Arc::clone(&runtime_apps),
+        metrics.clone(),
     ));
     let mutations: Arc<dyn AdminMutationHandler> = Arc::new(LiveAdminMutations {
         state_path: state_path.to_owned(),
         supervisor: Arc::clone(&supervisor),
         tenant_admin_socket: tenant_admin_socket.to_owned(),
         router: Arc::clone(&router),
+        runtime_apps: Arc::clone(&runtime_apps),
+        metrics: metrics.clone(),
         runtime: Arc::clone(&live_runtime),
     });
     let github = Arc::new(GitHubManager::new(state_path));
@@ -763,7 +933,9 @@ fn serve(
             },
             mutations,
         )
-        .with_github(Arc::clone(&github)),
+        .with_github(Arc::clone(&github))
+        .with_metrics(metrics.clone())
+        .with_runtime_logs(runtime_logs_root),
     );
     let admin_server = AdminServer::new(admin_bindings, admin_handler);
     let admin_shutdown = Arc::clone(&shutdown);
@@ -819,6 +991,7 @@ fn ensure_acme_certificates(
     edge: &EdgeConfig,
     domains: &[String],
     challenges: Http01Challenges,
+    metrics: &MetricsHub,
 ) -> Result<(), Box<dyn Error>> {
     let Some(config) = edge.acme.clone() else {
         return Ok(());
@@ -852,13 +1025,24 @@ fn ensure_acme_certificates(
     };
     let manager = AcmeManager::new(config, state_path, challenges, dns)?;
     for chunk in pending {
-        let input = manager.issue(&chunk)?;
+        let replacement = installed.iter().any(|certificate| {
+            chunk
+                .iter()
+                .any(|domain| certificate.domains.iter().any(|covered| covered == domain))
+        });
+        let input = match manager.issue(&chunk) {
+            Ok(input) => input,
+            Err(error) => {
+                record_event(metrics, "cert_failed", None, "certificate issuance failed");
+                return Err(Box::new(error));
+            }
+        };
         let mut digest = Sha256::new();
         for domain in &chunk {
             digest.update(domain.as_bytes());
         }
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        state.install_certificate(
+        if let Err(error) = state.install_certificate(
             &input,
             &AuditContext {
                 endpoint_role: AuditEndpointRole::Host,
@@ -870,7 +1054,29 @@ fn ensure_acme_certificates(
                 command_kind: "certificate_install".into(),
                 request_digest: format!("{:x}", digest.finalize()),
             },
-        )?;
+        ) {
+            record_event(
+                metrics,
+                "cert_failed",
+                None,
+                "certificate installation failed",
+            );
+            return Err(Box::new(error));
+        }
+        record_event(
+            metrics,
+            if replacement {
+                "cert_renewed"
+            } else {
+                "cert_issued"
+            },
+            None,
+            if replacement {
+                "certificate renewed"
+            } else {
+                "certificate issued"
+            },
+        );
     }
     Ok(())
 }
@@ -882,6 +1088,7 @@ fn spawn_certificate_renewer(
     challenges: Http01Challenges,
     tls: TlsServer,
     shutdown: Arc<AtomicBool>,
+    metrics: MetricsHub,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut next_check = Instant::now() + Duration::from_secs(12 * 60 * 60);
@@ -890,7 +1097,13 @@ fn spawn_certificate_renewer(
                 thread::sleep(Duration::from_millis(250));
                 continue;
             }
-            match ensure_acme_certificates(&state_path, &edge, &domains, challenges.clone()) {
+            match ensure_acme_certificates(
+                &state_path,
+                &edge,
+                &domains,
+                challenges.clone(),
+                &metrics,
+            ) {
                 Ok(()) => match State::open(&state_path)
                     .and_then(|state| state.certificates())
                     .map_err(|error| error.to_string())
@@ -932,12 +1145,14 @@ fn configure_tenant_admin(app: &mut LoadedApp, socket: &Path) -> Result<(), Box<
 
 fn install_app(
     supervisor: &Supervisor<Cage>,
+    runtime_apps: &RuntimeApps,
+    metrics: &MetricsHub,
     routes: &mut RouteTable,
     pinned: &mut Vec<String>,
     app: LoadedApp,
 ) {
     let LoadedApp {
-        name: _,
+        name,
         domains,
         upstream,
         spec,
@@ -946,6 +1161,7 @@ fn install_app(
     } = app;
 
     let runtime_key = spec.name.clone();
+    insert_runtime_app(runtime_apps, metrics, &runtime_key, &name);
     if lifecycle.min_instances >= 1 {
         pinned.push(runtime_key.clone());
     }
@@ -972,20 +1188,47 @@ fn lifecycle_state_name(state: LifecycleState) -> String {
     .into()
 }
 
-fn spawn_reaper(supervisor: Weak<Supervisor<Cage>>) {
+fn run_reaper_pass<I: Instance>(
+    supervisor: &Supervisor<I>,
+    runtime_apps: &RuntimeApps,
+    metrics: &MetricsHub,
+    now: Instant,
+) {
+    for outcome in supervisor.reconcile_with_outcomes(now) {
+        let app = logical_app(runtime_apps, &outcome.app);
+        record_event(metrics, "crash", Some(&app), "cage exited");
+        if outcome.crash_loop {
+            record_event(
+                metrics,
+                "crash_loop",
+                Some(&app),
+                "cage parked after repeated crashes",
+            );
+        }
+    }
+    for runtime_key in supervisor.reap_idle(now) {
+        let app = logical_app(runtime_apps, &runtime_key);
+        record_event(metrics, "scale_to_zero", Some(&app), "idle cage reaped");
+    }
+}
+
+fn spawn_reaper(
+    supervisor: Weak<Supervisor<Cage>>,
+    runtime_apps: RuntimeApps,
+    metrics: MetricsHub,
+) {
     thread::spawn(move || {
         loop {
             thread::sleep(REAPER_INTERVAL);
             let Some(supervisor) = supervisor.upgrade() else {
                 return;
             };
-            let now = Instant::now();
-            supervisor.reconcile(now);
-            supervisor.reap_idle(now);
+            run_reaper_pass(&supervisor, &runtime_apps, &metrics, Instant::now());
         }
     });
 }
 
+#[cfg(test)]
 fn boot_cage(spec: &CageSpec) -> Result<Cage, String> {
     prepare_upstream(spec)?;
     Cage::boot(spec.clone()).map_err(|error| error.to_string())
@@ -1121,8 +1364,104 @@ mod tests {
             Arc::clone(&supervisor),
             Arc::clone(&router),
             "/tmp/cygnus-test-admin.sock",
+            Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            MetricsHub::new(),
         );
         (runtime, supervisor, router, events, shutdowns)
+    }
+
+    struct ReaperInstance {
+        status: cygnus_supervisor::InstanceStatus,
+    }
+
+    impl Instance for ReaperInstance {
+        fn try_status(&mut self) -> Result<cygnus_supervisor::InstanceStatus, String> {
+            Ok(self.status)
+        }
+
+        fn shutdown(self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reaper_pass_emits_scale_to_zero_for_idle_app_without_root() {
+        let supervisor = Supervisor::new(|_spec| {
+            Ok(ReaperInstance {
+                status: cygnus_supervisor::InstanceStatus::Running,
+            })
+        });
+        let runtime_apps = Arc::new(parking_lot::RwLock::new(BTreeMap::from([(
+            "runtime-idle".to_owned(),
+            "idle-app".to_owned(),
+        )])));
+        let metrics = MetricsHub::new();
+        supervisor.register(
+            "runtime-idle",
+            CageSpec::new("runtime-idle", "/bin/true"),
+            cygnus_supervisor::LifecycleConfig {
+                idle_ttl: Duration::ZERO,
+                ..Default::default()
+            },
+        );
+        supervisor.acquire("runtime-idle").unwrap();
+
+        run_reaper_pass(
+            &supervisor,
+            &runtime_apps,
+            &metrics,
+            Instant::now() + Duration::from_millis(1),
+        );
+
+        assert_eq!(supervisor.state("runtime-idle"), Some(LifecycleState::Cold));
+        let events = metrics.list_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].r#type, "scale_to_zero");
+        assert_eq!(events[0].app.as_deref(), Some("idle-app"));
+    }
+
+    #[test]
+    fn reaper_pass_emits_crash_and_crash_loop_when_app_is_parked_without_root() {
+        let supervisor = Supervisor::new(|_spec| {
+            Ok(ReaperInstance {
+                status: cygnus_supervisor::InstanceStatus::Exited,
+            })
+        });
+        let runtime_apps = Arc::new(parking_lot::RwLock::new(BTreeMap::from([(
+            "runtime-crash".to_owned(),
+            "crash-app".to_owned(),
+        )])));
+        let metrics = MetricsHub::new();
+        supervisor.register(
+            "runtime-crash",
+            CageSpec::new("runtime-crash", "/bin/true"),
+            cygnus_supervisor::LifecycleConfig {
+                backoff_base: Duration::ZERO,
+                backoff_max: Duration::ZERO,
+                crash_loop_threshold: 2,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..2 {
+            supervisor.acquire("runtime-crash").unwrap();
+            run_reaper_pass(&supervisor, &runtime_apps, &metrics, Instant::now());
+        }
+
+        assert_eq!(
+            supervisor.state("runtime-crash"),
+            Some(LifecycleState::Failed)
+        );
+        let events = metrics.list_events(10);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.r#type == "crash")
+                .count(),
+            2
+        );
+        assert_eq!(events[0].r#type, "crash_loop");
+        assert_eq!(events[0].app.as_deref(), Some("crash-app"));
     }
 
     #[test]
@@ -1385,10 +1724,19 @@ mod tests {
         }
 
         let supervisor = Arc::new(Supervisor::<Cage>::new(boot_cage));
+        let runtime_apps = Arc::new(parking_lot::RwLock::new(BTreeMap::new()));
+        let metrics = MetricsHub::new();
         let mut routes = RouteTable::new();
         let mut pinned = Vec::new();
         for app in snapshot.apps {
-            install_app(&supervisor, &mut routes, &mut pinned, app);
+            install_app(
+                &supervisor,
+                &runtime_apps,
+                &metrics,
+                &mut routes,
+                &mut pinned,
+                app,
+            );
         }
         let frontend = Arc::new(Frontend::new(
             Arc::new(Router::new(routes)),

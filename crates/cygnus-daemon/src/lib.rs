@@ -18,6 +18,7 @@ pub mod deploy;
 pub mod edge;
 pub mod github;
 pub mod ingress;
+pub mod metrics;
 pub mod state;
 pub mod tls;
 
@@ -30,7 +31,10 @@ use std::thread;
 use std::time::Duration;
 
 use crate::acme::Http01Challenges;
-use crate::ingress::{BodyGuard, BodyGuardError, IngressController, IngressLimits, RequestSpan};
+use crate::ingress::{
+    BodyGuard, BodyGuardError, IngressController, IngressLimits, RequestSpan, ResponseStatus,
+};
+use crate::metrics::MetricsHub;
 use crate::tls::{TlsServer, relay_tls};
 use cygnus_cage::Cage;
 use cygnus_router::{
@@ -214,6 +218,7 @@ pub struct Frontend {
     supervisor: Arc<Supervisor<Cage>>,
     http01: Http01Challenges,
     ingress: IngressController,
+    metrics: MetricsHub,
 }
 
 impl Frontend {
@@ -233,7 +238,15 @@ impl Frontend {
             supervisor,
             http01: Http01Challenges::default(),
             ingress: IngressController::new(limits)?,
+            metrics: MetricsHub::new(),
         })
+    }
+
+    /// Use a caller-provided metrics hub for request telemetry.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsHub) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Return the shared HTTP-01 challenge registry used by the ACME manager.
@@ -304,7 +317,7 @@ impl Frontend {
         let Ok(peer) = client.peer_addr().map(|address| address.ip()) else {
             return;
         };
-        let mut span = RequestSpan::new("https", peer);
+        let mut span = RequestSpan::new(self.metrics.clone(), "https", peer);
         let _connection_permit = match self.ingress.enter_connection(peer) {
             Ok(permit) => permit,
             Err(_) => {
@@ -334,7 +347,12 @@ impl Frontend {
                 return;
             }
         };
-        span.set_head(&head.method, head.host.as_deref(), buffered.len());
+        span.set_head(
+            &head.method,
+            head.host.as_deref(),
+            &head.target,
+            buffered.len(),
+        );
         let limits = request_body_limits(&head, self.ingress.limits());
         let body_guard = match body_guard(&head, &buffered, &limits) {
             Ok(guard) => guard,
@@ -370,18 +388,21 @@ impl Frontend {
                 return;
             }
         };
-        if let Err(error) = self.supervisor.acquire(&route.app) {
-            eprintln!(
-                "cygnus-daemon: app {app:?} is unavailable: {error:?}",
-                app = route.app
-            );
-            reject(
-                &mut client,
-                &mut span,
-                acquire_status(&error),
-                "app_unavailable",
-            );
-            return;
+        match self.supervisor.acquire_with_outcome(&route.app) {
+            Ok(outcome) => span.set_cold(outcome.cold),
+            Err(error) => {
+                eprintln!(
+                    "cygnus-daemon: app {app:?} is unavailable: {error:?}",
+                    app = route.app
+                );
+                reject(
+                    &mut client,
+                    &mut span,
+                    acquire_status(&error),
+                    "app_unavailable",
+                );
+                return;
+            }
         }
         let upstream = match UnixStream::connect(&route.upstream) {
             Ok(upstream) => upstream,
@@ -402,7 +423,7 @@ impl Frontend {
         let (connection, client) = client.into_parts();
         let _ = client.set_read_timeout(None);
         match relay_tls(connection, client, upstream, body_guard) {
-            Ok(stats) => span.proxied(stats.to_upstream, stats.to_client),
+            Ok(stats) => span.proxied(stats.status, stats.to_upstream, stats.to_client),
             Err(_) => span.relay_error(),
         }
     }
@@ -413,7 +434,7 @@ impl Frontend {
         let Ok(peer) = client.peer_addr().map(|address| address.ip()) else {
             return;
         };
-        let mut span = RequestSpan::new("http", peer);
+        let mut span = RequestSpan::new(self.metrics.clone(), "http", peer);
         let _connection_permit = match self.ingress.enter_connection(peer) {
             Ok(permit) => permit,
             Err(_) => {
@@ -434,7 +455,12 @@ impl Frontend {
                 return;
             }
         };
-        span.set_head(&head.method, head.host.as_deref(), buffered.len());
+        span.set_head(
+            &head.method,
+            head.host.as_deref(),
+            &head.target,
+            buffered.len(),
+        );
         let limits = request_body_limits(&head, self.ingress.limits());
         let body_guard = match body_guard(&head, &buffered, &limits) {
             Ok(guard) => guard,
@@ -471,18 +497,21 @@ impl Frontend {
                 return;
             }
         };
-        if let Err(error) = self.supervisor.acquire(&route.app) {
-            eprintln!(
-                "cygnus-daemon: app {app:?} is unavailable: {error:?}",
-                app = route.app
-            );
-            reject(
-                &mut client,
-                &mut span,
-                acquire_status(&error),
-                "app_unavailable",
-            );
-            return;
+        match self.supervisor.acquire_with_outcome(&route.app) {
+            Ok(outcome) => span.set_cold(outcome.cold),
+            Err(error) => {
+                eprintln!(
+                    "cygnus-daemon: app {app:?} is unavailable: {error:?}",
+                    app = route.app
+                );
+                reject(
+                    &mut client,
+                    &mut span,
+                    acquire_status(&error),
+                    "app_unavailable",
+                );
+                return;
+            }
         }
         let upstream = match UnixStream::connect(&route.upstream) {
             Ok(upstream) => upstream,
@@ -505,7 +534,7 @@ impl Frontend {
         let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
         let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
         match relay(client, upstream, body_guard) {
-            Ok(stats) => span.proxied(stats.to_upstream, stats.to_client),
+            Ok(stats) => span.proxied(stats.status, stats.to_upstream, stats.to_client),
             Err(_) => span.relay_error(),
         }
     }
@@ -515,6 +544,7 @@ impl Frontend {
 struct RelayStats {
     to_upstream: u64,
     to_client: u64,
+    status: u16,
 }
 
 /// Relay bytes both ways between the client and the upstream until each side
@@ -531,15 +561,39 @@ fn relay(client: TcpStream, upstream: UnixStream, body_guard: BodyGuard) -> io::
         let _ = upstream_writer.shutdown(Shutdown::Write);
         copied
     });
-    let to_client = io::copy(&mut upstream_reader, &mut client_writer);
+    let to_client = copy_response_to_client(&mut upstream_reader, &mut client_writer);
     let _ = client_writer.shutdown(Shutdown::Write);
     let to_upstream = client_to_upstream
         .join()
         .map_err(|_| io::Error::other("client relay thread panicked"))?;
+    let (to_client, status) = to_client?;
     Ok(RelayStats {
         to_upstream: to_upstream?,
-        to_client: to_client?,
+        to_client,
+        status,
     })
+}
+
+fn copy_response_to_client<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<(u64, u16)> {
+    let mut copied = 0_u64;
+    let mut status = ResponseStatus::default();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            return Ok((copied, status.status().unwrap_or_default()));
+        }
+        status.observe(&buffer[..read]);
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
 }
 
 fn copy_to_upstream<R: Read, W: Write>(
@@ -683,6 +737,25 @@ mod tests {
             copy_to_upstream(&mut reader, &mut upstream, BodyGuard::chunked(3)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(upstream.is_empty());
+    }
+
+    #[test]
+    fn response_copy_preserves_bytes_and_captures_status() {
+        let response = b"HTTP/1.1 206 Partial Content\r\ncontent-length: 4\r\n\r\ndata";
+        let mut reader = ChunkedReader {
+            data: response.to_vec(),
+            position: 0,
+            chunk: 5,
+        };
+        let mut output = Vec::new();
+        let (copied, status) = copy_response_to_client(&mut reader, &mut output).unwrap();
+        assert_eq!(copied, response.len() as u64);
+        assert_eq!(status, 206);
+        assert_eq!(output, response);
+
+        let mut no_status = Cursor::new(b"opaque response".to_vec());
+        let (_, status) = copy_response_to_client(&mut no_status, &mut Vec::new()).unwrap();
+        assert_eq!(status, 0);
     }
 
     #[test]

@@ -122,6 +122,81 @@ describe("console request validation", () => {
     expect(JSON.stringify(command)).not.toContain("upstream");
   });
 
+  test("routes observability reads with exact payloads and defaults", async () => {
+    const command = async (path) => {
+      const request = new Request(`http://localhost${path}`);
+      return commandForRequest(request, new URL(request.url));
+    };
+
+    expect(await command("/api/v1/metrics")).toEqual({ type: "get_metrics" });
+    expect(await command("/api/v1/requests")).toEqual({ type: "list_requests", limit: 100 });
+    expect(await command("/api/v1/events")).toEqual({ type: "list_events", limit: 100 });
+    expect(await command("/api/v1/apps/demo/logs?stream=stdout")).toEqual({
+      type: "read_app_log",
+      app: "demo",
+      stream: "stdout",
+      offset: 0,
+      limit: 16_384,
+    });
+    expect(await command("/api/v1/deployments/dpl_1/logs?stream=stderr")).toEqual({
+      type: "read_log",
+      deployment: "dpl_1",
+      stream: "stderr",
+      offset: 0,
+      limit: 16_384,
+    });
+  });
+
+  test("accepts observability maximum bounds", async () => {
+    const command = async (path) => {
+      const request = new Request(`http://localhost${path}`);
+      return commandForRequest(request, new URL(request.url));
+    };
+
+    expect(await command("/api/v1/requests?limit=500")).toEqual({ type: "list_requests", limit: 500 });
+    expect(await command("/api/v1/events?limit=500")).toEqual({ type: "list_events", limit: 500 });
+    expect(await command("/api/v1/apps/demo/logs?stream=stderr&offset=9007199254740991&limit=49152")).toEqual({
+      type: "read_app_log",
+      app: "demo",
+      stream: "stderr",
+      offset: Number.MAX_SAFE_INTEGER,
+      limit: 49_152,
+    });
+    expect(await command("/api/v1/deployments/dpl_1/logs?stream=stdout&offset=12&limit=49152")).toEqual({
+      type: "read_log",
+      deployment: "dpl_1",
+      stream: "stdout",
+      offset: 12,
+      limit: 49_152,
+    });
+  });
+
+  test("rejects invalid observability bounds and streams", async () => {
+    const command = (path) => {
+      const request = new Request(`http://localhost${path}`);
+      return commandForRequest(request, new URL(request.url));
+    };
+
+    await expect(command("/api/v1/requests?limit=501")).rejects.toThrow("limit must be an integer between 1 and 500");
+    await expect(command("/api/v1/events?limit=0")).rejects.toThrow("limit must be an integer between 1 and 500");
+    await expect(command("/api/v1/apps/demo/logs?stream=combined")).rejects.toThrow("stream must be stdout or stderr");
+    await expect(command("/api/v1/deployments/dpl_1/logs?stream=stdout&offset=-1")).rejects.toThrow("offset must be an integer");
+    await expect(command("/api/v1/deployments/dpl_1/logs?stream=stdout&limit=49153")).rejects.toThrow("limit must be an integer between 1 and 49152");
+  });
+
+  test("rejects unsafe observability paths and unknown queries", async () => {
+    const command = (path) => {
+      const request = new Request(`http://localhost${path}`);
+      return commandForRequest(request, new URL(request.url));
+    };
+
+    await expect(command("/api/v1/apps/demo%2Fescape/logs?stream=stdout")).rejects.toThrow("app is invalid");
+    await expect(command("/api/v1/deployments/dpl_1%5Cescape/logs?stream=stdout")).rejects.toThrow("deployment is invalid");
+    await expect(command("/api/v1/metrics?limit=1")).rejects.toThrow("query contains unsupported fields");
+    await expect(command("/api/v1/requests?cursor=next")).rejects.toThrow("query contains unsupported fields");
+    await expect(command("/api/v1/apps/demo/logs?stream=stdout&cursor=next")).rejects.toThrow("query contains unsupported fields");
+  });
+
   test("builds exact public manifest and consumes session-bound state once", async () => {
     process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "manifest-bootstrap";
     process.env.CYGNUS_CONSOLE_SESSION_KEY = "manifest-session";

@@ -8,6 +8,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::Serialize;
 
+use crate::metrics::{MetricsHub, RequestRecord};
+
 #[derive(Clone, Debug)]
 pub struct IngressLimits {
     pub max_body_bytes: u64,
@@ -326,6 +328,75 @@ impl BodyGuard {
     }
 }
 
+const MAX_RESPONSE_STATUS_LINE_BYTES: usize = 1_024;
+
+#[derive(Debug)]
+pub(crate) struct ResponseStatus {
+    line: [u8; MAX_RESPONSE_STATUS_LINE_BYTES],
+    len: usize,
+    complete: bool,
+    status: Option<u16>,
+}
+
+impl Default for ResponseStatus {
+    fn default() -> Self {
+        Self {
+            line: [0; MAX_RESPONSE_STATUS_LINE_BYTES],
+            len: 0,
+            complete: false,
+            status: None,
+        }
+    }
+}
+
+impl ResponseStatus {
+    pub(crate) fn observe(&mut self, bytes: &[u8]) {
+        if self.complete {
+            return;
+        }
+        for &byte in bytes {
+            if self.len == self.line.len() {
+                self.complete = true;
+                return;
+            }
+            self.line[self.len] = byte;
+            self.len += 1;
+            if byte.is_ascii_whitespace()
+                && let Some(status) = parse_response_status(&self.line[..self.len])
+            {
+                self.status = Some(status);
+                self.complete = true;
+                return;
+            }
+            if byte == b'\n' {
+                self.complete = true;
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.status
+    }
+}
+
+fn parse_response_status(line: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(line)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    let mut fields = line.split_ascii_whitespace();
+    let version = fields.next()?;
+    let status = fields.next()?;
+    if !version.starts_with("HTTP/")
+        || status.len() != 3
+        || !status.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let status = status.parse().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Serialize)]
@@ -346,49 +417,69 @@ struct RequestEvent<'a> {
 }
 
 pub(crate) struct RequestSpan {
+    metrics: MetricsHub,
     started: Instant,
+    started_unix_ms: u64,
     request_id: String,
     protocol: &'static str,
     peer_ip: IpAddr,
     method: Option<String>,
     host: Option<String>,
     app: Option<String>,
+    path: Option<String>,
     outcome: &'static str,
     edge_status: Option<u16>,
+    upstream_status: Option<u16>,
+    cold: bool,
     bytes_from_client: u64,
     bytes_to_client: u64,
 }
 
 impl RequestSpan {
-    pub(crate) fn new(protocol: &'static str, peer_ip: IpAddr) -> Self {
-        let timestamp = SystemTime::now()
+    pub(crate) fn new(metrics: MetricsHub, protocol: &'static str, peer_ip: IpAddr) -> Self {
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+            .unwrap_or_default();
         let sequence = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         Self {
+            metrics,
             started: Instant::now(),
-            request_id: format!("{timestamp:016x}{sequence:016x}"),
+            started_unix_ms: u64::try_from(now.as_millis()).unwrap_or(u64::MAX),
+            request_id: format!("{:016x}{sequence:016x}", now.as_nanos()),
             protocol,
             peer_ip,
             method: None,
             host: None,
             app: None,
+            path: None,
             outcome: "connection_closed",
             edge_status: None,
+            upstream_status: None,
+            cold: false,
             bytes_from_client: 0,
             bytes_to_client: 0,
         }
     }
 
-    pub(crate) fn set_head(&mut self, method: &str, host: Option<&str>, bytes: usize) {
+    pub(crate) fn set_head(
+        &mut self,
+        method: &str,
+        host: Option<&str>,
+        target: &str,
+        bytes: usize,
+    ) {
         self.method = Some(method.into());
         self.host = host.map(str::to_owned);
+        self.path = Some(target.to_owned());
         self.bytes_from_client = bytes as u64;
     }
 
     pub(crate) fn set_app(&mut self, app: &str) {
         self.app = Some(app.into());
+    }
+
+    pub(crate) fn set_cold(&mut self, cold: bool) {
+        self.cold = cold;
     }
 
     pub(crate) fn responded(&mut self, status: u16, outcome: &'static str, bytes: usize) {
@@ -397,8 +488,9 @@ impl RequestSpan {
         self.bytes_to_client = bytes as u64;
     }
 
-    pub(crate) fn proxied(&mut self, to_upstream: u64, to_client: u64) {
+    pub(crate) fn proxied(&mut self, status: u16, to_upstream: u64, to_client: u64) {
         self.outcome = "proxied";
+        self.upstream_status = Some(status);
         self.bytes_from_client += to_upstream;
         self.bytes_to_client = to_client;
     }
@@ -431,6 +523,25 @@ impl RequestSpan {
 
 impl Drop for RequestSpan {
     fn drop(&mut self) {
+        self.metrics.record_request(RequestRecord {
+            time_ms: self.started_unix_ms,
+            request_id: self.request_id.clone(),
+            method: self.method.clone().unwrap_or_default(),
+            host: self.host.clone().unwrap_or_default(),
+            app: self.app.clone().unwrap_or_default(),
+            path: self.path.clone().unwrap_or_default(),
+            status: self
+                .edge_status
+                .or(self.upstream_status)
+                .unwrap_or_default(),
+            duration_ms: self.started.elapsed().as_secs_f64() * 1_000.0,
+            cold: self.cold,
+            protocol: self.protocol.to_owned(),
+            bytes_in: self.bytes_from_client,
+            bytes_out: self.bytes_to_client,
+            outcome: self.outcome.to_owned(),
+        });
+
         let event = self.event();
         let stderr = std::io::stderr();
         let mut writer = stderr.lock();
@@ -519,11 +630,14 @@ mod tests {
 
     #[test]
     fn request_event_is_structured_and_excludes_the_target() {
-        let mut span =
-            std::mem::ManuallyDrop::new(RequestSpan::new("https", "192.0.2.1".parse().unwrap()));
-        span.set_head("POST", Some("api.example.com"), 512);
+        let mut span = std::mem::ManuallyDrop::new(RequestSpan::new(
+            MetricsHub::new(),
+            "https",
+            "192.0.2.1".parse().unwrap(),
+        ));
+        span.set_head("POST", Some("api.example.com"), "/secret", 512);
         span.set_app("api");
-        span.proxied(1024, 2048);
+        span.proxied(201, 1024, 2048);
         let event = serde_json::to_value(span.event()).unwrap();
         assert_eq!(event["event"], "request");
         assert_eq!(event["protocol"], "https");
@@ -532,5 +646,45 @@ mod tests {
         assert_eq!(event["bytes_to_client"], 2048);
         assert_eq!(event["request_id"].as_str().unwrap().len(), 32);
         assert!(event.get("target").is_none());
+    }
+
+    #[test]
+    fn request_span_records_truncated_path_status_and_cold_flag() {
+        let metrics = MetricsHub::new();
+        {
+            let mut span = RequestSpan::new(metrics.clone(), "http", "192.0.2.1".parse().unwrap());
+            let target = format!("{}é", "a".repeat(199));
+            span.set_head("GET", Some("api.example.com"), &target, 64);
+            span.set_app("api");
+            span.set_cold(true);
+            span.proxied(202, 10, 20);
+        }
+
+        let requests = metrics.list_requests(1);
+        let request = &requests[0];
+        assert_eq!(request.path, "a".repeat(199));
+        assert_eq!(request.status, 202);
+        assert!(request.cold);
+        assert_eq!(request.bytes_in, 74);
+        assert_eq!(request.bytes_out, 20);
+        assert_eq!(request.outcome, "proxied");
+    }
+
+    #[test]
+    fn response_status_observer_handles_split_and_unobservable_lines() {
+        let mut status = ResponseStatus::default();
+        status.observe(b"HTTP/1.1 4");
+        assert_eq!(status.status(), None);
+        status.observe(b"29 Too Many Requests\r\ncontent-length: 0\r\n\r\n");
+        assert_eq!(status.status(), Some(429));
+
+        let mut invalid = ResponseStatus::default();
+        invalid.observe(b"not-http\r\n");
+        assert_eq!(invalid.status(), None);
+
+        let mut bounded = ResponseStatus::default();
+        bounded.observe(&[b'x'; MAX_RESPONSE_STATUS_LINE_BYTES + 1]);
+        bounded.observe(b"HTTP/1.1 200 OK\r\n");
+        assert_eq!(bounded.status(), None);
     }
 }

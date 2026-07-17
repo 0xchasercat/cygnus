@@ -30,7 +30,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const SHA256_HEX_LEN: usize = 64;
 const NODE_KEY_LEN: usize = 32;
@@ -62,6 +62,15 @@ pub struct EngineRecord {
     pub host_root: PathBuf,
     pub cage_executable: PathBuf,
     pub sha256: String,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// A registered engine together with the number of active apps using it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EngineStatus {
+    pub engine: EngineRecord,
+    pub app_count: u32,
 }
 
 /// A deployment identity accepted from the caller.
@@ -702,6 +711,7 @@ impl State {
                 2 => migrate_v2_to_v3(&transaction)?,
                 3 => migrate_v3_to_v4(&transaction)?,
                 4 => migrate_v4_to_v5(&transaction, &node_key)?,
+                5 => migrate_v5_to_v6(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -1028,15 +1038,19 @@ impl State {
             .map_err(StateError::from)
     }
 
-    /// Register an operator-trusted engine and return the validated record.
+    /// Register an operator-trusted engine and return the persisted record.
+    ///
+    /// The first registered engine becomes the default. After that, an input
+    /// with `is_default` set switches the default atomically; otherwise the
+    /// existing default is preserved.
     pub fn register_engine(&mut self, engine: &EngineRecord) -> Result<EngineRecord, StateError> {
         validate_engine(engine)?;
-        self.connection.execute(
-            "INSERT INTO engines (version, host_root, cage_executable, sha256) VALUES (?1, ?2, ?3, ?4)",
-            params![engine.version, engine.host_root.to_string_lossy(), engine.cage_executable.to_string_lossy(), engine.sha256],
-        )?;
-        Ok(engine.clone())
+        let transaction = self.connection.transaction()?;
+        let registered = register_engine_tx(&transaction, engine)?;
+        transaction.commit()?;
+        Ok(registered)
     }
+
     /// Register an engine and append its success audit in one transaction.
     pub fn register_engine_with_audit(
         &mut self,
@@ -1046,26 +1060,66 @@ impl State {
         validate_audit_context(audit)?;
         validate_engine(engine)?;
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO engines (version, host_root, cage_executable, sha256) VALUES (?1, ?2, ?3, ?4)",
-            params![engine.version, engine.host_root.to_string_lossy(), engine.cage_executable.to_string_lossy(), engine.sha256],
-        )?;
+        let registered = register_engine_tx(&transaction, engine)?;
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
-        Ok(engine.clone())
+        Ok(registered)
     }
 
     pub fn engine(&self, version: &str) -> Result<Option<EngineRecord>, StateError> {
-        self.connection.query_row(
-            "SELECT version, host_root, cage_executable, sha256 FROM engines WHERE version = ?1",
-            [version],
-            |row| Ok(EngineRecord {
-                version: row.get(0)?,
-                host_root: PathBuf::from(row.get::<_, String>(1)?),
-                cage_executable: PathBuf::from(row.get::<_, String>(2)?),
-                sha256: row.get(3)?,
-            }),
-        ).optional().map_err(StateError::from)
+        self.connection
+            .query_row(
+                "SELECT version, host_root, cage_executable, sha256, is_default
+                 FROM engines WHERE version = ?1",
+                [version],
+                engine_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    /// List registered engines in stable version order with active app counts.
+    pub fn engines(&self) -> Result<Vec<EngineStatus>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.version, e.host_root, e.cage_executable, e.sha256, e.is_default,
+                    COUNT(DISTINCT d.app)
+             FROM engines e
+             LEFT JOIN deployments d
+               ON d.engine_version = e.version AND d.status = 'active'
+             GROUP BY e.id
+             ORDER BY e.version COLLATE BINARY",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(EngineStatus {
+                    engine: engine_from_row(row)?,
+                    app_count: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    /// Select an already-registered engine as the default.
+    pub fn set_default_engine(&mut self, version: &str) -> Result<EngineRecord, StateError> {
+        let transaction = self.connection.transaction()?;
+        let engine = set_default_engine_tx(&transaction, version)?;
+        transaction.commit()?;
+        Ok(engine)
+    }
+
+    /// Select the default engine and append its success audit atomically.
+    pub fn set_default_engine_with_audit(
+        &mut self,
+        version: &str,
+        audit: &AuditContext,
+    ) -> Result<EngineRecord, StateError> {
+        validate_audit_context(audit)?;
+        let transaction = self.connection.transaction()?;
+        let engine = set_default_engine_tx(&transaction, version)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(engine)
     }
 
     /// Start a caller-identified build against a registered engine.
@@ -2693,6 +2747,95 @@ fn migrate_v4_to_v5(connection: &Connection, key: &[u8; NODE_KEY_LEN]) -> Result
     Ok(())
 }
 
+fn migrate_v5_to_v6(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "ALTER TABLE engines
+             ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0
+             CHECK (is_default IN (0, 1));
+         UPDATE engines
+             SET is_default = 1
+             WHERE id = (SELECT id FROM engines ORDER BY id ASC LIMIT 1);
+         CREATE UNIQUE INDEX engines_one_default
+             ON engines(is_default) WHERE is_default = 1;",
+    )?;
+    Ok(())
+}
+
+fn register_engine_tx(
+    transaction: &Transaction<'_>,
+    engine: &EngineRecord,
+) -> Result<EngineRecord, StateError> {
+    let has_default: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM engines WHERE is_default = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    let is_default = engine.is_default || !has_default;
+    if is_default {
+        transaction.execute("UPDATE engines SET is_default = 0 WHERE is_default = 1", [])?;
+    }
+    transaction.execute(
+        "INSERT INTO engines
+             (version, host_root, cage_executable, sha256, is_default)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            engine.version,
+            engine.host_root.to_string_lossy(),
+            engine.cage_executable.to_string_lossy(),
+            engine.sha256,
+            is_default,
+        ],
+    )?;
+    transaction
+        .query_row(
+            "SELECT version, host_root, cage_executable, sha256, is_default
+             FROM engines WHERE version = ?1",
+            [engine.version.as_str()],
+            engine_from_row,
+        )
+        .map_err(StateError::from)
+}
+
+fn set_default_engine_tx(
+    transaction: &Transaction<'_>,
+    version: &str,
+) -> Result<EngineRecord, StateError> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM engines WHERE version = ?1)",
+        [version],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(StateError::InvalidRecord {
+            kind: "engine",
+            detail: format!("engine {version:?} is not registered"),
+        });
+    }
+    transaction.execute("UPDATE engines SET is_default = 0 WHERE is_default = 1", [])?;
+    transaction.execute(
+        "UPDATE engines SET is_default = 1 WHERE version = ?1",
+        [version],
+    )?;
+    transaction
+        .query_row(
+            "SELECT version, host_root, cage_executable, sha256, is_default
+             FROM engines WHERE version = ?1",
+            [version],
+            engine_from_row,
+        )
+        .map_err(StateError::from)
+}
+
+fn engine_from_row(row: &rusqlite::Row<'_>) -> Result<EngineRecord, rusqlite::Error> {
+    Ok(EngineRecord {
+        version: row.get(0)?,
+        host_root: PathBuf::from(row.get::<_, String>(1)?),
+        cage_executable: PathBuf::from(row.get::<_, String>(2)?),
+        sha256: row.get(3)?,
+        is_default: row.get(4)?,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct ArtifactRow {
     id: i64,
@@ -4045,15 +4188,20 @@ mod tests {
         }
     }
 
-    fn register_test_engine(state: &mut State, version: &str) -> EngineRecord {
-        let engine = EngineRecord {
+    fn test_engine_record(version: &str, is_default: bool) -> EngineRecord {
+        EngineRecord {
             version: version.into(),
             host_root: "/".into(),
             cage_executable: "/usr/bin/true".into(),
             sha256: "a".repeat(64),
-        };
-        state.register_engine(&engine).unwrap();
-        engine
+            is_default,
+        }
+    }
+
+    fn register_test_engine(state: &mut State, version: &str) -> EngineRecord {
+        state
+            .register_engine(&test_engine_record(version, false))
+            .unwrap()
     }
 
     fn test_artifact(
@@ -4178,6 +4326,121 @@ mod tests {
         ));
         let _ = fs::remove_file(path);
     }
+    #[test]
+    fn migrates_v5_engines_and_selects_oldest_as_default() {
+        let path = temp_db("v5-engine-default");
+        {
+            let connection = Connection::open(&path).expect("fixture database");
+            create_schema(&connection).unwrap();
+            migrate_v1_to_v2(&connection).unwrap();
+            migrate_v2_to_v3(&connection).unwrap();
+            migrate_v3_to_v4(&connection).unwrap();
+            migrate_v4_to_v5(&connection, &[0; NODE_KEY_LEN]).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO engines
+                         (id, version, host_root, cage_executable, sha256)
+                     VALUES
+                         (10, 'bun-old', '/', '/usr/bin/true', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+                         (20, 'bun-new', '/', '/usr/bin/true', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+                     PRAGMA user_version = 5;",
+                )
+                .unwrap();
+        }
+
+        let state = State::open(&path).expect("migrate v5 fixture");
+        assert_eq!(
+            state
+                .engines()
+                .unwrap()
+                .into_iter()
+                .map(|status| (status.engine.version, status.engine.is_default))
+                .collect::<Vec<_>>(),
+            [("bun-new".into(), false), ("bun-old".into(), true)]
+        );
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn first_registered_engine_becomes_default_automatically() {
+        let path = temp_db("first-engine-default");
+        let mut state = State::open(&path).unwrap();
+
+        let registered = state
+            .register_engine(&test_engine_record("bun-1", false))
+            .unwrap();
+
+        assert!(registered.is_default);
+        assert!(state.engine("bun-1").unwrap().unwrap().is_default);
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn later_registration_preserves_the_existing_default() {
+        let path = temp_db("later-engine-default");
+        let mut state = State::open(&path).unwrap();
+        state
+            .register_engine(&test_engine_record("bun-1", false))
+            .unwrap();
+
+        let registered = state
+            .register_engine(&test_engine_record("bun-2", false))
+            .unwrap();
+
+        assert!(!registered.is_default);
+        assert!(state.engine("bun-1").unwrap().unwrap().is_default);
+        assert_eq!(
+            state
+                .engines()
+                .unwrap()
+                .into_iter()
+                .map(|status| (status.engine.version, status.app_count))
+                .collect::<Vec<_>>(),
+            [("bun-1".into(), 0), ("bun-2".into(), 0)]
+        );
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn explicit_default_switching_keeps_registration_immutable_and_audited() {
+        let path = temp_db("explicit-engine-default");
+        let mut state = State::open(&path).unwrap();
+        let first = state
+            .register_engine(&test_engine_record("bun-1", false))
+            .unwrap();
+        let second = state
+            .register_engine(&test_engine_record("bun-2", true))
+            .unwrap();
+
+        assert!(!state.engine("bun-1").unwrap().unwrap().is_default);
+        assert!(second.is_default);
+        assert_eq!(second.host_root, PathBuf::from("/"));
+        assert_eq!(second.sha256, "a".repeat(64));
+
+        let selected = state
+            .set_default_engine_with_audit("bun-1", &audit_context("default-bun-1"))
+            .unwrap();
+        assert!(selected.is_default);
+        assert!(!state.engine("bun-2").unwrap().unwrap().is_default);
+        assert_eq!(selected.host_root, first.host_root);
+        assert_eq!(selected.sha256, first.sha256);
+        assert_eq!(state.audit_records().unwrap().len(), 1);
+
+        let duplicate = test_engine_record("bun-1", true);
+        assert!(state.register_engine(&duplicate).is_err());
+        assert!(state.engine("bun-1").unwrap().unwrap().is_default);
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn migrates_v1_fixture_without_losing_runtime_data() {
         let path = temp_db("v1-migrate");
@@ -4437,8 +4700,9 @@ mod tests {
             host_root: "/".into(),
             cage_executable: "/usr/bin/true".into(),
             sha256: "a".repeat(64),
+            is_default: false,
         };
-        assert_eq!(state.register_engine(&engine).unwrap(), engine);
+        let engine = state.register_engine(&engine).unwrap();
         let source_hash = "b".repeat(64);
         let artifact_hash = "c".repeat(64);
         let input = DeploymentInput {
@@ -4615,6 +4879,7 @@ mod tests {
             host_root: "/".into(),
             cage_executable: "/usr/bin/true".into(),
             sha256: "a".repeat(64),
+            is_default: false,
         };
         state.register_engine(&engine).unwrap();
         let source = "b".repeat(64);
@@ -4684,6 +4949,7 @@ mod tests {
             host_root: "/".into(),
             cage_executable: "/usr/bin/true".into(),
             sha256: "a".repeat(64),
+            is_default: false,
         };
         state.register_engine(&engine).unwrap();
         let source = "b".repeat(64);
@@ -4759,6 +5025,7 @@ mod tests {
             host_root: "/".into(),
             cage_executable: "/usr/bin/true".into(),
             sha256: "a".repeat(64),
+            is_default: false,
         };
         state.register_engine(&engine).unwrap();
         let source = "b".repeat(64);
@@ -4881,6 +5148,7 @@ mod tests {
                 host_root: "/".into(),
                 cage_executable: "/usr/bin/true".into(),
                 sha256: "a".repeat(64),
+                is_default: false,
             })
             .unwrap();
         state
@@ -4917,6 +5185,7 @@ mod tests {
                 host_root: "/".into(),
                 cage_executable: "/usr/bin/true".into(),
                 sha256: "a".repeat(64),
+                is_default: false,
             })
             .unwrap();
         let source = "b".repeat(64);
@@ -4969,7 +5238,8 @@ mod tests {
                     version: "bad".into(),
                     host_root: "relative".into(),
                     cage_executable: "/usr/bin/true".into(),
-                    sha256: "A".repeat(64)
+                    sha256: "A".repeat(64),
+                    is_default: false,
                 })
                 .is_err()
         );
@@ -4978,6 +5248,7 @@ mod tests {
             host_root: "/".into(),
             cage_executable: "/usr/bin/true".into(),
             sha256: "d".repeat(64),
+            is_default: false,
         };
         state.register_engine(&engine).unwrap();
         assert!(

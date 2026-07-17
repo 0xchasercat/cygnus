@@ -62,6 +62,22 @@ pub enum AcquireError {
     BootFailed(String),
 }
 
+/// The result of successfully acquiring an app instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcquireOutcome {
+    /// Whether this acquire triggered or waited for the app's cold boot.
+    pub cold: bool,
+}
+
+/// The result of reconciling one crashed app instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconcileOutcome {
+    /// The registered app name whose instance crashed.
+    pub app: String,
+    /// Whether this crash crossed the crash-loop threshold and parked the app.
+    pub crash_loop: bool,
+}
+
 /// Boot function: turn a spec into a running instance, or an error string.
 type BootFn<I> = dyn Fn(&CageSpec) -> Result<I, String> + Send + Sync;
 
@@ -113,6 +129,13 @@ impl<I: Instance> Supervisor<I> {
     /// Ensure the named app is booted and ready, booting it on demand. Callers
     /// racing on a cold app coalesce onto a single boot.
     pub fn acquire(&self, name: &str) -> Result<(), AcquireError> {
+        self.acquire_with_outcome(name).map(|_| ())
+    }
+
+    /// Ensure the named app is booted and ready and report whether this caller
+    /// triggered or waited for a cold boot. An already-ready app reports
+    /// `cold: false`.
+    pub fn acquire_with_outcome(&self, name: &str) -> Result<AcquireOutcome, AcquireError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(AcquireError::ShuttingDown);
         }
@@ -121,6 +144,7 @@ impl<I: Instance> Supervisor<I> {
             apps.get(name).cloned().ok_or(AcquireError::Unknown)?
         };
 
+        let mut observed_cold_boot = false;
         let mut state = recover(slot.state.lock());
         loop {
             if self.shutting_down.load(Ordering::Acquire) {
@@ -129,12 +153,20 @@ impl<I: Instance> Supervisor<I> {
             match state.lifecycle.state() {
                 LifecycleState::Ready => {
                     state.lifecycle.note_request(Instant::now());
-                    return Ok(());
+                    return Ok(AcquireOutcome {
+                        cold: observed_cold_boot,
+                    });
                 }
                 LifecycleState::Failed => return Err(AcquireError::CrashLooping),
-                LifecycleState::Booting | LifecycleState::Draining => {
-                    // Another caller is booting this app, or it is draining;
-                    // wait for that to finish, then re-evaluate.
+                LifecycleState::Booting => {
+                    // Another caller owns this cold boot. Waiting for it still
+                    // counts as a cold acquire for the coalesced caller.
+                    observed_cold_boot = true;
+                    state = recover(slot.progress.wait(state));
+                }
+                LifecycleState::Draining => {
+                    // Wait for the drain to finish, then re-evaluate. If this
+                    // caller subsequently boots the app it will report cold.
                     state = recover(slot.progress.wait(state));
                 }
                 LifecycleState::Cold => {
@@ -170,7 +202,7 @@ impl<I: Instance> Supervisor<I> {
                             state.lifecycle.mark_ready(Instant::now());
                             state.retry_after = None;
                             slot.progress.notify_all();
-                            return Ok(());
+                            return Ok(AcquireOutcome { cold: true });
                         }
                         Err(error) => {
                             let outcome = state.lifecycle.note_crash(Instant::now());
@@ -188,11 +220,22 @@ impl<I: Instance> Supervisor<I> {
             }
         }
     }
+
+    /// Poll every ready instance and reconcile exits through the lifecycle
+    /// crash policy. Returns the names that crashed.
+    pub fn reconcile(&self, now: Instant) -> Vec<String> {
+        self.reconcile_with_outcomes(now)
+            .into_iter()
+            .map(|outcome| outcome.app)
+            .collect()
+    }
+
     /// Poll every ready instance and reconcile exits through the lifecycle
     /// crash policy. Exited instances are detached before shutdown so callers
     /// racing an asynchronous maintenance pass wait on `Draining` rather than
-    /// observing a stale `Ready` slot. Returns the names that crashed.
-    pub fn reconcile(&self, now: Instant) -> Vec<String> {
+    /// observing a stale `Ready` slot. Returns each crashed app and whether the
+    /// crash parked it as crash-looping.
+    pub fn reconcile_with_outcomes(&self, now: Instant) -> Vec<ReconcileOutcome> {
         let candidates: Vec<(String, Arc<Slot<I>>)> = {
             let apps = recover(self.apps.lock());
             apps.iter()
@@ -224,16 +267,21 @@ impl<I: Instance> Supervisor<I> {
             }
 
             let mut state = recover(slot.state.lock());
-            match state.lifecycle.note_crash(now) {
+            let crash_loop = match state.lifecycle.note_crash(now) {
                 CrashOutcome::Restart { after } => {
                     state.retry_after = Some(now + after);
+                    false
                 }
                 CrashOutcome::CrashLooping => {
                     state.retry_after = None;
+                    true
                 }
-            }
+            };
             slot.progress.notify_all();
-            crashed.push(name);
+            crashed.push(ReconcileOutcome {
+                app: name,
+                crash_loop,
+            });
         }
         crashed
     }
@@ -423,18 +471,33 @@ mod tests {
         }));
         supervisor.register("app", spec(), LifecycleConfig::default());
 
+        let start = Arc::new(Barrier::new(9));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let supervisor = Arc::clone(&supervisor);
-            handles.push(thread::spawn(move || supervisor.acquire("app")));
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                supervisor.acquire_with_outcome("app")
+            }));
         }
+        start.wait();
         for handle in handles {
-            assert_eq!(handle.join().unwrap(), Ok(()));
+            assert_eq!(
+                handle.join().unwrap(),
+                Ok(AcquireOutcome { cold: true }),
+                "boot owner and coalesced waiters report a cold boot"
+            );
         }
         assert_eq!(
             boots.load(Ordering::SeqCst),
             1,
             "eight racing callers should trigger exactly one boot"
+        );
+        assert_eq!(
+            supervisor.acquire_with_outcome("app"),
+            Ok(AcquireOutcome { cold: false }),
+            "an already-ready acquire is warm"
         );
     }
 
@@ -607,9 +670,15 @@ mod tests {
         };
         supervisor.register("app", spec(), config);
 
-        for _ in 0..3 {
+        for crash in 0..3 {
             assert_eq!(supervisor.acquire("app"), Ok(()));
-            supervisor.reconcile(Instant::now());
+            assert_eq!(
+                supervisor.reconcile_with_outcomes(Instant::now()),
+                vec![ReconcileOutcome {
+                    app: "app".to_owned(),
+                    crash_loop: crash == 2,
+                }]
+            );
         }
         assert_eq!(supervisor.state("app"), Some(LifecycleState::Failed));
         assert_eq!(supervisor.acquire("app"), Err(AcquireError::CrashLooping));
