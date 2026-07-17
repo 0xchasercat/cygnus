@@ -306,11 +306,12 @@ export const previewMetrics = {
   boot_phases: {
     sample_count: 41,
     phases: [
-      { name: 'namespaces + cgroup', p50_ms: 2.1 },
-      { name: 'mounts + seccomp', p50_ms: 1.2 },
-      { name: 'exec engine + runtime init', p50_ms: 24.6 },
-      { name: 'bytecode load', p50_ms: 5.3 },
-      { name: 'shim binds UDS', p50_ms: 0.8 },
+      { name: 'namespaces_cgroup', p50_ms: 2.1 },
+      { name: 'network', p50_ms: 0.4 },
+      { name: 'mounts', p50_ms: 1.2 },
+      { name: 'seccomp', p50_ms: 0.1 },
+      { name: 'exec_runtime_init', p50_ms: 24.6 },
+      { name: 'socket_ready', p50_ms: 3.9 },
     ],
   },
   apps: [

@@ -2,7 +2,7 @@
   import { ui, openDeploy } from '../stores.svelte.js';
   import { store } from '../live.svelte.js';
   import { relativeTime } from '../time.js';
-  import { shortHash, millis } from '../fmt.js';
+  import { shortHash, millis, phaseLabel } from '../fmt.js';
   import Icon from '../components/Icon.svelte';
   import Terminal from '../components/Terminal.svelte';
   import Anatomy from '../components/Anatomy.svelte';
@@ -108,7 +108,7 @@
   const bootPhases = $derived(
     store.metrics?.boot_phases?.phases
       ? store.metrics.boot_phases.phases.map((p) => ({
-          name: p.name,
+          name: phaseLabel(p.name),
           ms: p.p50_ms,
           hot: false,
         }))

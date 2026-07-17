@@ -2,7 +2,7 @@
   import { store } from '../live.svelte.js';
   import { previewEgress } from '../fixtures.js';
   import { uptime, relativeTime } from '../time.js';
-  import { bytes } from '../fmt.js';
+  import { bytes, phaseLabel } from '../fmt.js';
   import Anatomy from '../components/Anatomy.svelte';
   import Constellation from '../components/Constellation.svelte';
   import Icon from '../components/Icon.svelte';
@@ -16,7 +16,7 @@
 
   const bootPhases = $derived(
     store.metrics?.boot_phases?.phases
-      ? store.metrics.boot_phases.phases.map((p) => ({ name: p.name, ms: p.p50_ms, hot: false }))
+      ? store.metrics.boot_phases.phases.map((p) => ({ name: phaseLabel(p.name), ms: p.p50_ms, hot: false }))
       : []
   );
   const hotPhase = $derived(bootPhases.length ? bootPhases.reduce((a, b) => (b.ms > a.ms ? b : a)) : null);

@@ -42,3 +42,17 @@ export function int(n) {
   if (!Number.isFinite(v)) return '—';
   return Math.round(v).toLocaleString();
 }
+
+// Cold-boot phase names arrive as the daemon's snake_case identifiers.
+const PHASE_LABELS = {
+  namespaces_cgroup: 'namespaces + cgroup',
+  network: 'network',
+  mounts: 'mounts',
+  seccomp: 'seccomp',
+  exec_runtime_init: 'exec + runtime init',
+  socket_ready: 'socket ready',
+};
+
+export function phaseLabel(name) {
+  return PHASE_LABELS[name] ?? String(name).replaceAll('_', ' ');
+}
