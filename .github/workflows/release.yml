@@ -1,0 +1,57 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.1.0)'
+        required: true
+        type: string
+        default: '0.1.0'
+
+permissions:
+  contents: write # Required to create a GitHub Release
+
+jobs:
+  build-release:
+    runs-on: namespace-profile-cygnus-linux-x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build Console
+        working-directory: console
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Build Release Bundle
+        run: |
+          bash scripts/build-release.sh \
+            --output-dir release-bundle \
+            --version ${{ inputs.version }}
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cygnus-release-${{ inputs.version }}
+          path: release-bundle/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Cygnus v${{ inputs.version }}
+          files: release-bundle/*
+          draft: true # Creates a draft release so you can review before publishing
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
