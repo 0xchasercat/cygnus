@@ -149,7 +149,7 @@ pub(crate) fn relay_tls(
     client.set_nonblocking(true)?;
     upstream.set_nonblocking(true)?;
 
-    let mut client_closed = body_guard.is_complete();
+    let mut client_closed = false;
     let mut upstream_closed = false;
     let mut upstream_write_closed = false;
     let mut close_notify_sent = false;
@@ -194,7 +194,11 @@ pub(crate) fn relay_tls(
                             format!("request body rejected: {error:?}"),
                         )
                     })?;
-                    client_closed = body_guard.is_complete();
+                    // A complete request body does NOT close the client leg:
+                    // apps treat an early upstream half-close as a client
+                    // abort and cancel in-flight handlers. The forwarded head
+                    // carries `connection: close`, so the app ends the
+                    // exchange once its response is written.
                     to_upstream.extend_from_slice(&buffer[..read]);
                     progressed = true;
                 }
