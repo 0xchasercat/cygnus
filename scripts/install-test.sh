@@ -19,17 +19,17 @@ hash_file() {
 write_checksums() {
   local name
   : >"$BUNDLE/SHA256SUMS"
-  for name in cygnus-daemon cygnusctl cygnus-init bun cygnus-console.tar; do
+  for name in cygnus-daemon cygnus cygnus-init bun cygnus-console.tar; do
     printf '%s  %s\n' "$(hash_file "$BUNDLE/$name")" "$name" >>"$BUNDLE/SHA256SUMS"
   done
 }
 make_bundle() {
   local name
-  for name in cygnus-daemon cygnusctl cygnus-init bun; do
+  for name in cygnus-daemon cygnus cygnus-init bun; do
     cat >"$BUNDLE/$name" <<'EOF'
 #!/usr/bin/env sh
 case "$(basename "$0")" in
-  cygnusctl)
+  cygnus)
     printf '%s\n' "$*" >> "${CYGNUS_TEST_CTL_LOG:?}"
     exit 0
     ;;
@@ -105,7 +105,9 @@ make_bundle
 # 3. First install creates the rooted console, pinned Tenant Zero config, and
 # least-privilege files/directories.
 run_install >"$ROOT/install-output" 2>&1
-[[ -x $ROOT/usr/local/bin/cygnus-daemon && -x $ROOT/usr/local/bin/cygnusctl && -x $ROOT/usr/local/bin/cygnus-init ]] || { echo 'binaries missing' >&2; exit 1; }
+[[ -x $ROOT/usr/local/bin/cygnus-daemon && -x $ROOT/usr/local/bin/cygnus && -x $ROOT/usr/local/bin/cygnus-init ]] || { echo 'binaries missing' >&2; exit 1; }
+[[ -L $ROOT/usr/local/bin/cygnusctl ]] || { echo 'cygnusctl compatibility symlink missing' >&2; exit 1; }
+[[ $(readlink "$ROOT/usr/local/bin/cygnusctl") == cygnus ]] || { echo 'cygnusctl symlink does not point at cygnus' >&2; exit 1; }
 [[ -x $ROOT/var/lib/cygnus/engines/bun-1.3.14/usr/local/bin/bun && -x $ROOT/var/lib/cygnus/engines/bun-1.3.14/usr/local/bin/cygnus-init ]] || { echo 'engine lowerdir missing executable/init' >&2; exit 1; }
 [[ -f $ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js ]] || { echo 'console server missing from lowerdir' >&2; exit 1; }
 [[ -f $ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/admin-client.js ]] || { echo 'console admin client missing from lowerdir' >&2; exit 1; }

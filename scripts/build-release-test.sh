@@ -87,7 +87,7 @@ bash "$BUILDER" \
   --bun-bin "$FAKEBIN/bun"
 
 [[ -f $OUTPUT/SHA256SUMS ]] || { echo 'SHA256SUMS missing' >&2; exit 1; }
-for name in cygnus-daemon cygnusctl cygnus-init bun; do
+for name in cygnus-daemon cygnus cygnus-init bun; do
   [[ -f $OUTPUT/$name && ! -L $OUTPUT/$name ]] || { echo "missing binary: $name" >&2; exit 1; }
   [[ -x $OUTPUT/$name ]] || { echo "binary is not executable: $name" >&2; exit 1; }
   if mode=$(stat -c '%a' "$OUTPUT/$name" 2>/dev/null); then :; else mode=$(stat -f '%Lp' "$OUTPUT/$name"); fi
@@ -105,7 +105,7 @@ while IFS= read -r line || [[ -n $line ]]; do
   [[ -n ${sum:-} && -n ${name:-} && -z ${extra:-} ]] || { echo "malformed checksum line: $line" >&2; exit 1; }
   [[ $sum =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid checksum: $name" >&2; exit 1; }
   case $name in
-    cygnus-daemon|cygnusctl|cygnus-init|bun|cygnus-console.tar) ;;
+    cygnus-daemon|cygnus|cygnus-init|bun|cygnus-console.tar) ;;
     *) echo "unexpected checksum path: $name" >&2; exit 1 ;;
   esac
   [[ -z ${checksums[$name]+present} ]] || { echo "duplicate checksum: $name" >&2; exit 1; }
@@ -113,7 +113,7 @@ while IFS= read -r line || [[ -n $line ]]; do
   line_count=$((line_count + 1))
 done <"$OUTPUT/SHA256SUMS"
 [[ $line_count == 5 ]] || { echo "expected five checksum lines, got $line_count" >&2; exit 1; }
-for name in cygnus-daemon cygnusctl cygnus-init bun cygnus-console.tar; do
+for name in cygnus-daemon cygnus cygnus-init bun cygnus-console.tar; do
   [[ -n ${checksums[$name]+present} ]] || { echo "checksum missing: $name" >&2; exit 1; }
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum -- "$OUTPUT/$name")

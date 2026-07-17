@@ -241,7 +241,7 @@ sums_file=$bundle_dir/SHA256SUMS
 [[ -f $sums_file && ! -L $sums_file ]] || fail "bundle SHA256SUMS is missing or not regular"
 command -v sha256sum >/dev/null 2>&1 && hash_tool=sha256sum || hash_tool=shasum
 command -v "$hash_tool" >/dev/null 2>&1 || fail "sha256 checksum tool is missing"
-required=(cygnus-daemon cygnusctl cygnus-init bun cygnus-console.tar)
+required=(cygnus-daemon cygnus cygnus-init bun cygnus-console.tar)
 declare -A expected=()
 while IFS= read -r sum_line || [[ -n $sum_line ]]; do
   [[ -z $sum_line ]] && continue
@@ -250,7 +250,7 @@ while IFS= read -r sum_line || [[ -n $sum_line ]]; do
   [[ -n ${sum:-} && -n ${name:-} && -z ${extra:-} ]] || fail "malformed checksum line"
   if [[ $name == \** ]]; then name=${name#\*}; fi
   [[ $sum =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid checksum in SHA256SUMS"
-  case $name in cygnus-daemon|cygnusctl|cygnus-init|bun|cygnus-console.tar) ;; *) fail "unexpected or unsafe checksum path: $name" ;; esac
+  case $name in cygnus-daemon|cygnus|cygnus-init|bun|cygnus-console.tar) ;; *) fail "unexpected or unsafe checksum path: $name" ;; esac
   [[ -z ${expected[$name]+present} ]] || fail "duplicate checksum entry: $name"
   expected[$name]=${sum,,}
 done < "$sums_file"
@@ -451,7 +451,7 @@ elif [[ -e $secret_root ]]; then
   fi
 fi
 
-binaries=(cygnus-daemon cygnusctl cygnus-init bun)
+binaries=(cygnus-daemon cygnus cygnus-init bun)
 for name in "${binaries[@]}"; do
   src=$bundle_dir/$name
   cp -- "$src" "$stage/$name"
@@ -460,6 +460,15 @@ for name in "${binaries[@]}"; do
     (( reconfigure )) || fail "existing $prefix/$name differs; re-run with --reconfigure"
   fi
 done
+# Break-glass compatibility: the developer-facing binary is `cygnus`, but keep a
+# `cygnusctl` symlink next to it so existing operator muscle memory and docs
+# keep working. The symlink points at the real binary in the same directory.
+if [[ -e $prefix/cygnusctl || -L $prefix/cygnusctl ]]; then
+  [[ -L $prefix/cygnusctl ]] || fail "existing $prefix/cygnusctl is not a symlink; re-run with --reconfigure"
+  if [[ $(readlink "$prefix/cygnusctl") != cygnus ]]; then
+    (( reconfigure )) || fail "existing $prefix/cygnusctl does not point at cygnus; re-run with --reconfigure"
+  fi
+fi
 mkdir -p "$stage/engine/usr/local/bin"
 cp -- "$bundle_dir/bun" "$stage/engine/usr/local/bin/bun"
 cp -- "$bundle_dir/cygnus-init" "$stage/engine/usr/local/bin/cygnus-init"
@@ -537,6 +546,13 @@ find "$secret_root" -type d -exec chmod 0700 {} +
 find "$secret_root" -type f -exec chmod 0600 {} +
 ensure_dir "$state_dir/engines" 0700
 for name in "${binaries[@]}"; do atomic_copy "$stage/$name" "$prefix/$name" 0755; done
+# Install the break-glass `cygnusctl` symlink after the real binary lands. A
+# relative target keeps it valid regardless of where $prefix is mounted.
+if [[ -L $prefix/cygnusctl ]]; then
+  [[ $(readlink "$prefix/cygnusctl") == cygnus ]] || ln -sfn -- cygnus "$prefix/cygnusctl"
+else
+  ln -sf -- cygnus "$prefix/cygnusctl"
+fi
 
 if [[ ! -e $engine_root || $reconfigure -eq 1 ]]; then
   # Build the replacement completely before moving the current engine away.
@@ -583,8 +599,8 @@ for ((attempt=1; attempt<=50; attempt++)); do
 done
 (( ready )) || fail "daemon admin sockets did not become ready at $admin_socket and $tenant_admin_socket; diagnostics: $diag_file"
 
-"$prefix/cygnusctl" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
-"$prefix/cygnusctl" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "node configuration apply failed; diagnostics: $diag_file"
+"$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
+"$prefix/cygnus" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "node configuration apply failed; diagnostics: $diag_file"
 
 console_scheme=http
 console_listener=$listen
@@ -597,5 +613,5 @@ fi
 log "Cygnus is installed and configured. Console URL: ${console_scheme}://cygnus.${apps_domain}${console_port_suffix}"
 log "Bootstrap token: $bootstrap_hex"
 log "Bootstrap token file: $secret_bootstrap_file (hex-encode its 32 bytes to recover the token)"
-log "Next action: log in to the host and deploy with cygnusctl --admin-socket $admin_socket."
+log "Next action: log in to the host and deploy with cygnus --admin-socket $admin_socket."
 if [[ -n $https_listen ]]; then log "HTTPS is configured at $https_listen; ACME/DNS provider settings are in $secrets_env."; fi
