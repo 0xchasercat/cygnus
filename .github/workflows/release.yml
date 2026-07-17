@@ -54,13 +54,13 @@ jobs:
 
       - name: Archive Release Bundle
         run: |
-          tar -czvf cygnus-${{ inputs.version }}-${{ matrix.target }}.tar.gz -C release-bundle .
+          tar -czvf cygnus-${{ matrix.target }}.tar.gz -C release-bundle .
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: cygnus-release-${{ matrix.target }}
-          path: cygnus-${{ inputs.version }}-${{ matrix.target }}.tar.gz
+          path: cygnus-${{ matrix.target }}.tar.gz
 
   publish-release:
     needs: build-release

@@ -44,12 +44,11 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install Cygnus from a local release bundle (never downloads or executes a remote
-script).  Interactive installs prompt for values not supplied on the command
-line; --noninteractive requires --bundle-dir.
+Install Cygnus. By default, this downloads the latest release from GitHub for your
+architecture. Interactive installs prompt for values not supplied on the command line.
 
 Options:
-  --bundle-dir DIR       Local release bundle containing required binaries and cygnus-console.tar
+  --bundle-dir DIR       Install from a local bundle instead of downloading
   --prefix DIR           Binary destination (default: /usr/local/bin)
   --config-dir DIR       Configuration/secrets destination (default: /etc/cygnus)
   --state-dir DIR        Durable state/artifacts destination (default: /var/lib/cygnus)
@@ -100,11 +99,41 @@ while (($#)); do
   esac
 done
 
-if [[ -z $bundle_dir && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
-  default_bundle="$SCRIPT_DIR/release"
-  printf 'Local release bundle directory [%s]: ' "$default_bundle" >&2
-  IFS= read -r answer || true
-  bundle_dir=${answer:-$default_bundle}
+downloaded_bundle=""
+if [[ -z $bundle_dir ]]; then
+  OS=$(uname -s)
+  ARCH=$(uname -m)
+  case $OS in
+    Linux) OS_LOWER="unknown-linux-gnu" ;;
+    Darwin) OS_LOWER="apple-darwin" ;;
+    *) fail "Unsupported OS: $OS" ;;
+  esac
+  case $ARCH in
+    x86_64|amd64) ARCH_LOWER="x86_64" ;;
+    aarch64|arm64) ARCH_LOWER="aarch64" ;;
+    *) fail "Unsupported architecture: $ARCH" ;;
+  esac
+  TARGET="${ARCH_LOWER}-${OS_LOWER}"
+
+  if (( TEST_MODE )); then
+    # In tests, fallback to local build to avoid hitting the network
+    bundle_dir="$SCRIPT_DIR/release"
+  else
+    echo "Fetching latest release for $TARGET..." >&2
+    downloaded_bundle=$(mktemp -d "${TMPDIR:-/tmp}/cygnus-download.XXXXXX")
+    TAR_URL="https://github.com/0xchasercat/cygnus/releases/latest/download/cygnus-${TARGET}.tar.gz"
+
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL "$TAR_URL" -o "$downloaded_bundle/cygnus.tar.gz" || fail "Failed to download $TAR_URL"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "$downloaded_bundle/cygnus.tar.gz" "$TAR_URL" || fail "Failed to download $TAR_URL"
+    else
+      fail "curl or wget is required to download the release"
+    fi
+
+    tar -xzf "$downloaded_bundle/cygnus.tar.gz" -C "$downloaded_bundle" || fail "Failed to extract bundle"
+    bundle_dir="$downloaded_bundle"
+  fi
 fi
 if [[ -z $listen && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
   printf 'HTTP listen address [127.0.0.1:3000]: ' >&2; IFS= read -r answer || true; listen=${answer:-127.0.0.1:3000}
@@ -150,7 +179,7 @@ for path_name in bundle_dir prefix config_dir state_dir runtime_dir systemd_dir;
   [[ -n ${!path_name} ]] || fail "$path_name is required"
   is_abs_safe "${!path_name}" || fail "$path_name must be an absolute path without whitespace or path traversal: ${!path_name}"
 done
-[[ -n $bundle_dir ]] || fail "--bundle-dir is required (use --noninteractive for automation)"
+[[ -n $bundle_dir ]] || fail "--bundle-dir is required"
 [[ -n $listen ]] || listen=127.0.0.1:3000
 [[ -n $apps_domain ]] || apps_domain=apps.localhost
 [[ -n $dns_provider ]] || dns_provider=none
@@ -200,6 +229,7 @@ cleanup() {
   local status=$?
   exec 3>&- || true
   rm -rf -- "$stage"
+  [[ -n ${downloaded_bundle:-} ]] && rm -rf -- "$downloaded_bundle"
   if (( status == 0 )); then rm -f -- "$diag_file"; else printf 'cygnus installer: diagnostics retained at %s\n' "$diag_file" >&2; fi
   return "$status"
 }
