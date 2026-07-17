@@ -13,7 +13,8 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::unistd::pipe;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -183,24 +184,109 @@ impl JobResult {
     }
 }
 
+/// Terminal outcome and elapsed time for a completed streamed job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobCompletion {
+    pub outcome: JobExitOutcome,
+    pub duration: Duration,
+}
+
+impl JobCompletion {
+    pub fn success(&self) -> bool {
+        matches!(self.outcome, JobExitOutcome::Exited(0))
+    }
+}
+
 /// Run one finite job, draining stdout and stderr concurrently and always
 /// releasing the cage resources before returning.
 pub fn run_job(config: JobConfig) -> Result<JobResult, CageError> {
-    run_job_with_boot(config, Cage::boot_with_capture)
+    let run = run_job_with_boot(
+        config,
+        OutputSink::Capture(Vec::new()),
+        OutputSink::Capture(Vec::new()),
+        "capture job output",
+        Cage::boot_with_capture,
+    )?;
+    Ok(JobResult {
+        stdout: run.stdout,
+        stderr: run.stderr,
+        outcome: run.completion.outcome,
+        duration: run.completion.duration,
+    })
+}
+
+/// Run one finite job while incrementally writing its bounded output to
+/// caller-opened files. Each retained chunk is flushed before the reader waits
+/// for more output, and both files are synced before this function returns.
+pub fn run_job_streaming(
+    config: JobConfig,
+    stdout: File,
+    stderr: File,
+) -> Result<JobCompletion, CageError> {
+    Ok(run_job_with_boot(
+        config,
+        OutputSink::File(stdout),
+        OutputSink::File(stderr),
+        "stream job output",
+        Cage::boot_with_capture,
+    )?
+    .completion)
 }
 
 /// Run a domain-restricted finite job through the host DNS forwarder.
 #[cfg(target_os = "linux")]
 pub fn run_job_with_dns(config: JobConfig, dns: &DnsForwarder) -> Result<JobResult, CageError> {
-    run_job_with_boot(config, |spec, stdout, stderr| {
-        Cage::boot_with_capture_and_dns(spec, stdout, stderr, dns)
+    let run = run_job_with_boot(
+        config,
+        OutputSink::Capture(Vec::new()),
+        OutputSink::Capture(Vec::new()),
+        "capture job output",
+        |spec, stdout, stderr| Cage::boot_with_capture_and_dns(spec, stdout, stderr, dns),
+    )?;
+    Ok(JobResult {
+        stdout: run.stdout,
+        stderr: run.stderr,
+        outcome: run.completion.outcome,
+        duration: run.completion.duration,
     })
+}
+
+/// Stream a domain-restricted finite job through the host DNS forwarder.
+#[cfg(target_os = "linux")]
+pub fn run_job_streaming_with_dns(
+    config: JobConfig,
+    stdout: File,
+    stderr: File,
+    dns: &DnsForwarder,
+) -> Result<JobCompletion, CageError> {
+    Ok(run_job_with_boot(
+        config,
+        OutputSink::File(stdout),
+        OutputSink::File(stderr),
+        "stream job output",
+        |spec, stdout, stderr| Cage::boot_with_capture_and_dns(spec, stdout, stderr, dns),
+    )?
+    .completion)
+}
+
+struct JobRun {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    completion: JobCompletion,
+}
+
+enum OutputSink {
+    Capture(Vec<u8>),
+    File(File),
 }
 
 fn run_job_with_boot(
     config: JobConfig,
+    stdout_sink: OutputSink,
+    stderr_sink: OutputSink,
+    output_operation: &'static str,
     boot: impl FnOnce(CageSpec, OwnedFd, OwnedFd) -> Result<Cage, CageError>,
-) -> Result<JobResult, CageError> {
+) -> Result<JobRun, CageError> {
     let started = Instant::now();
     let (stdout_read, stdout_write) = make_pipe("create job stdout pipe")?;
     let (stderr_read, stderr_write) = make_pipe("create job stderr pipe")?;
@@ -209,6 +295,7 @@ fn run_job_with_boot(
     let exceeded = Arc::new(AtomicBool::new(false));
     let stdout = spawn_reader(
         stdout_read,
+        stdout_sink,
         config.stdout_limit,
         config.total_output_limit,
         Arc::clone(&total),
@@ -216,6 +303,7 @@ fn run_job_with_boot(
     );
     let stderr = spawn_reader(
         stderr_read,
+        stderr_sink,
         config.stderr_limit,
         config.total_output_limit,
         Arc::clone(&total),
@@ -251,19 +339,21 @@ fn run_job_with_boot(
     // teardown performs the kill-if-needed and exactly one reap, then removes
     // cgroup, veth, and rootfs resources. It is called on every terminal path.
     let cleanup = cage.teardown();
-    let stdout = join_capture(stdout)?;
-    let stderr = join_capture(stderr)?;
+    let stdout = join_reader(stdout, output_operation)?;
+    let stderr = join_reader(stderr, output_operation)?;
     cleanup?;
     let outcome = if exceeded.load(Ordering::Acquire) {
         JobExitOutcome::OutputLimitExceeded
     } else {
         outcome
     };
-    Ok(JobResult {
+    Ok(JobRun {
         stdout,
         stderr,
-        outcome,
-        duration: started.elapsed(),
+        completion: JobCompletion {
+            outcome,
+            duration: started.elapsed(),
+        },
     })
 }
 
@@ -285,6 +375,7 @@ fn make_pipe(operation: &'static str) -> Result<(OwnedFd, OwnedFd), CageError> {
 
 fn spawn_reader(
     fd: OwnedFd,
+    mut sink: OutputSink,
     stream_limit: usize,
     total_limit: Option<usize>,
     total: Arc<AtomicUsize>,
@@ -293,8 +384,11 @@ fn spawn_reader(
     thread::spawn(move || {
         // SAFETY: the OwnedFd is transferred to this reader and is not used
         // elsewhere after the spawn call.
-        let mut reader = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
-        let mut output = Vec::with_capacity(stream_limit.min(8192));
+        let mut reader = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
+        if let OutputSink::Capture(output) = &mut sink {
+            output.reserve(stream_limit.min(8192));
+        }
+        let mut retained = 0_usize;
         let mut buffer = [0_u8; 8192];
         loop {
             let count = match reader.read(&mut buffer) {
@@ -303,17 +397,32 @@ fn spawn_reader(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
-            let stream_remaining = stream_limit.saturating_sub(output.len());
+            let stream_remaining = stream_limit.saturating_sub(retained);
             let desired = count.min(stream_remaining);
             let retain = total_limit
                 .map(|limit| reserve_total(&total, limit, desired))
                 .unwrap_or(desired);
-            output.extend_from_slice(&buffer[..retain]);
+            if retain > 0 {
+                match &mut sink {
+                    OutputSink::Capture(output) => output.extend_from_slice(&buffer[..retain]),
+                    OutputSink::File(file) => {
+                        file.write_all(&buffer[..retain])?;
+                        file.flush()?;
+                    }
+                }
+                retained += retain;
+            }
             if retain < count {
                 exceeded.store(true, Ordering::Release);
             }
         }
-        Ok(output)
+        match sink {
+            OutputSink::Capture(output) => Ok(output),
+            OutputSink::File(file) => {
+                file.sync_all()?;
+                Ok(Vec::new())
+            }
+        }
     })
 }
 
@@ -334,14 +443,14 @@ fn reserve_total(total: &AtomicUsize, limit: usize, desired: usize) -> usize {
     }
 }
 
-fn join_capture(handle: JoinHandle<Result<Vec<u8>, io::Error>>) -> Result<Vec<u8>, CageError> {
+fn join_reader(
+    handle: JoinHandle<Result<Vec<u8>, io::Error>>,
+    operation: &'static str,
+) -> Result<Vec<u8>, CageError> {
     let output = handle
         .join()
         .map_err(|_| CageError::Internal("job output reader panicked"))?;
-    output.map_err(|source| CageError::Spawn {
-        operation: "capture job output",
-        source,
-    })
+    output.map_err(|source| CageError::Spawn { operation, source })
 }
 
 #[cfg(test)]

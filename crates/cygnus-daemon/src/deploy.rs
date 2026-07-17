@@ -24,11 +24,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use cygnus_cage::{
-    BuildOutputSpec, CageError, DomainEgressRule, EgressMode, FilterMode, JobConfig,
-    JobExitOutcome, JobResult, RootfsSpec, run_job,
+    BuildOutputSpec, CageError, DomainEgressRule, EgressMode, FilterMode, JobCompletion, JobConfig,
+    JobExitOutcome, RootfsSpec, run_job_streaming,
 };
 #[cfg(target_os = "linux")]
-use cygnus_cage::{DnsForwarder, run_job_with_dns};
+use cygnus_cage::{DnsForwarder, run_job_streaming_with_dns};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,7 +61,6 @@ const BUILD_INSTALL_PIDS_MAX: u32 = 512;
 const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_BUN_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BUILD_OUTPUT: usize = 4 * 1024 * 1024;
-const LOG_STAGING_REL: &str = ".logs";
 const LOG_REL: &str = "logs";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARTIFACT_INODES: u64 = 8_192;
@@ -370,20 +369,31 @@ where
     }
 
     let building = artifact_root.join(format!("{BUILD_OUTPUT_PREFIX}{deployment_id}"));
-    let log_staging = match prepare_log_staging(&artifact_root, &deployment_id) {
-        Ok(path) => path,
+    let log_path = artifact_root.join(LOG_REL).join(&deployment_id);
+    let (stdout_log, stderr_log) = match prepare_live_logs(&artifact_root, &deployment_id) {
+        Ok(logs) => logs,
         Err(error) => {
             let detail = error.to_string();
             return Err(fail_build(
                 state,
                 &artifact_root,
                 &building,
-                &artifact_root.join(LOG_STAGING_REL).join(&deployment_id),
+                &log_path,
                 &deployment_id,
                 detail,
             ));
         }
     };
+    if let Err(error) = state.set_deployment_log_path(&deployment_id, &log_path) {
+        return Err(fail_build(
+            state,
+            &artifact_root,
+            &building,
+            &log_path,
+            &deployment_id,
+            error.to_string(),
+        ));
+    }
     let result = (|| {
         let publish = PublishDir::create(
             &artifact_root,
@@ -399,22 +409,24 @@ where
             &deployment_id,
             build_plan,
         );
-        let job_result = match run_build_job(job, build_plan.install) {
+        let job_result = match run_build_job(job, build_plan.install, stdout_log, stderr_log) {
             Ok(result) => result,
             Err(error) => {
-                write_logs(&log_staging, &[], error.to_string().as_bytes())?;
+                append_log(
+                    &log_path.join("build.stderr.log"),
+                    error.to_string().as_bytes(),
+                )?;
                 publish.close()?;
                 return Err(fail_build(
                     state,
                     &artifact_root,
                     &building,
-                    &log_staging,
+                    &log_path,
                     &deployment_id,
                     format!("Bun build pipeline cage could not start: {error}"),
                 ));
             }
         };
-        write_logs(&log_staging, &job_result.stdout, &job_result.stderr)?;
         if !job_result.success() {
             let detail = match job_result.outcome {
                 JobExitOutcome::Exited(code) => {
@@ -433,7 +445,7 @@ where
                 state,
                 &artifact_root,
                 &building,
-                &log_staging,
+                &log_path,
                 &deployment_id,
                 detail,
             ));
@@ -446,8 +458,6 @@ where
         let close_result = publish.close();
         close_result?;
         staging_result?;
-        persist_success_logs(state, &artifact_root, &deployment_id, &log_staging)?;
-
         let generated = expected_generated_entry(&building.join("app"), &entry)?;
         let sidecar = generated.with_extension("js.jsc");
         let sidecar_meta = fs::symlink_metadata(&sidecar).map_err(|error| {
@@ -517,7 +527,7 @@ where
                 state,
                 &artifact_root,
                 &building,
-                &log_staging,
+                &log_path,
                 &deployment_id,
                 format!("artifact could not be sealed: {error}"),
             ));
@@ -568,7 +578,7 @@ where
                 state,
                 &artifact_root,
                 &building,
-                &log_staging,
+                &log_path,
                 &deployment_id,
                 detail,
             ))
@@ -576,16 +586,21 @@ where
     }
 }
 
-fn run_build_job(job: JobConfig, needs_dns: bool) -> Result<JobResult, CageError> {
+fn run_build_job(
+    job: JobConfig,
+    needs_dns: bool,
+    stdout: File,
+    stderr: File,
+) -> Result<JobCompletion, CageError> {
     #[cfg(target_os = "linux")]
     if needs_dns {
         let dns = DnsForwarder::start()?;
-        return run_job_with_dns(job, &dns);
+        return run_job_streaming_with_dns(job, stdout, stderr, &dns);
     }
 
     #[cfg(not(target_os = "linux"))]
     let _ = needs_dns;
-    run_job(job)
+    run_job_streaming(job, stdout, stderr)
 }
 
 fn build_job(
@@ -1270,100 +1285,97 @@ fn validate_tree(root: &Path) -> Result<(), DeployError> {
     Ok(())
 }
 
-fn prepare_log_staging(artifact_root: &Path, id: &str) -> Result<PathBuf, DeployError> {
-    let parent = artifact_root.join(LOG_STAGING_REL);
+fn prepare_live_logs(artifact_root: &Path, id: &str) -> Result<(File, File), DeployError> {
+    let parent = artifact_root.join(LOG_REL);
     fs::create_dir_all(&parent)?;
     let metadata = fs::symlink_metadata(&parent)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(DeployError::InvalidInput(
-            "deployment log staging path must be a directory".into(),
+            "deployment log path must be a directory".into(),
         ));
     }
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
     let logs = parent.join(id);
     fs::create_dir(&logs)?;
     fs::set_permissions(&logs, fs::Permissions::from_mode(0o700))?;
-    Ok(logs)
+    let stdout = create_log_file(&logs.join("build.stdout.log"))?;
+    let stderr = create_log_file(&logs.join("build.stderr.log"))?;
+    Ok((stdout, stderr))
 }
 
-fn write_logs(logs: &Path, stdout: &[u8], stderr: &[u8]) -> Result<(), io::Error> {
-    for (name, bytes) in [("build.stdout.log", stdout), ("build.stderr.log", stderr)] {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(logs.join(name))?;
-        file.write_all(bytes)?;
+fn create_log_file(path: &Path) -> Result<File, io::Error> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn append_log(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn sync_logs(logs: &Path) {
+    for name in ["build.stdout.log", "build.stderr.log"] {
+        if let Ok(file) = OpenOptions::new().write(true).open(logs.join(name)) {
+            let _ = file.sync_all();
+        }
     }
-    Ok(())
-}
-
-fn persist_success_logs(
-    state: &mut State,
-    artifact_root: &Path,
-    id: &str,
-    log_staging: &Path,
-) -> Result<PathBuf, DeployError> {
-    let deployment_logs = artifact_root.join(LOG_REL).join(id);
-    fs::create_dir_all(artifact_root.join(LOG_REL))?;
-    fs::rename(log_staging, &deployment_logs)?;
-    let _ = fs::remove_dir(artifact_root.join(LOG_STAGING_REL));
-    state.set_deployment_log_path(id, &deployment_logs)?;
-    Ok(deployment_logs)
 }
 
 fn fail_build(
     state: &mut State,
     artifact_root: &Path,
     output: &Path,
-    log_staging: &Path,
+    logs: &Path,
     id: &str,
     detail: String,
 ) -> DeployError {
     let failed = artifact_root.join(FAILED_REL).join(id);
     let failed_output = failed.join("output");
-    let failed_logs = failed.join("logs");
     let _ = fs::create_dir_all(artifact_root.join(FAILED_REL));
     let _ = fs::remove_dir_all(&failed);
     let _ = fs::create_dir(&failed);
     if output.exists() && !is_content_addressed_publication(artifact_root, output) {
         let _ = fs::rename(output, &failed_output);
     }
-    let logs = if log_staging.exists() {
-        let _ = fs::rename(log_staging, &failed_logs);
-        failed_logs
-    } else if artifact_root.join(LOG_REL).join(id).is_dir() {
-        let _ = fs::rename(artifact_root.join(LOG_REL).join(id), &failed_logs);
-        failed_logs
-    } else if failed_output.join("logs").is_dir() {
-        failed_output.join("logs")
-    } else {
-        let _ = fs::create_dir(&failed_logs);
-        failed_logs
-    };
+    let _ = fs::create_dir_all(logs);
+    let _ = fs::set_permissions(logs, fs::Permissions::from_mode(0o700));
     for name in ["build.stdout.log", "build.stderr.log"] {
-        let _ = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(logs.join(name));
+        let path = logs.join(name);
+        if !path.exists() {
+            let _ = create_log_file(&path);
+        }
     }
     let _ = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(logs.join("pipeline.error.log"))
-        .and_then(|mut file| file.write_all(detail.as_bytes()));
+        .and_then(|mut file| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(detail.as_bytes())?;
+            file.flush()?;
+            file.sync_all()
+        });
+    sync_logs(logs);
     let terminal = match state
-        .set_deployment_log_path(id, &logs)
+        .set_deployment_log_path(id, logs)
         .and_then(|_| state.mark_deployment_failed(id, &detail))
     {
         Ok(_) => detail,
         Err(error) => format!("{detail}; unable to persist failed state: {error}"),
     };
     let _ = remove_work(artifact_root, id);
-    let _ = fs::remove_dir(artifact_root.join(LOG_STAGING_REL));
     DeployError::BuildFailed {
         id: id.to_owned(),
         detail: terminal,
-        logs,
+        logs: logs.to_path_buf(),
     }
 }
 
@@ -1706,7 +1718,11 @@ mod tests {
     use super::*;
     use crate::state::DeploymentStatus;
     use std::ffi::OsStr;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn temp_dir(label: &str) -> PathBuf {
         let path =
@@ -2049,24 +2065,107 @@ mod tests {
                 engine_version: "shell".into(),
             })
             .unwrap();
-        let staging = prepare_log_staging(&artifacts, "dep-success").unwrap();
-        write_logs(&staging, b"stdout", b"stderr").unwrap();
+        let logs = artifacts.join("logs/dep-success");
+        let (mut stdout, mut stderr) = prepare_live_logs(&artifacts, "dep-success").unwrap();
+        state.set_deployment_log_path("dep-success", &logs).unwrap();
+        stdout.write_all(b"stdout").unwrap();
+        stderr.write_all(b"stderr").unwrap();
+        stdout.sync_all().unwrap();
+        stderr.sync_all().unwrap();
 
-        let logs = persist_success_logs(&mut state, &artifacts, "dep-success", &staging).unwrap();
         assert_eq!(logs, artifacts.join("logs/dep-success"));
         assert_eq!(
             state.deployment_logs_dir("dep-success").unwrap(),
             Some(logs.clone())
         );
         assert_eq!(fs::read(logs.join("build.stdout.log")).unwrap(), b"stdout");
+        assert_eq!(
+            fs::metadata(logs.join("build.stdout.log")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(logs.join("build.stderr.log")).unwrap().mode() & 0o777,
+            0o600
+        );
         assert!(!artifacts.join("c".repeat(64)).join("logs").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn publication_reuses_a_valid_interrupted_artifact_without_rewriting_it() {
-        use std::os::unix::fs::MetadataExt;
+    fn build_logs_are_readable_incrementally_while_rootless_job_runs() {
+        let root = temp_dir("live-build-logs");
+        let artifacts = fs::canonicalize(&root).unwrap();
+        let id = format!("live-{}", new_deployment_id());
+        let mut state = State::open(root.join("state.db")).unwrap();
+        register_engine(
+            &mut state,
+            "fixture",
+            "/",
+            fs::canonicalize("/bin/sh").unwrap(),
+        )
+        .unwrap();
+        state
+            .begin_deployment(&DeploymentInput {
+                id: id.clone(),
+                app: "live-app".into(),
+                source_hash: "b".repeat(64),
+                engine_version: "fixture".into(),
+            })
+            .unwrap();
+        let logs = artifacts.join(LOG_REL).join(&id);
+        let (stdout, stderr) = prepare_live_logs(&artifacts, &id).unwrap();
+        state.set_deployment_log_path(&id, &logs).unwrap();
 
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = Command::new("/bin/sh")
+                .args(["-c", "printf first; sleep 0.4; printf second"])
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .and_then(|mut child| child.wait());
+            finished_tx.send(result).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if fs::read(logs.join("build.stdout.log"))
+                .is_ok_and(|bytes| bytes.starts_with(b"first"))
+            {
+                break;
+            }
+            match finished_rx.try_recv() {
+                Ok(result) => panic!("job completed before first chunk was observed: {result:?}"),
+                Err(mpsc::TryRecvError::Disconnected) => panic!("fixture job disconnected"),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            assert!(Instant::now() < deadline, "first log chunk was not visible");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let deployment = state.deployment(&id).unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Building);
+        assert_eq!(deployment.log_path, Some(logs.clone()));
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let completion = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fixture job completion")
+            .expect("fixture job succeeds");
+        assert!(completion.success());
+        handle.join().unwrap();
+        assert_eq!(
+            fs::read(logs.join("build.stdout.log")).unwrap(),
+            b"firstsecond"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_reuses_a_valid_interrupted_artifact_without_rewriting_it() {
         let root = temp_dir("publication-recovery");
         let first = root.join("first");
         fs::create_dir_all(first.join("app")).unwrap();
@@ -2116,14 +2215,16 @@ mod tests {
                 engine_version: "shell".into(),
             })
             .unwrap();
-        let log_staging = prepare_log_staging(&artifacts, "dep-cleanup").unwrap();
-        write_logs(&log_staging, b"out", b"err").unwrap();
+        let logs = artifacts.join("logs/dep-cleanup");
+        let (mut stdout, mut stderr) = prepare_live_logs(&artifacts, "dep-cleanup").unwrap();
+        stdout.write_all(b"out").unwrap();
+        stderr.write_all(b"err").unwrap();
 
         let _ = fail_build(
             &mut state,
             &artifacts,
             &final_path,
-            &log_staging,
+            &logs,
             "dep-cleanup",
             "state seal failed".into(),
         );
