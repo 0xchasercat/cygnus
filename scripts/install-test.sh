@@ -64,7 +64,7 @@ export CYGNUS_TEST_TENANT_READY_FILE="$ROOT/run/cygnus/tenant-0/admin.sock"
 export PATH="$FAKEBIN:$PATH"
 
 run_install() {
-  "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE" \
+  bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE" \
     --prefix "$ROOT/usr/local/bin" --config-dir "$ROOT/etc/cygnus" \
     --state-dir "$ROOT/var/lib/cygnus" --runtime-dir "$ROOT/run/cygnus" \
     --listen 127.0.0.1:3300 --https-listen 127.0.0.1:3443 --apps-domain apps.test \
@@ -195,7 +195,7 @@ assert app["env"]["CYGNUS_CONSOLE_SESSION_KEY_FILE"] == "/cygnus/secrets/session
 PY
 
 # 7. Noninteractive mode fails when required bundle input is absent.
-expect_fail env CYGNUS_INSTALL_TEST_MODE=1 CYGNUS_INSTALL_TEST_ROOT="$ROOT/missing" PATH="$PATH" "$INSTALLER" --noninteractive --prefix "$ROOT/missing/bin"
+expect_fail env CYGNUS_INSTALL_TEST_MODE=1 CYGNUS_INSTALL_TEST_ROOT="$ROOT/missing" PATH="$PATH" bash "$INSTALLER" --noninteractive --prefix "$ROOT/missing/bin"
 
 # 8. Daemon readiness failure stops before either admin mutation.
 ROOT_FAIL=$ROOT/failure
@@ -209,7 +209,7 @@ export CYGNUS_TEST_CTL_LOG="$ROOT_FAIL/ctl.log"
 export CYGNUS_TEST_SYSTEMCTL_LOG="$ROOT_FAIL/systemctl.log"
 export CYGNUS_TEST_READY_FILE="$ROOT_FAIL/run/cygnus/admin.sock"
 export CYGNUS_TEST_TENANT_READY_FILE="$ROOT_FAIL/run/cygnus/tenant-0/admin.sock"
-expect_fail "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE_FAIL" \
+expect_fail bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE_FAIL" \
   --prefix "$ROOT_FAIL/usr/local/bin" --config-dir "$ROOT_FAIL/etc/cygnus" \
   --state-dir "$ROOT_FAIL/var/lib/cygnus" --runtime-dir "$ROOT_FAIL/run/cygnus" \
   --listen 127.0.0.1:3300 --apps-domain apps.test
