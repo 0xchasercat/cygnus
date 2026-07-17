@@ -1214,6 +1214,12 @@ fn spawn_reaper(
     });
 }
 
+#[cfg(test)]
+fn boot_cage(spec: &CageSpec) -> Result<Cage, String> {
+    prepare_upstream(spec)?;
+    Cage::boot(spec.clone()).map_err(|error| error.to_string())
+}
+
 fn prepare_upstream(spec: &CageSpec) -> Result<(), String> {
     let Some(path) = &spec.readiness_uds else {
         return Err(format!("app {:?} has no readiness UDS", spec.name));
