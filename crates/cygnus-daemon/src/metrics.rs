@@ -191,14 +191,11 @@ impl MetricsHub {
         let minute = request.time_ms / MILLIS_PER_MINUTE;
         let is_error = request.status >= 500;
         let latency = to_f32_ms(request.duration_ms);
-        let cold = request.cold;
-
         let mut inner = self.lock();
         roll_buckets(&mut inner.buckets, minute);
         if let Some(bucket) = bucket_mut(&mut inner.buckets, minute) {
             bucket.requests = bucket.requests.saturating_add(1);
             bucket.errors = bucket.errors.saturating_add(u64::from(is_error));
-            bucket.cold_starts = bucket.cold_starts.saturating_add(u64::from(cold));
             push_sample(&mut bucket.latency, latency);
         }
         push_bounded(&mut inner.requests, request, REQUEST_RING_CAPACITY);
@@ -224,6 +221,7 @@ impl MetricsHub {
         let mut inner = self.lock();
         roll_buckets(&mut inner.buckets, minute);
         if let Some(bucket) = bucket_mut(&mut inner.buckets, minute) {
+            bucket.cold_starts = bucket.cold_starts.saturating_add(1);
             push_sample(&mut bucket.boot_samples, record.total_ms);
         }
         push_bounded(&mut inner.boots, record, BOOT_RING_CAPACITY);

@@ -143,7 +143,10 @@ impl StateAdminHandler {
                 offset,
                 limit,
             } => {
-                let path = self.runtime_logs_root.join(&app).join(stream.app_filename());
+                let path = self
+                    .runtime_logs_root
+                    .join(&app)
+                    .join(stream.app_filename());
                 let (bytes, next_offset, eof) = read_log_chunk(&path, offset, limit, "app log")?;
                 Ok(AdminData::AppLog {
                     app,
@@ -373,8 +376,7 @@ impl StateAdminHandler {
                     .map_err(HandlerFault::internal)?
                     .ok_or_else(|| HandlerFault::not_found("deployment logs are unavailable"))?;
                 let path = directory.join(stream.build_filename());
-                let (bytes, next_offset, eof) =
-                    read_log_chunk(&path, offset, limit, "build log")?;
+                let (bytes, next_offset, eof) = read_log_chunk(&path, offset, limit, "build log")?;
                 Ok(AdminData::Log {
                     deployment,
                     stream,
@@ -394,16 +396,13 @@ impl StateAdminHandler {
             .engines()
             .map_err(HandlerFault::internal)?
             .into_iter()
-            .map(|status| {
-                Ok(EngineView {
-                    version: status.engine.version,
-                    sha256: status.engine.sha256,
-                    is_default: status.engine.is_default,
-                    apps: u32::try_from(status.app_count)
-                        .map_err(|_| HandlerFault::internal("engine app count does not fit u32"))?,
-                })
+            .map(|status| EngineView {
+                version: status.engine.version,
+                sha256: status.engine.sha256,
+                is_default: status.engine.is_default,
+                apps: status.app_count,
             })
-            .collect::<Result<Vec<_>, HandlerFault>>()?;
+            .collect();
         let now = unix_seconds();
         let acme = snapshot.edge.acme.as_ref();
         let mut certificates = Vec::new();
@@ -722,9 +721,7 @@ fn read_log_chunk(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => {
-                HandlerFault::not_found(format!("{label} does not exist"))
-            }
+            io::ErrorKind::NotFound => HandlerFault::not_found(format!("{label} does not exist")),
             _ => HandlerFault::internal(error),
         })?;
     let metadata = file.metadata().map_err(HandlerFault::internal)?;
@@ -937,8 +934,8 @@ mod tests {
         let logs = path.with_extension("runtime-logs");
         fs::create_dir_all(logs.join("api")).unwrap();
         fs::write(logs.join("api/stdout.log"), b"abcdef").unwrap();
-        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations())
-            .with_runtime_logs(&logs);
+        let handler =
+            StateAdminHandler::new(&path, |_| None, unused_mutations()).with_runtime_logs(&logs);
 
         let read = |offset, limit| {
             let response = handler.handle(

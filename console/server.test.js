@@ -129,8 +129,8 @@ describe("console request validation", () => {
     };
 
     expect(await command("/api/v1/metrics")).toEqual({ type: "get_metrics" });
-    expect(await command("/api/v1/requests")).toEqual({ type: "get_requests", limit: 100 });
-    expect(await command("/api/v1/events")).toEqual({ type: "get_events", limit: 100 });
+    expect(await command("/api/v1/requests")).toEqual({ type: "list_requests", limit: 100 });
+    expect(await command("/api/v1/events")).toEqual({ type: "list_events", limit: 100 });
     expect(await command("/api/v1/apps/demo/logs?stream=stdout")).toEqual({
       type: "read_app_log",
       app: "demo",
@@ -153,8 +153,8 @@ describe("console request validation", () => {
       return commandForRequest(request, new URL(request.url));
     };
 
-    expect(await command("/api/v1/requests?limit=500")).toEqual({ type: "get_requests", limit: 500 });
-    expect(await command("/api/v1/events?limit=500")).toEqual({ type: "get_events", limit: 500 });
+    expect(await command("/api/v1/requests?limit=500")).toEqual({ type: "list_requests", limit: 500 });
+    expect(await command("/api/v1/events?limit=500")).toEqual({ type: "list_events", limit: 500 });
     expect(await command("/api/v1/apps/demo/logs?stream=stderr&offset=9007199254740991&limit=49152")).toEqual({
       type: "read_app_log",
       app: "demo",

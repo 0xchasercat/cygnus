@@ -155,6 +155,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     version,
                     host_root,
                     cage_executable,
+                    is_default: false,
                 },
             )?)
         }

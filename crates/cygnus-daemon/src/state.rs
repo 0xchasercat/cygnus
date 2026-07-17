@@ -70,7 +70,7 @@ pub struct EngineRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EngineStatus {
     pub engine: EngineRecord,
-    pub app_count: usize,
+    pub app_count: u32,
 }
 
 /// A deployment identity accepted from the caller.

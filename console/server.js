@@ -388,11 +388,11 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
   }
   if (parts.length === 3 && parts[2] === "requests") {
     assertQueryKeys(url, ["limit"]);
-    return { type: "get_requests", limit: observabilityLimit(url) };
+    return { type: "list_requests", limit: observabilityLimit(url) };
   }
   if (parts.length === 3 && parts[2] === "events") {
     assertQueryKeys(url, ["limit"]);
-    return { type: "get_events", limit: observabilityLimit(url) };
+    return { type: "list_events", limit: observabilityLimit(url) };
   }
   if (parts.length === 3 && parts[2] === "apps") {
     assertQueryKeys(url, ["cursor", "limit"]);
