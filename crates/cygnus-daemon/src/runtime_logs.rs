@@ -21,11 +21,7 @@ const DRAIN_BUFFER_SIZE: usize = 64 * 1024;
 /// Callers that also need to prepare an upstream socket should use
 /// [`boot_with_logs_and_prepare`].
 #[allow(dead_code)]
-pub(crate) fn boot_with_logs(
-    spec: &CageSpec,
-    logs_root: &Path,
-    app: &str,
-) -> Result<Cage, String> {
+pub(crate) fn boot_with_logs(spec: &CageSpec, logs_root: &Path, app: &str) -> Result<Cage, String> {
     boot_with_logs_and_prepare(spec, logs_root, app, |_| Ok(()))
 }
 
@@ -89,9 +85,7 @@ fn validate_app_name(app: &str) -> Result<(), String> {
     if !first.is_ascii_alphanumeric() {
         return Err("app name must begin with an ASCII letter or digit".into());
     }
-    if !bytes.all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-    }) {
+    if !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')) {
         return Err("app name contains unsupported characters".into());
     }
     Ok(())
@@ -243,27 +237,17 @@ fn make_pipe() -> io::Result<(File, File)> {
     Ok((read, write))
 }
 
-fn spawn_drain(
-    mut pipe: File,
-    directory: OwnedFd,
-    live_name: &'static str,
-) -> io::Result<()> {
+fn spawn_drain(mut pipe: File, directory: OwnedFd, live_name: &'static str) -> io::Result<()> {
     let thread_name = format!("cygnus-{}-drain", live_name.trim_end_matches(".log"));
-    thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            if let Err(error) = drain(&mut pipe, &directory, live_name) {
-                eprintln!("cygnus: {live_name} drainer stopped: {error}");
-            }
-        })?;
+    thread::Builder::new().name(thread_name).spawn(move || {
+        if let Err(error) = drain(&mut pipe, &directory, live_name) {
+            eprintln!("cygnus: {live_name} drainer stopped: {error}");
+        }
+    })?;
     Ok(())
 }
 
-fn drain(
-    pipe: &mut impl Read,
-    directory: &OwnedFd,
-    live_name: &str,
-) -> io::Result<()> {
+fn drain(pipe: &mut impl Read, directory: &OwnedFd, live_name: &str) -> io::Result<()> {
     let rotated_name = format!("{live_name}.1");
     let mut live = open_live_file(directory, live_name)?;
     let mut length = live.metadata()?.len();
@@ -299,11 +283,8 @@ fn drain(
 
 fn open_live_file(directory: &OwnedFd, name: &str) -> io::Result<File> {
     let name = c_name(OsStr::new(name))?;
-    let flags = libc::O_WRONLY
-        | libc::O_APPEND
-        | libc::O_CREAT
-        | libc::O_NOFOLLOW
-        | libc::O_CLOEXEC;
+    let flags =
+        libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = unsafe {
         // SAFETY: `directory` is live and `name` is NUL-terminated.
         libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600)
@@ -332,12 +313,7 @@ fn set_mode_file(file: &File, mode: libc::mode_t) -> io::Result<()> {
     }
 }
 
-fn rotate(
-    directory: &OwnedFd,
-    live_name: &str,
-    rotated_name: &str,
-    live: File,
-) -> io::Result<()> {
+fn rotate(directory: &OwnedFd, live_name: &str, rotated_name: &str, live: File) -> io::Result<()> {
     live.sync_data()?;
     drop(live);
 
@@ -494,9 +470,8 @@ mod tests {
     fn app_directory_is_owned_by_current_user() {
         let root = TempDir::new("ownership");
         let _directory = open_log_directory(&root.0, "app").unwrap();
-        assert_eq!(
-            fs::metadata(root.0.join("app")).unwrap().uid(),
-            unsafe { libc::geteuid() }
-        );
+        assert_eq!(fs::metadata(root.0.join("app")).unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
     }
 }

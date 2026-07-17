@@ -3,11 +3,11 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::deploy::DeployRequest;
-use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
 pub use crate::github::{
     GitHubInstallationRepositoryView, GitHubManifestMetadata, GitHubRepositoryInput,
     GitHubRepositoryView,
 };
+use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
 use crate::state::NodeConfig;
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;

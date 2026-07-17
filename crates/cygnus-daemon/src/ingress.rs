@@ -383,7 +383,7 @@ impl ResponseStatus {
 fn parse_response_status(line: &[u8]) -> Option<u16> {
     let line = std::str::from_utf8(line)
         .ok()?
-        .trim_end_matches(|character| matches!(character, '\r' | '\n'));
+        .trim_end_matches(['\r', '\n']);
     let mut fields = line.split_ascii_whitespace();
     let version = fields.next()?;
     let status = fields.next()?;
@@ -651,11 +651,7 @@ mod tests {
     fn request_span_records_truncated_path_status_and_cold_flag() {
         let metrics = MetricsHub::new();
         {
-            let mut span = RequestSpan::new(
-                metrics.clone(),
-                "http",
-                "192.0.2.1".parse().unwrap(),
-            );
+            let mut span = RequestSpan::new(metrics.clone(), "http", "192.0.2.1".parse().unwrap());
             let target = format!("{}é", "a".repeat(199));
             span.set_head("GET", Some("api.example.com"), &target, 64);
             span.set_app("api");
