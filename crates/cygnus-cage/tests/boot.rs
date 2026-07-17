@@ -167,8 +167,8 @@ fn rooted_child_has_no_capabilities_and_no_new_privs() {
     };
 
     let pid = cage.host_pid().expect("cage has a host PID");
-    let status = fs::read_to_string(format!("/proc/{pid}/status"))
-        .expect("read rooted cage process status");
+    let status =
+        fs::read_to_string(format!("/proc/{pid}/status")).expect("read rooted cage process status");
     assert_capabilities_are_dropped(&status);
     cage.teardown().expect("tear down rooted capability cage");
     fs::remove_dir_all(&fixture).expect("remove capability fixture");
@@ -272,11 +272,12 @@ fn rooted_tenant_connects_through_read_only_admin_mount() {
             let mut stream = UnixStream::connect(&admin_socket).expect("release admin probe");
             stream.write_all(b"ping").expect("write release probe");
             let mut response = [0_u8; 4];
-            stream.read_exact(&mut response).expect("read release probe");
+            stream
+                .read_exact(&mut response)
+                .expect("read release probe");
             admin_thread.join().expect("join skipped admin probe");
             let _ = fs::remove_dir_all(&fixture);
-            if environment_unavailable(&error)
-                && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none()
+            if environment_unavailable(&error) && env::var_os("CYGNUS_REQUIRE_PRIVILEGED").is_none()
             {
                 eprintln!("skipping privileged Tenant admin mount test: {error}");
                 return;

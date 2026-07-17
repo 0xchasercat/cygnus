@@ -1,5 +1,7 @@
 <script>
-  import { deploys } from '../data.js';
+  import { store } from '../live.svelte.js';
+  import { relativeTime } from '../time.js';
+  import { shortHash } from '../fmt.js';
   import { openDeploy } from '../stores.svelte.js';
   import Identicon from '../components/Identicon.svelte';
   import Icon from '../components/Icon.svelte';
@@ -7,64 +9,68 @@
   let filter = $state('all');
 
   const filtered = $derived(
-    deploys.filter((d) => {
+    store.deployments.filter((d) => {
       if (filter === 'all') return true;
+      if (filter === 'active') return d.status === 'active';
+      if (filter === 'building') return d.status === 'building';
       if (filter === 'failed') return d.status === 'failed';
-      if (filter === 'previews') return d.status === 'preview';
-      return d.status === 'live' || d.status === 'previous' || d.status === 'building';
+      return true;
     })
   );
 
-  const LED = {
-    live: 'live',
-    building: 'build',
-    failed: 'fail',
-    preview: 'preview',
-    previous: 'cold',
-  };
-  const STATUS = {
-    live: 'production',
-    building: 'building',
-    failed: 'failed',
-    preview: 'preview',
-    previous: 'retained',
-  };
+  const LED = { active: 'live', building: 'build', failed: 'fail', sealed: 'cold' };
+  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'sealed' };
+
+  // Derive a "branch · sha7" source label when a github job references this deploy.
+  function sourceLabel(d) {
+    if (d.source?.kind === 'github' && d.source.branch) {
+      return `${d.source.branch} · ${d.source.commit ?? shortHash(d.source_hash).slice(0, 7)}`;
+    }
+    if (d.source?.kind === 'upload') return 'folder upload';
+    if (d.source?.kind === 'cli') return 'cli';
+    const job = store.github.jobs.find((j) => j.deployment_id === d.id);
+    if (job) return `${job.branch ?? '—'} · ${shortHash(job.sha).slice(0, 7)}`;
+    return '—';
+  }
 </script>
 
 <div class="page screen-enter">
   <div class="head">
     <div>
       <h1>Deploys</h1>
-      <p class="sub">Every artifact this node has built. Blue-green swaps, previous five retained for instant rollback.</p>
+      <p class="sub">Every artifact this node has built. Blue-green swaps, prior sealed deployments retained for instant rollback.</p>
     </div>
     <div class="seg">
       <button class:on={filter === 'all'} onclick={() => (filter = 'all')}>All</button>
-      <button class:on={filter === 'production'} onclick={() => (filter = 'production')}>Production</button>
-      <button class:on={filter === 'previews'} onclick={() => (filter = 'previews')}>Previews</button>
+      <button class:on={filter === 'active'} onclick={() => (filter = 'active')}>Active</button>
+      <button class:on={filter === 'building'} onclick={() => (filter = 'building')}>Building</button>
       <button class:on={filter === 'failed'} onclick={() => (filter = 'failed')}>Failed</button>
     </div>
   </div>
 
   <section class="card">
-    <div class="rows">
-      {#each filtered as d (d.id)}
-        <button class="row" onclick={() => openDeploy(d.app, d.id)}>
-          <span class="led {LED[d.status]}" class:breathe={d.status === 'building'}></span>
-          <span class="appcell">
-            <Identicon name={d.app} size={22} />
-            <span class="appname">{d.app}</span>
-          </span>
-          <span class="commit">{d.commit}</span>
-          <span class="chip branch"><Icon name="branch" size={11} />{d.branch}</span>
-          <span class="cellnum num who">{d.author}</span>
-          <span class="cellnum num">{d.dur}</span>
-          <span class="cellnum num">{d.size}</span>
-          <span class="cellnum num when">{d.when}</span>
-          <span class="status pill {LED[d.status] === 'cold' ? 'ghost' : LED[d.status]}">{STATUS[d.status]}</span>
-          <span class="chev"><Icon name="chevR" size={13} /></span>
-        </button>
-      {/each}
-    </div>
+    {#if filtered.length}
+      <div class="rows">
+        {#each filtered as d (d.id)}
+          <button class="row" onclick={() => openDeploy(d.app, d.id)}>
+            <span class="led {LED[d.status]}" class:breathe={d.status === 'building'}></span>
+            <span class="appcell">
+              <Identicon name={d.app} size={22} />
+              <span class="appname">{d.app}</span>
+            </span>
+            <span class="commit num">{d.id}</span>
+            <span class="chip branch"><Icon name="branch" size={11} />{sourceLabel(d)}</span>
+            <span class="cellnum num">{d.engine_version ?? '—'}</span>
+            <span class="cellnum num">{shortHash(d.artifact_hash)}</span>
+            <span class="cellnum num when">{d.created_ms ? relativeTime(d.created_ms) : '—'}</span>
+            <span class="status pill {LED[d.status] === 'cold' ? 'ghost' : LED[d.status]}">{STATUS[d.status] ?? d.status}</span>
+            <span class="chev"><Icon name="chevR" size={13} /></span>
+          </button>
+        {/each}
+      </div>
+    {:else}
+      <div class="empty mono">no deployments yet</div>
+    {/if}
   </section>
 </div>
 
@@ -94,6 +100,13 @@
   }
 
   .rows { padding: 6px; }
+  .empty {
+    padding: 48px 18px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--ink-4);
+    letter-spacing: 0.06em;
+  }
   .row {
     width: 100%;
     display: flex;

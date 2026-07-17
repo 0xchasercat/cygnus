@@ -1,36 +1,26 @@
 <script>
-  import { latency, nextRequest, events } from '../data.js';
+  import { store } from '../live.svelte.js';
+  import { relativeTime } from '../time.js';
+  import { eventIcon, eventStyle } from '../events.js';
   import Chart from '../components/Chart.svelte';
   import Icon from '../components/Icon.svelte';
 
-  let range = $state('1h');
   let tab = $state('requests');
 
-  let reqs = $state(Array.from({ length: 14 }, () => nextRequest()).reverse());
+  const series = $derived(
+    store.metrics?.series ? store.metrics.series.map((b) => [b.p50_ms, b.p99_ms]) : []
+  );
 
+  const reqs = $derived(store.requests.slice(0, 200));
+  const events = $derived(store.events);
 
-  const EVENT_ICON = {
-    deploy: 'ship',
-    revival: 'zap',
-    scale0: 'clock',
-    oom: 'node',
-    seccomp: 'lock',
-    cert: 'globe',
-  };
-  const TONE_FG = {
-    live: '#087a45',
-    cobalt: 'var(--cobalt-deep)',
-    ghost: 'var(--ink-3)',
-    amber: '#a36a06',
-    red: '#b02c23',
-  };
-  const TONE_BG = {
-    live: 'var(--live-soft)',
-    cobalt: 'var(--cobalt-ghost)',
-    ghost: 'var(--surface-3)',
-    amber: 'var(--amber-soft)',
-    red: 'var(--red-soft)',
-  };
+  function reqTime(r) {
+    const d = new Date(r.time_ms ?? 0);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
 </script>
 
 <div class="page screen-enter">
@@ -39,11 +29,7 @@
       <h1>Observe</h1>
       <p class="sub">Measured at the router — none of it self-reported by cages.</p>
     </div>
-    <div class="seg">
-      <button class:on={range === '1h'} onclick={() => (range = '1h')}>1h</button>
-      <button class:on={range === '24h'} onclick={() => (range = '24h')}>24h</button>
-      <button class:on={range === '7d'} onclick={() => (range = '7d')}>7d</button>
-    </div>
+    <span class="chip">last 60 min · in-memory</span>
   </div>
 
   <section class="card">
@@ -52,11 +38,15 @@
       <div class="legend num">
         <span><i class="sw p50"></i>p50</span>
         <span><i class="sw p99"></i>p99</span>
-        <span class="dim">router adds 0.3 ms</span>
+        {#if store.metrics}<span class="dim">{store.metrics.totals.p50_ms} / {store.metrics.totals.p99_ms} ms</span>{/if}
       </div>
     </div>
     <div class="chartwrap">
-      <Chart series={latency} h={225} />
+      {#if series.length}
+        <Chart {series} h={225} />
+      {:else}
+        <div class="empty mono">collecting…</div>
+      {/if}
     </div>
   </section>
 
@@ -67,39 +57,47 @@
         <button class:on={tab === 'events'} onclick={() => (tab = 'events')}>Events</button>
       </div>
       {#if tab === 'requests'}
-        <span class="livehint num"><span class="led preview"></span>preview snapshot</span>
+        <span class="livehint num"><span class="led {store.mode === 'live' ? 'live' : 'preview'}"></span>{store.mode === 'live' ? 'live' : 'preview'} · newest first</span>
       {/if}
     </div>
 
     {#if tab === 'requests'}
-      <div class="rows">
-        {#each reqs as r (r.id)}
-          <div class="req">
-            <span class="time num">{r.time}</span>
-            <span class="method num">{r.method}</span>
-            <span class="path num">{r.path}</span>
-            <span class="appchip num">{r.app}</span>
-            {#if r.cold}
-              <span class="pill cobalt">revived · {r.dur} ms</span>
-            {/if}
-            <span class="status num" class:err={r.status >= 500}>{r.status}</span>
-            <span class="dur num">{r.dur} ms</span>
-          </div>
-        {/each}
-      </div>
+      {#if reqs.length}
+        <div class="rows">
+          {#each reqs as r (r.request_id)}
+            <div class="req">
+              <span class="time num">{reqTime(r)}</span>
+              <span class="method num">{r.method}</span>
+              <span class="path num">{r.path}</span>
+              <span class="appchip num">{r.app}</span>
+              {#if r.cold}
+                <span class="pill cobalt">revived · {r.duration_ms} ms</span>
+              {/if}
+              <span class="status num" class:err={r.status >= 500}>{r.status}</span>
+              <span class="dur num">{r.duration_ms} ms</span>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="empty mono">collecting…</div>
+      {/if}
     {:else}
-      <div class="rows">
-        {#each events as e}
-          <div class="event">
-            <span class="eicon" style="color:{TONE_FG[e.tone]};background:{TONE_BG[e.tone]}">
-              <Icon name={EVENT_ICON[e.type]} size={14} />
-            </span>
-            <span class="eapp num">{e.app}</span>
-            <span class="emsg">{e.text}</span>
-            <span class="ewhen num">{e.when}</span>
-          </div>
-        {/each}
-      </div>
+      {#if events.length}
+        <div class="rows">
+          {#each events as e (e.time_ms + e.type)}
+            <div class="event">
+              <span class="eicon" style={eventStyle(e.type)}>
+                <Icon name={eventIcon(e.type)} size={14} />
+              </span>
+              <span class="eapp num">{e.app ?? 'node'}</span>
+              <span class="emsg">{e.message}</span>
+              <span class="ewhen num">{relativeTime(e.time_ms)}</span>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="empty mono">no events yet</div>
+      {/if}
     {/if}
   </section>
 </div>
@@ -146,6 +144,20 @@
   .sw.p50 { border-color: var(--cobalt); }
   .sw.p99 { border-color: var(--ink-4); border-top-style: dashed; }
   .chartwrap { padding: 4px 14px 14px; }
+  .chartwrap .empty {
+    padding: 60px 0;
+    text-align: center;
+    font-size: 11px;
+    color: var(--ink-4);
+    letter-spacing: 0.06em;
+  }
+  .stream .empty {
+    padding: 40px 0;
+    text-align: center;
+    font-size: 11px;
+    color: var(--ink-4);
+    letter-spacing: 0.06em;
+  }
 
   .stream { margin-top: 18px; }
   .livehint {

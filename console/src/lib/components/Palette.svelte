@@ -1,6 +1,6 @@
 <script>
   import { ui, go, openApp } from '../stores.svelte.js';
-  import { apps } from '../data.js';
+  import { store } from '../live.svelte.js';
   import Icon from './Icon.svelte';
   import Identicon from './Identicon.svelte';
 
@@ -20,14 +20,15 @@
     const query = q.trim().toLowerCase();
     const list = [];
 
-    for (const a of apps) {
-      if (!query || a.name.includes(query) || a.domain.includes(query)) {
+    for (const a of store.apps) {
+      const domains = (a.domains ?? []).join(' ');
+      if (!query || a.name.toLowerCase().includes(query) || domains.toLowerCase().includes(query)) {
         list.push({
           kind: 'app',
           title: a.name,
-          hint: a.domain,
+          hint: a.domains?.[0] ?? 'unrouted',
           app: a,
-          run: () => openApp(a.id),
+          run: () => openApp(a.name),
         });
       }
     }
@@ -37,9 +38,9 @@
       }
     }
     const actions = [
-      { title: 'Ship a new app', icon: 'ship', run: () => { ui.paletteOpen = false; ui.shipOpen = true; } },
-      { title: 'Ship · connect Git', icon: 'branch', run: () => { ui.paletteOpen = false; ui.shipOpen = true; } },
-      { title: 'Ship · upload a folder', icon: 'folder', run: () => { ui.paletteOpen = false; ui.shipOpen = true; } },
+      { title: 'Ship a new app', icon: 'ship', run: () => { ui.paletteOpen = false; ui.shipOpen = true; ui.shipTab = 'upload'; } },
+      { title: 'Ship · connect Git', icon: 'branch', run: () => { ui.paletteOpen = false; ui.shipOpen = true; ui.shipTab = 'git'; } },
+      { title: 'Ship · upload a folder', icon: 'folder', run: () => { ui.paletteOpen = false; ui.shipOpen = true; ui.shipTab = 'upload'; } },
     ];
     for (const a of actions) {
       if (!query || a.title.toLowerCase().includes(query)) {
@@ -110,7 +111,7 @@
             {/if}
             <span class="title">{r.title}</span>
             {#if r.app}
-              <span class="led {r.app.state === 'ready' ? (r.app.env === 'preview' ? 'preview' : 'live') : r.app.state === 'building' ? 'build' : 'cold'}"></span>
+              <span class="led {r.app.lifecycle_state === 'ready' ? 'live' : r.app.lifecycle_state === 'building' ? 'build' : 'cold'}"></span>
             {/if}
             <span class="hint num">{r.hint ?? ''}</span>
             {#if i === sel}<kbd>↵</kbd>{/if}
@@ -124,7 +125,7 @@
         <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
         <span><kbd>↵</kbd> open</span>
         <span class="grow"></span>
-        <span class="num">swan-01 · 287 apps</span>
+        <span class="num">{store.node?.apps_domain ?? 'cygnus'} · {store.apps.length} apps</span>
       </div>
     </div>
   </div>

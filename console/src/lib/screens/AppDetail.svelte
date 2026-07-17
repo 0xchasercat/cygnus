@@ -1,177 +1,272 @@
 <script>
   import { ui, openDeploy, go } from '../stores.svelte.js';
-  import { apps, deploys } from '../data.js';
+  import { store } from '../live.svelte.js';
+  import { relativeTime } from '../time.js';
+  import { bytes, millis, rate, shortHash } from '../fmt.js';
   import Identicon from '../components/Identicon.svelte';
   import Icon from '../components/Icon.svelte';
-  import Bars from '../components/Bars.svelte';
+  import Spark from '../components/Spark.svelte';
 
-  const app = $derived(apps.find((a) => a.id === ui.appId) ?? apps[0]);
-  const appDeploys = $derived(deploys.filter((d) => d.app === app.id));
-  const current = $derived(appDeploys.find((d) => d.status === 'live') ?? appDeploys[0]);
+  const app = $derived(store.appByName(ui.appId) ?? store.apps[0] ?? null);
+  const appDeploys = $derived(app ? store.deploymentsFor(app.name) : []);
+  const current = $derived(
+    app?.active ? appDeploys.find((d) => d.id === app.active.deployment_id) ?? appDeploys[0] : appDeploys[0] ?? null
+  );
+  const am = $derived(app ? store.appMetrics(app.name) : null);
 
-  const LED = { live: 'live', building: 'build', failed: 'fail', preview: 'preview', previous: 'cold' };
-  const STATUS = { live: 'production', building: 'building', failed: 'failed', preview: 'preview', previous: 'retained' };
+  const LED = { active: 'live', building: 'build', failed: 'fail', sealed: 'cold' };
+  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'sealed' };
 
   const stateLed = $derived(
-    app.state === 'building' ? 'build' : app.state === 'cold' ? 'cold' : app.env === 'preview' ? 'preview' : 'live'
+    app
+      ? app.lifecycle_state === 'building'
+        ? 'build'
+        : app.lifecycle_state === 'cold'
+          ? 'cold'
+          : app.name.startsWith('pr-')
+            ? 'preview'
+            : 'live'
+      : 'cold'
   );
+
+  // rollback
+  let rollbackOpen = $state(false);
+  let rollbackTarget = $state(null);
+  let rollbackError = $state('');
+  let rollbackBusy = $state(false);
+
+  const rollbackCandidates = $derived(
+    app ? appDeploys.filter((d) => d.status === 'sealed' && d.id !== app?.active?.deployment_id) : []
+  );
+
+  function askRollback() {
+    if (!rollbackCandidates.length) {
+      rollbackError = 'No prior sealed deployment is available to roll back to.';
+      rollbackOpen = true;
+      return;
+    }
+    rollbackError = '';
+    rollbackOpen = true;
+    rollbackTarget = rollbackCandidates[0]?.id ?? null;
+  }
+
+  async function confirmRollback() {
+    if (!app || !rollbackTarget || rollbackBusy) return;
+    rollbackBusy = true;
+    rollbackError = '';
+    const target = appDeploys.find((d) => d.id === rollbackTarget);
+    const expected = app.active?.artifact_hash ?? target?.artifact_hash ?? '';
+    const r = await store.rollback(app.name, rollbackTarget, expected);
+    rollbackBusy = false;
+    if (!r.ok) {
+      rollbackError = r.error ?? 'Rollback failed';
+      return;
+    }
+    rollbackOpen = false;
+    rollbackTarget = null;
+  }
+
+  function fmtIdle(ms) {
+    if (!ms) return 'pinned warm';
+    return `${Math.round(ms / 60000)}m idle`;
+  }
 </script>
 
-<div class="page screen-enter">
-  <!-- ————— header, boxless ————— -->
-  <header class="head">
-    <Identicon name={app.name} size={46} />
-    <div class="title">
-      <div class="row1">
-        <h1>{app.name}</h1>
-        <span class="led {stateLed}" class:breathe={app.state === 'ready'}></span>
-        <span class="pill {app.env === 'preview' ? 'preview' : 'ghost'}">{app.env}</span>
-      </div>
-      <div class="domains num">
-        <a href="https://{app.domain}" target="_blank" rel="noopener noreferrer" class="dom"
-          >{app.domain} <Icon name="ext" size={11} /></a
-        >
-        {#if app.custom}
-          <span class="dot">·</span>
-          <a href="https://{app.custom}" target="_blank" rel="noopener noreferrer" class="dom"
-            >{app.custom} <Icon name="ext" size={11} /></a
-          >
-        {/if}
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn" onclick={() => go('observe')}><Icon name="terminal" size={14} />Logs</button>
-      <button class="btn primary"><Icon name="ext" size={13} />Visit</button>
-      <button class="btn icon"><Icon name="dots" size={15} /></button>
-    </div>
-  </header>
-
-  <div class="grid">
-    <div class="main">
-      <!-- ————— current artifact ————— -->
-      <section class="card prod">
-        <div class="prodhead">
-          <span class="label">{app.env === 'preview' ? 'Preview' : 'Production'}</span>
-          <span class="pill {LED[current.status] === 'cold' ? 'ghost' : LED[current.status]}"
-            >{current.status === 'live' ? 'live' : STATUS[current.status]}</span
-          >
+{#if app}
+  <div class="page screen-enter">
+    <!-- ————— header, boxless ————— -->
+    <header class="head">
+      <Identicon name={app.name} size={46} />
+      <div class="title">
+        <div class="row1">
+          <h1>{app.name}</h1>
+          <span class="led {stateLed}" class:breathe={app.lifecycle_state === 'ready'}></span>
+          <span class="pill {app.name.startsWith('pr-') ? 'preview' : 'ghost'}">{app.name.startsWith('pr-') ? 'preview' : 'production'}</span>
         </div>
-        <button class="commit" onclick={() => openDeploy(app.id, current.id)}>{current.commit}</button>
-        <div class="meta num">
-          {current.id} · {current.author} · {current.when}
-          {#if current.dur !== '—'}· built in {current.dur}{/if}
-        </div>
-        <div class="hairline-h"></div>
-        <div class="prodfoot">
-          <div class="stat">
-            <span class="label">Revival</span>
-            <span class="readout md">{app.revival}<span class="unit">ms</span></span>
-          </div>
-          <div class="stat">
-            <span class="label">Bundle</span>
-            <span class="readout md">{current.size === '—' ? '…' : current.size.replace(' MB', '')}<span class="unit">MB</span></span>
-          </div>
-          <div class="stat">
-            <span class="label">Requests</span>
-            <span class="readout md">{app.rps}<span class="unit">rps</span></span>
-          </div>
-          <div class="grow"></div>
-          {#if app.env === 'preview'}
-            <button class="btn cobalt" disabled title="Unavailable: daemon admin bridge offline"><Icon name="ship" size={13} />Promote</button>
-          {:else}
-            <button class="btn" disabled title="Unavailable: daemon admin bridge offline"><Icon name="rollback" size={14} />Roll back</button>
-          {/if}
-          <button class="btn" onclick={() => openDeploy(app.id, current.id)}>Build log</button>
-        </div>
-      </section>
-
-      <!-- ————— deploy timeline ————— -->
-      <section class="card">
-        <div class="cardhead">
-          <span class="label">Deploys</span>
-          <span class="histbars"><Bars data={app.history} h={16} /></span>
-        </div>
-        <div class="rows">
-          {#each appDeploys as d (d.id)}
-            <button class="drow" onclick={() => openDeploy(app.id, d.id)}>
-              <span class="led {LED[d.status]}" class:breathe={d.status === 'building'}></span>
-              <span class="dcommit">{d.commit}</span>
-              <span class="chip"><Icon name="branch" size={11} />{d.branch}</span>
-              <span class="dnum num">{d.author}</span>
-              <span class="dnum num">{d.dur}</span>
-              <span class="dnum num when">{d.when}</span>
-              <span class="chev"><Icon name="chevR" size={13} /></span>
-            </button>
+        <div class="domains num">
+          {#each app.domains as d}
+            <a href="https://{d}" target="_blank" rel="noopener noreferrer" class="dom"
+              >{d} <Icon name="ext" size={11} /></a
+            >
+            <span class="dot">·</span>
           {/each}
         </div>
-      </section>
-    </div>
+      </div>
+      <div class="actions">
+        {#if app.domains?.length}
+          <a class="btn primary" href={`https://${app.domains[0]}`} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
+        {/if}
+      </div>
+    </header>
 
-    <aside class="side">
-      <!-- ————— the cage ————— -->
-      <section class="card">
-        <div class="cardhead">
-          <span class="label">Cage</span>
-          {#if app.state === 'ready'}
-            <span class="pill live">ready</span>
-          {:else if app.state === 'building'}
-            <span class="pill build">swapping</span>
-          {:else}
-            <span class="pill ghost">cold</span>
-          {/if}
-        </div>
-        {#if app.state === 'cold'}
-          <div class="coldbox">
-            <p>No process. The artifact sleeps on disk — {app.envVars} env vars sealed, route armed.</p>
-            <div class="coldstat num">next request revives in ≈{app.revival} ms</div>
-            <button class="btn sm" disabled title="Unavailable: daemon admin bridge offline"><Icon name="zap" size={12} />Warm up now</button>
+    <div class="grid">
+      <div class="main">
+        <!-- ————— current artifact ————— -->
+        <section class="card prod">
+          <div class="prodhead">
+            <span class="label">{app.name.startsWith('pr-') ? 'Preview' : 'Production'}</span>
+            {#if current}
+              <span class="pill {LED[current.status] === 'cold' ? 'ghost' : LED[current.status]}">{STATUS[current.status] ?? current.status}</span>
+            {:else}
+              <span class="pill ghost">no artifact</span>
+            {/if}
           </div>
-        {:else}
+          {#if current}
+            <button class="commit" onclick={() => openDeploy(app.name, current.id)}>
+              {current.source?.branch ? `${current.source.branch} · ${current.source.commit ?? shortHash(current.source_hash)}` : shortHash(current.source_hash)}
+            </button>
+            <div class="meta num">
+              {current.id} · {relativeTime(current.created_ms)}
+              {#if current.artifact_hash}· artifact {shortHash(current.artifact_hash)}{/if}
+            </div>
+          {:else}
+            <p class="commit dim">No active artifact yet.</p>
+          {/if}
+          <div class="hairline-h"></div>
+          <div class="prodfoot">
+            <div class="stat">
+              <span class="label">p50</span>
+              <span class="readout md">{am ? millis(am.p50_ms) : '— ms'}</span>
+            </div>
+            <div class="stat">
+              <span class="label">p99</span>
+              <span class="readout md">{am ? millis(am.p99_ms) : '— ms'}</span>
+            </div>
+            <div class="stat">
+              <span class="label">Requests</span>
+              <span class="readout md">{am ? rate(am.rps_1m) : '—'}<span class="unit">rps</span></span>
+            </div>
+            <div class="grow"></div>
+            {#if app.name.startsWith('pr-')}
+              <span class="pill ghost">preview</span>
+            {:else}
+              <button class="btn" onclick={askRollback}><Icon name="rollback" size={14} />Roll back</button>
+            {/if}
+            {#if current}
+              <button class="btn" onclick={() => openDeploy(app.name, current.id)}>Build log</button>
+            {/if}
+          </div>
+        </section>
+
+        <!-- ————— deploy timeline ————— -->
+        <section class="card">
+          <div class="cardhead">
+            <span class="label">Deploys</span>
+            {#if appDeploys.some((_, i) => i)}
+              <span class="histbars"><Spark data={store.appRequestSeries(app.name)} w={120} h={16} color="var(--ink-3)" /></span>
+            {/if}
+          </div>
+          {#if appDeploys.length}
+            <div class="rows">
+              {#each appDeploys as d (d.id)}
+                <button class="drow" onclick={() => openDeploy(app.name, d.id)}>
+                  <span class="led {LED[d.status] ?? 'cold'}" class:breathe={d.status === 'building'}></span>
+                  <span class="dcommit">{d.source?.branch ? `${d.source.branch} · ${d.source.commit ?? shortHash(d.source_hash)}` : shortHash(d.source_hash)}</span>
+                  <span class="chip"><Icon name="branch" size={11} />{d.source?.branch ?? '—'}</span>
+                  <span class="dnum num when">{relativeTime(d.created_ms)}</span>
+                  <span class="chev"><Icon name="chevR" size={13} /></span>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <div class="empty mono">no deployments yet</div>
+          {/if}
+        </section>
+      </div>
+
+      <aside class="side">
+        <!-- ————— the cage ————— -->
+        <section class="card">
+          <div class="cardhead">
+            <span class="label">Cage</span>
+            {#if app.lifecycle_state === 'ready'}
+              <span class="pill live">ready</span>
+            {:else if app.lifecycle_state === 'building'}
+              <span class="pill build">swapping</span>
+            {:else}
+              <span class="pill ghost">cold</span>
+            {/if}
+          </div>
+          {#if app.lifecycle_state === 'cold'}
+            <div class="coldbox">
+              <p>No process. The artifact sleeps on disk — {app.env_keys?.length ?? 0} env keys sealed, route armed.</p>
+              <div class="coldstat num">next request revives the cage</div>
+            </div>
+          {:else}
+            <div class="kv">
+              <div class="kvrow"><span>p50</span><b class="num">{am ? millis(am.p50_ms) : '—'}</b></div>
+              <div class="kvrow"><span>p99</span><b class="num">{am ? millis(am.p99_ms) : '—'}</b></div>
+              <div class="kvrow"><span>rps</span><b class="num">{am ? rate(am.rps_1m) : '—'}</b></div>
+            </div>
+          {/if}
+        </section>
+
+        <!-- ————— controls (read-only facts) ————— -->
+        <section class="card">
+          <div class="cardhead"><span class="label">Controls</span></div>
           <div class="kv">
-            <div class="kvrow"><span>Memory</span><b class="num">{app.rss} MB <i>/ {app.memory.split(' ·')[0]}</i></b></div>
-            <div class="kvrow"><span>CPU</span><b class="num">{app.cpu}%</b></div>
-            <div class="kvrow"><span>Connections</span><b class="num">{app.conns}</b></div>
-            <div class="kvrow"><span>Cage uptime</span><b class="num">{app.cageUptime}</b></div>
-            <div class="kvrow"><span>Last revival</span><b class="num">{app.revival} ms</b></div>
+            <div class="kvrow"><span>Pinned</span><span class="factpill {app.pinned ? 'on' : ''}">{app.pinned ? 'pinned warm' : 'unpinned'}</span></div>
+            <div class="kvrow"><span>Egress</span><b class="num">{app.egress ?? '—'}</b></div>
+            <div class="kvrow"><span>Idle TTL</span><b class="num">{fmtIdle(app.idle_ttl_ms)}</b></div>
+            <div class="kvrow"><span>Memory cap</span><b class="num">{app.memory_max ? bytes(app.memory_max) : '—'}</b></div>
+          </div>
+        </section>
+
+        <!-- ————— sealed env ————— -->
+        <section class="card">
+          <div class="cardhead">
+            <span class="label">Environment</span>
+            <span class="envcount num">{app.env_keys?.length ?? 0} keys</span>
+          </div>
+          {#if app.env_keys?.length}
+            <div class="kv">
+              {#each app.env_keys as k (k)}
+                <div class="kvrow env"><span class="num">{k}</span><span class="badge">set</span></div>
+              {/each}
+            </div>
+          {:else}
+            <div class="empty mono">no env keys</div>
+          {/if}
+          <div class="sealed"><Icon name="lock" size={11} /> sealed at rest · values never sent to the console</div>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  {#if rollbackOpen}
+    <div class="scrim" onclick={(e) => { if (e.target === e.currentTarget) rollbackOpen = false; }} role="presentation">
+      <div class="dialog" role="dialog" aria-label="Confirm rollback">
+        <p class="eyebrow">CONFIRM ROLLBACK</p>
+        <h2>Swap {app.name} to a prior deployment?</h2>
+        <p class="dcopy">The active artifact is checked (CAS) before the retained deployment is promoted. No rebuild is started.</p>
+        {#if rollbackCandidates.length}
+          <div class="targets">
+            {#each rollbackCandidates as d (d.id)}
+              <label class="target">
+                <input type="radio" name="rb" value={d.id} bind:group={rollbackTarget} />
+                <span class="led {LED[d.status]}"></span>
+                <span class="tid num">{d.id}</span>
+                <span class="tart num">{shortHash(d.artifact_hash)}</span>
+                <span class="twhen num">{relativeTime(d.created_ms)}</span>
+              </label>
+            {/each}
           </div>
         {/if}
-      </section>
-
-      <!-- ————— controls ————— -->
-      <section class="card">
-        <div class="cardhead"><span class="label">Controls</span></div>
-        <div class="kv">
-          <div class="kvrow">
-            <span>Pinned warm</span>
-            <i class="switch" class:on={app.pinned}></i>
-          </div>
-          <div class="kvrow">
-            <span>JIT</span>
-            <i class="switch" class:on={app.jit}></i>
-          </div>
-          <div class="kvrow"><span>Egress</span><b class="num">{app.egress}</b></div>
-          <div class="kvrow"><span>Memory cap</span><b class="num">{app.memory}</b></div>
-          <div class="kvrow"><span>Idle TTL</span><b class="num">{app.idleTtl}</b></div>
-          <div class="kvrow"><span>Engine</span><b class="num">{app.engine}</b></div>
+        {#if rollbackError}<p class="rerr" role="alert">{rollbackError}</p>{/if}
+        <div class="dactions">
+          <button class="btn" onclick={() => (rollbackOpen = false)}>Cancel</button>
+          <button class="btn danger" onclick={confirmRollback} disabled={rollbackBusy || !rollbackTarget}>
+            {rollbackBusy ? 'Rolling back…' : 'Confirm rollback'}
+          </button>
         </div>
-      </section>
-
-      <!-- ————— sealed env ————— -->
-      <section class="card">
-        <div class="cardhead">
-          <span class="label">Environment</span>
-          <span class="envcount num">{app.envVars} vars</span>
-        </div>
-        <div class="kv">
-          <div class="kvrow env"><span class="num">DATABASE_URL</span><b class="mask">••••••••</b><Icon name="eye" size={13} /></div>
-          <div class="kvrow env"><span class="num">STRIPE_SECRET</span><b class="mask">••••••••</b><Icon name="eye" size={13} /></div>
-          <div class="kvrow env"><span class="num">SESSION_KEY</span><b class="mask">••••••••</b><Icon name="eye" size={13} /></div>
-        </div>
-        <div class="sealed"><Icon name="lock" size={11} /> encrypted at rest · XChaCha20-Poly1305</div>
-      </section>
-    </aside>
+      </div>
+    </div>
+  {/if}
+{:else}
+  <div class="page screen-enter">
+    <div class="empty mono">no app selected</div>
   </div>
-</div>
+{/if}
 
 <style>
   .page {
@@ -305,36 +400,35 @@
   .kvrow + .kvrow { border-top: 1px solid var(--line-2); }
   .kvrow span { color: var(--ink-3); }
   .kvrow b { color: var(--ink); font-weight: 500; font-size: 12px; }
-  .kvrow b i { font-style: normal; color: var(--ink-4); }
-  .kvrow.env b { flex: 1; text-align: right; }
   .kvrow.env span { font-size: 11px; color: var(--ink-2); }
-  .mask { color: var(--ink-4) !important; letter-spacing: 0.14em; }
-  .kvrow.env :global(svg) { color: var(--ink-4); cursor: pointer; }
-  .kvrow.env:hover :global(svg) { color: var(--ink-2); }
-
-  .switch {
-    width: 30px;
-    height: 18px;
-    border-radius: 10px;
-    background: var(--ink-4);
-    position: relative;
-    transition: background 0.15s ease;
-    cursor: pointer;
+  .factpill {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    padding: 2px 8px;
+    border-radius: 7px;
+    color: var(--ink-3);
+    background: var(--surface-3);
+    border: 1px solid var(--line-2);
   }
-  .switch::after {
-    content: '';
-    position: absolute;
-    top: 2.5px;
-    left: 2.5px;
-    width: 13px;
-    height: 13px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 1px 2px rgba(13, 18, 28, 0.2);
-    transition: left 0.15s cubic-bezier(0.22, 1, 0.36, 1);
+  .factpill.on { color: #087a45; background: var(--live-soft); border-color: transparent; }
+  .badge {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface-3);
+    border-radius: 6px;
+    padding: 2px 7px;
   }
-  .switch.on { background: var(--live); }
-  .switch.on::after { left: 14.5px; }
+  .empty {
+    padding: 28px 18px;
+    font-size: 11px;
+    color: var(--ink-4);
+    text-align: center;
+    letter-spacing: 0.06em;
+  }
+  .commit.dim { color: var(--ink-3); font-size: 14px; }
 
   .coldbox { padding: 4px 18px 16px; }
   .coldbox p {
@@ -366,4 +460,53 @@
   @media (max-width: 1080px) {
     .grid { grid-template-columns: 1fr; }
   }
+
+  /* rollback dialog */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(12, 15, 20, 0.3);
+    backdrop-filter: blur(6px);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding-top: 16vh;
+  }
+  .dialog {
+    width: min(520px, calc(100vw - 32px));
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    box-shadow: var(--shadow-pop);
+    padding: 24px 24px 20px;
+  }
+  .eyebrow {
+    color: var(--amber);
+    font: 600 10px var(--mono);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+  .dialog h2 { margin-top: 8px; font-size: 17px; letter-spacing: -0.015em; }
+  .dcopy { margin-top: 8px; font-size: 12.5px; color: var(--ink-3); line-height: 1.55; }
+  .targets { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+  .target {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line-2);
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .target:hover { background: var(--surface-2); }
+  .target input { accent-color: var(--cobalt); }
+  .target .tid { color: var(--ink); }
+  .target .tart { color: var(--ink-3); margin-left: auto; }
+  .target .twhen { color: var(--ink-4); }
+  .rerr { margin-top: 12px; color: var(--red); font-size: 11.5px; }
+  .dactions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+  .btn.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--line)); }
+  .btn.danger:hover { background: var(--red-soft); }
 </style>

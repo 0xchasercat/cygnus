@@ -1,27 +1,59 @@
 <script>
-  import { node } from '../data.js';
+  import { store } from '../live.svelte.js';
+  import { previewEgress } from '../fixtures.js';
+  import { uptime, relativeTime } from '../time.js';
+  import { bytes } from '../fmt.js';
   import Anatomy from '../components/Anatomy.svelte';
   import Constellation from '../components/Constellation.svelte';
   import Icon from '../components/Icon.svelte';
 
-  const pct = (gb) => (gb / node.ram) * 100;
-  const free = $derived(node.ram - node.ramCages - node.ramEngines - node.ramSystem);
-  const maxEgress = $derived(Math.max(...node.egress.top.map((t) => t.gb)));
+  const node = $derived(store.node);
+
+  const hasMemory = $derived(!!node?.memory);
+  const usedBytes = $derived(node?.memory ? node.memory.total_bytes - node.memory.available_bytes : 0);
+  const usedPct = $derived(node?.memory ? (usedBytes / node.memory.total_bytes) * 100 : 0);
+  const totalGb = $derived(node?.memory ? node.memory.total_bytes / (1024 ** 3) : 0);
+
+  const bootPhases = $derived(
+    store.metrics?.boot_phases?.phases
+      ? store.metrics.boot_phases.phases.map((p) => ({ name: p.name, ms: p.p50_ms, hot: false }))
+      : []
+  );
+  const hotPhase = $derived(bootPhases.length ? bootPhases.reduce((a, b) => (b.ms > a.ms ? b : a)) : null);
+  const anatomyPhases = $derived(bootPhases.map((p) => ({ ...p, hot: hotPhase && p.name === hotPhase.name })));
+
+  // Egress has no live source — render the fixture only in preview.
+  const egress = $derived(store.mode === 'preview' ? previewEgress : null);
+  const maxEgress = $derived(egress ? Math.max(...egress.top.map((t) => t.gb)) : 0);
+
+  function certLed(c) {
+    return c.ok ? 'live' : 'build';
+  }
+  function certExpiry(c) {
+    if (!c.expires_unix) return c.ok ? 'ok' : 'pending';
+    const ms = c.expires_unix * 1000;
+    return `renews ${relativeTime(ms)}`;
+  }
+  function shortSha(sha) {
+    if (!sha) return '—';
+    return sha.slice(0, 8);
+  }
 </script>
 
 <div class="page screen-enter">
   <header class="head">
     <div>
       <div class="row1">
-        <h1>{node.name}</h1>
+        <h1>{node?.apps_domain ?? 'cygnus'}</h1>
         <span class="led live breathe"></span>
       </div>
-      <p class="sub num">{node.binary}</p>
+      <p class="sub num">{node?.version ?? 'cygnus dev'}</p>
       <div class="hostchips">
-        <span class="chip">kernel <b>{node.kernel}</b></span>
-        <span class="chip"><span class="led live"></span> patched {node.kernelPatched}</span>
-        <span class="chip">uptime <b>{node.uptime}</b></span>
-        <span class="chip">{node.ram} GB · 8 vCPU</span>
+        {#if node?.version}<span class="chip">version <b>{node.version}</b></span>{/if}
+        {#if node?.isolation}<span class="chip">{node.isolation}</span>{/if}
+        {#if node?.uptime_seconds}<span class="chip">uptime <b>{uptime(node.uptime_seconds)}</b></span>{/if}
+        {#if node?.listen}<span class="chip">listen <b>{node.listen}</b></span>{/if}
+        {#if node?.https_listen}<span class="chip">https <b>{node.https_listen}</b></span>{/if}
       </div>
     </div>
     <div class="constellation">
@@ -30,123 +62,146 @@
   </header>
 
   <div class="grid">
-    <!-- ————— density ————— -->
+    <!-- ————— identity ————— -->
     <section class="card">
-      <div class="cardhead">
-        <span class="label">Memory · density</span>
-        <span class="hint num">{node.ramUsed} / {node.ram} GB</span>
-      </div>
+      <div class="cardhead"><span class="label">Identity</span></div>
       <div class="pad">
-        <div class="rambar">
-          <i style="width:{pct(node.ramCages)}%" class="b-cages"></i>
-          <i style="width:{pct(node.ramEngines)}%" class="b-engines"></i>
-          <i style="width:{pct(node.ramSystem)}%" class="b-system"></i>
+        <div class="kv">
+          <div class="kvrow"><span>Apps domain</span><b class="num">{node?.apps_domain ?? '—'}</b></div>
+          <div class="kvrow"><span>Listener</span><b class="num">{node?.listen ?? '—'}</b></div>
+          {#if node?.https_listen}<div class="kvrow"><span>HTTPS</span><b class="num">{node.https_listen}</b></div>{/if}
+          {#if node?.isolation}<div class="kvrow"><span>Isolation</span><b class="num">{node.isolation}</b></div>{/if}
+          {#if node?.uptime_seconds}<div class="kvrow"><span>Uptime</span><b class="num">{uptime(node.uptime_seconds)}</b></div>{/if}
+          <div class="kvrow"><span>Apps</span><b class="num">{node?.app_count ?? store.apps.length}</b></div>
+          {#if node?.warm_count != null}<div class="kvrow"><span>Warm</span><b class="num">{node.warm_count}</b></div>{/if}
         </div>
-        <div class="ramlegend">
-          <span><i class="dot b-cages"></i>warm cages <b class="num">{node.ramCages} GB</b></span>
-          <span><i class="dot b-engines"></i>engine text <b class="num">{Math.round(node.ramEngines * 1000)} MB</b></span>
-          <span><i class="dot b-system"></i>system <b class="num">{node.ramSystem} GB</b></span>
-          <span><i class="dot b-free"></i>free <b class="num">{free.toFixed(1)} GB</b></span>
-        </div>
-        <div class="counts">
-          <div class="count">
-            <span class="readout md">{node.warm}</span>
-            <span class="label">warm</span>
-          </div>
-          <div class="hairline-v"></div>
-          <div class="count">
-            <span class="readout md">{node.registered}</span>
-            <span class="label">registered</span>
-          </div>
-          <div class="hairline-v"></div>
-          <div class="count">
-            <span class="readout md">{node.registered - node.warm}</span>
-            <span class="label">asleep · disk only</span>
-          </div>
-        </div>
-        <p class="axiom">Density is bounded by concurrent-active apps, not registered apps.</p>
       </div>
     </section>
 
-    <!-- ————— cold starts ————— -->
+    <!-- ————— memory density ————— -->
+    <section class="card">
+      <div class="cardhead">
+        <span class="label">Memory · density</span>
+        {#if hasMemory}<span class="hint num">{bytes(usedBytes)} / {bytes(node.memory.total_bytes)}</span>{/if}
+      </div>
+      <div class="pad">
+        {#if hasMemory}
+          <div class="rambar">
+            <i style="width:{usedPct}%" class="b-cages"></i>
+          </div>
+          <div class="ramlegend">
+            <span><i class="dot b-cages"></i>used <b class="num">{bytes(usedBytes)}</b></span>
+            <span><i class="dot b-free"></i>free <b class="num">{bytes(node.memory.available_bytes)}</b></span>
+          </div>
+          <div class="counts">
+            <div class="count"><span class="readout md">{node.warm_count ?? '—'}</span><span class="label">warm</span></div>
+            <div class="hairline-v"></div>
+            <div class="count"><span class="readout md">{node.app_count ?? store.apps.length}</span><span class="label">apps</span></div>
+          </div>
+          <p class="axiom">Density is bounded by concurrent-active apps, not registered apps.</p>
+        {:else}
+          <div class="counts">
+            <div class="count"><span class="readout md">{node?.app_count ?? store.apps.length}</span><span class="label">apps</span></div>
+            <div class="hairline-v"></div>
+            <div class="count"><span class="readout md">{node?.warm_count ?? '—'}</span><span class="label">warm</span></div>
+          </div>
+        {/if}
+      </div>
+    </section>
+
+    <!-- ————— revival anatomy ————— -->
     <section class="card">
       <div class="cardhead">
         <span class="label">Revival budget</span>
-        <span class="hint num">p50 <b>{node.coldStart.p50} ms</b> · p99 <b>{node.coldStart.p99} ms</b> · target ≤ 150</span>
+        {#if store.metrics}<span class="hint num">p50 <b>{store.metrics.totals.boot_p50_ms} ms</b> · p99 <b>{store.metrics.totals.boot_p99_ms} ms</b></span>{/if}
       </div>
       <div class="pad">
-        <Anatomy phases={node.coldStart.phases} />
+        {#if anatomyPhases.length}
+          <Anatomy phases={anatomyPhases} />
+        {:else}
+          <div class="empty mono">no boots sampled yet</div>
+        {/if}
       </div>
     </section>
 
     <!-- ————— engines ————— -->
     <section class="card">
       <div class="cardhead"><span class="label">Engines · page-cache shared</span></div>
-      <div class="rows pad0">
-        {#each node.engines as e}
-          <div class="engine">
-            <span class="ename num">{e.version}</span>
-            {#if e.def}<span class="pill cobalt">default</span>{/if}
-            <span class="grow"></span>
-            <span class="emeta num">{e.text} text · {e.apps} apps</span>
-          </div>
-        {/each}
-      </div>
-      <div class="foot num">one text copy per resident version · unreferenced engines are GC’d</div>
+      {#if node?.engines?.length}
+        <div class="rows pad0">
+          {#each node.engines as e (e.version)}
+            <div class="engine">
+              <span class="ename num">{e.version}</span>
+              {#if e.default}<span class="pill cobalt">default</span>{/if}
+              <span class="grow"></span>
+              <span class="emeta num">{shortSha(e.sha256)} · {e.apps ?? 0} apps</span>
+            </div>
+          {/each}
+        </div>
+        <div class="foot num">one text copy per resident version · unreferenced engines are GC'd</div>
+      {:else}
+        <div class="empty mono">no engines reported</div>
+      {/if}
     </section>
 
     <!-- ————— certificates ————— -->
     <section class="card">
       <div class="cardhead"><span class="label">Certificates · ACME</span></div>
-      <div class="rows pad0">
-        {#each node.certs as c}
-          <div class="cert">
-            <span class="led live"></span>
-            <span class="cdomain num">{c.domain}</span>
-            <span class="ckind num">{c.kind}</span>
-            <span class="grow"></span>
-            <span class="crenew num">renews {c.renews}</span>
-          </div>
-        {/each}
-      </div>
-      <div class="foot num">keys never enter a cage · hot-loaded into rustls</div>
-    </section>
-
-    <!-- ————— egress ————— -->
-    <section class="card">
-      <div class="cardhead">
-        <span class="label">Egress · nftables per cage</span>
-        <span class="hint num">{node.egress.today} today · {node.egress.conns} conns</span>
-      </div>
-      <div class="pad">
-        <div class="modes">
-          <span class="chip">public <b>{node.egress.modes.public}</b></span>
-          <span class="chip">restricted <b>{node.egress.modes.restricted}</b></span>
-          <span class="chip">none <b>{node.egress.modes.none}</b></span>
-          <span class="chip">open <b>{node.egress.modes.open}</b></span>
-        </div>
-        <div class="topapps">
-          {#each node.egress.top as t}
-            <div class="tapp">
-              <span class="tname num">{t.app}</span>
-              <span class="tbar"><i style="width:{(t.gb / maxEgress) * 100}%"></i></span>
-              <span class="tgb num">{t.gb} GB</span>
+      {#if node?.certificates?.length}
+        <div class="rows pad0">
+          {#each node.certificates as c (c.domain)}
+            <div class="cert">
+              <span class="led {certLed(c)}"></span>
+              <span class="cdomain num">{c.domain}</span>
+              <span class="ckind num">{c.kind}</span>
+              <span class="grow"></span>
+              <span class="crenew num">{certExpiry(c)}</span>
             </div>
           {/each}
         </div>
-      </div>
+        <div class="foot num">keys never enter a cage · hot-loaded into rustls</div>
+      {:else}
+        <div class="empty mono">no certificates reported</div>
+      {/if}
     </section>
+
+    <!-- ————— egress (preview only — no live source) ————— -->
+    {#if egress}
+      <section class="card">
+        <div class="cardhead">
+          <span class="label">Egress · nftables per cage</span>
+          <span class="hint num">{egress.today} today · {egress.conns} conns</span>
+        </div>
+        <div class="pad">
+          <div class="modes">
+            <span class="chip">public <b>{egress.modes.public}</b></span>
+            <span class="chip">restricted <b>{egress.modes.restricted}</b></span>
+            <span class="chip">none <b>{egress.modes.none}</b></span>
+            <span class="chip">open <b>{egress.modes.open}</b></span>
+          </div>
+          <div class="topapps">
+            {#each egress.top as t}
+              <div class="tapp">
+                <span class="tname num">{t.app}</span>
+                <span class="tbar"><i style="width:{(t.gb / maxEgress) * 100}%"></i></span>
+                <span class="tgb num">{t.gb} GB</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      </section>
+    {/if}
 
     <!-- ————— break-glass ————— -->
     <section class="card">
       <div class="cardhead"><span class="label">Break-glass</span></div>
       <div class="pad">
         <p class="bgtext">
-          If Tenant 0 — this dashboard — ever bricks itself, the node doesn’t care.
-          <code>cygnusctl</code> talks to the daemon over a root-only socket, past everything.
+          If this console ever bricks itself, the node doesn't care.
+          <code>cygnus</code> talks to the daemon over a root-only socket, past everything.
         </p>
         <div class="code num">
-          <span class="p">$</span> cygnusctl status --socket /run/cygnus.sock
+          <span class="p">$</span> cygnus --admin-socket /run/cygnus/admin.sock status
         </div>
       </div>
     </section>
@@ -205,6 +260,26 @@
   .hint b { color: var(--ink); font-weight: 500; }
   .pad { padding: 4px 18px 18px; }
   .pad0 { padding: 0 10px 6px; }
+
+  .kv { padding: 2px 4px 8px; }
+  .kvrow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 4px;
+    font-size: 12.5px;
+  }
+  .kvrow + .kvrow { border-top: 1px solid var(--line-2); }
+  .kvrow span { color: var(--ink-3); }
+  .kvrow b { color: var(--ink); font-weight: 500; font-size: 12px; }
+  .empty {
+    padding: 36px 18px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--ink-4);
+    letter-spacing: 0.06em;
+  }
 
   /* density */
   .rambar {

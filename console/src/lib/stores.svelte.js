@@ -6,6 +6,7 @@ export const ui = $state({
   deployId: null,
   paletteOpen: false,
   shipOpen: false,
+  shipTab: 'upload', // 'upload' | 'git'
 });
 
 export function go(screen, opts = {}) {

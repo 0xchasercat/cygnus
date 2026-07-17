@@ -1,10 +1,12 @@
 <script>
   import { onMount } from 'svelte';
   import { ui } from './lib/stores.svelte.js';
+  import { store } from './lib/live.svelte.js';
   import Nav from './lib/components/Nav.svelte';
   import TopBar from './lib/components/TopBar.svelte';
   import Palette from './lib/components/Palette.svelte';
   import ShipModal from './lib/components/ShipModal.svelte';
+  import Login from './lib/screens/Login.svelte';
   import Overview from './lib/screens/Overview.svelte';
   import AppDetail from './lib/screens/AppDetail.svelte';
   import DeployDetail from './lib/screens/DeployDetail.svelte';
@@ -12,7 +14,6 @@
   import Observe from './lib/screens/Observe.svelte';
   import NodeScreen from './lib/screens/NodeScreen.svelte';
   import SettingsScreen from './lib/screens/SettingsScreen.svelte';
-  import LiveConsole from './lib/screens/LiveConsole.svelte';
 
   const SCREENS = {
     overview: Overview,
@@ -26,21 +27,24 @@
 
   const Screen = $derived(SCREENS[ui.screen] ?? Overview);
   const screenKey = $derived(`${ui.screen}·${ui.appId ?? ''}·${ui.deployId ?? ''}`);
-  let dataMode = $state('loading');
 
-  onMount(async () => {
-    try {
-      const response = await fetch('/healthz', { headers: { accept: 'application/json' }, credentials: 'same-origin' });
-      const health = await response.json();
-      // A configured bridge is live even when the operator session is absent;
-      // LiveConsole owns the locked/sign-in state instead of falling back to fixtures.
-      dataMode = health.mode === 'live' ? 'live' : 'preview';
-    } catch {
-      // If health is temporarily unreachable, keep the authenticated bridge UX
-      // rather than silently showing stale preview data.
-      dataMode = 'live';
+  // One shell for live and preview. Login owns live+!ready; everything else
+  // renders the polished screens off the store.
+  const ready = $derived(store.mode !== 'loading' && store.auth === 'ready');
+
+  const footer = $derived.by(() => {
+    if (store.mode === 'preview') {
+      return 'preview dataset · cygnus 0.9.2 · no daemon connection';
     }
+    if (store.mode === 'live') {
+      const v = store.node?.version ?? 'dev';
+      const host = store.node?.apps_domain ?? store.node?.listen ?? '—';
+      return `cygnus ${v} · ${host}`;
+    }
+    return '';
   });
+
+  onMount(() => store.boot());
 
   function onKeydown(e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -57,9 +61,11 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-{#if dataMode === 'live'}
-  <LiveConsole />
-{:else if dataMode === 'preview'}
+{#if store.mode === 'loading'}
+  <div class="loading num">LOCATING TENANT ZERO…</div>
+{:else if store.mode === 'live' && !ready}
+  <Login />
+{:else}
   <div class="canvas-marks"></div>
 
   <div class="shell">
@@ -72,14 +78,19 @@
     </main>
 
     <footer class="colophon num">
-      preview dataset · cygnus 0.9.2 · no daemon connection
+      <span>{footer}</span>
+      {#if store.mode === 'live'}
+        {#if store.connected}
+          <span class="conn"><span class="led live breathe"></span>connected</span>
+        {:else}
+          <span class="conn amber"><span class="led build breathe"></span>reconnecting…</span>
+        {/if}
+      {/if}
     </footer>
   </div>
 
   <Palette />
   <ShipModal />
-{:else}
-  <div class="loading num">LOCATING TENANT ZERO…</div>
 {/if}
 
 <style>
@@ -97,5 +108,25 @@
     font-size: 10.5px;
     letter-spacing: 0.08em;
     color: var(--ink-4);
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    align-items: center;
+  }
+  .conn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .conn .led { width: 6px; height: 6px; }
+  .conn.amber { color: var(--amber); }
+
+  .loading {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    color: var(--ink-4);
+    font-size: 11px;
+    letter-spacing: 0.18em;
   }
 </style>

@@ -1,57 +1,52 @@
 <script>
-  import { apps, events, node } from '../data.js';
+  import { store } from '../live.svelte.js';
   import { openApp, go, ui } from '../stores.svelte.js';
+  import { relativeTime } from '../time.js';
+  import { rate, percent } from '../fmt.js';
+  import { eventIcon, eventStyle } from '../events.js';
   import Identicon from '../components/Identicon.svelte';
   import Icon from '../components/Icon.svelte';
   import Spark from '../components/Spark.svelte';
-  import Bars from '../components/Bars.svelte';
 
   let filter = $state('all');
   const filtered = $derived(
-    apps.filter((a) =>
-      filter === 'all' ? true : filter === 'previews' ? a.env === 'preview' : a.env === 'production'
+    store.apps.filter((a) =>
+      filter === 'all' ? true : filter === 'previews' ? a.name.startsWith('pr-') : !a.name.startsWith('pr-')
     )
   );
 
-  // static preview request pulse from the fixture dataset
-  let rps = $state(1284);
-  let sparkData = $state([48, 52, 50, 55, 61, 58, 54, 57, 63, 60, 56, 59, 66, 62, 58, 61, 55, 57, 64, 60, 62, 59, 61, 65]);
+  const m = $derived(store.metrics);
 
-  const EVENT_ICON = {
-    deploy: 'ship',
-    revival: 'zap',
-    scale0: 'clock',
-    oom: 'node',
-    seccomp: 'lock',
-    cert: 'globe',
-  };
-  const TONE_FG = {
-    live: '#087a45',
-    cobalt: 'var(--cobalt-deep)',
-    ghost: 'var(--ink-3)',
-    amber: '#a36a06',
-    red: '#b02c23',
-  };
-  const TONE_BG = {
-    live: 'var(--live-soft)',
-    cobalt: 'var(--cobalt-ghost)',
-    ghost: 'var(--surface-3)',
-    amber: 'var(--amber-soft)',
-    red: 'var(--red-soft)',
-  };
+  const rps = $derived(m?.totals?.rps_1m ?? null);
+  const rpsText = $derived(rps == null ? '—' : rate(rps));
+  const sparkData = $derived(m?.series ? m.series.map((b) => b.requests) : []);
+  const errRate = $derived(m?.totals?.error_rate_1m ?? null);
+  const bootP50 = $derived(m?.totals?.boot_p50_ms ?? null);
+  const bootP99 = $derived(m?.totals?.boot_p99_ms ?? null);
+  const warm = $derived(store.node?.warm_count ?? store.apps.filter((a) => a.lifecycle_state === 'ready').length);
+  const total = $derived(store.apps.length || store.node?.app_count || 0);
 
   function ledFor(a) {
-    if (a.state === 'building') return 'build';
-    if (a.state === 'cold') return 'cold';
-    if (a.env === 'preview') return 'preview';
+    if (a.lifecycle_state === 'building') return 'build';
+    if (a.lifecycle_state === 'cold') return 'cold';
+    if (a.name.startsWith('pr-')) return 'preview';
     return 'live';
   }
 
-  const ramPct = $derived({
-    cages: (node.ramCages / node.ram) * 100,
-    engines: (node.ramEngines / node.ram) * 100,
-    system: (node.ramSystem / node.ram) * 100,
-  });
+  function appRps(a) {
+    const am = store.appMetrics(a.name);
+    return am?.rps_1m ?? 0;
+  }
+
+  const hasMemory = $derived(!!store.node?.memory);
+  const usedBytes = $derived(
+    store.node?.memory ? store.node.memory.total_bytes - store.node.memory.available_bytes : 0
+  );
+  const usedPct = $derived(
+    store.node?.memory ? (usedBytes / store.node.memory.total_bytes) * 100 : 0
+  );
+
+  const recentEvents = $derived(store.events.slice(0, 6));
 </script>
 
 <div class="page screen-enter">
@@ -60,36 +55,36 @@
     <div class="cell">
       <span class="label">Requests · node</span>
       <div class="row">
-        <span class="readout big">{rps.toLocaleString()}<span class="unit">rps</span></span>
-        <Spark data={sparkData} w={92} h={30} />
+        <span class="readout big">{rpsText}<span class="unit">rps</span></span>
+        {#if sparkData.length}<Spark data={sparkData} w={92} h={30} />{/if}
       </div>
-      <span class="sub num">proxy overhead 0.3 ms p50</span>
+      <span class="sub num">{m ? `proxy overhead · ${rate(m.totals.p50_ms)} ms p50` : 'collecting…'}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
       <span class="label">Revival · p99</span>
       <div class="row">
-        <span class="readout big">{node.coldStart.p99}<span class="unit">ms</span></span>
+        <span class="readout big">{bootP99 == null ? '—' : `${bootP99}`}<span class="unit">ms</span></span>
       </div>
-      <span class="sub num">p50 {node.coldStart.p50} ms · budget ≤ 150</span>
+      <span class="sub num">{bootP50 == null ? 'collecting…' : `p50 ${bootP50} ms · budget ≤ 150`}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
-      <span class="label">Error rate · 1h</span>
+      <span class="label">Error rate · 1m</span>
       <div class="row">
-        <span class="readout big">0.03<span class="unit">%</span></span>
+        <span class="readout big">{errRate == null ? '—' : percent(errRate, 2).replace('%', '')}<span class="unit">%</span></span>
       </div>
-      <span class="sub num">4xx excluded · 2 of 6.1k</span>
+      <span class="sub num">{m ? `${m.totals.requests_1m.toLocaleString()} req · 1m` : 'collecting…'}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
       <span class="label">Cages</span>
       <div class="row">
         <span class="readout big"
-          >{node.warm}<span class="unit">warm</span><span class="dim num">&nbsp;/ {node.registered}</span></span
+          >{warm}<span class="unit">warm</span><span class="dim num">&nbsp;/ {total}</span></span
         >
       </div>
-      <span class="sub num">{node.registered - node.warm} asleep · disk only</span>
+      <span class="sub num">{Math.max(0, total - warm)} asleep · disk only</span>
     </div>
   </section>
 
@@ -108,33 +103,36 @@
       </div>
 
       <div class="appgrid">
-        {#each filtered as a (a.id)}
-          <button class="app card" onclick={() => openApp(a.id)}>
+        {#each filtered as a (a.name)}
+          {@const am = store.appMetrics(a.name)}
+          <button class="app card" onclick={() => openApp(a.name)}>
             <div class="top">
               <Identicon name={a.name} size={34} />
               <div class="names">
                 <span class="name">{a.name}</span>
-                <span class="fw">{a.framework}</span>
+                <span class="fw">{a.active ? a.active.engine_version : 'no active artifact'}</span>
               </div>
-              <span class="led {ledFor(a)}" class:breathe={a.state === 'ready'}></span>
+              <span class="led {ledFor(a)}" class:breathe={a.lifecycle_state === 'ready'}></span>
             </div>
-            <span class="domain num">{a.domain}</span>
+            <span class="domain num">{a.domains?.[0] ?? 'unrouted'}</span>
             <div class="foot">
               <span class="meta num">
-                {#if a.state === 'building'}
-                  <em class="bmeta">building · {a.branch}</em>
-                {:else if a.state === 'cold'}
-                  cold · revives ≈{a.revival} ms
+                {#if a.lifecycle_state === 'building'}
+                  <em class="bmeta">building · {a.active ? 'sealing' : 'no artifact yet'}</em>
+                {:else if a.lifecycle_state === 'cold'}
+                  cold · revives on next request
                 {:else}
-                  {a.branch} · {a.lastDeploy} · {a.revival} ms
+                  {rate(am?.rps_1m ?? 0)} rps · {am ? `${am.p50_ms} ms p50` : '—'}
                 {/if}
               </span>
-              <Bars data={a.history} h={20} />
+              {#if store.appRequestSeries(a.name).some((v) => v > 0)}
+                <Spark data={store.appRequestSeries(a.name)} w={70} h={20} color="var(--ink-3)" />
+              {/if}
             </div>
           </button>
         {/each}
 
-        <button class="app new" onclick={() => (ui.shipOpen = true)}>
+        <button class="app new" onclick={() => { ui.shipOpen = true; ui.shipTab = 'upload'; }}>
           <span class="plus"><Icon name="plus" size={16} /></span>
           <span>Ship an app</span>
           <span class="hint num">cygnus deploy</span>
@@ -149,40 +147,44 @@
           <span class="label">Events</span>
           <button class="mini" onclick={() => go('observe')}>View all <Icon name="arrowR" size={12} /></button>
         </div>
-        <div class="rows">
-          {#each events.slice(0, 6) as e}
-            <div class="event">
-              <span class="eicon" style="color:{TONE_FG[e.tone]};background:{TONE_BG[e.tone]}">
-                <Icon name={EVENT_ICON[e.type]} size={13} />
-              </span>
-              <div class="etext">
-                <span class="eapp num">{e.app}</span>
-                <span class="emsg">{e.text}</span>
+        {#if recentEvents.length}
+          <div class="rows">
+            {#each recentEvents as e (e.time_ms + e.type)}
+              <div class="event">
+                <span class="eicon" style={eventStyle(e.type)}>
+                  <Icon name={eventIcon(e.type)} size={13} />
+                </span>
+                <div class="etext">
+                  <span class="eapp num">{e.app ?? 'node'}</span>
+                  <span class="emsg">{e.message}</span>
+                </div>
+                <span class="ewhen num">{relativeTime(e.time_ms)}</span>
               </div>
-              <span class="ewhen num">{e.when}</span>
-            </div>
-          {/each}
-        </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="empty mono">collecting…</div>
+        {/if}
       </section>
 
       <section class="card nodeCard" role="button" tabindex="0" onclick={() => go('node')} onkeydown={(e) => e.key === 'Enter' && go('node')}>
         <div class="cardhead">
           <span class="label">Node</span>
-          <span class="nodename num">swan-01 <span class="led live breathe"></span></span>
+          <span class="nodename num">{store.node?.apps_domain ?? 'cygnus'} <span class="led live breathe"></span></span>
         </div>
-        <div class="rambar">
-          <i style="width:{ramPct.cages}%" class="b-cages" title="warm cages"></i>
-          <i style="width:{ramPct.engines}%" class="b-engines" title="engine text"></i>
-          <i style="width:{ramPct.system}%" class="b-system" title="system"></i>
-        </div>
-        <div class="ramlegend num">
-          <span>{node.ramUsed} / {node.ram} GB</span>
-          <span class="dim">{node.warm} cages warm</span>
-        </div>
+        {#if hasMemory}
+          <div class="rambar">
+            <i style="width:{usedPct}%" class="b-cages" title="used"></i>
+          </div>
+          <div class="ramlegend num">
+            <span>{(usedBytes / (1024 ** 3)).toFixed(1)} / {(store.node.memory.total_bytes / (1024 ** 3)).toFixed(0)} GB</span>
+            <span class="dim">{warm} cages warm</span>
+          </div>
+        {/if}
         <div class="nstats">
-          <div class="nrow"><span>Kernel</span><b class="num">{node.kernel} · patched {node.kernelPatched}</b></div>
-          <div class="nrow"><span>Engine</span><b class="num">bun 1.2.19 · page-cache shared</b></div>
-          <div class="nrow"><span>Uptime</span><b class="num">{node.uptime}</b></div>
+          <div class="nrow"><span>Version</span><b class="num">{store.node?.version ?? '—'}</b></div>
+          <div class="nrow"><span>Isolation</span><b class="num">{store.node?.isolation ?? '—'}</b></div>
+          <div class="nrow"><span>Apps</span><b class="num">{store.node?.app_count ?? store.apps.length}</b></div>
         </div>
       </section>
     </aside>
@@ -383,6 +385,13 @@
   .mini:hover { color: var(--ink); }
 
   .events .rows { padding: 0 8px 8px; }
+  .events .empty {
+    padding: 22px 16px;
+    font-size: 11px;
+    color: var(--ink-4);
+    text-align: center;
+    letter-spacing: 0.06em;
+  }
   .event {
     display: flex;
     gap: 11px;
