@@ -164,7 +164,10 @@ case $target in
   *-linux-*)
     [[ $bun_format == *ELF* ]] || fail "Bun executable does not target Linux: $bun_format"
     ;;
-  *) fail "release target must be Linux: $target" ;;
+  aarch64-apple-darwin|arm64-apple-darwin)
+    [[ $bun_format == *Mach-O* && ( $bun_format == *arm64* || $bun_format == *aarch64* ) ]] || fail "Bun executable does not target macOS aarch64: $bun_format"
+    ;;
+  *) fail "release target is not supported: $target" ;;
 esac
 if command -v sha256sum >/dev/null 2>&1; then
   hash_tool=$(command -v sha256sum)
@@ -209,8 +212,11 @@ printf 'build-release: installing frozen console dependencies and building dist/
 # caller's current directory or an implicit cargo configuration.
 CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
   --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-daemon --bin cygnus-daemon --bin cygnusctl
-CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
-  --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-init --bin cygnus-init
+
+if [[ $target == *-linux-* ]]; then
+  CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
+    --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-init --bin cygnus-init
+fi
 
 copy_binary() {
   local name=$1 source=$2 destination=$bundle_out/$1
@@ -223,7 +229,9 @@ copy_binary() {
 release_bin_dir=$cargo_target_dir/$target/release
 copy_binary cygnus-daemon "$release_bin_dir/cygnus-daemon"
 copy_binary cygnusctl "$release_bin_dir/cygnusctl"
-copy_binary cygnus-init "$release_bin_dir/cygnus-init"
+if [[ $target == *-linux-* ]]; then
+  copy_binary cygnus-init "$release_bin_dir/cygnus-init"
+fi
 copy_binary bun "$bun_bin"
 
 copy_tree() {
@@ -276,14 +284,20 @@ hash_file() {
 
 sums_tmp=$bundle_out/SHA256SUMS
 : >"$sums_tmp"
-for name in cygnus-daemon cygnusctl cygnus-init bun cygnus-console.tar; do
+
+bundle_files=(cygnus-daemon cygnusctl bun cygnus-console.tar)
+if [[ $target == *-linux-* ]]; then
+  bundle_files+=(cygnus-init)
+fi
+
+for name in "${bundle_files[@]}"; do
   [[ -f $bundle_out/$name && ! -L $bundle_out/$name ]] || fail "bundle artifact is missing: $name"
   sum=$(hash_file "$bundle_out/$name")
   [[ $sum =~ ^[[:xdigit:]]{64}$ ]] || fail "checksum tool returned an invalid SHA-256 for $name"
   printf '%s  %s\n' "${sum,,}" "$name" >>"$sums_tmp"
 done
 
-for name in cygnus-daemon cygnusctl cygnus-init bun cygnus-console.tar SHA256SUMS; do
+for name in "${bundle_files[@]}" SHA256SUMS; do
   destination=$output_dir/$name
   if [[ -L $destination || ( -e $destination && ! -f $destination ) ]]; then
     fail "output artifact destination is not a regular file: $destination"
