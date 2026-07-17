@@ -18,6 +18,10 @@ export const ACTOR_SUBJECT = "local:operator";
 export const SESSION_COOKIE = "__Host-cygnus_session";
 export const SESSION_TTL_SECONDS = 12 * 60 * 60;
 export const MAX_JSON_BODY_BYTES = 32 * 1024;
+export const MAX_DEPLOY_CHUNK_JSON_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_DEPLOY_TOTAL_BYTES = 64 * 1024 * 1024;
+export const MAX_DEPLOY_CHUNK_BYTES = 1024 * 1024;
+export const MAX_DEPLOY_ADMIN_CHUNK_BYTES = 32 * 1024;
 export const MAX_IDENTIFIER_LENGTH = 128;
 export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export const MAX_WEBHOOK_CHUNK_BYTES = 32 * 1024;
@@ -123,7 +127,12 @@ export async function handleApi(request, url) {
   if (path === GITHUB_MANIFEST_CALLBACK_PATH) return manifestCallback(request, url);
   if (path === GITHUB_SETUP_PATH || path === GITHUB_INSTALL_CALLBACK_PATH) return githubSetupRedirect(request, url);
 
-  const mutationRoute = [
+  const deployUploadRoute = [
+    "/api/v1/deploy/begin",
+    "/api/v1/deploy/chunk",
+    "/api/v1/deploy/finish",
+  ].includes(path);
+  const mutationRoute = deployUploadRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
@@ -139,6 +148,7 @@ export async function handleApi(request, url) {
     if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
   }
   if (path === "/api/v1/deploy") return apiError(404, "not_found", "API route not found");
+  if (deployUploadRoute) return deployUploadIngress(request, url);
 
   const auth = authStatus();
   if (!auth.configured) {
@@ -372,6 +382,81 @@ export async function commandForRequest(request, url) {
   return null;
 }
 
+export async function deployUploadIngress(request, url, requestAdmin = adminRequest, socket = adminSocketPath) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
+  if (!authStatus().configured) return apiError(503, "misconfigured", "console authentication is misconfigured");
+  if (!verifySessionCookie(request.headers.get("cookie"))) return apiError(401, "unauthorized", "authentication required");
+  if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
+
+  try {
+    if (url.pathname === "/api/v1/deploy/begin") {
+      const command = deployUploadBeginCommand(await readJsonBody(request));
+      const result = await requestAdmin(socket, command, ACTOR_SUBJECT);
+      return jsonResponse({ ok: true, data: result?.data, requestId: result?.requestId });
+    }
+    if (url.pathname === "/api/v1/deploy/finish") {
+      const command = deployUploadFinishCommand(await readJsonBody(request));
+      const result = await requestAdmin(socket, command, ACTOR_SUBJECT);
+      return jsonResponse({ ok: true, data: result?.data, requestId: result?.requestId });
+    }
+    if (url.pathname === "/api/v1/deploy/chunk") {
+      const body = await readJsonBody(request, MAX_DEPLOY_CHUNK_JSON_BODY_BYTES);
+      const { uploadId, bytes } = deployUploadChunk(body);
+      let last;
+      for (let offset = 0; offset < bytes.length; offset += MAX_DEPLOY_ADMIN_CHUNK_BYTES) {
+        const chunk = bytes.subarray(offset, offset + MAX_DEPLOY_ADMIN_CHUNK_BYTES);
+        last = await requestAdmin(socket, {
+          type: "deploy_upload_chunk",
+          upload_id: uploadId,
+          chunk_base64: chunk.toString("base64"),
+        }, ACTOR_SUBJECT);
+      }
+      return jsonResponse({
+        ok: true,
+        data: { received_bytes: last?.data?.received_bytes },
+        requestId: last?.requestId,
+      });
+    }
+    return apiError(404, "not_found", "API route not found");
+  } catch (error) {
+    if (error instanceof HttpInputError) return apiError(error.status, error.code, error.message);
+    const code = error instanceof AdminProtocolError ? error.code : "internal";
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code));
+  }
+}
+
+export function deployUploadBeginCommand(body) {
+  assertObjectKeys(body, ["app", "total_bytes"], ["domain", "engine_version", "entry"]);
+  const command = {
+    type: "deploy_upload_begin",
+    app: safeApp(body.app),
+    total_bytes: safeInteger(body.total_bytes, "total_bytes", 1, MAX_DEPLOY_TOTAL_BYTES),
+  };
+  if (body.domain !== undefined) command.domain = safeDomain(body.domain);
+  if (body.engine_version !== undefined) command.engine_version = safeVersion(body.engine_version);
+  if (body.entry !== undefined) command.entry = safeEntry(body.entry);
+  return command;
+}
+
+export function deployUploadFinishCommand(body) {
+  assertExactKeys(body, ["upload_id"]);
+  return { type: "deploy_upload_finish", upload_id: safeDeployment(body.upload_id) };
+}
+
+export function deployUploadChunk(body) {
+  assertExactKeys(body, ["upload_id", "chunk_base64"]);
+  const uploadId = safeDeployment(body.upload_id);
+  if (typeof body.chunk_base64 !== "string" || body.chunk_base64.length === 0) {
+    throw new HttpInputError(422, "validation", "chunk_base64 must be canonical base64");
+  }
+  const bytes = Buffer.from(body.chunk_base64, "base64");
+  if (bytes.length === 0 || bytes.length > MAX_DEPLOY_CHUNK_BYTES || bytes.toString("base64") !== body.chunk_base64) {
+    throw new HttpInputError(422, "validation", "chunk_base64 must be canonical base64 of at most 1 MiB");
+  }
+  return { uploadId, bytes };
+}
+
 export function commandFor(url) {
   const parts = url.pathname.split("/").filter(Boolean);
   return commandForRead(url, parts);
@@ -558,18 +643,29 @@ function safeGithubBranch(value) {
 }
 
 function assertExactKeys(value, expected) {
+  assertObjectKeys(value, expected, []);
+}
+
+function assertObjectKeys(value, required, optional) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new HttpInputError(422, "validation", "request body must be a JSON object");
   }
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((key, i) => key !== wanted[i])) {
+  const actual = Object.keys(value);
+  const allowed = new Set([...required, ...optional]);
+  if (actual.some((key) => !allowed.has(key)) || required.some((key) => !Object.hasOwn(value, key))) {
     throw new HttpInputError(422, "validation", "request contains unsupported fields");
   }
 }
 
+function safeInteger(value, name, minimum, maximum) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new HttpInputError(422, "validation", `${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
 function safeApp(value) {
-  return safeIdentifier(value, "app", /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u);
+  return safeIdentifier(value, "app", /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u);
 }
 function safeDeployment(value) {
   return safeIdentifier(value, "deployment", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u);
@@ -662,9 +758,9 @@ function decodeSegment(value, name = "path identifier") {
   return decoded;
 }
 
-async function readJsonBody(request) {
+async function readJsonBody(request, maxBytes = MAX_JSON_BODY_BYTES) {
   const rawLength = request.headers.get("content-length");
-  if (rawLength !== null && (!/^\d+$/u.test(rawLength) || Number(rawLength) > MAX_JSON_BODY_BYTES)) {
+  if (rawLength !== null && (!/^\d+$/u.test(rawLength) || Number(rawLength) > maxBytes)) {
     throw new HttpInputError(413, "body_too_large", "request body is too large");
   }
   const reader = request.body?.getReader();
@@ -675,7 +771,7 @@ async function readJsonBody(request) {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > MAX_JSON_BODY_BYTES) {
+    if (total > maxBytes) {
       await reader.cancel().catch(() => {});
       throw new HttpInputError(413, "body_too_large", "request body is too large");
     }

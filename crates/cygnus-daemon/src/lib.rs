@@ -144,12 +144,15 @@ pub fn read_head<R: Read>(client: &mut R) -> Result<(RequestHead, Vec<u8>), Stat
 }
 
 const MAX_GITHUB_WEBHOOK_BODY_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_DEPLOY_CHUNK_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
 fn request_body_limits(head: &RequestHead, defaults: &IngressLimits) -> IngressLimits {
     let mut limits = defaults.clone();
-    if head.method == "POST" && head.target == "/github/webhook" {
-        limits.max_body_bytes = MAX_GITHUB_WEBHOOK_BODY_BYTES;
-    }
+    limits.max_body_bytes = match (head.method.as_str(), head.target.as_str()) {
+        ("POST", "/github/webhook") => MAX_GITHUB_WEBHOOK_BODY_BYTES,
+        ("POST", "/api/v1/deploy/chunk") => MAX_DEPLOY_CHUNK_BODY_BYTES,
+        _ => defaults.max_body_bytes,
+    };
     limits
 }
 
@@ -659,6 +662,16 @@ mod tests {
         Router::new(table)
     }
 
+    fn request_head(target: &str, method: &str) -> RequestHead {
+        let raw = format!(
+            "{method} {target} HTTP/1.1\r\nHost: cygnus.apps.test\r\nContent-Length: 0\r\n\r\n"
+        );
+        match parse_request_head(raw.as_bytes()) {
+            HeadParse::Complete(head) => head,
+            _ => panic!("request head did not parse"),
+        }
+    }
+
     fn serve_once(frontend: Arc<Frontend>, request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -678,26 +691,39 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_github_webhook_path_gets_the_github_body_bound() {
+    fn only_the_exact_github_webhook_post_gets_the_github_body_bound() {
         let defaults = IngressLimits::default();
-        let parse = |target: &str, method: &str| {
-            let raw = format!(
-                "{method} {target} HTTP/1.1\r\nHost: cygnus.apps.test\r\nContent-Length: 0\r\n\r\n"
-            );
-            match parse_request_head(raw.as_bytes()) {
-                HeadParse::Complete(head) => head,
-                _ => panic!("request head did not parse"),
-            }
-        };
 
         assert_eq!(
-            request_body_limits(&parse("/github/webhook", "POST"), &defaults).max_body_bytes,
+            request_body_limits(&request_head("/github/webhook", "POST"), &defaults).max_body_bytes,
             MAX_GITHUB_WEBHOOK_BODY_BYTES
         );
         for head in [
-            parse("/github/webhook", "GET"),
-            parse("/github/webhook/extra", "POST"),
-            parse("/api/v1/deploy", "POST"),
+            request_head("/github/webhook", "GET"),
+            request_head("/github/webhook/extra", "POST"),
+            request_head("/github/webhook?delivery=1", "POST"),
+        ] {
+            assert_eq!(
+                request_body_limits(&head, &defaults).max_body_bytes,
+                defaults.max_body_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_exact_deploy_chunk_post_gets_the_deploy_chunk_body_bound() {
+        let defaults = IngressLimits::default();
+
+        assert_eq!(
+            request_body_limits(&request_head("/api/v1/deploy/chunk", "POST"), &defaults)
+                .max_body_bytes,
+            MAX_DEPLOY_CHUNK_BODY_BYTES
+        );
+        for head in [
+            request_head("/api/v1/deploy/chunk", "GET"),
+            request_head("/api/v1/deploy/chunk/", "POST"),
+            request_head("/api/v1/deploy/chunk?part=1", "POST"),
+            request_head("/api/v1/deploy", "POST"),
         ] {
             assert_eq!(
                 request_body_limits(&head, &defaults).max_body_bytes,
