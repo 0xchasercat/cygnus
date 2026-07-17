@@ -218,20 +218,43 @@ fn duplicate_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
 
 fn make_pipe() -> io::Result<(File, File)> {
     let mut fds = [-1; 2];
-    if unsafe {
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
         // SAFETY: `fds` provides storage for the two descriptors returned by
         // pipe2(2).
         libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC)
-    } < 0
-    {
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = unsafe {
+        // SAFETY: `fds` provides storage for the two descriptors returned by
+        // pipe(2). CLOEXEC is applied before either descriptor is exposed.
+        libc::pipe(fds.as_mut_ptr())
+    };
+    if result < 0 {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(not(target_os = "linux"))]
+    for fd in fds {
+        if unsafe {
+            // SAFETY: pipe(2) initialized both descriptors above.
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                // SAFETY: both descriptors are still owned by this function.
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(error);
+        }
+    }
     let read = unsafe {
-        // SAFETY: pipe2 succeeded and ownership of this fd is transferred once.
+        // SAFETY: pipe creation succeeded and ownership is transferred once.
         File::from_raw_fd(fds[0])
     };
     let write = unsafe {
-        // SAFETY: pipe2 succeeded and ownership of this fd is transferred once.
+        // SAFETY: pipe creation succeeded and ownership is transferred once.
         File::from_raw_fd(fds[1])
     };
     Ok((read, write))

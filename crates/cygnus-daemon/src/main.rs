@@ -287,7 +287,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
                     &self.metrics,
                     "deploy_failed",
                     Some(&app),
-                    format!("deployment failed: {error}"),
+                    "deployment failed",
                 );
                 Err(error)
             }
