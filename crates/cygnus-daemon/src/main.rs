@@ -1501,7 +1501,7 @@ fn spawn_reaper(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn boot_cage(spec: &CageSpec) -> Result<Cage, String> {
     prepare_upstream(spec)?;
     Cage::boot(spec.clone()).map_err(|error| error.to_string())

@@ -1248,7 +1248,9 @@ mod tests {
         let plain = "ready";
         let colored = plain.green().to_string();
         assert_eq!(visible_len(&colored), plain.len());
-        assert_eq!(visible_len("● ready"), "● ready".len());
+        // The dot is one visible column but three bytes: visible width is
+        // what tables align on.
+        assert_eq!(visible_len("● ready"), 7);
     }
 
     #[test]
