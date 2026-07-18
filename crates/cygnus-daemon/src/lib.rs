@@ -15,6 +15,7 @@
 pub mod acme;
 pub mod admin;
 pub mod deploy;
+pub mod domains;
 pub mod edge;
 pub mod github;
 pub mod ingress;

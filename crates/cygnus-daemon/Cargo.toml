@@ -25,6 +25,8 @@ cygnus-router = { path = "../cygnus-router" }
 cygnus-supervisor = { path = "../cygnus-supervisor" }
 owo-colors = "4"
 parking_lot = "0.12.5"
+rcgen = "0.14.8"
+time = "0.3.44"
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -37,9 +39,6 @@ tokio = { version = "1.49", features = ["net", "rt", "time"] }
 x509-parser = "0.18.1"
 ureq = { version = "3.1.4", default-features = false, features = ["json", "rustls"] }
 thiserror = "2.0"
-
-[dev-dependencies]
-rcgen = "0.14.8"
 
 [[bin]]
 name = "cygnus"

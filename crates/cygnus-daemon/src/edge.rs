@@ -12,12 +12,26 @@ pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/d
 const MAX_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const MAX_PRIVATE_KEY_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SslMode {
+    Acme,
+    #[default]
+    SelfSigned,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EdgeConfig {
     #[serde(default)]
     pub https_listen: Option<std::net::SocketAddr>,
     #[serde(default)]
     pub apps_domain: Option<String>,
+    #[serde(default)]
+    pub dashboard_domain: Option<String>,
+    #[serde(default)]
+    pub apex_domain: Option<String>,
+    #[serde(default)]
+    pub ssl_mode: SslMode,
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
 }

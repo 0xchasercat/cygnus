@@ -3,12 +3,15 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::deploy::DeployRequest;
+use crate::edge::SslMode;
 pub use crate::github::{
     GitHubInstallationRepositoryView, GitHubManifestMetadata, GitHubRepositoryInput,
     GitHubRepositoryView,
 };
 use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
-use crate::state::{DeployJobSource, DeploymentSource, NodeConfig};
+use crate::state::{
+    DeployJobSource, DeploymentSource, DomainKind, DomainStatus, DomainTls, NodeConfig,
+};
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
@@ -38,6 +41,29 @@ pub enum AdminCommand {
         password: String,
     },
     Status,
+    SetDashboardDomain {
+        domain: Option<String>,
+        apex: Option<String>,
+    },
+    SetDashboardTls {
+        mode: SslMode,
+    },
+    ListAppDomains {
+        app: String,
+    },
+    AddAppDomain {
+        app: String,
+        host: String,
+    },
+    RemoveAppDomain {
+        app: String,
+        host: String,
+    },
+    SetAppDomainTls {
+        app: String,
+        host: String,
+        mode: DomainTls,
+    },
     GetMetrics,
     ListRequests {
         #[serde(default = "default_metrics_list_limit")]
@@ -292,6 +318,26 @@ pub enum AdminData {
         app: String,
         domain: String,
     },
+    DashboardDomainSet {
+        domain: Option<String>,
+        apex: Option<String>,
+    },
+    DashboardTlsSet {
+        mode: SslMode,
+    },
+    AppDomains {
+        domains: Vec<AppDomainView>,
+    },
+    AppDomainAdded {
+        domain: AppDomainView,
+    },
+    AppDomainRemoved {
+        app: String,
+        host: String,
+    },
+    AppDomainTlsSet {
+        domain: AppDomainView,
+    },
     ConfigApplied {
         listen: String,
         app_count: usize,
@@ -383,12 +429,38 @@ pub enum AdminData {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct DomainDnsView {
+    pub expected_ip: Option<String>,
+    pub resolves_to: Vec<String>,
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDomainView {
+    pub host: String,
+    pub kind: DomainKind,
+    pub tls: DomainTls,
+    pub status: DomainStatus,
+    pub dns: DomainDnsView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeView {
     pub listen: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https_listen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apex_domain: Option<String>,
+    #[serde(default)]
+    pub ssl_mode: SslMode,
     pub app_count: usize,
     pub version: String,
     pub uptime_seconds: u64,
@@ -582,6 +654,74 @@ mod tests {
         assert_eq!(
             read_frame::<AdminRequest>(&mut frame.as_slice()).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn domain_lifecycle_protocol_shapes_are_frozen() {
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetDashboardDomain {
+                domain: Some("console.example.com".into()),
+                apex: Some("example.com".into()),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "set_dashboard_domain",
+                "domain": "console.example.com",
+                "apex": "example.com"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetDashboardTls {
+                mode: SslMode::SelfSigned,
+            })
+            .unwrap(),
+            serde_json::json!({"type":"set_dashboard_tls","mode":"self_signed"})
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetAppDomainTls {
+                app: "api".into(),
+                host: "api.example.com".into(),
+                mode: DomainTls::Acme,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type":"set_app_domain_tls",
+                "app":"api",
+                "host":"api.example.com",
+                "mode":"acme"
+            })
+        );
+        let data = AdminData::AppDomains {
+            domains: vec![AppDomainView {
+                host: "api.example.com".into(),
+                kind: DomainKind::Native,
+                tls: DomainTls::Acme,
+                status: DomainStatus::FallbackActive,
+                dns: DomainDnsView {
+                    expected_ip: Some("203.0.113.8".into()),
+                    resolves_to: vec!["203.0.113.8".into()],
+                    ok: true,
+                },
+                expires_unix: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(data).unwrap(),
+            serde_json::json!({
+                "kind":"app_domains",
+                "domains":[{
+                    "host":"api.example.com",
+                    "kind":"native",
+                    "tls":"acme",
+                    "status":"fallback_active",
+                    "dns":{
+                        "expected_ip":"203.0.113.8",
+                        "resolves_to":["203.0.113.8"],
+                        "ok":true
+                    }
+                }]
+            })
         );
     }
 

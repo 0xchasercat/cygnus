@@ -459,6 +459,22 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         | AdminCommand::AccountStatus
         | AdminCommand::Status
         | AdminCommand::GetMetrics => {}
+        AdminCommand::SetDashboardDomain { domain, apex } => {
+            if let Some(domain) = domain {
+                validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "dashboard domain")?;
+            }
+            if let Some(apex) = apex {
+                validate_text(apex, MAX_ADMIN_DOMAIN_BYTES, "apex domain")?;
+            }
+        }
+        AdminCommand::SetDashboardTls { .. } => {}
+        AdminCommand::ListAppDomains { app } => validate_app_name(app)?,
+        AdminCommand::AddAppDomain { app, host }
+        | AdminCommand::RemoveAppDomain { app, host }
+        | AdminCommand::SetAppDomainTls { app, host, .. } => {
+            validate_app_name(app)?;
+            validate_text(host, MAX_ADMIN_DOMAIN_BYTES, "host")?;
+        }
         AdminCommand::CreateInitialAccount { email, password }
         | AdminCommand::VerifyCredentials { email, password } => {
             validate_account_email(email)?;

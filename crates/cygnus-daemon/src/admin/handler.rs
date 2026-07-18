@@ -8,20 +8,22 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::{
     ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode, AdminHandler,
-    AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppView, CertificateView,
-    DeploymentView, EngineView, GitHubJobView, MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES,
-    MemoryView, NodeView,
+    AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppDomainView, AppView,
+    CertificateView, DeploymentView, DomainDnsView, EngineView, GitHubJobView,
+    MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES, MemoryView, NodeView,
 };
 use crate::deploy::upload::{UploadError, UploadManager, UploadMetadata};
 use crate::deploy::{
     DeployError, DeployRequest, canonical_source_root, new_deployment_id, resolve_deploy_request,
 };
+use crate::domains::{StdDnsResolver, dns_precheck, expected_public_ipv4};
+use crate::edge::SslMode;
 use crate::github::{GitHubError, GitHubManager};
 use crate::metrics::MetricsHub;
 use crate::state::{
     AuditContext, AuditEndpointRole, AuditOutcome, DeployJob, DeployJobSource, DeployJobSpec,
     DeployJobStatus, DeploymentInput, DeploymentRecord, DeploymentSource, DeploymentStatus,
-    GitHubJobKind, LoadedApp, NodeConfig, State, StateError,
+    DomainRecord, DomainTls, GitHubJobKind, LoadedApp, NodeConfig, State, StateError,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -43,6 +45,26 @@ pub enum AdminMutation {
         is_default: bool,
     },
     Deploy(DeployRequest),
+    SetDashboardDomain {
+        domain: Option<String>,
+        apex: Option<String>,
+    },
+    SetDashboardTls {
+        mode: SslMode,
+    },
+    AddAppDomain {
+        app: String,
+        host: String,
+    },
+    RemoveAppDomain {
+        app: String,
+        host: String,
+    },
+    SetAppDomainTls {
+        app: String,
+        host: String,
+        mode: DomainTls,
+    },
     MapDomain {
         app: String,
         domain: String,
@@ -186,6 +208,54 @@ impl StateAdminHandler {
                 })
             }
             AdminCommand::Status => self.status(),
+            AdminCommand::SetDashboardDomain { domain, apex } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetDashboardDomain { domain, apex },
+                "set_dashboard_domain",
+            ),
+            AdminCommand::SetDashboardTls { mode } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetDashboardTls { mode },
+                "set_dashboard_tls",
+            ),
+            AdminCommand::ListAppDomains { app } => {
+                let domains = self
+                    .open_state()?
+                    .app_domains(Some(&app))
+                    .map_err(map_state_query_error)?;
+                let expected_ip = expected_public_ipv4();
+                Ok(AdminData::AppDomains {
+                    domains: domains
+                        .into_iter()
+                        .map(|domain| app_domain_view(domain, expected_ip))
+                        .collect(),
+                })
+            }
+            AdminCommand::AddAppDomain { app, host } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::AddAppDomain { app, host },
+                "add_app_domain",
+            ),
+            AdminCommand::RemoveAppDomain { app, host } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::RemoveAppDomain { app, host },
+                "remove_app_domain",
+            ),
+            AdminCommand::SetAppDomainTls { app, host, mode } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetAppDomainTls { app, host, mode },
+                "set_app_domain_tls",
+            ),
             AdminCommand::GetMetrics => Ok(AdminData::Metrics {
                 metrics: self.metrics.metrics(),
             }),
@@ -668,6 +738,9 @@ impl StateAdminHandler {
                 listen: snapshot.listen.to_string(),
                 https_listen: snapshot.edge.https_listen.map(|value| value.to_string()),
                 apps_domain: snapshot.edge.apps_domain,
+                dashboard_domain: snapshot.edge.dashboard_domain,
+                apex_domain: snapshot.edge.apex_domain,
+                ssl_mode: snapshot.edge.ssl_mode,
                 app_count: snapshot.apps.len(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 uptime_seconds: self.started_at.elapsed().as_secs(),
@@ -806,6 +879,26 @@ impl StateAdminHandler {
             env_keys,
             active,
         })
+    }
+}
+
+fn app_domain_view(domain: DomainRecord, expected_ip: Option<std::net::Ipv4Addr>) -> AppDomainView {
+    let dns = dns_precheck(&StdDnsResolver, &domain.host, expected_ip);
+    AppDomainView {
+        host: domain.host,
+        kind: domain.kind,
+        tls: domain.tls,
+        status: domain.status,
+        dns: DomainDnsView {
+            expected_ip: dns.expected_ip.map(|ip| ip.to_string()),
+            resolves_to: dns
+                .resolves_to
+                .into_iter()
+                .map(|ip| ip.to_string())
+                .collect(),
+            ok: dns.ok,
+        },
+        expires_unix: domain.expires_unix,
     }
 }
 
@@ -1094,6 +1187,10 @@ fn map_state_query_error(error: crate::state::StateError) -> HandlerFault {
     match &error {
         crate::state::StateError::InvalidRecord { kind, .. } if *kind == "deployment cursor" => {
             HandlerFault::not_found("deployment cursor does not exist")
+        }
+        crate::state::StateError::AppNotFound(_) => HandlerFault::not_found("app does not exist"),
+        crate::state::StateError::DomainNotFound(_) => {
+            HandlerFault::not_found("domain does not exist")
         }
         _ => HandlerFault::internal(error),
     }
