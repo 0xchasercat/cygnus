@@ -180,7 +180,8 @@ export async function handleApi(request, url) {
   } catch (error) {
     const code = error instanceof AdminProtocolError ? error.code : "internal";
     const status = statusForDaemonCode(code);
-    return apiError(status, publicDaemonCode(code), safeErrorMessage(code));
+    const detail = error instanceof AdminProtocolError ? error.message : undefined;
+    return apiError(status, publicDaemonCode(code), safeErrorMessage(code, detail));
   }
 }
 
@@ -422,7 +423,7 @@ export async function deployUploadIngress(request, url, requestAdmin = adminRequ
   } catch (error) {
     if (error instanceof HttpInputError) return apiError(error.status, error.code, error.message);
     const code = error instanceof AdminProtocolError ? error.code : "internal";
-    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code));
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code, error instanceof AdminProtocolError ? error.message : undefined));
   }
 }
 
@@ -952,7 +953,7 @@ export async function webhookIngress(request, requestAdmin = adminRequest, socke
     begun = await requestAdmin(socket, { type: "webhook_begin", delivery_id: deliveryId, event, signature, total_bytes: totalBytes }, "github:webhook");
   } catch (error) {
     const code = error instanceof AdminProtocolError ? error.code : "internal";
-    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code));
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code, error instanceof AdminProtocolError ? error.message : undefined));
   }
   const duplicate = begun?.data?.duplicate === true;
   if (duplicate) {
@@ -989,7 +990,7 @@ export async function webhookIngress(request, requestAdmin = adminRequest, socke
   } catch (error) {
     await requestAdmin(socket, { type: "webhook_finish", delivery_id: deliveryId }, "github:webhook").catch(() => {});
     const code = error instanceof AdminProtocolError ? error.code : "internal";
-    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code));
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code, error instanceof AdminProtocolError ? error.message : undefined));
   }
 }
 
@@ -1118,12 +1119,16 @@ function sanitizeGithubJob(job) {
   };
 }
 
-function safeErrorMessage(code) {
+function safeErrorMessage(code, message) {
   if (code === "unauthorized") return "authentication required";
   if (code === "forbidden") return "permission denied";
-  if (code === "not_found") return "requested object was not found";
-  if (code === "conflict") return "state changed; refresh and try again";
-  if (code === "validation" || code === "invalid_request" || code === "unsupported_version") return "request was rejected";
+  if (code === "not_found") return message || "requested object was not found";
+  if (code === "conflict") return message || "state changed; refresh and try again";
+  if (code === "validation" || code === "invalid_request" || code === "unsupported_version") {
+    // Daemon validation messages are crafted for the operator; hiding them
+    // turns a precise explanation into a dead end. Pass them through.
+    return message || "request was rejected";
+  }
   return "daemon admin bridge unavailable";
 }
 

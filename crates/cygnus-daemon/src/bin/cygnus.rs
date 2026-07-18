@@ -20,6 +20,7 @@ use cygnus_daemon::admin::{
     MAX_LOG_CHUNK_BYTES, NodeView,
 };
 use cygnus_daemon::deploy::DeployRequest;
+use cygnus_daemon::state::DeploymentSource;
 use cygnus_daemon::state::NodeConfig;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
@@ -60,16 +61,21 @@ enum Command {
         source_dir: PathBuf,
         #[arg(long)]
         app: String,
+        /// Hostname to route (default: <app>.<apps-domain>).
         #[arg(long)]
-        domain: String,
+        domain: Option<String>,
+        /// Engine version (default: the node's default engine).
         #[arg(long)]
-        engine_version: String,
-        #[arg(long, default_value = "index.ts")]
-        entry: PathBuf,
+        engine_version: Option<String>,
+        /// Entry file inside the source directory (default: index.ts).
         #[arg(long)]
-        artifact_root: PathBuf,
+        entry: Option<PathBuf>,
+        /// Artifact store root (default: daemon-owned).
         #[arg(long)]
-        upstream: PathBuf,
+        artifact_root: Option<PathBuf>,
+        /// Upstream socket path (default: daemon-owned).
+        #[arg(long)]
+        upstream: Option<PathBuf>,
     },
     /// Check protocol and daemon availability.
     Health,
@@ -179,7 +185,15 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    let client = AdminClient::new(cli.admin_socket);
+    // Long-running commands hold the connection while the daemon works:
+    // a deploy blocks through the whole server-side build, and engine
+    // registration hashes the engine binary. Give them room to finish.
+    let timeout = match &cli.command {
+        Command::Deploy { .. } => Duration::from_secs(15 * 60),
+        Command::Apply { .. } | Command::Engine { .. } => Duration::from_secs(120),
+        _ => Duration::from_secs(10),
+    };
+    let client = AdminClient::new(cli.admin_socket).with_timeout(timeout)?;
     let theme = Theme::detect();
     match cli.command {
         Command::Apply { config } => {
@@ -223,7 +237,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             artifact_root,
             upstream,
         } => {
-            let request = DeployRequest::new(
+            let request = DeployRequest {
                 source_dir,
                 app,
                 domain,
@@ -231,7 +245,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 entry,
                 artifact_root,
                 upstream,
-            );
+                deployment_id: None,
+                source: DeploymentSource::cli(),
+            };
             render_deploy(&theme, &client, request)?;
         }
         Command::Health => {
@@ -353,7 +369,17 @@ fn call(client: &AdminClient, command: AdminCommand) -> Result<AdminData, Box<dy
         actor: None,
         command,
     };
-    match client.request(&request)? {
+    let response = client.request(&request).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            Box::<dyn Error>::from("timed out waiting for the daemon to answer")
+        } else {
+            Box::<dyn Error>::from(error)
+        }
+    })?;
+    match response {
         AdminResponse::Ok { data, .. } => Ok(*data),
         AdminResponse::Error { error, .. } => {
             Err(format!("{:?}: {}", error.code, error.message).into())
@@ -954,12 +980,9 @@ fn render_deploy(
                 &short_hash(&deploy.artifact_hash),
             );
             write_kv(&mut out, theme, "engine", &deploy.engine_version);
-            write_kv(
-                &mut out,
-                theme,
-                "url",
-                &format!("https://{}", deploy.domain),
-            );
+            if let Some(domain) = &deploy.domain {
+                write_kv(&mut out, theme, "url", &format!("https://{domain}"));
+            }
             let _ = elapsed;
             Ok(())
         }
@@ -972,7 +995,7 @@ struct DeployOutcome {
     deployment_id: String,
     artifact_hash: String,
     engine_version: String,
-    domain: String,
+    domain: Option<String>,
 }
 
 fn deploy_spinner(theme: &Theme, app: &str) -> ProgressBar {
