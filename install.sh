@@ -66,7 +66,7 @@ Options:
   --dns-provider NAME    DNS provider (default: none)
   --bun-version VERSION  Registered Bun engine version (default: bundled)
   --noninteractive       Never prompt; fail when required input is absent
-  --reconfigure          Permit replacing changed existing files/configuration
+  --reconfigure          Permit replacing changed config/service files
   --rotate-secrets       Generate and atomically install new console secrets
   -h, --help             Show this help
 
@@ -560,7 +560,10 @@ fi
 service_stage=$stage/cygnus.service
 [[ $OS == Darwin ]] && service_stage=$stage/com.cygnus.daemon.plist
 
-# Existing paths are never replaced without --reconfigure (or secret rotation).
+# Config and service files keep their values across upgrades unless the
+# operator opts in with --reconfigure. Package content (binaries, console,
+# engine) always tracks the release being installed so a plain reinstall is
+# the upgrade path. Secrets only change with --rotate-secrets.
 existing_diff() { [[ -e $1 ]] && { [[ ! -L $1 && -f $1 ]] || fail "existing path is not a regular file: $1"; } && ! cmp -s "$2" "$1"; }
 check_change_allowed() {
   local dest=$1 src=$2
@@ -584,15 +587,12 @@ if [[ -L $console_root ]]; then
   fail "existing console root is not a real directory: $console_root"
 elif [[ -e $console_root ]]; then
   [[ -d $console_root ]] || fail "existing console root is not a directory: $console_root"
-  if ! diff -qr "$console_stage" "$console_root" >/dev/null 2>&1 && (( ! reconfigure )); then
-    fail "existing $console_root differs; re-run with --reconfigure"
-  fi
 fi
 if [[ -L $secret_root ]]; then
   fail "existing secret root is not a real directory: $secret_root"
 elif [[ -e $secret_root ]]; then
   [[ -d $secret_root ]] || fail "existing secret root is not a directory: $secret_root"
-  if ! diff -qr "$secret_stage" "$secret_root" >/dev/null 2>&1 && (( ! reconfigure && ! rotate_secrets )); then
+  if ! diff -qr "$secret_stage" "$secret_root" >/dev/null 2>&1 && (( ! rotate_secrets )); then
     fail "existing $secret_root differs; re-run with --rotate-secrets"
   fi
 fi
@@ -606,18 +606,16 @@ for name in "${binaries[@]}"; do
   src=$bundle_dir/$name
   cp -- "$src" "$stage/$name"
   chmod 0755 "$stage/$name"
-  if [[ -e $prefix/$name ]] && { [[ -L $prefix/$name || ! -f $prefix/$name ]] || ! cmp -s "$src" "$prefix/$name"; }; then
-    (( reconfigure )) || fail "existing $prefix/$name differs; re-run with --reconfigure"
+  if [[ -e $prefix/$name ]]; then
+    [[ ! -L $prefix/$name && -f $prefix/$name ]] || fail "existing $prefix/$name is not a regular file"
   fi
 done
 # Break-glass compatibility: the developer-facing binary is `cygnus`, but keep a
 # `cygnusctl` symlink next to it so existing operator muscle memory and docs
 # keep working. The symlink points at the real binary in the same directory.
 if [[ -e $prefix/cygnusctl || -L $prefix/cygnusctl ]]; then
-  [[ -L $prefix/cygnusctl ]] || fail "existing $prefix/cygnusctl is not a symlink; re-run with --reconfigure"
-  if [[ $(readlink "$prefix/cygnusctl") != cygnus ]]; then
-    (( reconfigure )) || fail "existing $prefix/cygnusctl does not point at cygnus; re-run with --reconfigure"
-  fi
+  # Non-symlink leftovers are unexpected; the install step rewrites the link.
+  [[ -L $prefix/cygnusctl || ! -e $prefix/cygnusctl ]] || fail "existing $prefix/cygnusctl is not a symlink"
 fi
 mkdir -p "$stage/engine/usr/local/bin"
 cp -- "$bundle_dir/bun" "$stage/engine/usr/local/bin/bun"
@@ -631,9 +629,6 @@ if [[ -e $engine_root ]]; then
   [[ -f $engine_root/usr/local/bin/bun && ! -L $engine_root/usr/local/bin/bun ]] || fail "existing engine executable is invalid"
   if [[ $OS == Linux ]]; then
     [[ -f $engine_root/usr/local/bin/cygnus-init && ! -L $engine_root/usr/local/bin/cygnus-init ]] || fail "existing cage init executable is invalid"
-  fi
-  if ! cmp -s "$bundle_dir/bun" "$engine_root/usr/local/bin/bun" && (( ! reconfigure )); then
-    fail "existing engine differs; re-run with --reconfigure"
   fi
 fi
 
@@ -663,9 +658,11 @@ atomic_install_dir() {
   if [[ -e $dest ]]; then
     [[ -d $dest && ! -L $dest ]] || fail "${kind} destination is not a real directory: $dest"
     if diff -qr "$src" "$dest" >/dev/null 2>&1; then chmod "$mode" "$dest"; return; fi
-    (( reconfigure )) && allow_replace=1
-    [[ $kind == secrets && $rotate_secrets -eq 1 ]] && allow_replace=1
-    (( allow_replace )) || fail "existing $dest differs; re-run with $([[ $kind == secrets ]] && printf '%s' --rotate-secrets || printf '%s' --reconfigure)"
+    if [[ $kind == secrets ]]; then
+      (( rotate_secrets )) || fail "existing $dest differs; re-run with --rotate-secrets"
+    fi
+    # Package roots (console, engine) always track the release being installed.
+    allow_replace=1
   fi
   tmp=$parent/.$(basename "$dest").staging-$$
   old=$parent/.$(basename "$dest").previous-$$
@@ -683,6 +680,9 @@ atomic_install_dir() {
   fi
   [[ ! -e $old ]] || rm -rf -- "$old"
 }
+
+log "Stop existing Cygnus"
+stop_existing_service
 
 log "Install Cygnus"
 ensure_dir "$prefix" 0755
@@ -712,7 +712,15 @@ else
   ln -sf -- cygnus "$prefix/cygnusctl"
 fi
 
-if [[ ! -e $engine_root || $reconfigure -eq 1 ]]; then
+engine_needs_install=0
+if [[ ! -e $engine_root ]]; then
+  engine_needs_install=1
+elif ! cmp -s "$stage/engine/usr/local/bin/bun" "$engine_root/usr/local/bin/bun"; then
+  engine_needs_install=1
+elif [[ $OS == Linux ]] && ! cmp -s "$stage/engine/usr/local/bin/cygnus-init" "$engine_root/usr/local/bin/cygnus-init"; then
+  engine_needs_install=1
+fi
+if (( engine_needs_install )); then
   # Build the replacement completely before moving the current engine away.
   engine_tmp="$state_dir/engines/.bun-$bun_version.staging-$$"
   rm -rf -- "$engine_tmp"
@@ -741,16 +749,50 @@ atomic_copy "$stage/node.json" "$config_file" 0600
 atomic_copy "$stage/secrets.env" "$secrets_env" 0600
 atomic_copy "$service_stage" "$service_file" 0644
 
+# Tear down any previous install before replacing binaries or rebinding sockets.
+# Reinstalls must not fight a live daemon holding the old binary/sockets.
+stop_existing_service() {
+  if [[ $OS == Darwin ]]; then
+    local launchctl_bin
+    launchctl_bin=$(command -v launchctl || true)
+    if [[ -n $launchctl_bin ]]; then
+      "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
+    fi
+    if (( ! TEST_MODE )); then
+      # Cover both launchd-managed and direct nohup fallbacks from earlier runs.
+      pkill -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
+      pkill -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
+      pkill -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
+      local i
+      for ((i=1; i<=50; i++)); do
+        if ! pgrep -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" >/dev/null 2>&1           && ! pgrep -U "$(id -u)" -f "$prefix/cygnus-daemon" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.1
+      done
+      if pgrep -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" >/dev/null 2>&1         || pgrep -U "$(id -u)" -f "$prefix/cygnus-daemon" >/dev/null 2>&1; then
+        pkill -9 -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
+        pkill -9 -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
+        pkill -9 -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
+        sleep 0.2
+      fi
+      # Stale runtime sockets block the next bind if a previous process died hard.
+      rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
+    fi
+  else
+    local systemctl_bin
+    systemctl_bin=$(command -v systemctl || true)
+    if [[ -n $systemctl_bin ]]; then
+      "$systemctl_bin" stop cygnus.service >>"$diag_file" 2>&1 || true
+    fi
+  fi
+}
+
 start_service() {
 service_started=1
 if [[ $OS == Darwin ]]; then
   launchctl_bin=$(command -v launchctl || true)
   service_started=0
-  if (( ! TEST_MODE )); then
-    # A previous attempt may have started the daemon directly (launchd
-    # fallback); clear it so sockets rebind cleanly on this start.
-    pkill -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
-  fi
   if [[ -n $launchctl_bin ]]; then
     # Reinstalls and crashed runs leave the label registered; bootout is the
     # idempotent way to clear it, and repeated failures can leave the label

@@ -200,13 +200,29 @@ run_install
 [[ $(cat "$ROOT/etc/cygnus/node.json") == "$config_before" && $(cat "$ROOT/etc/systemd/system/cygnus.service") == "$unit_before" ]] || { echo 'idempotent rerun changed content' >&2; exit 1; }
 [[ $(hash_file "$ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js") == "$console_before" ]] || { echo 'idempotent rerun changed console root' >&2; exit 1; }
 
-# 5. Changed console content is gated, then atomically replaced with --reconfigure.
+# 5. Package content (console + binaries + engine) upgrades without --reconfigure.
+# Config/service files still require --reconfigure when they change.
 printf '%s\n' 'changed console' >"$CONSOLE_BUILD/opt/cygnus-console/server.js"
+# Keep the fake CLI intact; only mutate daemon + bun payloads.
+printf '%s\n' '#!/usr/bin/env sh' 'exit 0' 'new-daemon-marker' >"$BUNDLE/cygnus-daemon"
+printf '%s\n' '#!/usr/bin/env sh' 'exit 0' 'new-bun-marker' >"$BUNDLE/bun"
+chmod 0755 "$BUNDLE/cygnus-daemon" "$BUNDLE/bun"
+tar -cf "$BUNDLE/cygnus-console.tar" -C "$CONSOLE_BUILD" opt/cygnus-console
+write_checksums
+run_install
+[[ $(cat "$ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js") == 'changed console' ]] || { echo 'package reinstall did not replace console root' >&2; exit 1; }
+grep -q 'new-daemon-marker' "$ROOT/usr/local/bin/cygnus-daemon" || { echo 'package reinstall did not replace daemon binary' >&2; exit 1; }
+grep -q 'new-bun-marker' "$ROOT/var/lib/cygnus/engines/bun-1.3.14/usr/local/bin/bun" || { echo 'package reinstall did not replace engine bun' >&2; exit 1; }
+# Restore a full working fake bundle for later admin-mutation steps.
 make_bundle
-expect_fail run_install
-[[ $(hash_file "$ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js") == "$console_before" ]] || { echo 'gated reconfigure changed console root' >&2; exit 1; }
-run_install --reconfigure
-[[ $(cat "$ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js") == 'changed console' ]] || { echo 'reconfigure did not replace console root' >&2; exit 1; }
+run_install
+# Changed listen address rewrites node.json; that still needs --reconfigure.
+expect_fail bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE"   --prefix "$ROOT/usr/local/bin" --config-dir "$ROOT/etc/cygnus"   --state-dir "$ROOT/var/lib/cygnus" --runtime-dir "$ROOT/run/cygnus"   --listen 127.0.0.1:3399 --https-listen 127.0.0.1:3443 --apps-domain apps.test   --acme-email ops@apps.test --dns-provider cloudflare --bun-version 1.3.14
+[[ $(cat "$ROOT/etc/cygnus/node.json") == "$config_before" ]] || { echo 'config changed without --reconfigure' >&2; exit 1; }
+run_install --reconfigure --listen 127.0.0.1:3399
+grep -q '127.0.0.1:3399' "$ROOT/etc/cygnus/node.json" || { echo 'reconfigure did not replace node config' >&2; exit 1; }
+# Restore the original listen address for later readiness checks.
+run_install --reconfigure --listen 127.0.0.1:3300
 
 # 6. Secret rotation is explicit, changes both credentials, and updates the
 # rooted app env without requiring a separate reconfigure flag.
@@ -341,6 +357,30 @@ darwin_session_before=$(hash_file "$DARWIN_SECRETS/session.key")
 run_darwin_install >/dev/null 2>&1
 [[ $(hash_file "$DARWIN_SECRETS/bootstrap.token") == "$darwin_bootstrap_before" ]] || { echo 'darwin rerun rotated bootstrap token' >&2; exit 1; }
 [[ $(hash_file "$DARWIN_SECRETS/session.key") == "$darwin_session_before" ]] || { echo 'darwin rerun rotated session key' >&2; exit 1; }
+
+# Package upgrades replace binaries without --reconfigure and stop the old service first.
+printf '%s\n' '#!/usr/bin/env sh' 'exit 0' '# darwin-daemon-v2' >"$BUNDLE/cygnus-daemon"
+chmod 0755 "$BUNDLE/cygnus-daemon"
+write_darwin_checksums
+: >"$CYGNUS_TEST_LAUNCHCTL_LOG"
+run_darwin_install >/dev/null 2>&1
+grep -q 'darwin-daemon-v2' "$DARWIN_PREFIX/cygnus-daemon" || { echo 'darwin package reinstall did not replace daemon' >&2; exit 1; }
+grep -q '^bootout gui/' "$CYGNUS_TEST_LAUNCHCTL_LOG" || { echo 'darwin reinstall did not bootout existing service' >&2; exit 1; }
+# Restore a full darwin-compatible fake bundle for later steps (rotate secrets needs cygnus CLI).
+for name in cygnus-daemon cygnus bun; do
+  cat >"$BUNDLE/$name" <<'NOW'
+#!/usr/bin/env sh
+case "$(basename "$0")" in
+  cygnus)
+    printf '%s\n' "$*" >> "${CYGNUS_TEST_CTL_LOG:?}"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+NOW
+  chmod 0755 "$BUNDLE/$name"
+done
+write_darwin_checksums
 
 : >"$CYGNUS_TEST_LAUNCHCTL_LOG"
 export CYGNUS_TEST_LAUNCHCTL_BOOTSTRAP_STATUS=1

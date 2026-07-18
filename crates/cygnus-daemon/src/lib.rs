@@ -279,6 +279,16 @@ impl Frontend {
         while !shutdown.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((client, _)) => {
+                    // Accept on a nonblocking listener inherits O_NONBLOCK on
+                    // macOS/BSD. The request/response relay is a blocking
+                    // thread-per-connection copy; leave the client nonblocking
+                    // and a body-complete GET immediately WouldBlock on the
+                    // client read, SHUT_WR the upstream, and truncate large
+                    // Bun responses to one UDS buffer (~8-16 KiB).
+                    if let Err(error) = client.set_nonblocking(false) {
+                        eprintln!("cygnus-daemon: set client blocking: {error}");
+                        continue;
+                    }
                     let front = Arc::clone(&self);
                     thread::spawn(move || front.serve_connection(client));
                 }
@@ -302,6 +312,10 @@ impl Frontend {
         while !shutdown.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((client, _)) => {
+                    if let Err(error) = client.set_nonblocking(false) {
+                        eprintln!("cygnus-daemon: set tls client blocking: {error}");
+                        continue;
+                    }
                     let front = Arc::clone(&self);
                     let tls = tls.clone();
                     thread::spawn(move || front.serve_tls_connection(client, &tls));
@@ -576,7 +590,17 @@ fn forward_or_discard<R: Read, W: Write>(
                     forwarded += read as u64;
                 }
             }
+            // Keep waiting: a body-complete GET is silent while the response
+            // streams. TimedOut is the relay idle timeout firing, not a client
+            // hangup. WouldBlock should not happen on a blocking socket; if it
+            // does (accept inherited O_NONBLOCK), park briefly instead of
+            // returning — returning SHUT_WRs the upstream and truncates large
+            // macOS/Bun responses to one UDS buffer.
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
             Err(_) => return Ok(forwarded),
         }
     }
@@ -842,6 +866,229 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+
+    /// Regression: sockets accepted from a nonblocking listener inherit
+    /// O_NONBLOCK on macOS. Leaving them nonblocking makes body-complete GETs
+    /// WouldBlock in forward_or_discard, SHUT_WR the upstream immediately, and
+    /// truncate large responses (Bun ships ~8-16 KiB then stops).
+    #[test]
+    fn relay_delivers_large_response_from_nonblocking_accept() {
+        use std::net::TcpListener;
+        use std::os::unix::net::UnixListener;
+
+        let total = 600 * 1024;
+        let dir = std::env::temp_dir().join(format!(
+            "cyg-relay-nonblock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("upstream.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let upstream_listener = UnixListener::bind(&socket_path).expect("bind upstream");
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut conn, _) = upstream_listener.accept().expect("accept upstream");
+            let mut buffer = [0_u8; 4096];
+            let mut request = Vec::new();
+            loop {
+                let read = conn.read(&mut buffer).expect("read request");
+                assert_ne!(read, 0, "upstream saw EOF before responding");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {total}\r\n\r\n");
+            conn.write_all(head.as_bytes()).expect("write head");
+            // Single large write like Bun after buffering the console document.
+            conn.write_all(&vec![b'z'; total]).expect("write body");
+            // Hold the socket open briefly so a premature peer SHUT_WR is the
+            // only way to truncate — matching Bun's keep-open-until-done behavior.
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        // Production serve_until path: nonblocking accept.
+        tcp_listener
+            .set_nonblocking(true)
+            .expect("listener nonblocking");
+        let address = tcp_listener.local_addr().expect("tcp addr");
+
+        let server_side = thread::spawn(move || {
+            loop {
+                match tcp_listener.accept() {
+                    Ok((client, _)) => {
+                        // The fix under test: clear O_NONBLOCK on the accepted socket.
+                        client.set_nonblocking(false).expect("client blocking");
+                        return client;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect client");
+        let server_client = server_side.join().expect("join accept");
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            .expect("send request");
+
+        let upstream = UnixStream::connect(&socket_path).expect("connect upstream");
+        let _ = server_client.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = server_client.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        (&upstream)
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            .expect("forward head");
+
+        let relay_thread = thread::spawn(move || {
+            let stats = relay(server_client, upstream, BodyGuard::none(), false).expect("relay");
+            stats.to_client
+        });
+
+        let mut response = Vec::new();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        client.read_to_end(&mut response).expect("read response");
+        let relayed = relay_thread.join().expect("join relay");
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head complete")
+            + 4;
+        assert_eq!(
+            response.len() - header_end,
+            total,
+            "client received a truncated body (relay reported {relayed} bytes)"
+        );
+        upstream_thread.join().expect("upstream thread");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// macOS + Bun: early upstream SHUT_WR truncates large responses to ~8-16 KiB.
+    /// Covers the real console index over a UDS Bun server.
+    #[test]
+    fn relay_delivers_large_bun_unix_response() {
+        use std::net::TcpListener;
+        use std::process::{Command, Stdio};
+
+        let bun = std::env::var("CYGNUS_TEST_BUN")
+            .unwrap_or_else(|_| std::env::var("HOME").unwrap() + "/.cygnus/bin/bun");
+        let index = std::env::var("CYGNUS_TEST_INDEX").unwrap_or_else(|_| {
+            std::env::var("HOME").unwrap() + "/.cygnus/console/opt/cygnus-console/dist/index.html"
+        });
+        if !std::path::Path::new(&bun).exists() || !std::path::Path::new(&index).exists() {
+            eprintln!("skip bun relay test: bun or index missing");
+            return;
+        }
+        let body = std::fs::read(&index).expect("read index");
+        let total = body.len();
+        assert!(total > 64 * 1024, "index should be large, got {total}");
+
+        let dir = std::env::temp_dir().join(format!("cyg-bun-relay-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("console.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let server_js = dir.join("server.js");
+        std::fs::write(
+            &server_js,
+            format!(
+                r#"const bytes = new Uint8Array(await Bun.file({index:?}).arrayBuffer());
+const server = Bun.serve({{
+  unix: {sock:?},
+  fetch() {{
+    return new Response(bytes, {{ headers: {{ "content-type": "text/html", "cache-control": "no-store" }} }});
+  }},
+}});
+console.log("ready", server.hostname);"#,
+                index = index,
+                sock = socket_path,
+            ),
+        )
+        .unwrap();
+
+        let mut child = Command::new(&bun)
+            .arg(&server_js)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn bun");
+        // wait for socket
+        for _ in 0..200 {
+            if socket_path.exists() {
+                if let Ok(s) = UnixStream::connect(&socket_path) {
+                    drop(s);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = tcp_listener.local_addr().unwrap();
+        let server_side = thread::spawn(move || tcp_listener.accept().unwrap().0);
+        let mut client = TcpStream::connect(address).unwrap();
+        let server_client = server_side.join().unwrap();
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            .unwrap();
+
+        let upstream = UnixStream::connect(&socket_path).expect("connect bun");
+        let _ = server_client.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = server_client.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        // Production path: write request BEFORE relay
+        (&upstream)
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            .unwrap();
+
+        let relay_thread = thread::spawn(move || {
+            let stats = relay(server_client, upstream, BodyGuard::none(), false).expect("relay");
+            stats.to_client
+        });
+
+        let mut response = Vec::new();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // read until EOF or enough
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+                Err(e) => panic!("client read: {e}"),
+            }
+        }
+        let relayed = relay_thread.join().expect("join relay");
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .unwrap_or(0);
+        let body_len = response.len().saturating_sub(header_end);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            body_len, total,
+            "truncated bun body: got {body_len}, want {total}, relay reported {relayed}"
+        );
+    }
+
 
     /// Upgraded exchanges must tunnel both directions: client bytes after the
     /// request head are websocket frames, not garbage to discard.
