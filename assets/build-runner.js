@@ -1,10 +1,17 @@
-import { mkdir } from "node:fs/promises";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  rm,
+} from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 // Daemon-owned dependency build controller.
 //
 // This file is staged outside the tenant workspace and is launched with the
 // daemon-owned bunfig. Its argument surface is intentionally tiny: the daemon
-// may request one workspace-relative entrypoint and, when preflight says so,
-// the fixed install phase.
+// may request one workspace-relative entrypoint or the fixed static mode and,
+// when preflight says so, the fixed install phase.
 
 // Paths come from the daemon, which knows whether this build runs inside a
 // rooted cage (Linux: the fixed /cygnus layout) or as a plain process
@@ -13,10 +20,26 @@ const TRUSTED_CONFIG = process.env.CYGNUS_BUILD_CONFIG ?? "/cygnus/build.bunfig.
 const WORKSPACE = process.env.CYGNUS_BUILD_WORKSPACE ?? "/workspace";
 const OUTPUT = process.env.CYGNUS_BUILD_OUTPUT ?? "/cygnus/output/app";
 const CACHE = process.env.BUN_INSTALL_CACHE_DIR ?? "/workspace/.cygnus-cache";
+const STATIC_BUILD_SCRIPT = process.env.CYGNUS_STATIC_BUILD_SCRIPT ?? "";
+const BUILD_DETECTION = process.env.CYGNUS_BUILD_DETECTION ?? "";
+const STATIC_SERVER_SOURCE =
+  process.env.CYGNUS_STATIC_SERVER_SOURCE ?? "/cygnus/cygnus-static-server.ts";
 const REGISTRY = "https://registry.npmjs.org";
 const HOME = process.env.HOME ?? "/cygnus/home";
 const TMPDIR = process.env.TMPDIR ?? "/cygnus/tmp";
 const PATH = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
+const STATIC_OUTPUT_DIRECTORIES = Object.freeze([
+  "dist",
+  "build",
+  "out",
+  ".output/public",
+  "public",
+]);
+const ROOT_COPY_EXCLUSIONS = Object.freeze(new Set([
+  "node_modules",
+  ".git",
+  ".cygnus-cache",
+]));
 
 const CONTROL_ENV = Object.freeze({
   HOME,
@@ -42,8 +65,10 @@ function isSafeEntry(entry) {
 }
 
 export function parseRunnerArgs(argv) {
-  if (!Array.isArray(argv) || (argv.length !== 1 && argv.length !== 2)) {
-    fail("runner accepts [entry], [--install, entry], or [--install-latest, entry]");
+  if (!Array.isArray(argv) || argv.length === 0 || argv.length > 2) {
+    fail(
+      "runner accepts [entry], [--install, entry], [--install-latest, entry], [--static], [--install, --static], or [--install-latest, --static]",
+    );
   }
   const install = argv.length === 2;
   if (install && argv[0] !== "--install" && argv[0] !== "--install-latest") {
@@ -51,6 +76,12 @@ export function parseRunnerArgs(argv) {
   }
   const frozen = install && argv[0] === "--install";
   const entry = argv[install ? 1 : 0];
+  if (entry === "--static") {
+    return { install, frozen, static: true };
+  }
+  if (typeof entry === "string" && entry.startsWith("--")) {
+    fail(`unknown runner argument ${JSON.stringify(entry)}`);
+  }
   if (!isSafeEntry(entry)) {
     fail("runner entry must be a safe workspace-relative path");
   }
@@ -104,21 +135,25 @@ async function installDependencies(frozen) {
   return 0;
 }
 
+const DETERMINISTIC_BUILD_OPTIONS = Object.freeze({
+  target: "bun",
+  format: "cjs",
+  bytecode: true,
+  minify: true,
+  sourcemap: "none",
+  packages: "bundle",
+  splitting: false,
+  define: { "process.env.NODE_ENV": JSON.stringify("production") },
+  env: "disable",
+});
+
 async function buildBundle(entry) {
   phaseLog("build", "starting deterministic Bun bundle");
   const result = await Bun.build({
     entrypoints: [`${WORKSPACE}/${entry}`],
     root: WORKSPACE,
     outdir: OUTPUT,
-    target: "bun",
-    format: "cjs",
-    bytecode: true,
-    minify: true,
-    sourcemap: "none",
-    packages: "bundle",
-    splitting: false,
-    define: { "process.env.NODE_ENV": JSON.stringify("production") },
-    env: "disable",
+    ...DETERMINISTIC_BUILD_OPTIONS,
   });
   if (!result.success) {
     for (const log of result.logs) console.error("[build]", log);
@@ -129,14 +164,132 @@ async function buildBundle(entry) {
   return 0;
 }
 
+async function runStaticBuildScript() {
+  phaseLog("detect", `static build script configured: ${STATIC_BUILD_SCRIPT}`);
+  phaseLog("build", `starting bun run ${STATIC_BUILD_SCRIPT}`);
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      "--no-env-file",
+      `--config=${TRUSTED_CONFIG}`,
+      "run",
+      STATIC_BUILD_SCRIPT,
+    ],
+    {
+      cwd: WORKSPACE,
+      env: CONTROL_ENV,
+      stdio: ["ignore", "inherit", "inherit"],
+    },
+  );
+  const status = await child.exited;
+  if (status !== 0) {
+    phaseLog("build", `static build script failed with status ${status}`);
+    return status;
+  }
+  phaseLog("build", "static build script completed");
+  return 0;
+}
+
+async function firstStaticOutputDirectory() {
+  for (const relativePath of STATIC_OUTPUT_DIRECTORIES) {
+    const candidate = join(WORKSPACE, relativePath);
+    try {
+      const metadata = await lstat(candidate);
+      if (metadata.isSymbolicLink()) {
+        fail(`static output ${relativePath} must not be a symlink`);
+      }
+      if (metadata.isDirectory()) return { path: candidate, relativePath };
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  fail(
+    `static build completed but no output directory exists (${STATIC_OUTPUT_DIRECTORIES.join(", ")})`,
+  );
+}
+
+async function copyStaticTree(source, destination, excludeControls) {
+  const metadata = await lstat(source);
+  if (metadata.isSymbolicLink()) {
+    fail(`static output contains a symlink: ${source}`);
+  }
+  if (metadata.isFile()) {
+    await copyFile(source, destination);
+    return;
+  }
+  if (!metadata.isDirectory()) {
+    fail(`static output contains a special file: ${source}`);
+  }
+
+  await mkdir(destination, { recursive: true });
+  const entries = await readdir(source, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    if (excludeControls && ROOT_COPY_EXCLUSIONS.has(entry.name)) continue;
+    await copyStaticTree(
+      join(source, entry.name),
+      join(destination, entry.name),
+      excludeControls,
+    );
+  }
+}
+
+async function buildStaticServer() {
+  if (basename(STATIC_SERVER_SOURCE) !== "cygnus-static-server.ts") {
+    fail("static server source must use reserved entry cygnus-static-server.ts");
+  }
+  phaseLog("build", "starting deterministic static server bundle");
+  const result = await Bun.build({
+    entrypoints: [STATIC_SERVER_SOURCE],
+    root: dirname(STATIC_SERVER_SOURCE),
+    outdir: OUTPUT,
+    ...DETERMINISTIC_BUILD_OPTIONS,
+  });
+  if (!result.success) {
+    for (const log of result.logs) console.error("[build]", log);
+    phaseLog("build", "static server bundle failed");
+    return 1;
+  }
+  phaseLog("build", "static server bundle completed");
+  return 0;
+}
+
+async function buildStatic() {
+  const ranBuildScript = STATIC_BUILD_SCRIPT.length > 0;
+  if (ranBuildScript) {
+    const status = await runStaticBuildScript();
+    if (status !== 0) return status;
+  } else {
+    phaseLog("detect", "no static build script configured; publishing workspace root");
+  }
+
+  let source = WORKSPACE;
+  let selected = "workspace root";
+  if (ranBuildScript) {
+    const output = await firstStaticOutputDirectory();
+    source = output.path;
+    selected = output.relativePath;
+  }
+  phaseLog("detect", `selected static output: ${selected}`);
+
+  const publicOutput = join(OUTPUT, "public");
+  phaseLog("build", `copying static output from ${selected}`);
+  await rm(publicOutput, { recursive: true, force: true });
+  await copyStaticTree(source, publicOutput, !ranBuildScript);
+  phaseLog("build", "static output copy completed");
+
+  return buildStaticServer();
+}
+
 export async function runRunner(argv) {
-  const { install, frozen, entry } = parseRunnerArgs(argv);
+  const { install, frozen, static: staticMode, entry } = parseRunnerArgs(argv);
+  if (BUILD_DETECTION) phaseLog("detect", BUILD_DETECTION);
   await ensureDirectories();
   if (install) {
     const status = await installDependencies(frozen);
     if (status !== 0) return status;
   }
-  return buildBundle(entry);
+  return staticMode ? buildStatic() : buildBundle(entry);
 }
 
 if (import.meta.main) {

@@ -481,6 +481,10 @@ impl StateAdminHandler {
             source: DeploymentSource::upload(),
         };
         let target = resolve_deploy_request(&state, request).map_err(deploy_fault)?;
+        let queued_entry = target
+            .entry_explicit
+            .then(|| target.entry.clone())
+            .unwrap_or_default();
         let deployment_id = new_deployment_id();
         let deployment = DeploymentInput {
             id: deployment_id.clone(),
@@ -498,7 +502,7 @@ impl StateAdminHandler {
             app: target.app,
             domain: target.domain,
             engine_version: target.engine_version,
-            entry: target.entry,
+            entry: queued_entry,
             artifact_root: target.artifact_root,
             upstream: target.upstream,
             branch: None,
@@ -525,6 +529,10 @@ impl StateAdminHandler {
         let mut state = self.open_state()?;
         let mut target = resolve_deploy_request(&state, request).map_err(deploy_fault)?;
         target.source_dir = canonical_source_root(&target.source_dir).map_err(deploy_fault)?;
+        let queued_entry = target
+            .entry_explicit
+            .then(|| target.entry.clone())
+            .unwrap_or_default();
         let deployment_id = new_deployment_id();
         let job_id = new_deployment_id();
         let mut hasher = Sha256::new();
@@ -548,7 +556,7 @@ impl StateAdminHandler {
             app: target.app,
             domain: target.domain,
             engine_version: target.engine_version,
-            entry: target.entry,
+            entry: queued_entry,
             artifact_root: target.artifact_root,
             upstream: target.upstream,
             branch: None,

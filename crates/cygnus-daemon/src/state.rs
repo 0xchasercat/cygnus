@@ -2914,20 +2914,20 @@ fn validate_github_repository(config: &GitHubRepositoryConfig) -> Result<(), Sta
     ] {
         github_text(value, field)?;
     }
-    if config.entry.as_os_str().is_empty()
-        || config.entry.is_absolute()
-        || config.entry.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir
-                    | std::path::Component::ParentDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+    if !config.entry.as_os_str().is_empty()
+        && (config.entry.is_absolute()
+            || config.entry.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            }))
     {
         return Err(StateError::InvalidRecord {
             kind: "github repository",
-            detail: "entry must be a nonempty relative path without traversal".into(),
+            detail: "entry must be automatic or a relative path without traversal".into(),
         });
     }
     for (path, field) in [
@@ -2998,20 +2998,20 @@ fn validate_deploy_job_spec(job: &DeployJobSpec) -> Result<(), StateError> {
             detail: "source path must be nonempty and bounded".into(),
         });
     }
-    if job.entry.as_os_str().is_empty()
-        || job.entry.is_absolute()
-        || job.entry.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir
-                    | std::path::Component::ParentDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+    if !job.entry.as_os_str().is_empty()
+        && (job.entry.is_absolute()
+            || job.entry.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            }))
     {
         return Err(StateError::InvalidRecord {
             kind: "deploy job",
-            detail: "entry must be a nonempty relative path without traversal".into(),
+            detail: "entry must be automatic or a relative path without traversal".into(),
         });
     }
     for (path, field) in [
