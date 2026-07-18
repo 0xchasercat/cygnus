@@ -1577,13 +1577,16 @@ mod tests {
             .as_nanos();
         // Canonicalize so paths derived from here satisfy the daemon's
         // canonical-path record checks on hosts whose temp directory sits
-        // behind a symlink (macOS /var -> private/var).
+        // behind a symlink (macOS /var -> private/var). Keep the leaf name
+        // compact: unix socket paths bound under it must stay inside
+        // SUN_LEN, and macOS temp roots are already long.
         let base = std::env::temp_dir()
             .canonicalize()
             .expect("canonical temp dir");
         base.join(format!(
-            "cygnus-daemon-{label}-{}-{nonce}",
-            std::process::id()
+            "cyg-{label}-{:x}-{:08x}",
+            std::process::id(),
+            (nonce & 0xffff_ffff) as u32
         ))
     }
 
