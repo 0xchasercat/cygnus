@@ -1588,13 +1588,14 @@ fn reconcile_acme_domains(
     challenges: Http01Challenges,
     tls: Option<&TlsServer>,
     metrics: &MetricsHub,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     let mut state = State::open(state_path)?;
     let snapshot = state.load()?;
     let Some(manager) = acme_manager(&snapshot.edge, state_path, challenges)? else {
-        return Ok(());
+        return Ok(false);
     };
     let expected_ip = expected_public_ipv4();
+    let mut had_failure = false;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let renew_before = now + 30 * 24 * 60 * 60;
     let domains = state.app_domains(None)?;
@@ -1644,6 +1645,7 @@ fn reconcile_acme_domains(
                 );
             }
             Err(_) => {
+                had_failure = true;
                 let has_fallback = certificate_for_host(&state.certificates()?, &domain.host)
                     .is_some_and(|certificate| certificate.not_after_unix > now);
                 state.update_domain_status(
@@ -1694,7 +1696,7 @@ fn reconcile_acme_domains(
             );
         }
     }
-    Ok(())
+    Ok(had_failure)
 }
 
 fn spawn_domain_reconciler(
@@ -1708,13 +1710,14 @@ fn spawn_domain_reconciler(
         let mut next_check = Instant::now();
         while !shutdown.load(Ordering::Acquire) {
             if Instant::now() >= next_check {
-                if let Err(error) =
-                    reconcile_acme_domains(&state_path, challenges.clone(), Some(&tls), &metrics)
+                match reconcile_acme_domains(&state_path, challenges.clone(), Some(&tls), &metrics)
                 {
-                    eprintln!("cygnus-daemon: domain reconciliation failed: {error}");
-                    next_check = Instant::now() + Duration::from_secs(60 * 60);
-                } else {
-                    next_check = Instant::now() + Duration::from_secs(60);
+                    Ok(true) => next_check = Instant::now() + Duration::from_secs(60 * 60),
+                    Ok(false) => next_check = Instant::now() + Duration::from_secs(10 * 60),
+                    Err(error) => {
+                        eprintln!("cygnus-daemon: domain reconciliation failed: {error}");
+                        next_check = Instant::now() + Duration::from_secs(60 * 60);
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(250));
