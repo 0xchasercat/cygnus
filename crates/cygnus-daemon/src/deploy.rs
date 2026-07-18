@@ -2532,7 +2532,7 @@ mod tests {
     #[test]
     fn static_payload_uses_reserved_entry_with_browser_assets() {
         let app = temp_dir("static-entry");
-        fs::create_dir(app.join("public/assets")).unwrap();
+        fs::create_dir_all(app.join("public/assets")).unwrap();
         fs::write(app.join("public/index.html"), b"<!doctype html>").unwrap();
         fs::write(app.join("public/assets/app.js"), b"browser").unwrap();
         fs::write(app.join("cygnus-static-server.js"), b"server").unwrap();
