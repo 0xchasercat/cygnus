@@ -934,68 +934,165 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Render the deploy command. Isolated so a follow-up branch can swap the
 /// single spinner for live streamed build logs without touching the command.
+/// The deploy experience: start the build asynchronously, stream the server
+/// side build log to the terminal as it happens, then print the outcome.
 fn render_deploy(
     theme: &Theme,
     client: &AdminClient,
     request: DeployRequest,
 ) -> Result<(), Box<dyn Error>> {
-    let domain = request.domain.clone();
+    let app = request.app.clone();
+    let requested_domain = request.domain.clone();
     let started = Instant::now();
-    let spinner = deploy_spinner(theme, &request.app);
-    let result = call(client, AdminCommand::Deploy { request });
-    let outcome: Result<DeployOutcome, Box<dyn Error>> = match result {
-        Ok(AdminData::DeploymentActivated {
-            app,
-            deployment_id,
-            artifact_hash,
-            engine_version,
-        }) => Ok(DeployOutcome {
-            app,
-            deployment_id,
-            artifact_hash,
-            engine_version,
-            domain,
-        }),
-        Ok(_) => Err("daemon returned an unexpected response to Deploy".into()),
-        Err(error) => Err(error),
+
+    let data = call(client, AdminCommand::DeployStart { request })?;
+    let AdminData::DeployStarted { deployment_id, .. } = data else {
+        return Err("daemon returned an unexpected response to DeployStart".into());
+    };
+
+    {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let _ = writeln!(
+            out,
+            "{} {} {}",
+            self_paint(theme, "building", true),
+            theme.paint(&app).blue(),
+            theme.paint(&format!("· deployment {deployment_id}")).dim()
+        );
+    }
+
+    let spinner = deploy_spinner(theme, &app);
+    let mut offset = 0_u64;
+    let mut printed_any = false;
+    let deployment = loop {
+        // Pull whatever new build output exists and print it raw.
+        let log = call(
+            client,
+            AdminCommand::ReadLog {
+                deployment: deployment_id.clone(),
+                stream: LogStream::Stdout,
+                offset,
+                limit: MAX_LOG_CHUNK_BYTES,
+            },
+        );
+        if let Ok(AdminData::Log {
+            next_offset,
+            data_base64,
+            ..
+        }) = log
+        {
+            let bytes = BASE64_STANDARD.decode(data_base64)?;
+            if !bytes.is_empty() {
+                if !printed_any {
+                    spinner.finish_and_clear();
+                    printed_any = true;
+                }
+                spinner.suspend(|| {
+                    let stdout = io::stdout();
+                    let mut out = stdout.lock();
+                    let _ = out.write_all(&bytes);
+                    let _ = out.flush();
+                });
+            }
+            offset = next_offset;
+        }
+
+        let data = call(
+            client,
+            AdminCommand::GetDeployment {
+                deployment: deployment_id.clone(),
+            },
+        )?;
+        let AdminData::Deployment { deployment } = data else {
+            return Err("daemon returned an unexpected response to GetDeployment".into());
+        };
+        match deployment.status.as_str() {
+            "building" => {}
+            _ => break deployment,
+        }
+        thread::sleep(Duration::from_millis(400));
     };
     spinner.finish_and_clear();
     let elapsed = started.elapsed();
 
-    match outcome {
-        Ok(deploy) => {
+    match deployment.status.as_str() {
+        "active" | "sealed" => {
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            let prefix = if theme.color {
-                "deployed ".bold().to_string()
-            } else {
-                "deployed ".to_owned()
-            };
-            let _ = writeln!(out, "{}{}", prefix, theme.paint(&deploy.app).blue());
-            write_kv(&mut out, theme, "deployment", &deploy.deployment_id);
+            let _ = writeln!(
+                out,
+                "{}{}",
+                self_paint(theme, "deployed ", false),
+                theme.paint(&app).blue()
+            );
+            write_kv(&mut out, theme, "deployment", &deployment.id);
+            if let Some(artifact) = deployment.artifact_hash.as_deref() {
+                write_kv(&mut out, theme, "artifact", &short_hash(artifact));
+            }
+            write_kv(&mut out, theme, "engine", &deployment.engine_version);
+            let domain = requested_domain.or_else(|| {
+                // The daemon defaulted the domain; derive it the same way for
+                // the printed URL when the node has an apps domain.
+                match call(client, AdminCommand::Status) {
+                    Ok(AdminData::Status { node }) => node
+                        .apps_domain
+                        .map(|apps_domain| format!("{app}.{apps_domain}")),
+                    _ => None,
+                }
+            });
+            if let Some(domain) = domain {
+                write_kv(&mut out, theme, "url", &format!("https://{domain}"));
+            }
             write_kv(
                 &mut out,
                 theme,
-                "artifact",
-                &short_hash(&deploy.artifact_hash),
+                "time",
+                &format!("{:.1} s", elapsed.as_secs_f64()),
             );
-            write_kv(&mut out, theme, "engine", &deploy.engine_version);
-            if let Some(domain) = &deploy.domain {
-                write_kv(&mut out, theme, "url", &format!("https://{domain}"));
-            }
-            let _ = elapsed;
             Ok(())
         }
-        Err(error) => Err(error),
+        _ => {
+            // Show the build's stderr tail before the final error: that is
+            // where compilers and installers explain themselves.
+            if let Ok(AdminData::Log { data_base64, .. }) = call(
+                client,
+                AdminCommand::ReadLog {
+                    deployment: deployment_id.clone(),
+                    stream: LogStream::Stderr,
+                    offset: 0,
+                    limit: MAX_LOG_CHUNK_BYTES,
+                },
+            ) {
+                let bytes = BASE64_STANDARD.decode(data_base64)?;
+                if !bytes.is_empty() {
+                    let stdout = io::stdout();
+                    let mut out = stdout.lock();
+                    let _ = writeln!(out, "{}", theme.paint("build stderr:").dim());
+                    let _ = out.write_all(&bytes);
+                    if !bytes.ends_with(b"\n") {
+                        let _ = writeln!(out);
+                    }
+                    let _ = out.flush();
+                }
+            }
+            let message = deployment
+                .error
+                .unwrap_or_else(|| "build failed".to_owned());
+            Err(format!("deploy failed: {message}").into())
+        }
     }
 }
 
-struct DeployOutcome {
-    app: String,
-    deployment_id: String,
-    artifact_hash: String,
-    engine_version: String,
-    domain: Option<String>,
+fn self_paint(theme: &Theme, text: &str, dim: bool) -> String {
+    if !theme.color {
+        return text.to_owned();
+    }
+    if dim {
+        text.dimmed().to_string()
+    } else {
+        text.bold().to_string()
+    }
 }
 
 fn deploy_spinner(theme: &Theme, app: &str) -> ProgressBar {
