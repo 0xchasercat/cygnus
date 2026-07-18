@@ -703,6 +703,102 @@ mod tests {
         assert_eq!(text.matches("onnection").count(), 1);
     }
 
+    /// Large responses must relay completely on every platform. The unix
+    /// socket buffer on macOS is 8 KiB — a fraction of the Linux default —
+    /// so backpressure and teardown ordering bugs only show up there.
+    #[test]
+    fn relay_delivers_large_response_single_write() {
+        relay_large_response(600 * 1024, 600 * 1024, 0);
+    }
+
+    #[test]
+    fn relay_delivers_large_response_chunked_slow_writer() {
+        relay_large_response(600 * 1024, 8 * 1024, 2);
+    }
+
+    fn relay_large_response(total: usize, chunk: usize, delay_ms: u64) {
+        use std::net::TcpListener;
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cyg-relay-large-{}-{total}-{chunk}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("upstream.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let upstream_listener = UnixListener::bind(&socket_path).expect("bind upstream");
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut conn, _) = upstream_listener.accept().expect("accept upstream");
+            let mut buffer = [0_u8; 4096];
+            let mut request = Vec::new();
+            loop {
+                let read = conn.read(&mut buffer).expect("read request");
+                assert_ne!(read, 0, "upstream saw EOF before responding");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head =
+                format!("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {total}\r\n\r\n");
+            conn.write_all(head.as_bytes()).expect("write head");
+            let body = vec![b'z'; total];
+            for piece in body.chunks(chunk) {
+                conn.write_all(piece).expect("write body chunk");
+                if delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+            // The app closes after one exchange, exactly like a
+            // connection: close upstream does.
+        });
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let address = tcp_listener.local_addr().expect("tcp addr");
+        let server_side = thread::spawn(move || tcp_listener.accept().expect("accept client").0);
+        let mut client = TcpStream::connect(address).expect("connect client");
+        let server_client = server_side.join().expect("join accept");
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .expect("send request");
+
+        let upstream = UnixStream::connect(&socket_path).expect("connect upstream");
+        // Mirror serve_connection's socket configuration exactly.
+        let _ = server_client.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = server_client.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        (&upstream)
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .expect("forward head");
+
+        // Mirror serve_connection's epilogue: relay, then drop the streams.
+        let relay_thread = thread::spawn(move || {
+            let stats = relay(server_client, upstream, BodyGuard::none()).expect("relay");
+            stats.to_client
+        });
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        let relayed = relay_thread.join().expect("join relay");
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head complete")
+            + 4;
+        assert_eq!(
+            response.len() - header_end,
+            total,
+            "client received a truncated body (relay reported {relayed} bytes)"
+        );
+        upstream_thread.join().expect("upstream thread");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The regression that broke every async app: the relay used to half-close
     /// the upstream write side as soon as the request body was complete, which
     /// upstream servers treat as a client abort. The response must arrive even
