@@ -396,12 +396,14 @@ pub fn resolve_deploy_request(
     let domain = match request.domain {
         Some(domain) if !domain.trim().is_empty() => domain,
         _ => {
-            let apps_domain = state.load()?.edge.apps_domain.ok_or_else(|| {
+            let edge = state.load()?.edge;
+            let apex = edge.apex_domain.or(edge.apps_domain).ok_or_else(|| {
                 DeployError::InvalidInput(
-                    "domain was omitted and edge.apps_domain is not configured".into(),
+                    "domain was omitted and neither edge.apex_domain nor edge.apps_domain is configured"
+                        .into(),
                 )
             })?;
-            format!("{}.{}", request.app, apps_domain)
+            format!("{}.{}", request.app, apex)
         }
     };
     let entry_explicit = request.entry.is_some();

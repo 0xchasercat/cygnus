@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use crate::edge::{
     AcmeConfig, CertificateInput, CertificateRecord, CertificateStore, CertificateStoreError,
-    EdgeConfig,
+    EdgeConfig, SslMode,
 };
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use cygnus_cage::{
@@ -22,7 +24,7 @@ use cygnus_supervisor::{
     DEFAULT_IDLE_TTL, LifecycleConfig,
 };
 use getrandom::fill as random_fill;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -30,8 +32,12 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 10;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_ACCOUNT_EMAIL_BYTES: usize = 254;
+pub const MIN_ACCOUNT_PASSWORD_BYTES: usize = 12;
+pub const MAX_ACCOUNT_PASSWORD_BYTES: usize = 1024;
+const ACCOUNT_SALT_BYTES: usize = 16;
 const SHA256_HEX_LEN: usize = 64;
 const NODE_KEY_LEN: usize = 32;
 const SECRET_NONCE_LEN: usize = 24;
@@ -51,6 +57,45 @@ pub enum DeploymentStatus {
     Failed,
     Sealed,
     Active,
+}
+
+/// Ownership class for an application domain.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainKind {
+    Native,
+    Custom,
+}
+
+/// Requested TLS policy for a domain.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainTls {
+    Acme,
+    SelfSigned,
+}
+
+/// Runtime certificate lifecycle for a domain.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainStatus {
+    Active,
+    FallbackActive,
+    Issuing,
+    Pending,
+    Failed,
+}
+
+/// One persisted application-domain lifecycle record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DomainRecord {
+    pub host: String,
+    pub app: String,
+    pub kind: DomainKind,
+    pub tls: DomainTls,
+    pub status: DomainStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<i64>,
 }
 
 /// A trusted Bun engine registered by the operator. `host_root` is the host
@@ -171,6 +216,25 @@ pub struct ActiveDeploymentRecord {
     pub deployment_id: String,
     pub artifact_hash: String,
     pub engine_version: String,
+}
+
+/// Whether password authentication has been configured for this node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct AccountStatus {
+    pub configured: bool,
+}
+
+/// Public identity returned after the first account is created.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InitialAccount {
+    pub subject: String,
+}
+
+/// Result of checking an email/password pair. Password hashes never leave state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CredentialVerification {
+    pub ok: bool,
+    pub subject: Option<String>,
 }
 
 /// Administrative endpoint provenance persisted with an audit event.
@@ -780,6 +844,14 @@ pub enum StateError {
     Io(#[from] std::io::Error),
     #[error("secret authentication failed")]
     SecretAuthentication,
+    #[error("password hashing failed: {0}")]
+    PasswordHash(#[from] argon2::password_hash::Error),
+    #[error("invalid account input: {0}")]
+    InvalidAccountInput(String),
+    #[error("an account with email {0:?} already exists")]
+    DuplicateAccountEmail(String),
+    #[error("initial account setup has already been completed")]
+    AccountAlreadyConfigured,
     #[error("state schema version {found} is unsupported (expected {expected})")]
     UnknownSchemaVersion { found: i32, expected: i32 },
     #[error("configuration for app {app:?} has an invalid cage specification: {source}")]
@@ -829,6 +901,10 @@ pub enum StateError {
     AppNotFound(String),
     #[error("domain {domain:?} is already mapped to app {owner:?}")]
     DomainConflict { domain: String, owner: String },
+    #[error("domain {0:?} does not exist")]
+    DomainNotFound(String),
+    #[error("native domain {0:?} is managed by the configured apex and cannot be removed")]
+    NativeDomainImmutable(String),
     #[error("certificate store error: {0}")]
     CertificateStore(#[from] CertificateStoreError),
     #[error("certificate domain {domain:?} is already owned by certificate {owner:?}")]
@@ -893,6 +969,8 @@ impl State {
                 5 => migrate_v5_to_v6(&transaction)?,
                 6 => migrate_v6_to_v7(&transaction)?,
                 7 => migrate_v7_to_v8(&transaction)?,
+                8 => migrate_v8_to_v9(&transaction)?,
+                9 => migrate_v9_to_v10(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -912,6 +990,109 @@ impl State {
     /// Canonical parent directory that owns daemon state and deployment data.
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    /// Report whether the node has an account configured for password authentication.
+    pub fn account_status(&self) -> Result<AccountStatus, StateError> {
+        let configured =
+            self.connection
+                .query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(AccountStatus { configured })
+    }
+
+    /// Create the node's first account. Once any account exists, setup is permanently closed.
+    pub fn create_initial_account(
+        &mut self,
+        email: &str,
+        password: &str,
+    ) -> Result<InitialAccount, StateError> {
+        self.create_initial_account_inner(email, password, None)
+    }
+
+    /// Create the first account and append the successful creation audit atomically.
+    pub fn create_initial_account_with_audit(
+        &mut self,
+        email: &str,
+        password: &str,
+        audit: &AuditContext,
+    ) -> Result<InitialAccount, StateError> {
+        validate_audit_context(audit)?;
+        self.create_initial_account_inner(email, password, Some(audit))
+    }
+
+    fn create_initial_account_inner(
+        &mut self,
+        email: &str,
+        password: &str,
+        audit: Option<&AuditContext>,
+    ) -> Result<InitialAccount, StateError> {
+        let email = normalize_and_validate_account_email(email)?;
+        validate_account_password(password)?;
+        let password_hash = hash_account_password(password)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let duplicate: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE email = ?1)",
+            params![email],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            return Err(StateError::DuplicateAccountEmail(email));
+        }
+        let configured: bool =
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |row| {
+                row.get(0)
+            })?;
+        if configured {
+            return Err(StateError::AccountAlreadyConfigured);
+        }
+        transaction.execute(
+            "INSERT INTO accounts (email, password_hash) VALUES (?1, ?2)",
+            params![email, password_hash],
+        )?;
+        let id = transaction.last_insert_rowid();
+        if let Some(audit) = audit {
+            append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        }
+        transaction.commit()?;
+        Ok(InitialAccount {
+            subject: account_subject(id),
+        })
+    }
+
+    /// Verify a bounded email/password pair without exposing the stored password hash.
+    pub fn verify_credentials(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<CredentialVerification, StateError> {
+        let email = normalize_and_validate_account_email(email)?;
+        validate_account_password(password)?;
+        let account = self
+            .connection
+            .query_row(
+                "SELECT id, password_hash FROM accounts WHERE email = ?1",
+                params![email],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((id, password_hash)) = account else {
+            return Ok(CredentialVerification {
+                ok: false,
+                subject: None,
+            });
+        };
+        let parsed = PasswordHash::new(&password_hash)?;
+        let ok = Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok();
+        Ok(CredentialVerification {
+            ok,
+            subject: ok.then(|| account_subject(id)),
+        })
     }
 
     /// Daemon-owned artifact root for an app deployment.
@@ -981,7 +1162,8 @@ impl State {
         let edge = self
             .connection
             .query_row(
-                "SELECT https_listen, apps_domain, acme_email, acme_directory_url, dns_provider
+                "SELECT https_listen, apps_domain, acme_email, acme_directory_url, dns_provider,
+                        dashboard_domain, apex_domain, ssl_mode
                  FROM edge_config WHERE id = 1",
                 [],
                 |row| {
@@ -991,6 +1173,9 @@ impl State {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -1022,11 +1207,24 @@ impl State {
                 ));
             }
         };
+        let ssl_mode = match edge.7.as_str() {
+            "acme" => SslMode::Acme,
+            "self_signed" => SslMode::SelfSigned,
+            value => {
+                return Err(StateError::InvalidPersisted {
+                    app: "<edge>".into(),
+                    detail: format!("invalid SSL mode {value:?}"),
+                });
+            }
+        };
         let edge = canonical_edge_config(
             listen,
             &EdgeConfig {
                 https_listen,
                 apps_domain: edge.1,
+                dashboard_domain: edge.5,
+                apex_domain: edge.6,
+                ssl_mode,
                 acme,
             },
         )?;
@@ -1087,6 +1285,7 @@ impl State {
         let listen = self.load()?.listen;
         let edge = canonical_edge_config(listen, edge)?;
         let transaction = self.connection.transaction()?;
+        reconcile_native_domains_tx(&transaction, edge.apex_domain.as_deref(), edge.ssl_mode)?;
         store_edge_config_tx(&transaction, &edge)?;
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
@@ -1118,6 +1317,7 @@ impl State {
                 .optional()?;
             if let Some(owner) = owner
                 && owner != input.id
+                && !input.id.starts_with("domain-")
             {
                 return Err(StateError::CertificateDomainConflict {
                     domain: domain.clone(),
@@ -1142,10 +1342,17 @@ impl State {
             if let Some(owner) = owner
                 && owner != input.id
             {
-                return Err(StateError::CertificateDomainConflict {
-                    domain: domain.clone(),
-                    owner,
-                });
+                if input.id.starts_with("domain-") {
+                    transaction.execute(
+                        "DELETE FROM certificate_domains WHERE domain = ?1",
+                        [domain],
+                    )?;
+                } else {
+                    return Err(StateError::CertificateDomainConflict {
+                        domain: domain.clone(),
+                        owner,
+                    });
+                }
             }
         }
         transaction.execute(
@@ -1881,7 +2088,6 @@ impl State {
                     runtime_json
                 ],
             )?;
-            transaction.execute("DELETE FROM domains WHERE app_id = ?1", [app_id])?;
             app_id
         } else {
             transaction.query_row(
@@ -1894,11 +2100,55 @@ impl State {
                 |row| row.get::<_, i64>(0),
             )?
         };
+        let (apex, mode) = transaction.query_row(
+            "SELECT apex_domain, ssl_mode FROM edge_config WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let native = apex
+            .as_deref()
+            .map(|apex| native_domain(&plan.logical_app, apex))
+            .transpose()?;
         for domain in &plan.candidate.domains {
-            transaction.execute(
-                "INSERT INTO domains (app_id, domain) VALUES (?1, ?2)",
-                params![app_id, domain],
-            )?;
+            match domain_owner_tx(&transaction, domain)? {
+                Some((owner, _)) if owner != plan.logical_app => {
+                    return Err(StateError::DomainConflict {
+                        domain: domain.clone(),
+                        owner,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    let kind = if native.as_deref() == Some(domain.as_str()) {
+                        "native"
+                    } else {
+                        "custom"
+                    };
+                    transaction.execute(
+                        "INSERT INTO domains (app_id, domain, kind, tls, status)
+                         VALUES (?1, ?2, ?3, ?4, 'pending')",
+                        params![app_id, domain, kind, mode],
+                    )?;
+                }
+            }
+        }
+        if let Some(native) = native {
+            match domain_owner_tx(&transaction, &native)? {
+                Some((owner, _)) if owner != plan.logical_app => {
+                    return Err(StateError::DomainConflict {
+                        domain: native,
+                        owner,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    transaction.execute(
+                        "INSERT INTO domains (app_id, domain, kind, tls, status)
+                         VALUES (?1, ?2, 'native', ?3, 'pending')",
+                        params![app_id, native, mode],
+                    )?;
+                }
+            }
         }
         transaction.execute("INSERT INTO app_artifacts (app_id, artifact_id, activated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP) ON CONFLICT(app_id) DO UPDATE SET artifact_id = excluded.artifact_id, activated_at = CURRENT_TIMESTAMP", params![app_id, artifact.id])?;
         transaction.execute("UPDATE deployments SET status = 'sealed', updated_at = CURRENT_TIMESTAMP WHERE app = ?1 AND status = 'active'", [&plan.logical_app])?;
@@ -2050,15 +2300,228 @@ impl State {
             }
             Some(_) => {}
             None => {
+                let tls = edge_ssl_mode_tx(&transaction)?;
                 transaction.execute(
-                    "INSERT INTO domains (app_id, domain) VALUES (?1, ?2)",
-                    params![app_id, canonical],
+                    "INSERT INTO domains (app_id, domain, kind, tls, status)
+                     VALUES (?1, ?2, 'custom', ?3, 'pending')",
+                    params![app_id, canonical, tls],
                 )?;
             }
         }
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
         Ok(canonical)
+    }
+
+    /// Return all application domains, optionally restricted to one app.
+    pub fn app_domains(&self, app: Option<&str>) -> Result<Vec<DomainRecord>, StateError> {
+        if let Some(app) = app {
+            let exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM apps WHERE name = ?1)",
+                [app],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StateError::AppNotFound(app.to_owned()));
+            }
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT d.domain, a.name, d.kind, d.tls, d.status, d.expires_unix
+             FROM domains d JOIN apps a ON a.id = d.app_id
+             WHERE (?1 IS NULL OR a.name = ?1)
+             ORDER BY a.name COLLATE BINARY, d.domain COLLATE BINARY",
+        )?;
+        let rows = statement.query_map([app], domain_record_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    /// Add one custom domain using the current node SSL baseline.
+    pub fn add_custom_domain(
+        &mut self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<DomainRecord, StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        let transaction = self.connection.transaction()?;
+        let app_id = app_id_tx(&transaction, app)?;
+        if let Some((owner, kind)) = domain_owner_tx(&transaction, &host)? {
+            if owner != app {
+                return Err(StateError::DomainConflict {
+                    domain: host,
+                    owner,
+                });
+            }
+            if kind == "native" {
+                return Err(StateError::NativeDomainImmutable(host));
+            }
+        } else {
+            let tls = edge_ssl_mode_tx(&transaction)?;
+            transaction.execute(
+                "INSERT INTO domains (app_id, domain, kind, tls, status)
+                 VALUES (?1, ?2, 'custom', ?3, 'pending')",
+                params![app_id, host, tls],
+            )?;
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.domain_for_app(app, &host)
+    }
+
+    /// Remove one custom domain. Native rows are managed only by apex reconciliation.
+    pub fn remove_custom_domain(
+        &mut self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        let transaction = self.connection.transaction()?;
+        app_id_tx(&transaction, app)?;
+        let record = transaction
+            .query_row(
+                "SELECT d.kind FROM domains d JOIN apps a ON a.id = d.app_id
+                 WHERE a.name = ?1 AND d.domain = ?2",
+                params![app, host],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match record.as_deref() {
+            Some("native") => return Err(StateError::NativeDomainImmutable(host)),
+            Some("custom") => {
+                transaction.execute(
+                    "DELETE FROM domains WHERE domain = ?1 AND kind = 'custom'",
+                    [&host],
+                )?;
+            }
+            _ => return Err(StateError::DomainNotFound(host)),
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Change one domain's TLS policy and return it to pending reconciliation.
+    pub fn set_app_domain_tls(
+        &mut self,
+        app: &str,
+        host: &str,
+        tls: DomainTls,
+        audit: &AuditContext,
+    ) -> Result<DomainRecord, StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        let transaction = self.connection.transaction()?;
+        app_id_tx(&transaction, app)?;
+        let changed = transaction.execute(
+            "UPDATE domains SET tls = ?3, status = 'pending', expires_unix = NULL
+             WHERE domain = ?2 AND app_id = (SELECT id FROM apps WHERE name = ?1)",
+            params![app, host, domain_tls_name(tls)],
+        )?;
+        if changed == 0 {
+            return Err(StateError::DomainNotFound(host));
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.domain_for_app(app, &host)
+    }
+
+    /// Atomically set dashboard/apex domains and replace all native app domains.
+    pub fn update_dashboard_domains(
+        &mut self,
+        dashboard_domain: Option<&str>,
+        apex_domain: Option<&str>,
+        audit: &AuditContext,
+    ) -> Result<EdgeConfig, StateError> {
+        validate_audit_context(audit)?;
+        let mut edge = self.load()?.edge;
+        edge.dashboard_domain = dashboard_domain.map(str::to_owned);
+        edge.apex_domain = apex_domain.map(str::to_owned);
+        let listen = self.load()?.listen;
+        let edge = canonical_edge_config(listen, &edge)?;
+        let transaction = self.connection.transaction()?;
+        reconcile_native_domains_tx(&transaction, edge.apex_domain.as_deref(), edge.ssl_mode)?;
+        store_edge_config_tx(&transaction, &edge)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(edge)
+    }
+
+    /// Update the node SSL baseline and reset native domains for reconciliation.
+    pub fn update_ssl_mode(
+        &mut self,
+        mode: SslMode,
+        audit: &AuditContext,
+    ) -> Result<EdgeConfig, StateError> {
+        validate_audit_context(audit)?;
+        let snapshot = self.load()?;
+        let mut edge = snapshot.edge;
+        edge.ssl_mode = mode;
+        let transaction = self.connection.transaction()?;
+        store_edge_config_tx(&transaction, &edge)?;
+        transaction.execute(
+            "UPDATE domains SET tls = ?1, status = 'pending', expires_unix = NULL
+             WHERE kind = 'native'",
+            [ssl_mode_name(mode)],
+        )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(edge)
+    }
+
+    /// Update a domain reconciliation status and expiry atomically with its audit event.
+    pub fn update_domain_status(
+        &mut self,
+        host: &str,
+        status: DomainStatus,
+        expires_unix: Option<i64>,
+        audit: &AuditContext,
+    ) -> Result<DomainRecord, StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        if expires_unix.is_some_and(|expires| expires <= 0) {
+            return Err(StateError::InvalidRecord {
+                kind: "domain",
+                detail: "expires_unix must be positive when present".into(),
+            });
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE domains SET status = ?2, expires_unix = ?3 WHERE domain = ?1",
+            params![host, domain_status_name(status), expires_unix],
+        )?;
+        if changed == 0 {
+            return Err(StateError::DomainNotFound(host));
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.domain(&host)
+    }
+
+    fn domain(&self, host: &str) -> Result<DomainRecord, StateError> {
+        self.connection
+            .query_row(
+                "SELECT d.domain, a.name, d.kind, d.tls, d.status, d.expires_unix
+                 FROM domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?1",
+                [host],
+                domain_record_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| StateError::DomainNotFound(host.to_owned()))
+    }
+
+    fn domain_for_app(&self, app: &str, host: &str) -> Result<DomainRecord, StateError> {
+        let record = self.domain(host)?;
+        if record.app != app {
+            return Err(StateError::DomainConflict {
+                domain: host.to_owned(),
+                owner: record.app,
+            });
+        }
+        Ok(record)
     }
 
     /// Append one explicit success or failure event.
@@ -2694,6 +3157,156 @@ impl State {
         }
         Ok(domains)
     }
+}
+
+fn canonical_exact_domain(input: &str) -> Result<String, StateError> {
+    let domain = canonical_domain(input)
+        .ok_or_else(|| StateError::InvalidConfig(format!("invalid DNS hostname {input:?}")))?;
+    if domain.starts_with("*.") {
+        return Err(StateError::InvalidConfig(
+            "application domains must be exact hostnames".into(),
+        ));
+    }
+    Ok(domain)
+}
+
+fn native_domain(app: &str, apex: &str) -> Result<String, StateError> {
+    canonical_exact_domain(&format!("{app}.{apex}"))
+}
+
+fn app_id_tx(transaction: &Transaction<'_>, app: &str) -> Result<i64, StateError> {
+    transaction
+        .query_row("SELECT id FROM apps WHERE name = ?1", [app], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| StateError::AppNotFound(app.to_owned()))
+}
+
+fn domain_owner_tx(
+    transaction: &Transaction<'_>,
+    host: &str,
+) -> Result<Option<(String, String)>, StateError> {
+    transaction
+        .query_row(
+            "SELECT a.name, d.kind FROM domains d JOIN apps a ON a.id = d.app_id
+             WHERE d.domain = ?1",
+            [host],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(StateError::from)
+}
+
+fn edge_ssl_mode_tx(transaction: &Transaction<'_>) -> Result<&'static str, StateError> {
+    let mode =
+        transaction.query_row("SELECT ssl_mode FROM edge_config WHERE id = 1", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+    match mode.as_str() {
+        "acme" => Ok("acme"),
+        "self_signed" => Ok("self_signed"),
+        _ => Err(StateError::IncompleteState("invalid edge SSL mode".into())),
+    }
+}
+
+fn ssl_mode_name(mode: SslMode) -> &'static str {
+    match mode {
+        SslMode::Acme => "acme",
+        SslMode::SelfSigned => "self_signed",
+    }
+}
+
+fn domain_tls_name(tls: DomainTls) -> &'static str {
+    match tls {
+        DomainTls::Acme => "acme",
+        DomainTls::SelfSigned => "self_signed",
+    }
+}
+
+fn domain_status_name(status: DomainStatus) -> &'static str {
+    match status {
+        DomainStatus::Active => "active",
+        DomainStatus::FallbackActive => "fallback_active",
+        DomainStatus::Issuing => "issuing",
+        DomainStatus::Pending => "pending",
+        DomainStatus::Failed => "failed",
+    }
+}
+
+fn domain_record_from_row(row: &rusqlite::Row<'_>) -> Result<DomainRecord, rusqlite::Error> {
+    let kind = match row.get::<_, String>(2)?.as_str() {
+        "native" => DomainKind::Native,
+        "custom" => DomainKind::Custom,
+        value => {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "domain kind {value}"
+            )));
+        }
+    };
+    let tls = match row.get::<_, String>(3)?.as_str() {
+        "acme" => DomainTls::Acme,
+        "self_signed" => DomainTls::SelfSigned,
+        value => {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "domain TLS {value}"
+            )));
+        }
+    };
+    let status = match row.get::<_, String>(4)?.as_str() {
+        "active" => DomainStatus::Active,
+        "fallback_active" => DomainStatus::FallbackActive,
+        "issuing" => DomainStatus::Issuing,
+        "pending" => DomainStatus::Pending,
+        "failed" => DomainStatus::Failed,
+        value => {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "domain status {value}"
+            )));
+        }
+    };
+    Ok(DomainRecord {
+        host: row.get(0)?,
+        app: row.get(1)?,
+        kind,
+        tls,
+        status,
+        expires_unix: row.get(5)?,
+    })
+}
+
+fn reconcile_native_domains_tx(
+    transaction: &Transaction<'_>,
+    apex: Option<&str>,
+    mode: SslMode,
+) -> Result<(), StateError> {
+    transaction.execute("DELETE FROM domains WHERE kind = 'native'", [])?;
+    let Some(apex) = apex else {
+        return Ok(());
+    };
+    let mut statement =
+        transaction.prepare("SELECT id, name FROM apps ORDER BY name COLLATE BINARY")?;
+    let apps = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (app_id, app) in apps {
+        let host = native_domain(&app, apex)?;
+        if let Some((owner, _)) = domain_owner_tx(transaction, &host)? {
+            return Err(StateError::DomainConflict {
+                domain: host,
+                owner,
+            });
+        }
+        transaction.execute(
+            "INSERT INTO domains (app_id, domain, kind, tls, status)
+             VALUES (?1, ?2, 'native', ?3, 'pending')",
+            params![app_id, host, ssl_mode_name(mode)],
+        )?;
+    }
+    Ok(())
 }
 
 fn create_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -3513,6 +4126,113 @@ fn migrate_v7_to_v8(connection: &Connection) -> Result<(), StateError> {
          UPDATE deployments SET source_kind = 'cli';",
     )?;
     Ok(())
+}
+
+fn migrate_v8_to_v9(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE accounts (
+             id INTEGER PRIMARY KEY,
+             email TEXT NOT NULL COLLATE BINARY UNIQUE
+                 CHECK (email = lower(email) AND email = trim(email)),
+             password_hash TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v9_to_v10(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edge_config (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             https_listen TEXT,
+             apps_domain TEXT,
+             acme_email TEXT,
+             acme_directory_url TEXT,
+             dns_provider TEXT
+         );
+         INSERT OR IGNORE INTO edge_config (id) VALUES (1);
+         ALTER TABLE edge_config ADD COLUMN dashboard_domain TEXT;
+         ALTER TABLE edge_config ADD COLUMN apex_domain TEXT;
+         ALTER TABLE edge_config ADD COLUMN ssl_mode TEXT NOT NULL DEFAULT 'self_signed'
+             CHECK (ssl_mode IN ('acme', 'self_signed'));
+         ALTER TABLE domains RENAME TO domains_v9;
+         CREATE TABLE domains (
+             id INTEGER PRIMARY KEY,
+             app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+             domain TEXT NOT NULL COLLATE BINARY UNIQUE,
+             kind TEXT NOT NULL CHECK (kind IN ('native', 'custom')),
+             tls TEXT NOT NULL CHECK (tls IN ('acme', 'self_signed')),
+             status TEXT NOT NULL CHECK (status IN ('active', 'fallback_active', 'issuing', 'pending', 'failed')),
+             expires_unix INTEGER CHECK (expires_unix IS NULL OR expires_unix > 0)
+         );
+         INSERT INTO domains (id, app_id, domain, kind, tls, status, expires_unix)
+             SELECT id, app_id, domain, 'custom', 'self_signed', 'pending', NULL
+             FROM domains_v9;
+         DROP TABLE domains_v9;
+         CREATE INDEX domains_app_id ON domains(app_id);
+         CREATE INDEX domains_tls_status ON domains(tls, status);",
+    )?;
+    Ok(())
+}
+
+fn normalize_and_validate_account_email(email: &str) -> Result<String, StateError> {
+    let normalized = email.trim().to_lowercase();
+    if normalized.is_empty() || normalized.len() > MAX_ACCOUNT_EMAIL_BYTES {
+        return Err(StateError::InvalidAccountInput(format!(
+            "email must be between 1 and {MAX_ACCOUNT_EMAIL_BYTES} bytes"
+        )));
+    }
+    if normalized
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(StateError::InvalidAccountInput(
+            "email contains whitespace or control characters".into(),
+        ));
+    }
+    let Some((local, domain)) = normalized.split_once('@') else {
+        return Err(StateError::InvalidAccountInput(
+            "email must contain a local part and domain".into(),
+        ));
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return Err(StateError::InvalidAccountInput(
+            "email must contain a local part and domain".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_account_password(password: &str) -> Result<(), StateError> {
+    if !(MIN_ACCOUNT_PASSWORD_BYTES..=MAX_ACCOUNT_PASSWORD_BYTES).contains(&password.len()) {
+        return Err(StateError::InvalidAccountInput(format!(
+            "password must be between {MIN_ACCOUNT_PASSWORD_BYTES} and {MAX_ACCOUNT_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if password.chars().any(char::is_control) {
+        return Err(StateError::InvalidAccountInput(
+            "password contains control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_account_password(password: &str) -> Result<String, StateError> {
+    let mut salt = [0_u8; ACCOUNT_SALT_BYTES];
+    random_fill(&mut salt).map_err(|error| {
+        StateError::Io(std::io::Error::other(format!(
+            "could not generate account password salt: {error}"
+        )))
+    })?;
+    let salt = SaltString::encode_b64(&salt)?;
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string())
+}
+
+fn account_subject(id: i64) -> String {
+    format!("account:{id}")
 }
 
 fn register_engine_tx(
@@ -4563,18 +5283,28 @@ fn store_edge_config_tx(
         .unwrap_or((None, None, None));
     transaction.execute(
         "INSERT INTO edge_config
-         (id, https_listen, apps_domain, acme_email, acme_directory_url, dns_provider)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5)
+         (id, https_listen, apps_domain, acme_email, acme_directory_url, dns_provider,
+          dashboard_domain, apex_domain, ssl_mode)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET https_listen = excluded.https_listen,
              apps_domain = excluded.apps_domain, acme_email = excluded.acme_email,
              acme_directory_url = excluded.acme_directory_url,
-             dns_provider = excluded.dns_provider",
+             dns_provider = excluded.dns_provider,
+             dashboard_domain = excluded.dashboard_domain,
+             apex_domain = excluded.apex_domain,
+             ssl_mode = excluded.ssl_mode",
         params![
             https_listen,
             edge.apps_domain,
             acme_email,
             acme_directory_url,
             dns_provider,
+            edge.dashboard_domain,
+            edge.apex_domain,
+            match edge.ssl_mode {
+                SslMode::Acme => "acme",
+                SslMode::SelfSigned => "self_signed",
+            },
         ],
     )?;
     Ok(())
@@ -4613,13 +5343,28 @@ fn replace_database(
             params![app.name, app.upstream, runtime_json],
             |row| row.get::<_, i64>(0),
         )?;
+        let native = snapshot
+            .edge
+            .apex_domain
+            .as_deref()
+            .map(|apex| native_domain(&app.name, apex))
+            .transpose()?;
         for domain in &app.domains {
+            if native.as_deref() == Some(domain.as_str()) {
+                continue;
+            }
             transaction.execute(
-                "INSERT INTO domains (app_id, domain) VALUES (?1, ?2)",
-                params![app_id, domain],
+                "INSERT INTO domains (app_id, domain, kind, tls, status)
+                 VALUES (?1, ?2, 'custom', ?3, 'pending')",
+                params![app_id, domain, ssl_mode_name(snapshot.edge.ssl_mode)],
             )?;
         }
     }
+    reconcile_native_domains_tx(
+        transaction,
+        snapshot.edge.apex_domain.as_deref(),
+        snapshot.edge.ssl_mode,
+    )?;
     Ok(())
 }
 
@@ -4656,9 +5401,17 @@ fn snapshot_from_config(config: &NodeConfig) -> Result<Snapshot, StateError> {
             lifecycle,
         });
     }
+    let edge = canonical_edge_config(config.listen, &config.edge)?;
+    if let Some(apex) = edge.apex_domain.as_deref() {
+        for app in &mut apps {
+            let native = native_domain(&app.name, apex)?;
+            app.domains.retain(|domain| domain != &native);
+            app.domains.push(native);
+        }
+    }
     let snapshot = Snapshot {
         listen: config.listen,
-        edge: canonical_edge_config(config.listen, &config.edge)?,
+        edge,
         apps,
     };
     validate_snapshot(&snapshot)?;
@@ -4773,6 +5526,22 @@ fn canonical_edge_config(listen: SocketAddr, edge: &EdgeConfig) -> Result<EdgeCo
                 .ok_or_else(|| StateError::InvalidConfig(format!("invalid apps_domain {domain:?}")))
         })
         .transpose()?;
+    let canonical_edge_host = |value: Option<&str>, field: &str| {
+        value
+            .map(|domain| {
+                if domain.trim_start().starts_with("*.") {
+                    return Err(StateError::InvalidConfig(format!(
+                        "{field} must be a hostname, not a wildcard pattern"
+                    )));
+                }
+                canonical_domain(domain)
+                    .ok_or_else(|| StateError::InvalidConfig(format!("invalid {field} {domain:?}")))
+            })
+            .transpose()
+    };
+    let dashboard_domain =
+        canonical_edge_host(edge.dashboard_domain.as_deref(), "dashboard_domain")?;
+    let apex_domain = canonical_edge_host(edge.apex_domain.as_deref(), "apex_domain")?;
     let acme = edge
         .acme
         .as_ref()
@@ -4826,6 +5595,9 @@ fn canonical_edge_config(listen: SocketAddr, edge: &EdgeConfig) -> Result<EdgeCo
     Ok(EdgeConfig {
         https_listen: edge.https_listen,
         apps_domain,
+        dashboard_domain,
+        apex_domain,
+        ssl_mode: edge.ssl_mode,
         acme,
     })
 }
@@ -5116,6 +5888,163 @@ mod tests {
         );
         drop(state);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_v8_through_v10_with_constrained_accounts_table() {
+        let path = temp_db("v8-accounts");
+        {
+            let connection = Connection::open(&path).expect("fixture database");
+            create_schema(&connection).unwrap();
+            migrate_v1_to_v2(&connection).unwrap();
+            migrate_v2_to_v3(&connection).unwrap();
+            migrate_v3_to_v4(&connection).unwrap();
+            migrate_v4_to_v5(&connection, &[0; NODE_KEY_LEN]).unwrap();
+            migrate_v5_to_v6(&connection).unwrap();
+            migrate_v6_to_v7(&connection).unwrap();
+            migrate_v7_to_v8(&connection).unwrap();
+            connection
+                .pragma_update(None, "user_version", 8_i32)
+                .unwrap();
+        }
+
+        let state = State::open(&path).expect("migrate v8 fixture");
+        assert_eq!(
+            state.account_status().unwrap(),
+            AccountStatus { configured: false }
+        );
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let columns = state
+            .connection
+            .prepare("PRAGMA table_info(accounts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, ["id", "email", "password_hash", "created_at"]);
+        assert!(
+            state
+                .connection
+                .execute(
+                    "INSERT INTO accounts (email, password_hash) VALUES ('Admin@Example.com', 'hash')",
+                    [],
+                )
+                .is_err()
+        );
+        state
+            .connection
+            .execute(
+                "INSERT INTO accounts (email, password_hash) VALUES ('admin@example.com', 'hash')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            state
+                .connection
+                .execute(
+                    "INSERT INTO accounts (email, password_hash) VALUES ('admin@example.com', 'other')",
+                    [],
+                )
+                .is_err()
+        );
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn account_password_auth_round_trips_and_wrong_password_is_false() {
+        let path = temp_db("account-roundtrip");
+        let mut state = State::open(&path).unwrap();
+        let account = state
+            .create_initial_account("  Admin@Example.COM  ", "correct horse battery staple")
+            .unwrap();
+        assert_eq!(account.subject, "account:1");
+        assert_eq!(
+            state.account_status().unwrap(),
+            AccountStatus { configured: true }
+        );
+        let (email, password_hash): (String, String) = state
+            .connection
+            .query_row("SELECT email, password_hash FROM accounts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(email, "admin@example.com");
+        assert!(password_hash.starts_with("$argon2id$"));
+        assert!(!password_hash.contains("correct horse battery staple"));
+
+        assert_eq!(
+            state
+                .verify_credentials("ADMIN@example.com", "correct horse battery staple")
+                .unwrap(),
+            CredentialVerification {
+                ok: true,
+                subject: Some(account.subject),
+            }
+        );
+        assert_eq!(
+            state
+                .verify_credentials("admin@example.com", "wrong password value")
+                .unwrap(),
+            CredentialVerification {
+                ok: false,
+                subject: None,
+            }
+        );
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn initial_account_normalization_rejects_duplicates_and_closes_tofu() {
+        let path = temp_db("account-tofu");
+        let mut state = State::open(&path).unwrap();
+        state
+            .create_initial_account("Admin@Example.com", "correct horse battery staple")
+            .unwrap();
+        assert!(matches!(
+            state.create_initial_account(" admin@example.COM ", "another strong password"),
+            Err(StateError::DuplicateAccountEmail(email)) if email == "admin@example.com"
+        ));
+        assert!(matches!(
+            state.create_initial_account("other@example.com", "another strong password"),
+            Err(StateError::AccountAlreadyConfigured)
+        ));
+        let count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn account_inputs_are_bounded() {
+        let path = temp_db("account-bounds");
+        let mut state = State::open(&path).unwrap();
+        assert!(matches!(
+            state.create_initial_account("not-an-email", "correct horse battery staple"),
+            Err(StateError::InvalidAccountInput(_))
+        ));
+        assert!(matches!(
+            state.create_initial_account("admin@example.com", "short"),
+            Err(StateError::InvalidAccountInput(_))
+        ));
+        assert!(matches!(
+            state.create_initial_account(
+                "admin@example.com",
+                &"x".repeat(MAX_ACCOUNT_PASSWORD_BYTES + 1)
+            ),
+            Err(StateError::InvalidAccountInput(_))
+        ));
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -6242,6 +7171,9 @@ mod tests {
         input.edge = EdgeConfig {
             https_listen: Some("0.0.0.0:443".parse().unwrap()),
             apps_domain: Some("Apps.Example.COM.".into()),
+            dashboard_domain: None,
+            apex_domain: None,
+            ssl_mode: SslMode::SelfSigned,
             acme: Some(AcmeConfig {
                 email: "ops@example.com".into(),
                 directory_url: crate::edge::DEFAULT_ACME_DIRECTORY.into(),
@@ -6257,6 +7189,9 @@ mod tests {
         let updated = EdgeConfig {
             https_listen: Some("127.0.0.1:8443".parse().unwrap()),
             apps_domain: Some("preview.example.com".into()),
+            dashboard_domain: Some("console.example.com".into()),
+            apex_domain: Some("native.example.com".into()),
+            ssl_mode: SslMode::Acme,
             acme: Some(AcmeConfig {
                 email: "admin@example.com".into(),
                 directory_url: "https://acme.test/directory".into(),
@@ -6277,6 +7212,154 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.audit_records().unwrap().len(), 1);
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn v9_domain_rows_migrate_as_custom_with_self_signed_pending_state() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE apps (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+                 CREATE TABLE domains (
+                     id INTEGER PRIMARY KEY,
+                     app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+                     domain TEXT NOT NULL COLLATE BINARY UNIQUE
+                 );
+                 CREATE INDEX domains_app_id ON domains(app_id);
+                 CREATE TABLE edge_config (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     https_listen TEXT, apps_domain TEXT, acme_email TEXT,
+                     acme_directory_url TEXT, dns_provider TEXT
+                 );
+                 INSERT INTO apps VALUES (1, 'api');
+                 INSERT INTO domains VALUES (1, 1, 'api.example.com');
+                 INSERT INTO edge_config (id) VALUES (1);",
+            )
+            .unwrap();
+        migrate_v9_to_v10(&connection).unwrap();
+        let row = connection
+            .query_row(
+                "SELECT kind, tls, status, expires_unix FROM domains WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "custom".into(),
+                "self_signed".into(),
+                "pending".into(),
+                None
+            )
+        );
+        let edge = connection
+            .query_row(
+                "SELECT dashboard_domain, apex_domain, ssl_mode FROM edge_config WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(edge, (None, None, "self_signed".into()));
+    }
+
+    #[test]
+    fn apex_reconciliation_and_custom_lifecycle_are_atomic_and_audited() {
+        let path = temp_db("domain-lifecycle");
+        let mut state = State::open(&path).unwrap();
+        let mut input = config();
+        input.apps[0].domains = vec!["custom.example.net".into()];
+        input.edge.apex_domain = Some("Example.COM.".into());
+        state.apply(&input).unwrap();
+        assert_eq!(
+            native_domain("api", "example.com").unwrap(),
+            "api.example.com"
+        );
+        let domains = state.app_domains(Some("api")).unwrap();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.iter().any(|domain| domain.host == "api.example.com" && domain.kind == DomainKind::Native));
+        assert!(
+            domains
+                .iter()
+                .any(|domain| domain.host == "custom.example.net"
+                    && domain.kind == DomainKind::Custom)
+        );
+
+        let custom = state
+            .add_custom_domain("api", "WWW.Example.NET.", &audit_context("domain-add"))
+            .unwrap();
+        assert_eq!(custom.host, "www.example.net");
+        let toggled = state
+            .set_app_domain_tls(
+                "api",
+                "www.example.net",
+                DomainTls::Acme,
+                &audit_context("domain-tls"),
+            )
+            .unwrap();
+        assert_eq!(toggled.tls, DomainTls::Acme);
+        assert_eq!(toggled.status, DomainStatus::Pending);
+        let active = state
+            .update_domain_status(
+                "www.example.net",
+                DomainStatus::Active,
+                Some(4_102_444_800),
+                &audit_context("domain-status"),
+            )
+            .unwrap();
+        assert_eq!(active.status, DomainStatus::Active);
+        assert!(matches!(
+            state.remove_custom_domain(
+                "api",
+                "api.example.com",
+                &audit_context("domain-native-remove")
+            ),
+            Err(StateError::NativeDomainImmutable(_))
+        ));
+        state
+            .remove_custom_domain("api", "www.example.net", &audit_context("domain-remove"))
+            .unwrap();
+        state
+            .update_dashboard_domains(
+                Some("Console.New.Example"),
+                Some("new.example"),
+                &audit_context("domain-apex"),
+            )
+            .unwrap();
+        let domains = state.app_domains(Some("api")).unwrap();
+        assert!(domains.iter().any(|domain| domain.host == "api.new.example" && domain.kind == DomainKind::Native));
+        assert!(
+            !domains
+                .iter()
+                .any(|domain| domain.host == "api.example.com")
+        );
+        assert!(
+            domains
+                .iter()
+                .any(|domain| domain.host == "custom.example.net"
+                    && domain.kind == DomainKind::Custom)
+        );
+        assert_eq!(
+            state.load().unwrap().edge.dashboard_domain.as_deref(),
+            Some("console.new.example")
+        );
+        assert_eq!(state.audit_records().unwrap().len(), 5);
         drop(state);
         let _ = fs::remove_file(path);
     }

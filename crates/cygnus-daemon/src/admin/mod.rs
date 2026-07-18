@@ -9,10 +9,10 @@ pub use client::{AdminClient, invalid_request_id, request, request as request_ad
 pub use handler::{AdminMutation, AdminMutationError, AdminMutationHandler, StateAdminHandler};
 pub use protocol::{
     ADMIN_PROTOCOL_VERSION, ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode,
-    AdminFault, AdminRequest, AdminResponse, AppView, CertificateView, DeploymentView, EngineView,
-    GitHubInstallationRepositoryView, GitHubJobView, GitHubRepositoryView, LogStream,
-    MAX_ADMIN_FRAME_BYTES, MAX_LOG_CHUNK_BYTES, MemoryView, NodeView, read_frame, valid_request_id,
-    write_frame,
+    AdminFault, AdminRequest, AdminResponse, AppDomainView, AppView, CertificateView,
+    DeploymentView, DomainDnsView, EngineView, GitHubInstallationRepositoryView, GitHubJobView,
+    GitHubRepositoryView, LogStream, MAX_ADMIN_FRAME_BYTES, MAX_LOG_CHUNK_BYTES, MemoryView,
+    NodeView, read_frame, valid_request_id, write_frame,
 };
 pub use server::{
     ADMIN_IO_TIMEOUT, AdminBinding, AdminHandler, AdminPeerCredentials, AdminRole, AdminServer,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -20,24 +20,25 @@ use cygnus_daemon::Frontend;
 use cygnus_daemon::acme::{AcmeManager, CloudflareDnsProvider, Dns01Provider, Http01Challenges};
 use cygnus_daemon::admin::{
     ActiveDeploymentView, AdminBinding, AdminData, AdminErrorCode, AdminHandler, AdminMutation,
-    AdminMutationError, AdminMutationHandler, AdminRole, AdminServer, DEFAULT_HOST_ADMIN_SOCKET,
-    DEFAULT_TENANT_ADMIN_SOCKET, StateAdminHandler,
+    AdminMutationError, AdminMutationHandler, AdminRole, AdminServer, AppDomainView,
+    DEFAULT_HOST_ADMIN_SOCKET, DEFAULT_TENANT_ADMIN_SOCKET, DomainDnsView, StateAdminHandler,
 };
 use cygnus_daemon::deploy::{
     ActivationPreparation, DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare,
     register_engine_with_audit,
 };
-use cygnus_daemon::edge::EdgeConfig;
+use cygnus_daemon::domains::{StdDnsResolver, dns_precheck, expected_public_ipv4};
+use cygnus_daemon::edge::{CertificateRecord, EdgeConfig, SslMode};
 use cygnus_daemon::github::{
     GitHubDeployExecutor, GitHubManager, GitHubWorker, safe_extract_archive_reader,
 };
 use cygnus_daemon::metrics::{EventRecord, MetricsHub};
 use cygnus_daemon::state::{
     AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, DeployJob, DeployJobSource,
-    DeployJobStatus, DeploymentSource, DeploymentStatus, LoadedApp, NodeConfig, Snapshot, State,
-    StateError,
+    DeployJobStatus, DeploymentSource, DeploymentStatus, DomainRecord, DomainStatus, DomainTls,
+    LoadedApp, NodeConfig, Snapshot, State, StateError,
 };
-use cygnus_daemon::tls::TlsServer;
+use cygnus_daemon::tls::{TlsServer, domain_certificate_id, self_signed_fallback};
 use cygnus_router::{Route, RouteTable, Router};
 use cygnus_supervisor::{Instance, LifecycleState, Supervisor};
 use sha2::{Digest, Sha256};
@@ -179,6 +180,7 @@ struct LiveDeployRuntime<I> {
     tenant_admin_socket: PathBuf,
     runtime_apps: RuntimeApps,
     metrics: MetricsHub,
+    tls: Option<TlsServer>,
     gate: Arc<parking_lot::Mutex<()>>,
 }
 
@@ -189,6 +191,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         tenant_admin_socket: impl Into<PathBuf>,
         runtime_apps: RuntimeApps,
         metrics: MetricsHub,
+        tls: Option<TlsServer>,
     ) -> Self {
         Self {
             supervisor,
@@ -196,6 +199,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
             tenant_admin_socket: tenant_admin_socket.into(),
             runtime_apps,
             metrics,
+            tls,
             gate: Arc::new(parking_lot::Mutex::new(())),
         }
     }
@@ -272,6 +276,8 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
             })?;
 
             let new_runtime_key = format!("r-{}", result.artifact_hash);
+            ensure_domain_fallbacks(state, self.tls.as_ref(), self.tls.is_some(), &self.metrics)
+                .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
             self.install_after_commit(&state.load()?, previous_runtime_key, &new_runtime_key);
             Ok(result)
         })();
@@ -587,6 +593,8 @@ struct LiveAdminMutations {
     runtime_apps: RuntimeApps,
     metrics: MetricsHub,
     runtime: Arc<LiveDeployRuntime<Cage>>,
+    tls: Option<TlsServer>,
+    http01_challenges: Http01Challenges,
 }
 
 impl AdminMutationHandler for LiveAdminMutations {
@@ -604,6 +612,17 @@ impl AdminMutationHandler for LiveAdminMutations {
                 is_default,
             } => self.register_engine(version, host_root, cage_executable, is_default, audit),
             AdminMutation::Deploy(request) => self.deploy(request, audit),
+            AdminMutation::SetDashboardDomain { domain, apex } => {
+                self.set_dashboard_domains(domain.as_deref(), apex.as_deref(), audit)
+            }
+            AdminMutation::SetDashboardTls { mode } => self.set_dashboard_tls(mode, audit),
+            AdminMutation::AddAppDomain { app, host } => self.add_app_domain(&app, &host, audit),
+            AdminMutation::RemoveAppDomain { app, host } => {
+                self.remove_app_domain(&app, &host, audit)
+            }
+            AdminMutation::SetAppDomainTls { app, host, mode } => {
+                self.set_app_domain_tls(&app, &host, mode, audit)
+            }
             AdminMutation::MapDomain { app, domain } => self.map_domain(&app, &domain, audit),
             AdminMutation::Rollback {
                 app,
@@ -622,10 +641,14 @@ impl LiveAdminMutations {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
         let current = state.load().map_err(map_admin_state_error)?;
         let desired = state.preview(config).map_err(map_admin_state_error)?;
-        if current.listen != desired.listen || current.edge != desired.edge {
+        if current.listen != desired.listen
+            || current.edge.https_listen != desired.edge.https_listen
+            || current.edge.apps_domain != desired.edge.apps_domain
+            || current.edge.acme != desired.edge.acme
+        {
             return Err(AdminMutationError::new(
                 AdminErrorCode::Conflict,
-                "listener and public-edge changes require daemon restart",
+                "listener, legacy apps-domain, and ACME account changes require daemon restart",
             ));
         }
 
@@ -691,7 +714,23 @@ impl LiveAdminMutations {
             }
             return Err(map_admin_state_error(error));
         }
-        let retired = self.router.install(route_table(&desired));
+        ensure_domain_fallbacks(
+            &mut state,
+            self.tls.as_ref(),
+            self.tls.is_some(),
+            &self.metrics,
+        )
+        .map_err(|error| AdminMutationError::new(AdminErrorCode::Internal, error.to_string()))?;
+        let applied = state.load().map_err(map_admin_state_error)?;
+        let retired = self.router.install(route_table(&applied));
+        if applied.edge.ssl_mode == SslMode::Acme {
+            let _ = reconcile_acme_domains(
+                &self.state_path,
+                self.http01_challenges.clone(),
+                self.tls.as_ref(),
+                &self.metrics,
+            );
+        }
         let removed = current_apps
             .keys()
             .filter(|name| !desired_apps.contains_key(**name))
@@ -768,6 +807,12 @@ impl LiveAdminMutations {
             .runtime
             .deploy(&mut state, request, audit)
             .map_err(map_deploy_error)?;
+        let _ = reconcile_acme_domains(
+            &self.state_path,
+            self.http01_challenges.clone(),
+            self.tls.as_ref(),
+            &self.metrics,
+        );
         Ok(AdminData::DeploymentActivated {
             app: result.deployment.app,
             deployment_id: result.deployment_id,
@@ -778,6 +823,145 @@ impl LiveAdminMutations {
 }
 
 impl LiveAdminMutations {
+    fn set_dashboard_domains(
+        &self,
+        domain: Option<&str>,
+        apex: Option<&str>,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let edge = state
+            .update_dashboard_domains(domain, apex, audit)
+            .map_err(map_admin_state_error)?;
+        self.refresh_domains(&mut state)?;
+        if edge.ssl_mode == SslMode::Acme {
+            let _ = reconcile_acme_domains(
+                &self.state_path,
+                self.http01_challenges.clone(),
+                self.tls.as_ref(),
+                &self.metrics,
+            );
+        }
+        Ok(AdminData::DashboardDomainSet {
+            domain: edge.dashboard_domain,
+            apex: edge.apex_domain,
+        })
+    }
+
+    fn set_dashboard_tls(
+        &self,
+        mode: SslMode,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        state
+            .update_ssl_mode(mode, audit)
+            .map_err(map_admin_state_error)?;
+        self.refresh_domains(&mut state)?;
+        if mode == SslMode::Acme {
+            let _ = reconcile_acme_domains(
+                &self.state_path,
+                self.http01_challenges.clone(),
+                self.tls.as_ref(),
+                &self.metrics,
+            );
+        }
+        Ok(AdminData::DashboardTlsSet { mode })
+    }
+
+    fn add_app_domain(
+        &self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let domain = state
+            .add_custom_domain(app, host, audit)
+            .map_err(map_admin_state_error)?;
+        self.refresh_domains(&mut state)?;
+        if domain.tls == DomainTls::Acme {
+            let _ = reconcile_acme_domains(
+                &self.state_path,
+                self.http01_challenges.clone(),
+                self.tls.as_ref(),
+                &self.metrics,
+            );
+        }
+        let domain = State::open(&self.state_path)
+            .and_then(|state| state.app_domains(Some(app)))
+            .map_err(map_admin_state_error)?
+            .into_iter()
+            .find(|candidate| candidate.host == domain.host)
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::Internal, "domain disappeared")
+            })?;
+        Ok(AdminData::AppDomainAdded {
+            domain: live_domain_view(domain),
+        })
+    }
+
+    fn remove_app_domain(
+        &self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        state
+            .remove_custom_domain(app, host, audit)
+            .map_err(map_admin_state_error)?;
+        let snapshot = state.load().map_err(map_admin_state_error)?;
+        drop(self.router.install(route_table(&snapshot)));
+        Ok(AdminData::AppDomainRemoved {
+            app: app.to_owned(),
+            host: host.to_lowercase().trim_end_matches('.').to_owned(),
+        })
+    }
+
+    fn set_app_domain_tls(
+        &self,
+        app: &str,
+        host: &str,
+        mode: DomainTls,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let domain = state
+            .set_app_domain_tls(app, host, mode, audit)
+            .map_err(map_admin_state_error)?;
+        self.refresh_domains(&mut state)?;
+        if mode == DomainTls::Acme {
+            let _ = reconcile_acme_domains(
+                &self.state_path,
+                self.http01_challenges.clone(),
+                self.tls.as_ref(),
+                &self.metrics,
+            );
+        }
+        let domain = State::open(&self.state_path)
+            .and_then(|state| state.app_domains(Some(app)))
+            .map_err(map_admin_state_error)?
+            .into_iter()
+            .find(|candidate| candidate.host == domain.host)
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::Internal, "domain disappeared")
+            })?;
+        Ok(AdminData::AppDomainTlsSet {
+            domain: live_domain_view(domain),
+        })
+    }
+
+    fn refresh_domains(&self, state: &mut State) -> Result<(), AdminMutationError> {
+        ensure_domain_fallbacks(state, self.tls.as_ref(), self.tls.is_some(), &self.metrics)
+            .map_err(|error| {
+                AdminMutationError::new(AdminErrorCode::Internal, error.to_string())
+            })?;
+        let snapshot = state.load().map_err(map_admin_state_error)?;
+        drop(self.router.install(route_table(&snapshot)));
+        Ok(())
+    }
+
     fn map_domain(
         &self,
         app: &str,
@@ -785,26 +969,16 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
-        let snapshot = state.load().map_err(map_admin_state_error)?;
-        let loaded = snapshot
-            .apps
-            .iter()
-            .find(|candidate| candidate.name == app)
-            .ok_or_else(|| {
-                AdminMutationError::new(AdminErrorCode::NotFound, "app does not exist")
-            })?;
-        let mut routes = route_table(&snapshot);
         let canonical = state
             .map_domain(app, domain, audit)
             .map_err(map_admin_state_error)?;
-        routes.insert(
-            &canonical,
-            Route {
-                app: loaded.spec.name.clone(),
-                upstream: loaded.upstream.clone(),
-            },
+        self.refresh_domains(&mut state)?;
+        let _ = reconcile_acme_domains(
+            &self.state_path,
+            self.http01_challenges.clone(),
+            self.tls.as_ref(),
+            &self.metrics,
         );
-        drop(self.router.install(routes));
         record_event(
             &self.metrics,
             "domain_mapped",
@@ -924,8 +1098,9 @@ fn map_deploy_error(error: DeployError) -> AdminMutationError {
 
 fn map_admin_state_error(error: StateError) -> AdminMutationError {
     let code = match error {
-        StateError::AppNotFound(_) => AdminErrorCode::NotFound,
+        StateError::AppNotFound(_) | StateError::DomainNotFound(_) => AdminErrorCode::NotFound,
         StateError::DomainConflict { .. }
+        | StateError::NativeDomainImmutable(_)
         | StateError::ActivationConflict { .. }
         | StateError::DestructiveApply => AdminErrorCode::Conflict,
         StateError::InvalidConfig(_)
@@ -946,6 +1121,7 @@ fn map_admin_state_error(error: StateError) -> AdminMutationError {
 
 fn route_table(snapshot: &Snapshot) -> RouteTable {
     let mut routes = RouteTable::new();
+    let mut tenant_zero = None;
     for app in &snapshot.apps {
         for domain in &app.domains {
             routes.insert(
@@ -962,11 +1138,16 @@ fn route_table(snapshot: &Snapshot) -> RouteTable {
         // instead of returning 404. It stays auth-gated, so this exposes no
         // data; it only guarantees the operator can always reach the console.
         if app.tenant_admin {
-            routes.set_default(Some(Route {
+            let route = Route {
                 app: app.spec.name.clone(),
                 upstream: app.upstream.clone(),
-            }));
+            };
+            routes.set_default(Some(route.clone()));
+            tenant_zero = Some(route);
         }
+    }
+    if let (Some(domain), Some(route)) = (snapshot.edge.dashboard_domain.as_deref(), tenant_zero) {
+        routes.insert(domain, route);
     }
     routes
 }
@@ -1040,18 +1221,10 @@ fn serve(
     }));
     let mut routes = RouteTable::new();
     let mut pinned = Vec::new();
-    let edge = snapshot.edge.clone();
-    let certificate_domains = snapshot
-        .apps
-        .iter()
-        .flat_map(|app| app.domains.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-
     for app in &mut snapshot.apps {
         configure_tenant_admin(app, tenant_admin_socket)?;
     }
+    let routing_snapshot = snapshot.clone();
     for app in snapshot.apps {
         install_app(
             &supervisor,
@@ -1062,7 +1235,7 @@ fn serve(
             app,
         );
     }
-    drop(router.install(routes));
+    drop(router.install(route_table(&routing_snapshot)));
 
     for app in pinned {
         if let Err(error) = supervisor.acquire(&app) {
@@ -1090,14 +1263,10 @@ fn serve(
         }
         result
     });
-    if https_listener.is_some() && edge.acme.is_some() {
-        ensure_acme_certificates(
-            state_path,
-            &edge,
-            &certificate_domains,
-            frontend.http01_challenges(),
-            &metrics,
-        )?;
+    let http01_challenges = frontend.http01_challenges();
+    if https_listener.is_some() {
+        let mut state = State::open(state_path)?;
+        ensure_domain_fallbacks(&mut state, None, true, &metrics)?;
     }
     let tls = https_listener
         .map(|listener| {
@@ -1106,17 +1275,15 @@ fn serve(
             Ok::<_, Box<dyn Error>>((listener, TlsServer::from_certificates(&certificates)?))
         })
         .transpose()?;
-    let renewal_thread = tls.as_ref().and_then(|(_, tls)| {
-        edge.acme.as_ref()?;
-        Some(spawn_certificate_renewer(
+    let live_tls = tls.as_ref().map(|(_, tls)| tls.clone());
+    let renewal_thread = live_tls.as_ref().map(|tls| {
+        spawn_domain_reconciler(
             state_path.to_owned(),
-            edge.clone(),
-            certificate_domains.clone(),
-            frontend.http01_challenges(),
+            http01_challenges.clone(),
             tls.clone(),
             Arc::clone(&shutdown),
             metrics.clone(),
-        ))
+        )
     });
     let tls_thread = tls.map(|(tls_listener, tls)| {
         let tls_address = local_addr(&tls_listener);
@@ -1140,6 +1307,7 @@ fn serve(
         tenant_admin_socket.to_owned(),
         Arc::clone(&runtime_apps),
         metrics.clone(),
+        live_tls.clone(),
     ));
     let mutations: Arc<dyn AdminMutationHandler> = Arc::new(LiveAdminMutations {
         state_path: state_path.to_owned(),
@@ -1149,6 +1317,8 @@ fn serve(
         runtime_apps: Arc::clone(&runtime_apps),
         metrics: metrics.clone(),
         runtime: Arc::clone(&live_runtime),
+        tls: live_tls,
+        http01_challenges,
     });
     let github = Arc::new(GitHubManager::new(state_path));
     let github_worker = GitHubWorker::new(
@@ -1267,141 +1437,294 @@ fn serve(
     admin_result?;
     Ok(())
 }
-fn ensure_acme_certificates(
-    state_path: &Path,
-    edge: &EdgeConfig,
-    domains: &[String],
-    challenges: Http01Challenges,
+fn system_domain_audit(host: &str, command: &str) -> AuditContext {
+    let mut digest = Sha256::new();
+    digest.update(command.as_bytes());
+    digest.update([0]);
+    digest.update(host.as_bytes());
+    let request_digest = format!("{:x}", digest.finalize());
+    AuditContext {
+        endpoint_role: AuditEndpointRole::Host,
+        peer_uid: Some(unsafe { libc::geteuid() }),
+        peer_gid: Some(unsafe { libc::getegid() }),
+        peer_pid: Some(std::process::id()),
+        actor_subject: Some("system:domain-reconciler".into()),
+        request_id: request_digest[..32].into(),
+        command_kind: command.into(),
+        request_digest,
+    }
+}
+
+fn live_domain_view(domain: DomainRecord) -> AppDomainView {
+    let expected_ip = expected_public_ipv4();
+    let precheck = dns_precheck(&StdDnsResolver, &domain.host, expected_ip);
+    AppDomainView {
+        host: domain.host,
+        kind: domain.kind,
+        tls: domain.tls,
+        status: domain.status,
+        dns: DomainDnsView {
+            expected_ip: precheck.expected_ip.map(|ip| ip.to_string()),
+            resolves_to: precheck
+                .resolves_to
+                .into_iter()
+                .map(|ip| ip.to_string())
+                .collect(),
+            ok: precheck.ok,
+        },
+        expires_unix: domain.expires_unix,
+    }
+}
+
+fn certificate_is_fallback(certificate: &CertificateRecord) -> bool {
+    let Ok(file) = fs::File::open(&certificate.certificate_path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let Some(Ok(der)) = rustls_pemfile::certs(&mut reader).next() else {
+        return false;
+    };
+    let Ok((_, parsed)) = x509_parser::parse_x509_certificate(der.as_ref()) else {
+        return false;
+    };
+    parsed.subject().iter_common_name().any(|name| {
+        name.as_str()
+            .is_ok_and(|value| value == "Cygnus self-signed fallback")
+    })
+}
+
+fn certificate_for_host<'a>(
+    certificates: &'a [CertificateRecord],
+    host: &str,
+) -> Option<&'a CertificateRecord> {
+    let id = domain_certificate_id(host);
+    certificates.iter().find(|certificate| certificate.id == id)
+}
+
+fn ensure_domain_fallbacks(
+    state: &mut State,
+    tls: Option<&TlsServer>,
+    https_enabled: bool,
     metrics: &MetricsHub,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(config) = edge.acme.clone() else {
+    if !https_enabled {
         return Ok(());
-    };
-    if domains.is_empty() {
-        return Err("ACME is configured but no routed domains exist".into());
+    }
+    let snapshot = state.load()?;
+    let mut app_domains = state.app_domains(None)?;
+    let mut hosts = app_domains
+        .iter()
+        .map(|domain| domain.host.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(dashboard) = snapshot.edge.dashboard_domain.as_ref() {
+        hosts.insert(dashboard.clone());
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let renew_before = now + 30 * 24 * 60 * 60;
-    let mut state = State::open(state_path)?;
-    let installed = state.certificates()?;
-    let pending = domains
-        .chunks(100)
-        .filter(|chunk| {
-            !installed.iter().any(|certificate| {
-                certificate.not_after_unix > renew_before
-                    && chunk
-                        .iter()
-                        .all(|domain| certificate.domains.iter().any(|covered| covered == domain))
-            })
-        })
-        .map(<[String]>::to_vec)
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let dns: Option<Arc<dyn Dns01Provider>> = match config.dns_provider.as_deref() {
-        None => None,
-        Some("cloudflare") => Some(Arc::new(CloudflareDnsProvider::from_environment()?)),
-        Some(provider) => return Err(format!("unsupported DNS-01 provider {provider:?}").into()),
-    };
-    let manager = AcmeManager::new(config, state_path, challenges, dns)?;
-    for chunk in pending {
-        let replacement = installed.iter().any(|certificate| {
-            chunk
-                .iter()
-                .any(|domain| certificate.domains.iter().any(|covered| covered == domain))
+    let mut certificates = state.certificates()?;
+    let mut changed = false;
+    for host in hosts {
+        let force_fallback = app_domains
+            .iter()
+            .find(|domain| domain.host == host)
+            .is_some_and(|domain| domain.tls == DomainTls::SelfSigned)
+            || (snapshot.edge.dashboard_domain.as_deref() == Some(host.as_str())
+                && snapshot.edge.ssl_mode == SslMode::SelfSigned);
+        let usable = certificate_for_host(&certificates, &host).is_some_and(|certificate| {
+            certificate.not_after_unix > now
+                && (!force_fallback || certificate_is_fallback(certificate))
         });
-        let input = match manager.issue(&chunk) {
-            Ok(input) => input,
-            Err(error) => {
-                record_event(metrics, "cert_failed", None, "certificate issuance failed");
-                return Err(Box::new(error));
-            }
-        };
-        let mut digest = Sha256::new();
-        for domain in &chunk {
-            digest.update(domain.as_bytes());
-        }
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        if let Err(error) = state.install_certificate(
-            &input,
-            &AuditContext {
-                endpoint_role: AuditEndpointRole::Host,
-                peer_uid: Some(unsafe { libc::geteuid() }),
-                peer_gid: Some(unsafe { libc::getegid() }),
-                peer_pid: Some(std::process::id()),
-                actor_subject: Some("cygnus-acme".into()),
-                request_id: format!("acme-{timestamp}"),
-                command_kind: "certificate_install".into(),
-                request_digest: format!("{:x}", digest.finalize()),
-            },
-        ) {
+        let fallback_installed = !usable;
+        if fallback_installed {
+            let fallback = self_signed_fallback(&host)?;
+            let audit = system_domain_audit(&host, "fallback_certificate_install");
+            state.install_certificate(&fallback, &audit)?;
+            certificates = state.certificates()?;
+            changed = true;
             record_event(
                 metrics,
-                "cert_failed",
+                "cert_fallback",
                 None,
-                "certificate installation failed",
+                format!("self-signed fallback installed for {host}"),
             );
-            return Err(Box::new(error));
         }
-        record_event(
-            metrics,
-            if replacement {
-                "cert_renewed"
-            } else {
-                "cert_issued"
-            },
-            None,
-            if replacement {
-                "certificate renewed"
-            } else {
-                "certificate issued"
-            },
-        );
+        if let Some(domain) = app_domains.iter_mut().find(|domain| domain.host == host)
+            && (fallback_installed
+                || domain.status != DomainStatus::Active
+                || domain.tls == DomainTls::SelfSigned)
+        {
+            let audit = system_domain_audit(&host, "domain_fallback_active");
+            *domain = state.update_domain_status(
+                &host,
+                DomainStatus::FallbackActive,
+                certificate_for_host(&certificates, &host)
+                    .map(|certificate| certificate.not_after_unix),
+                &audit,
+            )?;
+        }
+    }
+    if changed && let Some(tls) = tls {
+        tls.reload(&certificates)?;
     }
     Ok(())
 }
 
-fn spawn_certificate_renewer(
+fn acme_manager(
+    edge: &EdgeConfig,
+    state_path: &Path,
+    challenges: Http01Challenges,
+) -> Result<Option<AcmeManager>, Box<dyn Error>> {
+    let Some(config) = edge.acme.clone() else {
+        return Ok(None);
+    };
+    let dns: Option<Arc<dyn Dns01Provider>> = match config.dns_provider.as_deref() {
+        None => None,
+        Some("cloudflare") => match CloudflareDnsProvider::from_environment() {
+            Ok(provider) => Some(Arc::new(provider)),
+            Err(_) => return Ok(None),
+        },
+        Some(_) => return Ok(None),
+    };
+    Ok(Some(AcmeManager::new(config, state_path, challenges, dns)?))
+}
+
+fn reconcile_acme_domains(
+    state_path: &Path,
+    challenges: Http01Challenges,
+    tls: Option<&TlsServer>,
+    metrics: &MetricsHub,
+) -> Result<bool, Box<dyn Error>> {
+    let mut state = State::open(state_path)?;
+    let snapshot = state.load()?;
+    let Some(manager) = acme_manager(&snapshot.edge, state_path, challenges)? else {
+        return Ok(false);
+    };
+    let expected_ip = expected_public_ipv4();
+    let mut had_failure = false;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let renew_before = now + 30 * 24 * 60 * 60;
+    let domains = state.app_domains(None)?;
+    for domain in domains {
+        if domain.tls != DomainTls::Acme
+            || (domain.status == DomainStatus::Active
+                && domain
+                    .expires_unix
+                    .is_some_and(|expires| expires > renew_before))
+        {
+            continue;
+        }
+        let precheck = dns_precheck(&StdDnsResolver, &domain.host, expected_ip);
+        if !precheck.ok {
+            continue;
+        }
+        state.update_domain_status(
+            &domain.host,
+            DomainStatus::Issuing,
+            domain.expires_unix,
+            &system_domain_audit(&domain.host, "domain_acme_issuing"),
+        )?;
+        let issued = manager.issue(std::slice::from_ref(&domain.host));
+        match issued {
+            Ok(mut certificate) => {
+                certificate.id = domain_certificate_id(&domain.host);
+                let expires = certificate.not_after_unix;
+                state.install_certificate(
+                    &certificate,
+                    &system_domain_audit(&domain.host, "domain_acme_install"),
+                )?;
+                let certificates = state.certificates()?;
+                if let Some(tls) = tls {
+                    tls.reload(&certificates)?;
+                }
+                state.update_domain_status(
+                    &domain.host,
+                    DomainStatus::Active,
+                    Some(expires),
+                    &system_domain_audit(&domain.host, "domain_acme_active"),
+                )?;
+                record_event(
+                    metrics,
+                    "cert_issued",
+                    Some(&domain.app),
+                    "ACME certificate active",
+                );
+            }
+            Err(_) => {
+                had_failure = true;
+                let has_fallback = certificate_for_host(&state.certificates()?, &domain.host)
+                    .is_some_and(|certificate| certificate.not_after_unix > now);
+                state.update_domain_status(
+                    &domain.host,
+                    if has_fallback {
+                        DomainStatus::FallbackActive
+                    } else {
+                        DomainStatus::Failed
+                    },
+                    domain.expires_unix,
+                    &system_domain_audit(&domain.host, "domain_acme_failed"),
+                )?;
+                record_event(
+                    metrics,
+                    "cert_failed",
+                    Some(&domain.app),
+                    "ACME issuance failed",
+                );
+            }
+        }
+    }
+    if snapshot.edge.ssl_mode == SslMode::Acme
+        && let Some(host) = snapshot.edge.dashboard_domain.as_deref()
+    {
+        let certificates = state.certificates()?;
+        let installed = certificate_for_host(&certificates, host);
+        let needs_certificate = installed.is_none_or(|certificate| {
+            certificate_is_fallback(certificate) || certificate.not_after_unix <= renew_before
+        });
+        if needs_certificate
+            && dns_precheck(&StdDnsResolver, host, expected_ip).ok
+            && let Ok(mut certificate) = manager.issue(&[host.to_owned()])
+        {
+            certificate.id = domain_certificate_id(host);
+            state.install_certificate(
+                &certificate,
+                &system_domain_audit(host, "dashboard_acme_install"),
+            )?;
+            let certificates = state.certificates()?;
+            if let Some(tls) = tls {
+                tls.reload(&certificates)?;
+            }
+            record_event(
+                metrics,
+                "cert_issued",
+                None,
+                "dashboard ACME certificate active",
+            );
+        }
+    }
+    Ok(had_failure)
+}
+
+fn spawn_domain_reconciler(
     state_path: PathBuf,
-    edge: EdgeConfig,
-    domains: Vec<String>,
     challenges: Http01Challenges,
     tls: TlsServer,
     shutdown: Arc<AtomicBool>,
     metrics: MetricsHub,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut next_check = Instant::now() + Duration::from_secs(12 * 60 * 60);
+        let mut next_check = Instant::now();
         while !shutdown.load(Ordering::Acquire) {
-            if Instant::now() < next_check {
-                thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            match ensure_acme_certificates(
-                &state_path,
-                &edge,
-                &domains,
-                challenges.clone(),
-                &metrics,
-            ) {
-                Ok(()) => match State::open(&state_path)
-                    .and_then(|state| state.certificates())
-                    .map_err(|error| error.to_string())
-                    .and_then(|certificates| {
-                        tls.reload(&certificates).map_err(|error| error.to_string())
-                    }) {
-                    Ok(()) => next_check = Instant::now() + Duration::from_secs(12 * 60 * 60),
+            if Instant::now() >= next_check {
+                match reconcile_acme_domains(&state_path, challenges.clone(), Some(&tls), &metrics)
+                {
+                    Ok(true) => next_check = Instant::now() + Duration::from_secs(60 * 60),
+                    Ok(false) => next_check = Instant::now() + Duration::from_secs(10 * 60),
                     Err(error) => {
-                        eprintln!("cygnus-daemon: TLS certificate reload failed: {error}");
+                        eprintln!("cygnus-daemon: domain reconciliation failed: {error}");
                         next_check = Instant::now() + Duration::from_secs(60 * 60);
                     }
-                },
-                Err(error) => {
-                    eprintln!("cygnus-daemon: ACME renewal failed: {error}");
-                    next_check = Instant::now() + Duration::from_secs(60 * 60);
                 }
             }
+            thread::sleep(Duration::from_millis(250));
         }
     })
 }
@@ -1610,6 +1933,75 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn dashboard_route_targets_tenant_zero_and_keeps_default_fallback() {
+        let directory = unique_dir("dashboard-route");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = directory.join("state.db");
+        let mut state = State::open(&state_path).unwrap();
+        let mut config = NodeConfig::default();
+        config.edge.dashboard_domain = Some("console.example.com".into());
+        config.apps = vec![
+            cygnus_daemon::state::AppConfig {
+                name: "tenant-zero".into(),
+                tenant_admin: true,
+                upstream: "/tmp/tenant-zero.sock".into(),
+                command: "/bin/true".into(),
+                ..Default::default()
+            },
+            cygnus_daemon::state::AppConfig {
+                name: "api".into(),
+                domains: vec!["api.example.com".into()],
+                upstream: "/tmp/api.sock".into(),
+                command: "/bin/true".into(),
+                ..Default::default()
+            },
+        ];
+        state.apply(&config).unwrap();
+        let routes = route_table(&state.load().unwrap());
+        assert_eq!(
+            routes.resolve("console.example.com").unwrap().app,
+            "tenant-zero"
+        );
+        assert_eq!(
+            routes.resolve("unknown.example.com").unwrap().app,
+            "tenant-zero"
+        );
+        assert_eq!(routes.resolve("api.example.com").unwrap().app, "api");
+        drop(state);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fallback_install_covers_every_named_route_and_updates_domain_status() {
+        let directory = unique_dir("fallback-install");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = directory.join("state.db");
+        let mut state = State::open(&state_path).unwrap();
+        let mut config = NodeConfig::default();
+        config.edge.https_listen = Some("127.0.0.1:8443".parse().unwrap());
+        config.edge.dashboard_domain = Some("console.example.com".into());
+        config.apps = vec![cygnus_daemon::state::AppConfig {
+            name: "api".into(),
+            domains: vec!["api.example.com".into()],
+            upstream: "/tmp/api-fallback.sock".into(),
+            command: "/bin/true".into(),
+            ..Default::default()
+        }];
+        state.apply(&config).unwrap();
+        let tls = TlsServer::from_certificates(&[]).unwrap();
+        ensure_domain_fallbacks(&mut state, Some(&tls), true, &MetricsHub::new()).unwrap();
+        let certificates = state.certificates().unwrap();
+        assert!(certificate_for_host(&certificates, "api.example.com").is_some());
+        assert!(certificate_for_host(&certificates, "console.example.com").is_some());
+        assert_eq!(
+            state.app_domains(Some("api")).unwrap()[0].status,
+            DomainStatus::FallbackActive
+        );
+        drop(state);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[derive(Clone)]
     struct FakeInstance {
         events: Arc<parking_lot::Mutex<Vec<&'static str>>>,
@@ -1668,6 +2060,7 @@ mod tests {
             "/tmp/cygnus-test-admin.sock",
             Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             MetricsHub::new(),
+            None,
         );
         (runtime, supervisor, router, events, shutdowns)
     }

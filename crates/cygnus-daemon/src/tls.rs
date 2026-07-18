@@ -16,11 +16,44 @@ use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, ServerConnection};
 use thiserror::Error;
 
-use crate::edge::CertificateRecord;
+use crate::edge::{CertificateInput, CertificateRecord};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use sha2::{Digest, Sha256};
 
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const TLS_BUFFER_LIMIT: usize = 256 * 1024;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const FALLBACK_VALID_DAYS: i64 = 365;
+
+/// Stable certificate id shared by a host's fallback and eventual ACME certificate.
+pub fn domain_certificate_id(host: &str) -> String {
+    let digest = Sha256::digest(normalize_host(host).as_bytes());
+    format!("domain-{}", hex::encode(&digest[..12]))
+}
+
+/// Generate a one-host self-signed certificate under the host's stable certificate id.
+pub fn self_signed_fallback(host: &str) -> Result<CertificateInput, TlsError> {
+    let host = normalize_host(host);
+    let mut params = CertificateParams::new(vec![host.clone()])
+        .map_err(|error| TlsError::Invalid(error.to_string()))?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, "Cygnus self-signed fallback");
+    params.distinguished_name = distinguished_name;
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(FALLBACK_VALID_DAYS);
+    let key = KeyPair::generate().map_err(|error| TlsError::Invalid(error.to_string()))?;
+    let certificate = params
+        .self_signed(&key)
+        .map_err(|error| TlsError::Invalid(error.to_string()))?;
+    Ok(CertificateInput {
+        id: domain_certificate_id(&host),
+        domains: vec![host],
+        certificate_pem: certificate.pem().into_bytes(),
+        private_key_pem: key.serialize_pem().into_bytes(),
+        not_after_unix: params.not_after.unix_timestamp(),
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -58,11 +91,6 @@ impl TlsServer {
 }
 
 fn server_config(certificates: &[CertificateRecord]) -> Result<ServerConfig, TlsError> {
-    if certificates.is_empty() {
-        return Err(TlsError::Invalid(
-            "HTTPS requires at least one installed certificate".into(),
-        ));
-    }
     let provider = Arc::new(default_provider());
     let mut resolver = CertificateResolver::default();
     for certificate in certificates {
@@ -421,6 +449,17 @@ mod tests {
     }
 
     #[test]
+    fn fallback_generation_uses_exact_san_and_stable_replacement_id() {
+        let first = self_signed_fallback("API.Example.COM.").unwrap();
+        let second = self_signed_fallback("api.example.com").unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.id, domain_certificate_id("api.example.com"));
+        assert_eq!(first.domains, ["api.example.com"]);
+        assert_ne!(first.private_key_pem, second.private_key_pem);
+        assert!(first.not_after_unix > time::OffsetDateTime::now_utc().unix_timestamp());
+    }
+
+    #[test]
     fn resolver_matches_exact_and_one_label_wildcards() {
         let (directory, record, _) = certificate_fixture();
         let tls = TlsServer::from_certificates(&[record]).unwrap();
@@ -454,8 +493,8 @@ mod tests {
         let (first_directory, first, _) = certificate_fixture();
         let tls = TlsServer::from_certificates(&[first]).unwrap();
         let initial = tls.config.load_full();
-        assert!(tls.reload(&[]).is_err());
-        assert!(Arc::ptr_eq(&initial, &tls.config.load_full()));
+        tls.reload(&[]).unwrap();
+        assert!(!Arc::ptr_eq(&initial, &tls.config.load_full()));
 
         let (second_directory, second, _) = certificate_fixture();
         tls.reload(&[second]).unwrap();
