@@ -496,21 +496,18 @@ log "Configure Cygnus"
 if [[ $OS == Darwin ]]; then
   json_command=$(json_safe_string "$prefix/bun")
   json_console_script=$(json_safe_string "$console_root/opt/cygnus-console/server.js")
-  cat >"$stage/node.json" <<EOF
-{"listen":"$json_listen","edge":{"https_listen":$json_https,"apps_domain":"$json_domain","acme":$json_acme},"apps":[{"name":"tenant-0","domains":["$json_console_domain"],"tenant_admin":true,"upstream":"$json_console_upstream","command":"$json_command","args":["$json_console_script"],"env":{"CYGNUS_SOCKET":"$json_console_upstream","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"$json_secret_bootstrap_path","CYGNUS_CONSOLE_SESSION_KEY_FILE":"$json_secret_session_path"},"lifecycle":{"min_instances":1}}]}
-EOF
+  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"%s","args":["%s"],"env":{"CYGNUS_SOCKET":"%s","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"lifecycle":{"min_instances":1}}]}\n' \
+    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_command" "$json_console_script" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" >"$stage/node.json"
 else
-  cat >"$stage/node.json" <<EOF
-{"listen":"$json_listen","edge":{"https_listen":$json_https,"apps_domain":"$json_domain","acme":$json_acme},"apps":[{"name":"tenant-0","domains":["$json_console_domain"],"tenant_admin":true,"upstream":"$json_console_upstream","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"$json_secret_bootstrap_path","CYGNUS_CONSOLE_SESSION_KEY_FILE":"$json_secret_session_path"},"rootfs":{"lowerdirs":["$json_engine_root","$json_console_root","$json_secret_root"]},"lifecycle":{"min_instances":1}}]}
-EOF
+  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
+    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" "$json_engine_root" "$json_console_root" "$json_secret_root" >"$stage/node.json"
 fi
-cat >"$stage/secrets.env" <<EOF
-# Cygnus console credentials; keep this file mode 0600.
-CYGNUS_APPS_DOMAIN=$apps_domain
-CYGNUS_HTTPS_LISTEN=$https_listen
-CYGNUS_ACME_EMAIL=$acme_email
-CYGNUS_DNS_PROVIDER=$dns_provider
-EOF
+printf '%s\n' \
+  '# Cygnus console credentials; keep this file mode 0600.' \
+  "CYGNUS_APPS_DOMAIN=$apps_domain" \
+  "CYGNUS_HTTPS_LISTEN=$https_listen" \
+  "CYGNUS_ACME_EMAIL=$acme_email" \
+  "CYGNUS_DNS_PROVIDER=$dns_provider" >"$stage/secrets.env"
 if [[ $OS == Darwin ]]; then
   xml_escape() {
     printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
@@ -522,59 +519,57 @@ if [[ $OS == Darwin ]]; then
   plist_config=$(xml_escape "$config_file")
   plist_stdout=$(xml_escape "$log_dir/daemon.log")
   plist_stderr=$(xml_escape "$log_dir/daemon.error.log")
-  cat >"$stage/com.cygnus.daemon.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.cygnus.daemon</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$plist_daemon</string>
-    <string>--state</string>
-    <string>$plist_state</string>
-    <string>--admin-socket</string>
-    <string>$plist_admin</string>
-    <string>--tenant-admin-socket</string>
-    <string>$plist_tenant_admin</string>
-    <string>serve</string>
-    <string>--initial-config</string>
-    <string>$plist_config</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$plist_stdout</string>
-  <key>StandardErrorPath</key>
-  <string>$plist_stderr</string>
-</dict>
-</plist>
-EOF
+  printf '%s\n' \
+    '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' \
+    '<dict>' \
+    '  <key>Label</key>' \
+    '  <string>com.cygnus.daemon</string>' \
+    '  <key>ProgramArguments</key>' \
+    '  <array>' \
+    "    <string>$plist_daemon</string>" \
+    '    <string>--state</string>' \
+    "    <string>$plist_state</string>" \
+    '    <string>--admin-socket</string>' \
+    "    <string>$plist_admin</string>" \
+    '    <string>--tenant-admin-socket</string>' \
+    "    <string>$plist_tenant_admin</string>" \
+    '    <string>serve</string>' \
+    '    <string>--initial-config</string>' \
+    "    <string>$plist_config</string>" \
+    '  </array>' \
+    '  <key>RunAtLoad</key>' \
+    '  <true/>' \
+    '  <key>KeepAlive</key>' \
+    '  <true/>' \
+    '  <key>StandardOutPath</key>' \
+    "  <string>$plist_stdout</string>" \
+    '  <key>StandardErrorPath</key>' \
+    "  <string>$plist_stderr</string>" \
+    '</dict>' \
+    '</plist>' >"$stage/com.cygnus.daemon.plist"
 else
-  cat >"$stage/cygnus.service" <<EOF
-[Unit]
-Description=Cygnus request plane
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=-$secrets_env
-ExecStart=$prefix/cygnus-daemon --state $state_dir/state.db --admin-socket $admin_socket --tenant-admin-socket $tenant_admin_socket serve --initial-config $config_file
-Restart=on-failure
-RestartSec=2s
-UMask=0077
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=$state_dir $runtime_dir $config_dir
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  printf '%s\n' \
+    '[Unit]' \
+    'Description=Cygnus request plane' \
+    'Wants=network-online.target' \
+    'After=network-online.target' \
+    '' \
+    '[Service]' \
+    'Type=simple' \
+    "EnvironmentFile=-$secrets_env" \
+    "ExecStart=$prefix/cygnus-daemon --state $state_dir/state.db --admin-socket $admin_socket --tenant-admin-socket $tenant_admin_socket serve --initial-config $config_file" \
+    'Restart=on-failure' \
+    'RestartSec=2s' \
+    'UMask=0077' \
+    'PrivateTmp=true' \
+    'ProtectSystem=full' \
+    'ProtectHome=read-only' \
+    "ReadWritePaths=$state_dir $runtime_dir $config_dir" \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' >"$stage/cygnus.service"
 fi
 service_stage=$stage/cygnus.service
 [[ $OS == Darwin ]] && service_stage=$stage/com.cygnus.daemon.plist
