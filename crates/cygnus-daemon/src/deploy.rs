@@ -1545,8 +1545,8 @@ fn publish_or_reuse(
     artifact_hash: &str,
     metadata_json: &str,
 ) -> Result<bool, DeployError> {
-    validate_tree(building)?;
-    if hash_manifest(&build_manifest(building)?) != artifact_hash {
+    validate_tree(building).map_err(|e| DeployError::InvalidInput(format!("STEP validate_tree: {e:?}")))?;
+    if hash_manifest(&build_manifest(building).map_err(|e| DeployError::InvalidInput(format!("STEP manifest: {e:?}")))?) != artifact_hash {
         return Err(DeployError::InvalidInput(
             "staged artifact content does not match its computed hash".into(),
         ));
@@ -1558,13 +1558,14 @@ fn publish_or_reuse(
         return Ok(true);
     }
 
-    sync_tree(building)?;
-    make_read_only(building)?;
-    sync_tree(building)?;
+    sync_tree(building).map_err(|e| DeployError::InvalidInput(format!("STEP sync1: {e:?}")))?;
+    make_read_only(building).map_err(|e| DeployError::InvalidInput(format!("STEP make_read_only: {e:?}")))?;
+    sync_tree(building).map_err(|e| DeployError::InvalidInput(format!("STEP sync2: {e:?}")))?;
     match rename_noreplace(building, final_path) {
         Ok(()) => {
             if let Some(parent) = final_path.parent() {
-                sync_best_effort(&File::open(parent)?)?;
+                sync_best_effort(&File::open(parent).map_err(|e| DeployError::InvalidInput(format!("STEP parent_open: {e:?}")))?)
+                    .map_err(|e| DeployError::InvalidInput(format!("STEP parent_sync: {e:?}")))?;
             }
             Ok(false)
         }
@@ -1573,7 +1574,7 @@ fn publish_or_reuse(
             remove_read_only_tree(building)?;
             Ok(true)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(DeployError::InvalidInput(format!("STEP rename: {error:?}"))),
     }
 }
 
