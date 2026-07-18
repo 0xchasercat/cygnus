@@ -79,5 +79,5 @@ jobs:
           tag_name: v${{ inputs.version }}
           name: Cygnus v${{ inputs.version }}
           files: artifacts/*
-          draft: true
+          draft: false
           generate_release_notes: true
