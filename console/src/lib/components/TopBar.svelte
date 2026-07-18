@@ -77,7 +77,7 @@
         <span class="av-t">OP</span>
       </button>
       {#if menuOpen}
-        <div class="popover" role="menu" onclick={(e) => e.stopPropagation()}>
+        <div class="popover" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.key === 'Escape' && closeMenu()}>
           <div class="pop-head">
             <span class="pop-label mono">operator</span>
           </div>
