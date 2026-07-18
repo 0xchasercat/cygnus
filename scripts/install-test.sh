@@ -340,6 +340,18 @@ darwin_session_before=$(hash_file "$DARWIN_SECRETS/session.key")
 run_darwin_install >/dev/null 2>&1
 [[ $(hash_file "$DARWIN_SECRETS/bootstrap.token") == "$darwin_bootstrap_before" ]] || { echo 'darwin rerun rotated bootstrap token' >&2; exit 1; }
 [[ $(hash_file "$DARWIN_SECRETS/session.key") == "$darwin_session_before" ]] || { echo 'darwin rerun rotated session key' >&2; exit 1; }
+
+: >"$CYGNUS_TEST_LAUNCHCTL_LOG"
+export CYGNUS_TEST_LAUNCHCTL_BOOTSTRAP_STATUS=1
+run_darwin_install >/dev/null 2>&1
+grep -q "^load -w $DARWIN_PLIST$" "$CYGNUS_TEST_LAUNCHCTL_LOG" || { echo 'launchctl load fallback missing' >&2; exit 1; }
+
+rm -f "$CYGNUS_TEST_READY_FILE" "$CYGNUS_TEST_TENANT_READY_FILE"
+export CYGNUS_TEST_LAUNCHCTL_LOAD_STATUS=1
+run_darwin_install >"$DARWIN_ROOT/foreground-output" 2>&1 || { echo 'darwin install failed when launchctl was unavailable' >&2; exit 1; }
+grep -Fq "Launch Cygnus with: $DARWIN_PREFIX/cygnus-daemon --state $DARWIN_STATE/state.db --admin-socket $DARWIN_RUNTIME/admin.sock --tenant-admin-socket $DARWIN_RUNTIME/tenant-0/admin.sock serve" "$DARWIN_ROOT/foreground-output" || { echo 'darwin foreground command missing' >&2; exit 1; }
+unset CYGNUS_TEST_LAUNCHCTL_BOOTSTRAP_STATUS CYGNUS_TEST_LAUNCHCTL_LOAD_STATUS
+
 run_darwin_install --rotate-secrets >/dev/null 2>&1
 [[ $(hash_file "$DARWIN_SECRETS/bootstrap.token") != "$darwin_bootstrap_before" ]] || { echo 'darwin bootstrap token did not rotate' >&2; exit 1; }
 [[ $(hash_file "$DARWIN_SECRETS/session.key") != "$darwin_session_before" ]] || { echo 'darwin session key did not rotate' >&2; exit 1; }

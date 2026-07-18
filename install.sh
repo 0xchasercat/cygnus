@@ -4,15 +4,16 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VERSION_DEFAULT=${CYGNUS_BUN_VERSION:-bundled}
-OS=${CYGNUS_INSTALL_TEST_UNAME:-$(uname -s)}
-case $OS in
-  Linux|Darwin) ;;
-  *) printf 'cygnus installer: ERROR: Unsupported OS: %s\n' "$OS" >&2; exit 1 ;;
-esac
 TEST_MODE=0
 if [[ ${CYGNUS_INSTALL_TEST_MODE:-0} == 1 || ${CYGNUS_INSTALL_TEST:-0} == 1 || ${CYGNUS_TEST_MODE:-0} == 1 ]]; then
   TEST_MODE=1
 fi
+OS=$(uname -s)
+if (( TEST_MODE )) && [[ -n ${CYGNUS_INSTALL_TEST_UNAME:-} ]]; then OS=$CYGNUS_INSTALL_TEST_UNAME; fi
+case $OS in
+  Linux|Darwin) ;;
+  *) printf 'cygnus installer: ERROR: Unsupported OS: %s\n' "$OS" >&2; exit 1 ;;
+esac
 TEST_ROOT=${CYGNUS_INSTALL_TEST_ROOT:-${CYGNUS_TEST_ROOT:-}}
 if (( TEST_MODE )) && [[ -z $TEST_ROOT ]]; then
   TEST_ROOT=${TMPDIR:-/tmp}/cygnus-installer-test-root
@@ -236,7 +237,7 @@ if (( ! TEST_MODE )) && [[ $OS == Linux ]]; then check_host; fi
 # All source checks happen before any destination mkdir/write.  The staging
 # directory and diagnostics are outside installation destinations.
 stage=$(mktemp -d "${TMPDIR:-/tmp}/cygnus-install.XXXXXX")
-diag_file=${TMPDIR:-/tmp}/cygnus-install-$BASHPID.log
+diag_file=${TMPDIR:-/tmp}/cygnus-install-$$.log
 : >"$diag_file"
 chmod 0600 "$diag_file"
 exec 3>>"$diag_file"
@@ -260,11 +261,13 @@ command -v "$hash_tool" >/dev/null 2>&1 || fail "sha256 checksum tool is missing
 if [[ $OS == Darwin ]]; then
   required=(cygnus-daemon cygnus bun cygnus-console.tar)
   allowed_bundle_member='cygnus-daemon|cygnus|bun|cygnus-console.tar'
+  [[ ! -e $bundle_dir/cygnus-init ]] || fail "unexpected Darwin bundle member: cygnus-init"
 else
   required=(cygnus-daemon cygnus cygnus-init bun cygnus-console.tar)
   allowed_bundle_member='cygnus-daemon|cygnus|cygnus-init|bun|cygnus-console.tar'
 fi
-declare -A expected=()
+expected_file=$stage/expected-checksums
+: >"$expected_file"
 while IFS= read -r sum_line || [[ -n $sum_line ]]; do
   [[ -z $sum_line ]] && continue
   # Checksums are intentionally strict: only a hash and one bundle basename.
@@ -273,21 +276,33 @@ while IFS= read -r sum_line || [[ -n $sum_line ]]; do
   if [[ $name == \** ]]; then name=${name#\*}; fi
   [[ $sum =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid checksum in SHA256SUMS"
   [[ $name =~ ^($allowed_bundle_member)$ ]] || fail "unexpected or unsafe checksum path: $name"
-  [[ -z ${expected[$name]+present} ]] || fail "duplicate checksum entry: $name"
-  expected[$name]=${sum,,}
+  duplicate=0
+  while IFS=$'\t' read -r _ existing_name; do
+    if [[ $existing_name == "$name" ]]; then duplicate=1; break; fi
+  done <"$expected_file"
+  (( ! duplicate )) || fail "duplicate checksum entry: $name"
+  sum=$(printf '%s' "$sum" | tr '[:upper:]' '[:lower:]')
+  printf '%s\t%s\n' "$sum" "$name" >>"$expected_file"
 done < "$sums_file"
 checksum_file() {
   local file=$1 result
   if [[ $hash_tool == sha256sum ]]; then result=$(sha256sum -- "$file"); else result=$(shasum -a 256 -- "$file"); fi
   printf '%s' "${result%% *}"
 }
+expected_checksum() {
+  local wanted=$1 stored_sum stored_name
+  while IFS=$'\t' read -r stored_sum stored_name; do
+    if [[ $stored_name == "$wanted" ]]; then printf '%s' "$stored_sum"; return 0; fi
+  done <"$expected_file"
+  return 1
+}
 for name in "${required[@]}"; do
   src=$bundle_dir/$name
-  [[ -n ${expected[$name]+present} ]] || fail "SHA256SUMS has no entry for required binary: $name"
+  expected_sum=$(expected_checksum "$name") || fail "SHA256SUMS has no entry for required binary: $name"
   [[ -f $src && ! -L $src ]] || fail "bundle input is not a regular file: $name"
   if [[ $name != cygnus-console.tar ]]; then [[ -x $src ]] || fail "bundle input is not executable: $name"; fi
-  actual=$(checksum_file "$src")
-  [[ ${expected[$name]} == "${actual,,}" ]] || fail "checksum verification failed for $name"
+  actual=$(checksum_file "$src" | tr '[:upper:]' '[:lower:]')
+  [[ $expected_sum == "$actual" ]] || fail "checksum verification failed for $name"
 done
 
 console_archive=$bundle_dir/cygnus-console.tar
@@ -447,11 +462,7 @@ CYGNUS_DNS_PROVIDER=$dns_provider
 EOF
 if [[ $OS == Darwin ]]; then
   xml_escape() {
-    local value=$1
-    value=${value//&/&amp;}
-    value=${value//</&lt;}
-    value=${value//>/&gt;}
-    printf '%s' "$value"
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
   }
   plist_daemon=$(xml_escape "$prefix/cygnus-daemon")
   plist_state=$(xml_escape "$state_dir/state.db")
@@ -621,8 +632,8 @@ atomic_install_dir() {
     [[ $kind == secrets && $rotate_secrets -eq 1 ]] && allow_replace=1
     (( allow_replace )) || fail "existing $dest differs; re-run with $([[ $kind == secrets ]] && printf '%s' --rotate-secrets || printf '%s' --reconfigure)"
   fi
-  tmp=$parent/.$(basename "$dest").staging-$BASHPID
-  old=$parent/.$(basename "$dest").previous-$BASHPID
+  tmp=$parent/.$(basename "$dest").staging-$$
+  old=$parent/.$(basename "$dest").previous-$$
   rm -rf -- "$tmp" "$old"
   mkdir -p -- "$tmp"
   chmod "$mode" "$tmp"
