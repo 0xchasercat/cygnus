@@ -28,6 +28,15 @@ pub struct AdminRequest {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
     Health,
+    AccountStatus,
+    CreateInitialAccount {
+        email: String,
+        password: String,
+    },
+    VerifyCredentials {
+        email: String,
+        password: String,
+    },
     Status,
     GetMetrics,
     ListRequests {
@@ -239,6 +248,16 @@ pub enum AdminData {
     Health {
         service: String,
         isolation: String,
+    },
+    AccountStatus {
+        configured: bool,
+    },
+    InitialAccountCreated {
+        subject: String,
+    },
+    Credentials {
+        ok: bool,
+        subject: Option<String>,
     },
     Status {
         node: NodeView,
@@ -564,6 +583,90 @@ mod tests {
             read_frame::<AdminRequest>(&mut frame.as_slice()).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn account_auth_protocol_shapes_are_frozen() {
+        let request_id = "0123456789abcdef0123456789abcdef";
+        let account_status = AdminRequest {
+            version: ADMIN_PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            actor: None,
+            command: AdminCommand::AccountStatus,
+        };
+        assert_eq!(
+            serde_json::to_value(account_status).unwrap(),
+            serde_json::json!({
+                "version": 1,
+                "request_id": request_id,
+                "command": {"type": "account_status"}
+            })
+        );
+
+        let create = AdminRequest {
+            version: ADMIN_PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            actor: None,
+            command: AdminCommand::CreateInitialAccount {
+                email: "admin@example.com".into(),
+                password: "correct horse battery staple".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(create).unwrap()["command"],
+            serde_json::json!({
+                "type": "create_initial_account",
+                "email": "admin@example.com",
+                "password": "correct horse battery staple"
+            })
+        );
+
+        let verify = AdminRequest {
+            version: ADMIN_PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            actor: None,
+            command: AdminCommand::VerifyCredentials {
+                email: "admin@example.com".into(),
+                password: "correct horse battery staple".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(verify).unwrap()["command"],
+            serde_json::json!({
+                "type": "verify_credentials",
+                "email": "admin@example.com",
+                "password": "correct horse battery staple"
+            })
+        );
+
+        for (data, expected) in [
+            (
+                AdminData::AccountStatus { configured: true },
+                serde_json::json!({"kind": "account_status", "configured": true}),
+            ),
+            (
+                AdminData::InitialAccountCreated {
+                    subject: "account:1".into(),
+                },
+                serde_json::json!({
+                    "kind": "initial_account_created",
+                    "subject": "account:1"
+                }),
+            ),
+            (
+                AdminData::Credentials {
+                    ok: false,
+                    subject: None,
+                },
+                serde_json::json!({
+                    "kind": "credentials",
+                    "ok": false,
+                    "subject": null
+                }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(data).unwrap(), expected);
+        }
     }
 
     #[test]

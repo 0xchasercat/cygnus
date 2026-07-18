@@ -146,6 +146,45 @@ impl StateAdminHandler {
                 service: "cygnus-daemon".into(),
                 isolation: cygnus_cage::ISOLATION.into(),
             }),
+            AdminCommand::AccountStatus => {
+                let status = self
+                    .open_state()?
+                    .account_status()
+                    .map_err(HandlerFault::internal)?;
+                Ok(AdminData::AccountStatus {
+                    configured: status.configured,
+                })
+            }
+            AdminCommand::CreateInitialAccount { email, password } => {
+                let audit = self.account_creation_audit(role, peer, request, &email)?;
+                let mut state = self.open_state()?;
+                match state.create_initial_account_with_audit(&email, &password, &audit) {
+                    Ok(account) => Ok(AdminData::InitialAccountCreated {
+                        subject: account.subject,
+                    }),
+                    Err(error) => {
+                        let fault = map_account_state_error(error);
+                        state
+                            .append_audit(
+                                &audit,
+                                AuditOutcome::Failure,
+                                Some(admin_error_name(fault.code)),
+                            )
+                            .map_err(HandlerFault::internal)?;
+                        Err(fault)
+                    }
+                }
+            }
+            AdminCommand::VerifyCredentials { email, password } => {
+                let credentials = self
+                    .open_state()?
+                    .verify_credentials(&email, &password)
+                    .map_err(map_account_state_error)?;
+                Ok(AdminData::Credentials {
+                    ok: credentials.ok,
+                    subject: credentials.subject,
+                })
+            }
             AdminCommand::Status => self.status(),
             AdminCommand::GetMetrics => Ok(AdminData::Metrics {
                 metrics: self.metrics.metrics(),
@@ -688,6 +727,29 @@ impl StateAdminHandler {
             .ok_or_else(|| HandlerFault::internal("GitHub integration is unavailable"))
     }
 
+    fn account_creation_audit(
+        &self,
+        role: AdminRole,
+        peer: AdminPeerCredentials,
+        request: &AdminRequest,
+        email: &str,
+    ) -> Result<AuditContext, HandlerFault> {
+        let digest_input = format!("create_initial_account\0{}", email.trim().to_lowercase());
+        Ok(AuditContext {
+            endpoint_role: match role {
+                AdminRole::Host => AuditEndpointRole::Host,
+                AdminRole::TenantZero => AuditEndpointRole::TenantZero,
+            },
+            peer_uid: peer.uid,
+            peer_gid: peer.gid,
+            peer_pid: peer.pid,
+            actor_subject: None,
+            request_id: request.request_id.clone(),
+            command_kind: "create_initial_account".into(),
+            request_digest: format!("{:x}", Sha256::digest(digest_input)),
+        })
+    }
+
     fn request_audit(
         &self,
         role: AdminRole,
@@ -1037,12 +1099,29 @@ fn map_state_query_error(error: crate::state::StateError) -> HandlerFault {
     }
 }
 
+fn map_account_state_error(error: StateError) -> HandlerFault {
+    match error {
+        StateError::InvalidAccountInput(message) => HandlerFault::validation(message),
+        error @ (StateError::DuplicateAccountEmail(_) | StateError::AccountAlreadyConfigured) => {
+            HandlerFault::conflict(error.to_string())
+        }
+        error => HandlerFault::internal(error),
+    }
+}
+
 struct HandlerFault {
     code: AdminErrorCode,
     message: String,
 }
 
 impl HandlerFault {
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            code: AdminErrorCode::Conflict,
+            message: message.into(),
+        }
+    }
+
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             code: AdminErrorCode::NotFound,
@@ -1143,6 +1222,127 @@ mod tests {
             })
             .unwrap();
         (root, path)
+    }
+
+    #[test]
+    fn account_handlers_create_verify_and_audit_without_exposing_hashes() {
+        let root = state_path().with_extension("account-auth");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.db");
+        State::open(&path).unwrap();
+        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations());
+
+        let status = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::AccountStatus),
+        );
+        let AdminResponse::Ok { data, .. } = &status else {
+            panic!("unexpected account status response");
+        };
+        assert_eq!(
+            data.as_ref(),
+            &AdminData::AccountStatus { configured: false }
+        );
+
+        let created = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials {
+                uid: Some(1000),
+                gid: Some(1000),
+                pid: Some(42),
+            },
+            request(AdminCommand::CreateInitialAccount {
+                email: " Admin@Example.COM ".into(),
+                password: "correct horse battery staple".into(),
+            }),
+        );
+        let AdminResponse::Ok { data, .. } = &created else {
+            panic!("unexpected account creation response");
+        };
+        assert_eq!(
+            data.as_ref(),
+            &AdminData::InitialAccountCreated {
+                subject: "account:1".into(),
+            }
+        );
+
+        for (password, expected_ok) in [
+            ("correct horse battery staple", true),
+            ("incorrect password value", false),
+        ] {
+            let verified = handler.handle(
+                AdminRole::TenantZero,
+                AdminPeerCredentials::default(),
+                request(AdminCommand::VerifyCredentials {
+                    email: "ADMIN@example.com".into(),
+                    password: password.into(),
+                }),
+            );
+            let AdminResponse::Ok { data, .. } = verified else {
+                panic!("unexpected credential verification response");
+            };
+            assert_eq!(
+                *data,
+                AdminData::Credentials {
+                    ok: expected_ok,
+                    subject: expected_ok.then(|| "account:1".into()),
+                }
+            );
+        }
+
+        let duplicate = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::CreateInitialAccount {
+                email: "admin@example.com".into(),
+                password: "another strong password".into(),
+            }),
+        );
+        assert!(matches!(
+            duplicate,
+            AdminResponse::Error { error, .. } if error.code == AdminErrorCode::Conflict
+        ));
+
+        let state = State::open(&path).unwrap();
+        let audits = state.audit_records().unwrap();
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].command_kind, "create_initial_account");
+        assert_eq!(audits[0].outcome, AuditOutcome::Success);
+        assert_eq!(audits[0].endpoint_role, AuditEndpointRole::TenantZero);
+        assert_eq!(audits[0].peer_uid, Some(1000));
+        assert_eq!(audits[0].actor_subject, None);
+        assert_eq!(audits[1].outcome, AuditOutcome::Failure);
+        assert_eq!(audits[1].error_code.as_deref(), Some("conflict"));
+        let serialized = serde_json::to_string(&created).unwrap();
+        assert!(!serialized.contains("password_hash"));
+        assert!(!serialized.contains("$argon2"));
+        drop(state);
+        drop(handler);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_handler_maps_invalid_inputs_to_validation() {
+        let root = state_path().with_extension("account-validation");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.db");
+        State::open(&path).unwrap();
+        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations());
+        let response = handler.handle(
+            AdminRole::TenantZero,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::CreateInitialAccount {
+                email: "bad".into(),
+                password: "correct horse battery staple".into(),
+            }),
+        );
+        assert!(matches!(
+            response,
+            AdminResponse::Error { error, .. } if error.code == AdminErrorCode::Validation
+        ));
+        drop(handler);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

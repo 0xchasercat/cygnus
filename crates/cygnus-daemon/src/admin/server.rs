@@ -21,7 +21,9 @@ use super::protocol::{
 use crate::deploy::upload::{
     MAX_UPLOAD_BYTES, MAX_UPLOAD_CHUNK_BASE64_CHARS, MAX_UPLOAD_CHUNK_BYTES,
 };
-use crate::state::NodeConfig;
+use crate::state::{
+    MAX_ACCOUNT_EMAIL_BYTES, MAX_ACCOUNT_PASSWORD_BYTES, MIN_ACCOUNT_PASSWORD_BYTES, NodeConfig,
+};
 
 /// The listener through which an admin request arrived.
 ///
@@ -453,7 +455,15 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         validate_actor(actor)?;
     }
     match &request.command {
-        AdminCommand::Health | AdminCommand::Status | AdminCommand::GetMetrics => {}
+        AdminCommand::Health
+        | AdminCommand::AccountStatus
+        | AdminCommand::Status
+        | AdminCommand::GetMetrics => {}
+        AdminCommand::CreateInitialAccount { email, password }
+        | AdminCommand::VerifyCredentials { email, password } => {
+            validate_account_email(email)?;
+            validate_account_password(password)?;
+        }
         AdminCommand::ListRequests { limit } | AdminCommand::ListEvents { limit } => {
             if !(1..=MAX_ADMIN_METRICS_LIST_LIMIT).contains(limit) {
                 return Err(format!(
@@ -672,6 +682,22 @@ fn authorize_actor(role: AdminRole, request: &AdminRequest) -> Result<(), String
     if host_only && role != AdminRole::Host {
         return Err("command is restricted to the host admin listener".into());
     }
+    let account_auth = matches!(
+        request.command,
+        AdminCommand::AccountStatus
+            | AdminCommand::CreateInitialAccount { .. }
+            | AdminCommand::VerifyCredentials { .. }
+    );
+    if account_auth {
+        if role != AdminRole::TenantZero {
+            return Err("command is restricted to the Tenant Zero admin listener".into());
+        }
+        return if request.actor.is_none() {
+            Ok(())
+        } else {
+            Err("account authentication requests must not supply an actor".into())
+        };
+    }
     match (role, request.actor.as_deref()) {
         (AdminRole::Host, None) => Ok(()),
         (AdminRole::Host, Some(_)) => Err("host admin requests must not supply an actor".into()),
@@ -680,6 +706,40 @@ fn authorize_actor(role: AdminRole, request: &AdminRequest) -> Result<(), String
             Err("Tenant Zero admin requests require an authenticated actor".into())
         }
     }
+}
+
+fn validate_account_email(email: &str) -> Result<(), String> {
+    let email = email.trim();
+    if email.is_empty() || email.len() > MAX_ACCOUNT_EMAIL_BYTES {
+        return Err(format!(
+            "email must be between 1 and {MAX_ACCOUNT_EMAIL_BYTES} bytes"
+        ));
+    }
+    if email
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err("email contains whitespace or control characters".into());
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err("email must contain a local part and domain".into());
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return Err("email must contain a local part and domain".into());
+    }
+    Ok(())
+}
+
+fn validate_account_password(password: &str) -> Result<(), String> {
+    if !(MIN_ACCOUNT_PASSWORD_BYTES..=MAX_ACCOUNT_PASSWORD_BYTES).contains(&password.len()) {
+        return Err(format!(
+            "password must be between {MIN_ACCOUNT_PASSWORD_BYTES} and {MAX_ACCOUNT_PASSWORD_BYTES} bytes"
+        ));
+    }
+    if password.chars().any(char::is_control) {
+        return Err("password contains control characters".into());
+    }
+    Ok(())
 }
 
 fn validate_actor(actor: &str) -> Result<(), String> {
@@ -1016,6 +1076,57 @@ mod tests {
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.actor = Some("bad actor".into());
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
+    }
+
+    #[test]
+    fn account_auth_commands_are_unauthenticated_only_on_tenant_zero() {
+        for command in [
+            AdminCommand::AccountStatus,
+            AdminCommand::CreateInitialAccount {
+                email: " Admin@Example.COM ".into(),
+                password: "correct horse battery staple".into(),
+            },
+            AdminCommand::VerifyCredentials {
+                email: "admin@example.com".into(),
+                password: "correct horse battery staple".into(),
+            },
+        ] {
+            let mut auth = request();
+            auth.command = command;
+            assert!(authorize_actor(AdminRole::TenantZero, &auth).is_ok());
+            assert!(authorize_actor(AdminRole::Host, &auth).is_err());
+            assert!(validate_request(&auth).is_ok());
+            auth.actor = Some("account:1".into());
+            assert!(authorize_actor(AdminRole::TenantZero, &auth).is_err());
+        }
+    }
+
+    #[test]
+    fn account_auth_validation_rejects_malformed_and_unbounded_inputs() {
+        let mut auth = request();
+        auth.command = AdminCommand::CreateInitialAccount {
+            email: "not-an-email".into(),
+            password: "correct horse battery staple".into(),
+        };
+        assert!(validate_request(&auth).is_err());
+
+        auth.command = AdminCommand::CreateInitialAccount {
+            email: "admin@example.com".into(),
+            password: "short".into(),
+        };
+        assert!(validate_request(&auth).is_err());
+
+        auth.command = AdminCommand::VerifyCredentials {
+            email: format!("{}@example.com", "a".repeat(MAX_ACCOUNT_EMAIL_BYTES)),
+            password: "correct horse battery staple".into(),
+        };
+        assert!(validate_request(&auth).is_err());
+
+        auth.command = AdminCommand::VerifyCredentials {
+            email: "admin@example.com".into(),
+            password: "x".repeat(MAX_ACCOUNT_PASSWORD_BYTES + 1),
+        };
+        assert!(validate_request(&auth).is_err());
     }
 
     #[test]

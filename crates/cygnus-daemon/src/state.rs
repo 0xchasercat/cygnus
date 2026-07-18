@@ -10,6 +10,8 @@ use crate::edge::{
     AcmeConfig, CertificateInput, CertificateRecord, CertificateStore, CertificateStoreError,
     EdgeConfig,
 };
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use cygnus_cage::{
@@ -22,7 +24,7 @@ use cygnus_supervisor::{
     DEFAULT_IDLE_TTL, LifecycleConfig,
 };
 use getrandom::fill as random_fill;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -30,8 +32,12 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_ACCOUNT_EMAIL_BYTES: usize = 254;
+pub const MIN_ACCOUNT_PASSWORD_BYTES: usize = 12;
+pub const MAX_ACCOUNT_PASSWORD_BYTES: usize = 1024;
+const ACCOUNT_SALT_BYTES: usize = 16;
 const SHA256_HEX_LEN: usize = 64;
 const NODE_KEY_LEN: usize = 32;
 const SECRET_NONCE_LEN: usize = 24;
@@ -171,6 +177,25 @@ pub struct ActiveDeploymentRecord {
     pub deployment_id: String,
     pub artifact_hash: String,
     pub engine_version: String,
+}
+
+/// Whether password authentication has been configured for this node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct AccountStatus {
+    pub configured: bool,
+}
+
+/// Public identity returned after the first account is created.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InitialAccount {
+    pub subject: String,
+}
+
+/// Result of checking an email/password pair. Password hashes never leave state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CredentialVerification {
+    pub ok: bool,
+    pub subject: Option<String>,
 }
 
 /// Administrative endpoint provenance persisted with an audit event.
@@ -780,6 +805,14 @@ pub enum StateError {
     Io(#[from] std::io::Error),
     #[error("secret authentication failed")]
     SecretAuthentication,
+    #[error("password hashing failed: {0}")]
+    PasswordHash(#[from] argon2::password_hash::Error),
+    #[error("invalid account input: {0}")]
+    InvalidAccountInput(String),
+    #[error("an account with email {0:?} already exists")]
+    DuplicateAccountEmail(String),
+    #[error("initial account setup has already been completed")]
+    AccountAlreadyConfigured,
     #[error("state schema version {found} is unsupported (expected {expected})")]
     UnknownSchemaVersion { found: i32, expected: i32 },
     #[error("configuration for app {app:?} has an invalid cage specification: {source}")]
@@ -893,6 +926,7 @@ impl State {
                 5 => migrate_v5_to_v6(&transaction)?,
                 6 => migrate_v6_to_v7(&transaction)?,
                 7 => migrate_v7_to_v8(&transaction)?,
+                8 => migrate_v8_to_v9(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -912,6 +946,109 @@ impl State {
     /// Canonical parent directory that owns daemon state and deployment data.
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    /// Report whether the node has an account configured for password authentication.
+    pub fn account_status(&self) -> Result<AccountStatus, StateError> {
+        let configured =
+            self.connection
+                .query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(AccountStatus { configured })
+    }
+
+    /// Create the node's first account. Once any account exists, setup is permanently closed.
+    pub fn create_initial_account(
+        &mut self,
+        email: &str,
+        password: &str,
+    ) -> Result<InitialAccount, StateError> {
+        self.create_initial_account_inner(email, password, None)
+    }
+
+    /// Create the first account and append the successful creation audit atomically.
+    pub fn create_initial_account_with_audit(
+        &mut self,
+        email: &str,
+        password: &str,
+        audit: &AuditContext,
+    ) -> Result<InitialAccount, StateError> {
+        validate_audit_context(audit)?;
+        self.create_initial_account_inner(email, password, Some(audit))
+    }
+
+    fn create_initial_account_inner(
+        &mut self,
+        email: &str,
+        password: &str,
+        audit: Option<&AuditContext>,
+    ) -> Result<InitialAccount, StateError> {
+        let email = normalize_and_validate_account_email(email)?;
+        validate_account_password(password)?;
+        let password_hash = hash_account_password(password)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let duplicate: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE email = ?1)",
+            params![email],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            return Err(StateError::DuplicateAccountEmail(email));
+        }
+        let configured: bool =
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM accounts)", [], |row| {
+                row.get(0)
+            })?;
+        if configured {
+            return Err(StateError::AccountAlreadyConfigured);
+        }
+        transaction.execute(
+            "INSERT INTO accounts (email, password_hash) VALUES (?1, ?2)",
+            params![email, password_hash],
+        )?;
+        let id = transaction.last_insert_rowid();
+        if let Some(audit) = audit {
+            append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        }
+        transaction.commit()?;
+        Ok(InitialAccount {
+            subject: account_subject(id),
+        })
+    }
+
+    /// Verify a bounded email/password pair without exposing the stored password hash.
+    pub fn verify_credentials(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<CredentialVerification, StateError> {
+        let email = normalize_and_validate_account_email(email)?;
+        validate_account_password(password)?;
+        let account = self
+            .connection
+            .query_row(
+                "SELECT id, password_hash FROM accounts WHERE email = ?1",
+                params![email],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((id, password_hash)) = account else {
+            return Ok(CredentialVerification {
+                ok: false,
+                subject: None,
+            });
+        };
+        let parsed = PasswordHash::new(&password_hash)?;
+        let ok = Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok();
+        Ok(CredentialVerification {
+            ok,
+            subject: ok.then(|| account_subject(id)),
+        })
     }
 
     /// Daemon-owned artifact root for an app deployment.
@@ -3515,6 +3652,78 @@ fn migrate_v7_to_v8(connection: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn migrate_v8_to_v9(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE accounts (
+             id INTEGER PRIMARY KEY,
+             email TEXT NOT NULL COLLATE BINARY UNIQUE
+                 CHECK (email = lower(email) AND email = trim(email)),
+             password_hash TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );",
+    )?;
+    Ok(())
+}
+
+fn normalize_and_validate_account_email(email: &str) -> Result<String, StateError> {
+    let normalized = email.trim().to_lowercase();
+    if normalized.is_empty() || normalized.len() > MAX_ACCOUNT_EMAIL_BYTES {
+        return Err(StateError::InvalidAccountInput(format!(
+            "email must be between 1 and {MAX_ACCOUNT_EMAIL_BYTES} bytes"
+        )));
+    }
+    if normalized
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(StateError::InvalidAccountInput(
+            "email contains whitespace or control characters".into(),
+        ));
+    }
+    let Some((local, domain)) = normalized.split_once('@') else {
+        return Err(StateError::InvalidAccountInput(
+            "email must contain a local part and domain".into(),
+        ));
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return Err(StateError::InvalidAccountInput(
+            "email must contain a local part and domain".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_account_password(password: &str) -> Result<(), StateError> {
+    if !(MIN_ACCOUNT_PASSWORD_BYTES..=MAX_ACCOUNT_PASSWORD_BYTES).contains(&password.len()) {
+        return Err(StateError::InvalidAccountInput(format!(
+            "password must be between {MIN_ACCOUNT_PASSWORD_BYTES} and {MAX_ACCOUNT_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if password.chars().any(char::is_control) {
+        return Err(StateError::InvalidAccountInput(
+            "password contains control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_account_password(password: &str) -> Result<String, StateError> {
+    let mut salt = [0_u8; ACCOUNT_SALT_BYTES];
+    random_fill(&mut salt).map_err(|error| {
+        StateError::Io(std::io::Error::other(format!(
+            "could not generate account password salt: {error}"
+        )))
+    })?;
+    let salt = SaltString::encode_b64(&salt)?;
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string())
+}
+
+fn account_subject(id: i64) -> String {
+    format!("account:{id}")
+}
+
 fn register_engine_tx(
     transaction: &Transaction<'_>,
     engine: &EngineRecord,
@@ -5116,6 +5325,163 @@ mod tests {
         );
         drop(state);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_v8_to_v9_with_constrained_accounts_table() {
+        let path = temp_db("v8-accounts");
+        {
+            let connection = Connection::open(&path).expect("fixture database");
+            create_schema(&connection).unwrap();
+            migrate_v1_to_v2(&connection).unwrap();
+            migrate_v2_to_v3(&connection).unwrap();
+            migrate_v3_to_v4(&connection).unwrap();
+            migrate_v4_to_v5(&connection, &[0; NODE_KEY_LEN]).unwrap();
+            migrate_v5_to_v6(&connection).unwrap();
+            migrate_v6_to_v7(&connection).unwrap();
+            migrate_v7_to_v8(&connection).unwrap();
+            connection
+                .pragma_update(None, "user_version", 8_i32)
+                .unwrap();
+        }
+
+        let state = State::open(&path).expect("migrate v8 fixture");
+        assert_eq!(
+            state.account_status().unwrap(),
+            AccountStatus { configured: false }
+        );
+        let version: i32 = state
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        let columns = state
+            .connection
+            .prepare("PRAGMA table_info(accounts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, ["id", "email", "password_hash", "created_at"]);
+        assert!(
+            state
+                .connection
+                .execute(
+                    "INSERT INTO accounts (email, password_hash) VALUES ('Admin@Example.com', 'hash')",
+                    [],
+                )
+                .is_err()
+        );
+        state
+            .connection
+            .execute(
+                "INSERT INTO accounts (email, password_hash) VALUES ('admin@example.com', 'hash')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            state
+                .connection
+                .execute(
+                    "INSERT INTO accounts (email, password_hash) VALUES ('admin@example.com', 'other')",
+                    [],
+                )
+                .is_err()
+        );
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn account_password_auth_round_trips_and_wrong_password_is_false() {
+        let path = temp_db("account-roundtrip");
+        let mut state = State::open(&path).unwrap();
+        let account = state
+            .create_initial_account("  Admin@Example.COM  ", "correct horse battery staple")
+            .unwrap();
+        assert_eq!(account.subject, "account:1");
+        assert_eq!(
+            state.account_status().unwrap(),
+            AccountStatus { configured: true }
+        );
+        let (email, password_hash): (String, String) = state
+            .connection
+            .query_row("SELECT email, password_hash FROM accounts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(email, "admin@example.com");
+        assert!(password_hash.starts_with("$argon2id$"));
+        assert!(!password_hash.contains("correct horse battery staple"));
+
+        assert_eq!(
+            state
+                .verify_credentials("ADMIN@example.com", "correct horse battery staple")
+                .unwrap(),
+            CredentialVerification {
+                ok: true,
+                subject: Some(account.subject),
+            }
+        );
+        assert_eq!(
+            state
+                .verify_credentials("admin@example.com", "wrong password value")
+                .unwrap(),
+            CredentialVerification {
+                ok: false,
+                subject: None,
+            }
+        );
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn initial_account_normalization_rejects_duplicates_and_closes_tofu() {
+        let path = temp_db("account-tofu");
+        let mut state = State::open(&path).unwrap();
+        state
+            .create_initial_account("Admin@Example.com", "correct horse battery staple")
+            .unwrap();
+        assert!(matches!(
+            state.create_initial_account(" admin@example.COM ", "another strong password"),
+            Err(StateError::DuplicateAccountEmail(email)) if email == "admin@example.com"
+        ));
+        assert!(matches!(
+            state.create_initial_account("other@example.com", "another strong password"),
+            Err(StateError::AccountAlreadyConfigured)
+        ));
+        let count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn account_inputs_are_bounded() {
+        let path = temp_db("account-bounds");
+        let mut state = State::open(&path).unwrap();
+        assert!(matches!(
+            state.create_initial_account("not-an-email", "correct horse battery staple"),
+            Err(StateError::InvalidAccountInput(_))
+        ));
+        assert!(matches!(
+            state.create_initial_account("admin@example.com", "short"),
+            Err(StateError::InvalidAccountInput(_))
+        ));
+        assert!(matches!(
+            state.create_initial_account(
+                "admin@example.com",
+                &"x".repeat(MAX_ACCOUNT_PASSWORD_BYTES + 1)
+            ),
+            Err(StateError::InvalidAccountInput(_))
+        ));
+        drop(state);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
