@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::ingress::{BodyGuard, ResponseStatus};
+use crate::ingress::BodyGuard;
 use arc_swap::ArcSwap;
 use cygnus_router::normalize_host;
 use rustls::crypto::ring::default_provider;
@@ -145,6 +145,7 @@ pub(crate) fn relay_tls(
     mut client: TcpStream,
     mut upstream: UnixStream,
     mut body_guard: BodyGuard,
+    request_is_head: bool,
 ) -> io::Result<TlsRelayStats> {
     client.set_nonblocking(true)?;
     upstream.set_nonblocking(true)?;
@@ -159,7 +160,7 @@ pub(crate) fn relay_tls(
     let mut to_client_offset = 0;
     let mut buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut stats = TlsRelayStats::default();
-    let mut response_status = ResponseStatus::default();
+    let mut framing = crate::relay_framing::ResponseFraming::new(request_is_head);
     let mut last_progress = Instant::now();
 
     loop {
@@ -188,18 +189,22 @@ pub(crate) fn relay_tls(
             match connection.reader().read(&mut buffer) {
                 Ok(0) => {}
                 Ok(read) => {
-                    body_guard.observe(&buffer[..read]).map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("request body rejected: {error:?}"),
-                        )
-                    })?;
-                    // A complete request body does NOT close the client leg:
-                    // apps treat an early upstream half-close as a client
-                    // abort and cancel in-flight handlers. The forwarded head
-                    // carries `connection: close`, so the app ends the
-                    // exchange once its response is written.
-                    to_upstream.extend_from_slice(&buffer[..read]);
+                    if framing.tunnel() {
+                        // Upgraded exchange: client frames flow freely.
+                        to_upstream.extend_from_slice(&buffer[..read]);
+                    } else if body_guard.is_complete() {
+                        // The request is done and nothing upgraded: extra
+                        // client bytes have nowhere to go. Consume them so
+                        // the session keeps flowing toward its response.
+                    } else {
+                        body_guard.observe(&buffer[..read]).map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("request body rejected: {error:?}"),
+                            )
+                        })?;
+                        to_upstream.extend_from_slice(&buffer[..read]);
+                    }
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -244,9 +249,14 @@ pub(crate) fn relay_tls(
                     progressed = true;
                 }
                 Ok(read) => {
-                    response_status.observe(&buffer[..read]);
-                    stats.status = response_status.status().unwrap_or_default();
+                    framing.observe(&buffer[..read]);
+                    stats.status = framing.status().unwrap_or_default();
                     to_client.extend_from_slice(&buffer[..read]);
+                    if framing.complete() {
+                        // One full response observed: the exchange ends here
+                        // regardless of when the app closes its side.
+                        upstream_closed = true;
+                    }
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -469,7 +479,7 @@ mod tests {
             stream.read_exact(&mut request).unwrap();
             relay_upstream.write_all(&request).unwrap();
             let (connection, client) = stream.into_parts();
-            relay_tls(connection, client, relay_upstream, BodyGuard::none()).unwrap()
+            relay_tls(connection, client, relay_upstream, BodyGuard::none(), false).unwrap()
         });
         let upstream = thread::spawn(move || {
             let mut request = [0_u8; 4];

@@ -19,6 +19,7 @@ pub mod edge;
 pub mod github;
 pub mod ingress;
 pub mod metrics;
+mod relay_framing;
 pub mod state;
 pub mod tls;
 
@@ -31,10 +32,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::acme::Http01Challenges;
-use crate::ingress::{
-    BodyGuard, BodyGuardError, IngressController, IngressLimits, RequestSpan, ResponseStatus,
-};
+use crate::ingress::{BodyGuard, BodyGuardError, IngressController, IngressLimits, RequestSpan};
 use crate::metrics::MetricsHub;
+use crate::relay_framing::ResponseFraming;
 use crate::tls::{TlsServer, relay_tls};
 use cygnus_cage::Cage;
 use cygnus_router::{
@@ -426,7 +426,8 @@ impl Frontend {
         }
         let (connection, client) = client.into_parts();
         let _ = client.set_read_timeout(None);
-        match relay_tls(connection, client, upstream, body_guard) {
+        let request_is_head = head.method.eq_ignore_ascii_case("HEAD");
+        match relay_tls(connection, client, upstream, body_guard, request_is_head) {
             Ok(stats) => span.proxied(stats.status, stats.to_upstream, stats.to_client),
             Err(_) => span.relay_error(),
         }
@@ -538,7 +539,8 @@ impl Frontend {
         let _ = client.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
         let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
         let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
-        match relay(client, upstream, body_guard) {
+        let request_is_head = head.method.eq_ignore_ascii_case("HEAD");
+        match relay(client, upstream, body_guard, request_is_head) {
             Ok(stats) => span.proxied(stats.status, stats.to_upstream, stats.to_client),
             Err(_) => span.relay_error(),
         }
@@ -555,26 +557,37 @@ struct RelayStats {
 /// Relay bytes both ways between the client and the upstream until each side
 /// closes, propagating half-close so a one-way finish (a drained response, a
 /// client that stopped sending) is passed through rather than hung on.
-/// Read and discard whatever the client sends after its request is complete,
-/// returning when it closes, times out, or errors. Pipelined bytes have
-/// nowhere to go on a `connection: close` upstream exchange.
-fn drain_until_close<R: Read>(reader: &mut R) {
-    let mut sink = [0_u8; 4096];
+/// After the request body: forward client bytes when the exchange upgraded
+/// to a tunnel (websockets), discard them otherwise. Returns when the client
+/// closes, times out, or errors, counting only forwarded bytes.
+fn forward_or_discard<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    tunnel: &AtomicBool,
+) -> io::Result<u64> {
+    let mut forwarded = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
     loop {
-        match reader.read(&mut sink) {
-            Ok(0) => return,
-            Ok(_) => {}
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(forwarded),
+            Ok(read) => {
+                if tunnel.load(Ordering::Acquire) {
+                    writer.write_all(&buffer[..read])?;
+                    forwarded += read as u64;
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Err(_) => return Ok(forwarded),
         }
     }
 }
 
-/// The bytes to hand the upstream: the parsed head rewritten to demand
-/// `connection: close`, followed by any payload bytes already buffered.
-/// The front opens a fresh upstream connection per request, so keep-alive
-/// on that leg is a fiction — making the close explicit lets the app end
-/// the exchange deterministically once its response is written.
+/// The bytes to hand the upstream: the parsed head with hop-by-hop
+/// connection headers stripped, followed by any payload bytes already
+/// buffered. The exchange is ended by the relay itself once the response is
+/// fully framed (see [`relay_framing`]); the app is never asked to close,
+/// because event loops differ in how faithfully they flush large bodies
+/// while closing.
 fn upstream_request_bytes(head: &RequestHead, buffered: &[u8]) -> Vec<u8> {
     let head_bytes = &buffered[..head.head_len];
     let mut rewritten = Vec::with_capacity(buffered.len() + 32);
@@ -596,24 +609,46 @@ fn upstream_request_bytes(head: &RequestHead, buffered: &[u8]) -> Vec<u8> {
         }
         rewritten.extend_from_slice(line);
     }
-    rewritten.extend_from_slice(b"connection: close\r\n\r\n");
+    rewritten.extend_from_slice(b"\r\n");
     rewritten.extend_from_slice(&buffered[head.head_len..]);
     rewritten
 }
 
-fn relay(client: TcpStream, upstream: UnixStream, body_guard: BodyGuard) -> io::Result<RelayStats> {
+fn relay(
+    client: TcpStream,
+    upstream: UnixStream,
+    body_guard: BodyGuard,
+    request_is_head: bool,
+) -> io::Result<RelayStats> {
     let mut client_reader = client.try_clone()?;
     let mut upstream_writer = upstream.try_clone()?;
-    let mut upstream_reader = upstream;
-    let mut client_writer = client;
+    let mut upstream_reader = upstream.try_clone()?;
+    let mut client_writer = client.try_clone()?;
+    let tunnel = Arc::new(AtomicBool::new(false));
 
+    let request_tunnel = Arc::clone(&tunnel);
     let client_to_upstream = thread::spawn(move || {
-        let copied = copy_to_upstream(&mut client_reader, &mut upstream_writer, body_guard);
+        let copied = copy_to_upstream(
+            &mut client_reader,
+            &mut upstream_writer,
+            body_guard,
+            &request_tunnel,
+        );
         let _ = upstream_writer.shutdown(Shutdown::Write);
         copied
     });
-    let to_client = copy_response_to_client(&mut upstream_reader, &mut client_writer);
+    let to_client = copy_response_to_client(
+        &mut upstream_reader,
+        &mut client_writer,
+        request_is_head,
+        &tunnel,
+    );
     let _ = client_writer.shutdown(Shutdown::Write);
+    // End the exchange decisively: closing the read sides unblocks the
+    // request-direction thread immediately instead of holding both sockets
+    // until a peer close or idle timeout.
+    let _ = client.shutdown(Shutdown::Read);
+    let _ = upstream.shutdown(Shutdown::Both);
     let to_upstream = client_to_upstream
         .join()
         .map_err(|_| io::Error::other("client relay thread panicked"))?;
@@ -628,9 +663,11 @@ fn relay(client: TcpStream, upstream: UnixStream, body_guard: BodyGuard) -> io::
 fn copy_response_to_client<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    request_is_head: bool,
+    tunnel: &AtomicBool,
 ) -> io::Result<(u64, u16)> {
     let mut copied = 0_u64;
-    let mut status = ResponseStatus::default();
+    let mut framing = ResponseFraming::new(request_is_head);
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         let read = match reader.read(&mut buffer) {
@@ -639,11 +676,18 @@ fn copy_response_to_client<R: Read, W: Write>(
             Err(error) => return Err(error),
         };
         if read == 0 {
-            return Ok((copied, status.status().unwrap_or_default()));
+            return Ok((copied, framing.status().unwrap_or_default()));
         }
-        status.observe(&buffer[..read]);
+        framing.observe(&buffer[..read]);
+        if framing.tunnel() {
+            tunnel.store(true, Ordering::Release);
+        }
         writer.write_all(&buffer[..read])?;
         copied += read as u64;
+        if framing.complete() {
+            // One full response delivered; the exchange is over.
+            return Ok((copied, framing.status().unwrap_or_default()));
+        }
     }
 }
 
@@ -651,18 +695,18 @@ fn copy_to_upstream<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     mut body_guard: BodyGuard,
+    tunnel: &AtomicBool,
 ) -> io::Result<u64> {
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         if body_guard.is_complete() {
             // The request is fully forwarded, but the upstream write side
-            // must stay open until the client hangs up: apps treat an early
-            // half-close as a client abort and cancel in-flight handlers
-            // before the response is written. The forwarded head carries
-            // `connection: close`, so the app ends the exchange itself.
-            drain_until_close(reader);
-            return Ok(copied);
+            // must stay open: apps treat an early half-close as a client
+            // abort and cancel in-flight handlers before responding. On an
+            // upgraded exchange the client keeps talking (websocket frames);
+            // otherwise anything else it sends has nowhere to go.
+            return forward_or_discard(reader, writer, tunnel).map(|extra| copied + extra);
         }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
@@ -687,7 +731,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn upstream_head_rewrite_forces_connection_close() {
+    fn upstream_head_rewrite_strips_hop_by_hop_headers() {
         let raw = b"GET /api HTTP/1.1\r\nHost: a.example\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nX-Custom: yes\r\n\r\nBODY";
         let (head, buffered) = match parse_request_head(raw) {
             HeadParse::Complete(head) => (head, raw.to_vec()),
@@ -698,9 +742,185 @@ mod tests {
         assert!(text.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(text.contains("Host: a.example\r\n"));
         assert!(text.contains("X-Custom: yes\r\n"));
-        assert!(text.contains("connection: close\r\n\r\nBODY"));
+        assert!(text.ends_with("\r\n\r\nBODY"));
         assert!(!text.contains("keep-alive"));
-        assert_eq!(text.matches("onnection").count(), 1);
+        assert!(!text.to_ascii_lowercase().contains("connection"));
+    }
+
+    /// Large responses must relay completely on every platform. The unix
+    /// socket buffer on macOS is 8 KiB — a fraction of the Linux default —
+    /// so backpressure and teardown ordering bugs only show up there.
+    #[test]
+    fn relay_delivers_large_response_single_write() {
+        relay_large_response(600 * 1024, 600 * 1024, 0);
+    }
+
+    #[test]
+    fn relay_delivers_large_response_chunked_slow_writer() {
+        relay_large_response(600 * 1024, 8 * 1024, 2);
+    }
+
+    fn relay_large_response(total: usize, chunk: usize, delay_ms: u64) {
+        use std::net::TcpListener;
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cyg-relay-large-{}-{total}-{chunk}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("upstream.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let upstream_listener = UnixListener::bind(&socket_path).expect("bind upstream");
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut conn, _) = upstream_listener.accept().expect("accept upstream");
+            let mut buffer = [0_u8; 4096];
+            let mut request = Vec::new();
+            loop {
+                let read = conn.read(&mut buffer).expect("read request");
+                assert_ne!(read, 0, "upstream saw EOF before responding");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head =
+                format!("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {total}\r\n\r\n");
+            conn.write_all(head.as_bytes()).expect("write head");
+            let body = vec![b'z'; total];
+            for piece in body.chunks(chunk) {
+                conn.write_all(piece).expect("write body chunk");
+                if delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+            // The app closes after one exchange, exactly like a
+            // connection: close upstream does.
+        });
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let address = tcp_listener.local_addr().expect("tcp addr");
+        let server_side = thread::spawn(move || tcp_listener.accept().expect("accept client").0);
+        let mut client = TcpStream::connect(address).expect("connect client");
+        let server_client = server_side.join().expect("join accept");
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .expect("send request");
+
+        let upstream = UnixStream::connect(&socket_path).expect("connect upstream");
+        // Mirror serve_connection's socket configuration exactly.
+        let _ = server_client.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = server_client.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        (&upstream)
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .expect("forward head");
+
+        // Mirror serve_connection's epilogue: relay, then drop the streams.
+        let relay_thread = thread::spawn(move || {
+            let stats = relay(server_client, upstream, BodyGuard::none(), false).expect("relay");
+            stats.to_client
+        });
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        let relayed = relay_thread.join().expect("join relay");
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head complete")
+            + 4;
+        assert_eq!(
+            response.len() - header_end,
+            total,
+            "client received a truncated body (relay reported {relayed} bytes)"
+        );
+        upstream_thread.join().expect("upstream thread");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Upgraded exchanges must tunnel both directions: client bytes after the
+    /// request head are websocket frames, not garbage to discard.
+    #[test]
+    fn relay_tunnels_upgraded_exchanges_bidirectionally() {
+        use std::net::TcpListener;
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("cyg-relay-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("upstream.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let upstream_listener = UnixListener::bind(&socket_path).expect("bind upstream");
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut conn, _) = upstream_listener.accept().expect("accept upstream");
+            let mut buffer = [0_u8; 4096];
+            let mut request = Vec::new();
+            loop {
+                let read = conn.read(&mut buffer).expect("read request");
+                assert_ne!(read, 0, "upstream saw EOF before responding");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            conn.write_all(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: test\r\n\r\n")
+                .expect("write upgrade");
+            // Echo one client frame back, prefixed, then close.
+            let mut frame = [0_u8; 5];
+            conn.read_exact(&mut frame).expect("read client frame");
+            conn.write_all(b"echo:").expect("write echo prefix");
+            conn.write_all(&frame).expect("write echo frame");
+        });
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let address = tcp_listener.local_addr().expect("tcp addr");
+        let server_side = thread::spawn(move || tcp_listener.accept().expect("accept client").0);
+        let mut client = TcpStream::connect(address).expect("connect client");
+        let mut server_client = server_side.join().expect("join accept");
+
+        client
+            .write_all(b"GET /ws HTTP/1.1\r\nhost: x\r\nupgrade: test\r\n\r\n")
+            .expect("send handshake");
+        // serve_connection consumes the request head before relaying; the
+        // relay must never see handshake bytes on the client leg.
+        let (_, _) = read_head(&mut server_client).expect("consume handshake");
+
+        let upstream = UnixStream::connect(&socket_path).expect("connect upstream");
+        let _ = server_client.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        (&upstream)
+            .write_all(b"GET /ws HTTP/1.1\r\nhost: x\r\nupgrade: test\r\n\r\n")
+            .expect("forward head");
+
+        let relay_thread =
+            thread::spawn(move || relay(server_client, upstream, BodyGuard::none(), false));
+
+        // Read the 101 head, then speak through the tunnel.
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            client.read_exact(&mut byte).expect("read upgrade head");
+            head.push(byte[0]);
+        }
+        client.write_all(b"hello").expect("send frame");
+        let mut echo = Vec::new();
+        client.read_to_end(&mut echo).expect("read echo");
+        assert_eq!(echo, b"echo:hello");
+
+        let stats = relay_thread
+            .join()
+            .expect("join relay")
+            .expect("relay result");
+        assert_eq!(stats.status, 101);
+        assert_eq!(stats.to_upstream, 5);
+        upstream_thread.join().expect("upstream thread");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The regression that broke every async app: the relay used to half-close
@@ -763,7 +983,7 @@ mod tests {
             .shutdown(Shutdown::Write)
             .expect("client done sending");
 
-        let stats = relay(server_client, upstream, BodyGuard::none()).expect("relay");
+        let stats = relay(server_client, upstream, BodyGuard::none(), false).expect("relay");
         assert_eq!(stats.status, 200);
 
         let mut response = Vec::new();
@@ -902,8 +1122,13 @@ mod tests {
     fn streamed_chunked_body_is_cut_off_before_oversized_bytes_reach_upstream() {
         let mut reader = Cursor::new(b"4\r\nWiki\r\n0\r\n\r\n".to_vec());
         let mut upstream = Vec::new();
-        let error =
-            copy_to_upstream(&mut reader, &mut upstream, BodyGuard::chunked(3)).unwrap_err();
+        let error = copy_to_upstream(
+            &mut reader,
+            &mut upstream,
+            BodyGuard::chunked(3),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(upstream.is_empty());
     }
@@ -917,13 +1142,21 @@ mod tests {
             chunk: 5,
         };
         let mut output = Vec::new();
-        let (copied, status) = copy_response_to_client(&mut reader, &mut output).unwrap();
+        let (copied, status) =
+            copy_response_to_client(&mut reader, &mut output, false, &AtomicBool::new(false))
+                .unwrap();
         assert_eq!(copied, response.len() as u64);
         assert_eq!(status, 206);
         assert_eq!(output, response);
 
         let mut no_status = Cursor::new(b"opaque response".to_vec());
-        let (_, status) = copy_response_to_client(&mut no_status, &mut Vec::new()).unwrap();
+        let (_, status) = copy_response_to_client(
+            &mut no_status,
+            &mut Vec::new(),
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(status, 0);
     }
 
