@@ -531,21 +531,29 @@ fn archive_path(directory: &Path, upload_id: &str) -> PathBuf {
 }
 
 fn create_private_directory(directory: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "deploy upload path is not a directory",
-                ));
+    loop {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "deploy upload path is not a directory",
+                    ));
+                }
+                return fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
             }
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                match builder.mode(0o700).create(directory) {
+                    Ok(()) => return Ok(()),
+                    // Lost a creation race: loop back and validate whatever
+                    // now exists instead of failing initialization.
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700).create(directory)
-        }
-        Err(error) => Err(error),
     }
 }
 
