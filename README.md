@@ -17,10 +17,16 @@ a page-cache exec, not an image pull.
 
 ## Install
 
-One command on a Linux host (kernel 5.15+, systemd):
+**Linux** (kernel 5.15+, systemd) — root, system-wide:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash
+```
+
+**macOS** — your user, everything under `~/.cygnus`, no sudo:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | bash
 ```
 
 The installer downloads the latest release, walks you through listeners and
@@ -28,9 +34,8 @@ domains, starts the daemon, and prints your console URL and bootstrap token.
 Open the console, paste the token, and ship your first app from the dashboard
 — upload a folder or connect a GitHub repository for push-to-deploy.
 
-macOS runs the same platform for development, with cages as plain processes:
-no namespaces, no cgroups, no seccomp. Your machine, your call. The installer
-sets everything up under `~/.cygnus` — no root required.
+macOS runs cages as plain processes: no namespaces, no cgroups, no seccomp.
+Your machine, your call.
 
 ## Deploy
 

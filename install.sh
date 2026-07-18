@@ -115,6 +115,23 @@ fi
 echo "cygnus installer" >&2
 if [[ $OS == Darwin ]]; then
   echo "macOS runs cages as plain processes: no namespaces, no cgroups, no seccomp." >&2
+  # macOS installs are per-user: everything lives under ~/.cygnus and the
+  # daemon runs as a launchd user agent, which root cannot bootstrap into a
+  # user session. Refuse root before touching the filesystem so a mistaken
+  # sudo leaves nothing behind.
+  if (( ! TEST_MODE )) && [[ $EUID -eq 0 ]]; then
+    fail "macOS installs run as your user, not root. Rerun without sudo:
+  curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | bash"
+  fi
+  # A previous run under sudo leaves root-owned files in ~/.cygnus that a
+  # user install cannot replace. Say exactly how to recover.
+  for owned_path in "$HOME/.cygnus" "$HOME/Library/LaunchAgents/com.cygnus.daemon.plist"; do
+    if [[ -e $owned_path && ! -w $owned_path ]]; then
+      fail "$owned_path is not writable by $(id -un) (a previous sudo run?). Recover with:
+  sudo rm -rf \"$HOME/.cygnus\" \"$HOME/Library/LaunchAgents/com.cygnus.daemon.plist\"
+then rerun this installer without sudo."
+    fi
+  done
 fi
 
 downloaded_bundle=""
