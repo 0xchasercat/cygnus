@@ -500,6 +500,7 @@ if [[ $OS == Darwin ]]; then
   plist_state=$(xml_escape "$state_dir/state.db")
   plist_admin=$(xml_escape "$admin_socket")
   plist_tenant_admin=$(xml_escape "$tenant_admin_socket")
+  plist_config=$(xml_escape "$config_file")
   plist_stdout=$(xml_escape "$log_dir/daemon.log")
   plist_stderr=$(xml_escape "$log_dir/daemon.error.log")
   cat >"$stage/com.cygnus.daemon.plist" <<EOF
@@ -519,6 +520,8 @@ if [[ $OS == Darwin ]]; then
     <string>--tenant-admin-socket</string>
     <string>$plist_tenant_admin</string>
     <string>serve</string>
+    <string>--initial-config</string>
+    <string>$plist_config</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -738,11 +741,16 @@ atomic_copy "$stage/node.json" "$config_file" 0600
 atomic_copy "$stage/secrets.env" "$secrets_env" 0600
 atomic_copy "$service_stage" "$service_file" 0644
 
-log "Start Cygnus"
+start_service() {
 service_started=1
 if [[ $OS == Darwin ]]; then
   launchctl_bin=$(command -v launchctl || true)
   service_started=0
+  if (( ! TEST_MODE )); then
+    # A previous attempt may have started the daemon directly (launchd
+    # fallback); clear it so sockets rebind cleanly on this start.
+    pkill -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
+  fi
   if [[ -n $launchctl_bin ]]; then
     # Reinstalls and crashed runs leave the label registered; bootout is the
     # idempotent way to clear it, and repeated failures can leave the label
@@ -769,14 +777,15 @@ if [[ $OS == Darwin ]]; then
     # until launchd accepts the service (rerun the installer to retry).
     echo "launchd did not accept the service; starting the daemon directly (no restart at login). Diagnostics: $diag_file" >&2
     nohup "$prefix/cygnus-daemon" --state "$state_dir/state.db" \
-      --admin-socket "$admin_socket" --tenant-admin-socket "$tenant_admin_socket" serve \
+      --admin-socket "$admin_socket" --tenant-admin-socket "$tenant_admin_socket" \
+      serve --initial-config "$config_file" \
       >>"$log_dir/daemon.log" 2>>"$log_dir/daemon.error.log" </dev/null &
     disown %% 2>/dev/null || true
     service_started=1
   fi
   if (( ! service_started )); then
-    printf 'Launch Cygnus with: %q --state %q --admin-socket %q --tenant-admin-socket %q serve\n' \
-      "$prefix/cygnus-daemon" "$state_dir/state.db" "$admin_socket" "$tenant_admin_socket" >&2
+    printf 'Launch Cygnus with: %q --state %q --admin-socket %q --tenant-admin-socket %q serve --initial-config %q\n' \
+      "$prefix/cygnus-daemon" "$state_dir/state.db" "$admin_socket" "$tenant_admin_socket" "$config_file" >&2
   fi
 else
   systemctl_bin=$(command -v systemctl || true)
@@ -787,26 +796,44 @@ else
     fail "could not start cygnus.service; diagnostics: $diag_file"
   fi
 fi
+}
 
-ready=0
-for ((attempt=1; attempt<=50; attempt++)); do
-  if (( TEST_MODE )); then
-    [[ -e $admin_socket && -e $tenant_admin_socket ]] && { ready=1; break; }
-  else
-    [[ -S $admin_socket && -S $tenant_admin_socket ]] && { ready=1; break; }
-  fi
-  sleep 0.1
-done
-if (( ! ready )); then
+log "Start Cygnus"
+start_service
+
+socket_present() {
+  if (( TEST_MODE )); then [[ -e $1 ]]; else [[ -S $1 ]]; fi
+}
+wait_for_socket() {
+  local path=$1 attempts=$2 i
+  for ((i=1; i<=attempts; i++)); do
+    socket_present "$path" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+if ! wait_for_socket "$admin_socket" 50; then
   if [[ $OS == Darwin && $service_started -eq 0 ]]; then
     log "Cygnus is installed; start it with the foreground command above to finish configuration."
     exit 0
   fi
-  fail "daemon admin sockets did not become ready at $admin_socket and $tenant_admin_socket; diagnostics: $diag_file$([[ $OS == Darwin ]] && printf '%s' '. If a previous sudo run is fighting this install, check: sudo launchctl print system/com.cygnus.daemon (remove with sudo launchctl bootout system/com.cygnus.daemon), then rerun')"
+  fail "daemon admin socket did not become ready at $admin_socket; diagnostics: $diag_file$([[ $OS == Darwin ]] && printf '%s' '. If a previous sudo run is fighting this install, check: sudo launchctl print system/com.cygnus.daemon (remove with sudo launchctl bootout system/com.cygnus.daemon), then rerun')"
 fi
 
 "$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun --default >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
 "$prefix/cygnus" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "node configuration apply failed; diagnostics: $diag_file"
+
+# The Tenant Zero bridge socket binds at daemon startup from stored state. A
+# daemon that booted before the configuration was stored (an interrupted
+# earlier install) is configured now but not listening for the console — one
+# restart picks the bridge up.
+if ! wait_for_socket "$tenant_admin_socket" 20; then
+  log "Restart Cygnus to bind the Tenant Zero bridge"
+  start_service
+  wait_for_socket "$admin_socket" 50 || fail "daemon did not come back after restart; diagnostics: $diag_file"
+  wait_for_socket "$tenant_admin_socket" 50 || fail "Tenant Zero bridge socket did not become ready at $tenant_admin_socket; diagnostics: $diag_file"
+fi
 
 console_scheme=http
 console_listener=$listen

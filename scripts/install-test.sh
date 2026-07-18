@@ -320,6 +320,7 @@ assert plist["ProgramArguments"] == [
     "--admin-socket", str(runtime / "admin.sock"),
     "--tenant-admin-socket", str(runtime / "tenant-0/admin.sock"),
     "serve",
+    "--initial-config", str(config / "node.json"),
 ]
 assert plist["RunAtLoad"] is True
 assert plist["KeepAlive"] is True
