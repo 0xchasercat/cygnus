@@ -1196,8 +1196,14 @@ pub(crate) fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(
     safe_extract_archive_reader(bytes, destination)
 }
 
-/// Reader-friendly archive entry point shared by GitHub, upload, and CLI ingestion.
-pub(crate) fn safe_extract_archive_reader<R: Read>(
+/// Safely extract a tar or gzip-compressed tar stream into `destination`.
+///
+/// This public reader-based entry point is shared by the library's GitHub
+/// ingestion and the daemon binary's upload worker. It rejects absolute and
+/// parent-traversing paths, links, special files, duplicate output files, and
+/// archives whose compressed or extracted size exceeds the configured bounds.
+/// Callers must provide a private, daemon-owned destination directory.
+pub fn safe_extract_archive_reader<R: Read>(
     mut reader: R,
     destination: &Path,
 ) -> Result<(), GitHubError> {
