@@ -211,7 +211,7 @@ printf 'build-release: installing frozen console dependencies and building dist/
 # Keep cargo's target directory explicit, so output lookup never depends on the
 # caller's current directory or an implicit cargo configuration.
 CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
-  --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-daemon --bin cygnus-daemon --bin cygnusctl
+  --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-daemon --bin cygnus-daemon --bin cygnus
 
 if [[ $target == *-linux-* ]]; then
   CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
@@ -228,7 +228,7 @@ copy_binary() {
 
 release_bin_dir=$cargo_target_dir/$target/release
 copy_binary cygnus-daemon "$release_bin_dir/cygnus-daemon"
-copy_binary cygnusctl "$release_bin_dir/cygnusctl"
+copy_binary cygnus "$release_bin_dir/cygnus"
 if [[ $target == *-linux-* ]]; then
   copy_binary cygnus-init "$release_bin_dir/cygnus-init"
 fi
@@ -285,7 +285,7 @@ hash_file() {
 sums_tmp=$bundle_out/SHA256SUMS
 : >"$sums_tmp"
 
-bundle_files=(cygnus-daemon cygnusctl bun cygnus-console.tar)
+bundle_files=(cygnus-daemon cygnus bun cygnus-console.tar)
 if [[ $target == *-linux-* ]]; then
   bundle_files+=(cygnus-init)
 fi
