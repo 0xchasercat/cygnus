@@ -2186,12 +2186,26 @@ mod tests {
                 frozen: true,
             },
         );
+        // Rooted (Linux) builds address the fixed cage layout; rootless
+        // (macOS) builds address the same controls where they live on the host.
+        let staging_root = workspace.parent().unwrap();
+        let (expected_config, expected_runner) = if cfg!(target_os = "linux") {
+            (
+                "--config=/cygnus/build.bunfig.toml".to_string(),
+                OsString::from("/cygnus/build-runner.js"),
+            )
+        } else {
+            (
+                format!("--config={}", staging_root.join(BUILD_CONFIG_REL).display()),
+                staging_root.join(BUILD_RUNNER_REL).into_os_string(),
+            )
+        };
         assert_eq!(
             job.args,
             vec![
                 OsString::from("--no-env-file"),
-                OsString::from("--config=/cygnus/build.bunfig.toml"),
-                OsString::from("/cygnus/build-runner.js"),
+                OsString::from(expected_config),
+                expected_runner,
                 OsString::from("--install"),
                 OsString::from("index.ts"),
             ]
