@@ -867,7 +867,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// Regression: sockets accepted from a nonblocking listener inherit
     /// O_NONBLOCK on macOS. Leaving them nonblocking makes body-complete GETs
     /// WouldBlock in forward_or_discard, SHUT_WR the upstream immediately, and
@@ -878,10 +877,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
 
         let total = 600 * 1024;
-        let dir = std::env::temp_dir().join(format!(
-            "cyg-relay-nonblock-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("cyg-relay-nonblock-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let socket_path = dir.join("upstream.sock");
         let _ = std::fs::remove_file(&socket_path);
@@ -899,8 +895,7 @@ mod tests {
                     break;
                 }
             }
-            let head =
-                format!("HTTP/1.1 200 OK\r\ncontent-length: {total}\r\n\r\n");
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {total}\r\n\r\n");
             conn.write_all(head.as_bytes()).expect("write head");
             // Single large write like Bun after buffering the console document.
             conn.write_all(&vec![b'z'; total]).expect("write body");
@@ -974,7 +969,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// macOS + Bun: early upstream SHUT_WR truncates large responses to ~8-16 KiB.
     /// Covers the real console index over a UDS Bun server.
     #[test]
@@ -1025,11 +1019,11 @@ console.log("ready", server.hostname);"#,
             .expect("spawn bun");
         // wait for socket
         for _ in 0..200 {
-            if socket_path.exists() {
-                if let Ok(s) = UnixStream::connect(&socket_path) {
-                    drop(s);
-                    break;
-                }
+            if socket_path.exists()
+                && let Ok(s) = UnixStream::connect(&socket_path)
+            {
+                drop(s);
+                break;
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -1069,7 +1063,12 @@ console.log("ready", server.hostname);"#,
             match client.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => response.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
                 Err(e) => panic!("client read: {e}"),
             }
         }
@@ -1088,7 +1087,6 @@ console.log("ready", server.hostname);"#,
             "truncated bun body: got {body_len}, want {total}, relay reported {relayed}"
         );
     }
-
 
     /// Upgraded exchanges must tunnel both directions: client bytes after the
     /// request head are websocket frames, not garbage to discard.

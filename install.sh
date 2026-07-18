@@ -681,6 +681,47 @@ atomic_install_dir() {
   [[ ! -e $old ]] || rm -rf -- "$old"
 }
 
+# Tear down any previous install before replacing binaries or rebinding sockets.
+# Reinstalls must not fight a live daemon holding the old binary/sockets.
+stop_existing_service() {
+  if [[ $OS == Darwin ]]; then
+    local launchctl_bin
+    launchctl_bin=$(command -v launchctl || true)
+    if [[ -n $launchctl_bin ]]; then
+      "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
+    fi
+    if (( ! TEST_MODE )); then
+      # Cover both launchd-managed and direct nohup fallbacks from earlier runs.
+      pkill -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
+      pkill -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
+      pkill -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
+      local i
+      for ((i=1; i<=50; i++)); do
+        if ! pgrep -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" >/dev/null 2>&1 \
+          && ! pgrep -U "$(id -u)" -f "$prefix/cygnus-daemon" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.1
+      done
+      if pgrep -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" >/dev/null 2>&1 \
+        || pgrep -U "$(id -u)" -f "$prefix/cygnus-daemon" >/dev/null 2>&1; then
+        pkill -9 -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
+        pkill -9 -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
+        pkill -9 -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
+        sleep 0.2
+      fi
+      # Stale runtime sockets block the next bind if a previous process died hard.
+      rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
+    fi
+  else
+    local systemctl_bin
+    systemctl_bin=$(command -v systemctl || true)
+    if [[ -n $systemctl_bin ]]; then
+      "$systemctl_bin" stop cygnus.service >>"$diag_file" 2>&1 || true
+    fi
+  fi
+}
+
 log "Stop existing Cygnus"
 stop_existing_service
 
@@ -749,44 +790,6 @@ atomic_copy "$stage/node.json" "$config_file" 0600
 atomic_copy "$stage/secrets.env" "$secrets_env" 0600
 atomic_copy "$service_stage" "$service_file" 0644
 
-# Tear down any previous install before replacing binaries or rebinding sockets.
-# Reinstalls must not fight a live daemon holding the old binary/sockets.
-stop_existing_service() {
-  if [[ $OS == Darwin ]]; then
-    local launchctl_bin
-    launchctl_bin=$(command -v launchctl || true)
-    if [[ -n $launchctl_bin ]]; then
-      "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
-    fi
-    if (( ! TEST_MODE )); then
-      # Cover both launchd-managed and direct nohup fallbacks from earlier runs.
-      pkill -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
-      pkill -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
-      pkill -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
-      local i
-      for ((i=1; i<=50; i++)); do
-        if ! pgrep -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" >/dev/null 2>&1           && ! pgrep -U "$(id -u)" -f "$prefix/cygnus-daemon" >/dev/null 2>&1; then
-          break
-        fi
-        sleep 0.1
-      done
-      if pgrep -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" >/dev/null 2>&1         || pgrep -U "$(id -u)" -f "$prefix/cygnus-daemon" >/dev/null 2>&1; then
-        pkill -9 -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
-        pkill -9 -U "$(id -u)" -f "cygnus-daemon --state $state_dir/state.db" 2>/dev/null || true
-        pkill -9 -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
-        sleep 0.2
-      fi
-      # Stale runtime sockets block the next bind if a previous process died hard.
-      rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
-    fi
-  else
-    local systemctl_bin
-    systemctl_bin=$(command -v systemctl || true)
-    if [[ -n $systemctl_bin ]]; then
-      "$systemctl_bin" stop cygnus.service >>"$diag_file" 2>&1 || true
-    fi
-  fi
-}
 
 start_service() {
 service_started=1
