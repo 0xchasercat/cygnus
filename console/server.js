@@ -1095,6 +1095,9 @@ function sanitizeGithubJob(job) {
   return {
     id: job?.id,
     key: job?.key,
+    source: job?.source,
+    source_ref: job?.source_ref,
+    app: job?.app,
     installation_id: job?.installation_id,
     repository_id: job?.repository_id,
     owner: job?.owner,
@@ -1108,6 +1111,7 @@ function sanitizeGithubJob(job) {
     next_attempt_at: job?.next_attempt_at,
     error: job?.error,
     check_run_id: job?.check_run_id,
+    github_deployment_id: job?.github_deployment_id,
     deployment_id: job?.deployment_id,
     created_at: job?.created_at,
     updated_at: job?.updated_at,
