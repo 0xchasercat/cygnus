@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,10 +28,13 @@ use cygnus_daemon::deploy::{
     register_engine_with_audit,
 };
 use cygnus_daemon::edge::EdgeConfig;
-use cygnus_daemon::github::{GitHubDeployExecutor, GitHubManager, GitHubWorker};
+use cygnus_daemon::github::{
+    GitHubDeployExecutor, GitHubManager, GitHubWorker, safe_extract_archive_reader,
+};
 use cygnus_daemon::metrics::{EventRecord, MetricsHub};
 use cygnus_daemon::state::{
-    AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, LoadedApp, NodeConfig, Snapshot, State,
+    AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, DeployJob, DeployJobSource,
+    DeployJobStatus, DeploymentSource, DeploymentStatus, LoadedApp, NodeConfig, Snapshot, State,
     StateError,
 };
 use cygnus_daemon::tls::TlsServer;
@@ -328,6 +331,232 @@ impl GitHubDeployExecutor for ProductionGitHubDeployExecutor {
             audit,
         )
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GenericWorkerResult {
+    Idle,
+    Succeeded {
+        job_id: String,
+    },
+    Failed {
+        job_id: String,
+        app: String,
+        before_runtime: bool,
+    },
+}
+
+fn generic_worker_audit(job: &DeployJob) -> AuditContext {
+    let mut digest = Sha256::new();
+    digest.update(job.id.as_bytes());
+    digest.update([0]);
+    digest.update(job.source_ref.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    AuditContext {
+        endpoint_role: AuditEndpointRole::Host,
+        peer_uid: None,
+        peer_gid: None,
+        peer_pid: Some(std::process::id()),
+        actor_subject: Some("deploy:worker".into()),
+        request_id: digest[..32].into(),
+        command_kind: "queued_deploy".into(),
+        request_digest: digest,
+    }
+}
+
+fn create_private_workspace(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "upload workspace has no parent".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create upload workspace root {}: {error}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure upload workspace root {}: {error}", parent.display()))?;
+    if path.exists() {
+        fs::remove_dir_all(path).map_err(|error| {
+            format!("remove stale upload workspace {}: {error}", path.display())
+        })?;
+    }
+    fs::create_dir(path)
+        .map_err(|error| format!("create upload workspace {}: {error}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure upload workspace {}: {error}", path.display()))
+}
+
+fn safe_queue_component(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.as_bytes().contains(&0)
+}
+
+fn valid_upload_job_identity(job: &DeployJob) -> bool {
+    safe_queue_component(&job.id)
+        && job.key.len() == 64
+        && job
+            .key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn prepare_generic_source(state: &State, job: &DeployJob) -> Result<PathBuf, String> {
+    match job.source {
+        DeployJobSource::Upload => {
+            if !valid_upload_job_identity(job) {
+                return Err("upload job identity is not a safe spool component".into());
+            }
+            let expected_archive = state
+                .state_root()
+                .join("deploy-uploads")
+                .join(format!("{}.archive", job.key));
+            if job.source_path != expected_archive {
+                return Err("upload archive path is outside the daemon spool".into());
+            }
+            let workspace = state.state_root().join("upload-work").join(&job.id);
+            create_private_workspace(&workspace)?;
+            let archive = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&expected_archive)
+                .map_err(|error| format!("open upload archive: {error}"))?;
+            let metadata = archive
+                .metadata()
+                .map_err(|error| format!("inspect upload archive: {error}"))?;
+            if !metadata.file_type().is_file() {
+                return Err("upload archive is not a regular file".into());
+            }
+            safe_extract_archive_reader(archive, &workspace)
+                .map_err(|error| format!("extract upload archive: {error}"))?;
+            Ok(workspace)
+        }
+        DeployJobSource::Cli => {
+            let canonical = fs::canonicalize(&job.source_path)
+                .map_err(|error| format!("canonicalize CLI source: {error}"))?;
+            if canonical != job.source_path || !canonical.is_dir() {
+                return Err("CLI source is no longer the canonical authorized directory".into());
+            }
+            Ok(canonical)
+        }
+        DeployJobSource::GitHub => Err("generic worker cannot claim GitHub jobs".into()),
+    }
+}
+
+fn generic_deploy_request(job: &DeployJob, source_dir: PathBuf) -> Result<DeployRequest, String> {
+    let deployment_id = job
+        .deployment_id
+        .clone()
+        .ok_or_else(|| "queued deployment has no preassigned deployment id".to_owned())?;
+    let source = match job.source {
+        DeployJobSource::Upload => DeploymentSource::upload(),
+        DeployJobSource::Cli => DeploymentSource::cli(),
+        DeployJobSource::GitHub => return Err("generic worker cannot dispatch GitHub jobs".into()),
+    };
+    Ok(DeployRequest {
+        source_dir,
+        app: job.app.clone(),
+        domain: Some(job.domain.clone()),
+        engine_version: Some(job.engine_version.clone()),
+        entry: Some(job.entry.clone()),
+        artifact_root: Some(job.artifact_root.clone()),
+        upstream: Some(job.upstream.clone()),
+        deployment_id: Some(deployment_id),
+        source,
+    })
+}
+
+fn fail_preassigned_deployment(
+    state: &mut State,
+    job: &DeployJob,
+    error: &str,
+) -> Result<(), String> {
+    let deployment_id = job
+        .deployment_id
+        .as_deref()
+        .ok_or_else(|| "queued deployment has no preassigned deployment id".to_owned())?;
+    let deployment = state
+        .deployment(deployment_id)
+        .map_err(|state_error| state_error.to_string())?
+        .ok_or_else(|| "preassigned deployment no longer exists".to_owned())?;
+    if deployment.status == DeploymentStatus::Building {
+        state
+            .mark_deployment_failed(deployment_id, error)
+            .map_err(|state_error| state_error.to_string())?;
+    }
+    Ok(())
+}
+
+fn cleanup_upload_job(state_root: &Path, job: &DeployJob) {
+    if job.source != DeployJobSource::Upload || !valid_upload_job_identity(job) {
+        return;
+    }
+    let expected_archive = state_root
+        .join("deploy-uploads")
+        .join(format!("{}.archive", job.key));
+    if job.source_path == expected_archive {
+        let _ = fs::remove_file(expected_archive);
+    }
+    let _ = fs::remove_dir_all(state_root.join("upload-work").join(&job.id));
+}
+
+fn run_generic_worker_once<F>(
+    state_path: &Path,
+    source: DeployJobSource,
+    mut deploy: F,
+) -> Result<GenericWorkerResult, String>
+where
+    F: FnMut(&mut State, DeployRequest, &AuditContext) -> Result<String, String>,
+{
+    if source == DeployJobSource::GitHub {
+        return Err("generic worker cannot claim GitHub jobs".into());
+    }
+    let mut state = State::open(state_path).map_err(|error| error.to_string())?;
+    let Some(job) = state
+        .claim_deploy_job_for_source(source)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(GenericWorkerResult::Idle);
+    };
+    let state_root = state.state_root().to_owned();
+    let mut before_runtime = true;
+    let outcome: Result<(), String> = (|| {
+        let source_dir = prepare_generic_source(&state, &job)?;
+        let request = generic_deploy_request(&job, source_dir)?;
+        let expected_id = request
+            .deployment_id
+            .clone()
+            .ok_or_else(|| "queued deployment has no preassigned deployment id".to_owned())?;
+        before_runtime = false;
+        let actual_id = deploy(&mut state, request, &generic_worker_audit(&job))?;
+        if actual_id != expected_id {
+            return Err("runtime returned a different deployment id".into());
+        }
+        Ok(())
+    })();
+
+    let result = match outcome {
+        Ok(()) => state
+            .finish_deploy_job(&job.id, DeployJobStatus::Succeeded, None)
+            .map_err(|error| error.to_string())
+            .map(|()| GenericWorkerResult::Succeeded {
+                job_id: job.id.clone(),
+            }),
+        Err(error) => {
+            let deployment_result = fail_preassigned_deployment(&mut state, &job, &error);
+            let job_result = state
+                .finish_deploy_job(&job.id, DeployJobStatus::Failed, Some(&error))
+                .map_err(|state_error| state_error.to_string());
+            deployment_result
+                .and(job_result)
+                .map(|()| GenericWorkerResult::Failed {
+                    job_id: job.id.clone(),
+                    app: job.app.clone(),
+                    before_runtime,
+                })
+        }
+    };
+    cleanup_upload_job(&state_root, &job);
+    result
 }
 
 fn retire_runtime_after_quiescence<I: Instance + 'static>(
@@ -908,9 +1137,41 @@ fn serve(
             &live_runtime,
         ))),
     );
-    let github_shutdown = Arc::clone(&shutdown);
-    let github_thread = thread::spawn(move || {
-        while !github_shutdown.load(Ordering::Acquire) {
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_state_path = state_path.to_owned();
+    let worker_runtime = Arc::clone(&live_runtime);
+    let worker_metrics = metrics.clone();
+    let worker_thread = thread::spawn(move || {
+        match State::open(&worker_state_path).and_then(|mut state| state.recover_deploy_jobs()) {
+            Ok(_) => {}
+            Err(error) => eprintln!("cygnus-daemon: deploy job recovery error: {error}"),
+        }
+        while !worker_shutdown.load(Ordering::Acquire) {
+            for source in [DeployJobSource::Upload, DeployJobSource::Cli] {
+                match run_generic_worker_once(
+                    &worker_state_path,
+                    source,
+                    |state, request, audit| {
+                        worker_runtime
+                            .deploy(state, request, audit)
+                            .map(|result| result.deployment_id)
+                            .map_err(|error| error.to_string())
+                    },
+                ) {
+                    Ok(GenericWorkerResult::Failed {
+                        job_id,
+                        app,
+                        before_runtime: true,
+                    }) => record_event(
+                        &worker_metrics,
+                        "deploy_failed",
+                        Some(&app),
+                        format!("queued deployment job {job_id} failed before runtime"),
+                    ),
+                    Ok(_) => {}
+                    Err(error) => eprintln!("cygnus-daemon: queued deploy worker error: {error}"),
+                }
+            }
             if let Err(error) = github_worker.run_once() {
                 eprintln!("cygnus-daemon: GitHub worker error: {error}");
             }
@@ -973,9 +1234,9 @@ fn serve(
             .join()
             .map_err(|_| io::Error::other("ACME renewal thread panicked"))?;
     }
-    github_thread
+    worker_thread
         .join()
-        .map_err(|_| io::Error::other("GitHub worker thread panicked"))?;
+        .map_err(|_| io::Error::other("deploy worker thread panicked"))?;
     for (app, error) in supervisor.shutdown_all() {
         eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
     }
@@ -1380,6 +1641,237 @@ mod tests {
             MetricsHub::new(),
         );
         (runtime, supervisor, router, events, shutdowns)
+    }
+
+    fn enqueue_generic_job(
+        directory: &Path,
+        source: DeployJobSource,
+        source_path: PathBuf,
+        key: &str,
+    ) -> (PathBuf, String, String) {
+        use cygnus_daemon::state::{DeployJobSpec, DeploymentInput, EngineRecord};
+
+        fs::create_dir_all(directory).unwrap();
+        let state_path = directory.join("state.db");
+        let engine = directory.join("bin/true");
+        fs::create_dir_all(engine.parent().unwrap()).unwrap();
+        fs::write(&engine, b"test engine").unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut state = State::open(&state_path).unwrap();
+        state
+            .register_engine(&EngineRecord {
+                version: "test-engine".into(),
+                host_root: directory.to_owned(),
+                cage_executable: "/bin/true".into(),
+                sha256: "a".repeat(64),
+                is_default: true,
+            })
+            .unwrap();
+        let deployment_id = format!("deployment-{key}");
+        let job_id = format!("job-{key}");
+        let provenance = match source {
+            DeployJobSource::Upload => DeploymentSource::upload(),
+            DeployJobSource::Cli => DeploymentSource::cli(),
+            DeployJobSource::GitHub => unreachable!("generic fixture source"),
+        };
+        state
+            .enqueue_preassigned_deployment(
+                &DeploymentInput {
+                    id: deployment_id.clone(),
+                    app: "app".into(),
+                    source_hash: "b".repeat(64),
+                    engine_version: "test-engine".into(),
+                    source: provenance,
+                },
+                &DeployJobSpec {
+                    id: job_id.clone(),
+                    key: key.into(),
+                    source,
+                    source_path,
+                    source_ref: "b".repeat(64),
+                    app: "app".into(),
+                    domain: "app.example".into(),
+                    engine_version: "test-engine".into(),
+                    entry: "index.ts".into(),
+                    artifact_root: directory.join("artifacts/app"),
+                    upstream: directory.join("upstreams/app"),
+                    branch: None,
+                    commit: None,
+                    installation_id: None,
+                    repository_id: None,
+                    owner: None,
+                    name: None,
+                    environment: None,
+                    kind: None,
+                    pull_request: None,
+                },
+            )
+            .unwrap();
+        (state_path, deployment_id, job_id)
+    }
+
+    fn write_test_archive(path: &Path) {
+        use std::io::Cursor;
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = fs::File::create(path).unwrap();
+        let mut archive = tar::Builder::new(file);
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o755);
+        directory.set_size(0);
+        directory.set_cksum();
+        archive
+            .append_data(&mut directory, "source", Cursor::new(Vec::<u8>::new()))
+            .unwrap();
+        let body = b"export default { fetch() { return new Response('ok') } }";
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o600);
+        file.set_size(body.len() as u64);
+        file.set_cksum();
+        archive
+            .append_data(&mut file, "source/index.ts", Cursor::new(body))
+            .unwrap();
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn upload_worker_extracts_constructs_request_succeeds_and_cleans_up() {
+        let directory = unique_dir("queued-upload-success");
+        fs::create_dir_all(&directory).unwrap();
+        let key = "1".repeat(64);
+        let archive = directory
+            .join("deploy-uploads")
+            .join(format!("{key}.archive"));
+        write_test_archive(&archive);
+        let (state_path, deployment_id, job_id) =
+            enqueue_generic_job(&directory, DeployJobSource::Upload, archive.clone(), &key);
+        let workspace = directory.join("upload-work").join(&job_id);
+        let mut seen = None;
+
+        let result =
+            run_generic_worker_once(&state_path, DeployJobSource::Upload, |_, request, audit| {
+                assert!(
+                    !fs::read(request.source_dir.join("index.ts"))
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(request.source_dir, workspace);
+                assert_eq!(request.app, "app");
+                assert_eq!(request.domain.as_deref(), Some("app.example"));
+                assert_eq!(request.engine_version.as_deref(), Some("test-engine"));
+                assert_eq!(request.entry.as_deref(), Some(Path::new("index.ts")));
+                assert_eq!(
+                    request.deployment_id.as_deref(),
+                    Some(deployment_id.as_str())
+                );
+                assert_eq!(request.source, DeploymentSource::upload());
+                assert_eq!(audit.actor_subject.as_deref(), Some("deploy:worker"));
+                let id = request.deployment_id.clone().unwrap();
+                seen = Some(request);
+                Ok(id)
+            })
+            .unwrap();
+
+        assert_eq!(
+            result,
+            GenericWorkerResult::Succeeded {
+                job_id: job_id.clone()
+            }
+        );
+        assert!(seen.is_some());
+        let state = State::open(&state_path).unwrap();
+        assert_eq!(
+            state.deploy_job(&job_id).unwrap().unwrap().status,
+            DeployJobStatus::Succeeded
+        );
+        assert!(!archive.exists());
+        assert!(!workspace.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn upload_extraction_failure_marks_deployment_and_job_failed_and_cleans_up() {
+        let directory = unique_dir("queued-upload-failure");
+        fs::create_dir_all(&directory).unwrap();
+        let key = "2".repeat(64);
+        let archive = directory
+            .join("deploy-uploads")
+            .join(format!("{key}.archive"));
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::write(&archive, b"not a tar archive").unwrap();
+        let (state_path, deployment_id, job_id) =
+            enqueue_generic_job(&directory, DeployJobSource::Upload, archive.clone(), &key);
+        let workspace = directory.join("upload-work").join(&job_id);
+        let mut called = false;
+
+        let result = run_generic_worker_once(&state_path, DeployJobSource::Upload, |_, _, _| {
+            called = true;
+            unreachable!("invalid archive must fail before runtime")
+        })
+        .unwrap();
+
+        assert_eq!(
+            result,
+            GenericWorkerResult::Failed {
+                job_id: job_id.clone(),
+                app: "app".into(),
+                before_runtime: true
+            }
+        );
+        assert!(!called);
+        let state = State::open(&state_path).unwrap();
+        assert_eq!(
+            state.deploy_job(&job_id).unwrap().unwrap().status,
+            DeployJobStatus::Failed
+        );
+        let deployment = state.deployment(&deployment_id).unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Failed);
+        assert!(deployment.error.unwrap().contains("extract upload archive"));
+        assert!(!archive.exists());
+        assert!(!workspace.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cli_worker_dispatches_the_existing_canonical_authorized_source() {
+        let directory = unique_dir("queued-cli");
+        let source = directory.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("index.ts"), b"export default {};").unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let key = "cli-app";
+        let (state_path, deployment_id, job_id) =
+            enqueue_generic_job(&directory, DeployJobSource::Cli, source.clone(), key);
+        let mut dispatched = false;
+
+        let result = run_generic_worker_once(&state_path, DeployJobSource::Cli, |_, request, _| {
+            assert_eq!(request.source_dir, source);
+            assert_eq!(
+                request.deployment_id.as_deref(),
+                Some(deployment_id.as_str())
+            );
+            assert_eq!(request.source, DeploymentSource::cli());
+            dispatched = true;
+            Ok(request.deployment_id.unwrap())
+        })
+        .unwrap();
+
+        assert!(dispatched);
+        assert_eq!(
+            result,
+            GenericWorkerResult::Succeeded {
+                job_id: job_id.clone()
+            }
+        );
+        assert!(source.exists());
+        let state = State::open(&state_path).unwrap();
+        assert_eq!(
+            state.deploy_job(&job_id).unwrap().unwrap().status,
+            DeployJobStatus::Succeeded
+        );
+        assert!(!directory.join("upload-work").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     struct ReaperInstance {

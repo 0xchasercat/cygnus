@@ -31,9 +31,9 @@ mod spec;
 #[cfg(target_os = "linux")]
 pub use dns::{DnsForwarder, DnsLease};
 pub use error::CageError;
+pub use jobs::{JobCompletion, JobConfig, JobExitOutcome, JobResult, run_job, run_job_streaming};
 #[cfg(target_os = "linux")]
-pub use jobs::run_job_with_dns;
-pub use jobs::{JobConfig, JobExitOutcome, JobResult, run_job};
+pub use jobs::{run_job_streaming_with_dns, run_job_with_dns};
 #[cfg(target_os = "linux")]
 pub use linux::Cage;
 #[cfg(not(target_os = "linux"))]

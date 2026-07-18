@@ -8,7 +8,7 @@ pub use crate::github::{
     GitHubRepositoryView,
 };
 use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
-use crate::state::NodeConfig;
+use crate::state::{DeployJobSource, DeploymentSource, NodeConfig};
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
@@ -75,6 +75,26 @@ pub enum AdminCommand {
         is_default: bool,
     },
     Deploy {
+        request: DeployRequest,
+    },
+    DeployUploadBegin {
+        app: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        domain: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<std::path::PathBuf>,
+        total_bytes: u64,
+    },
+    DeployUploadChunk {
+        upload_id: String,
+        chunk_base64: String,
+    },
+    DeployUploadFinish {
+        upload_id: String,
+    },
+    DeployStart {
         request: DeployRequest,
     },
     MapDomain {
@@ -261,6 +281,21 @@ pub enum AdminData {
         version: String,
         sha256: String,
     },
+    DeployUploadBegun {
+        upload_id: String,
+    },
+    DeployUploadChunked {
+        upload_id: String,
+        received_bytes: u64,
+    },
+    DeployUploadFinished {
+        deployment_id: String,
+        job_id: String,
+    },
+    DeployStarted {
+        deployment_id: String,
+        job_id: String,
+    },
     DeploymentActivated {
         app: String,
         deployment_id: String,
@@ -320,7 +355,7 @@ pub enum AdminData {
         next_cursor: Option<String>,
     },
     DeployJobRetried {
-        job: GitHubJobView,
+        job: Box<GitHubJobView>,
     },
     InstallationRepositories {
         repositories: Vec<GitHubInstallationRepositoryView>,
@@ -401,6 +436,8 @@ pub struct DeploymentView {
     pub app: String,
     pub source_hash: String,
     pub engine_version: String,
+    pub created_ms: i64,
+    pub source: DeploymentSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
     pub status: String,
@@ -413,15 +450,25 @@ pub struct DeploymentView {
 pub struct GitHubJobView {
     pub id: String,
     pub key: String,
-    pub installation_id: i64,
-    pub repository_id: i64,
-    pub owner: String,
-    pub name: String,
-    pub environment: String,
-    pub kind: String,
+    pub source: DeployJobSource,
+    pub source_ref: String,
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<i64>,
-    pub sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
     pub status: String,
     pub attempts: u32,
     pub next_attempt_at: String,
@@ -430,7 +477,9 @@ pub struct GitHubJobView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_run_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deployment_id: Option<i64>,
+    pub github_deployment_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -543,6 +592,103 @@ mod tests {
             serde_json::from_value::<AdminRequest>(encoded).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn upload_and_async_deploy_commands_have_exact_frozen_json_shapes() {
+        let begin = AdminCommand::DeployUploadBegin {
+            app: "hello".into(),
+            domain: Some("hello.example".into()),
+            engine_version: None,
+            entry: Some("src/index.ts".into()),
+            total_bytes: 123,
+        };
+        assert_eq!(
+            serde_json::to_value(&begin).unwrap(),
+            serde_json::json!({
+                "type": "deploy_upload_begin",
+                "app": "hello",
+                "domain": "hello.example",
+                "entry": "src/index.ts",
+                "total_bytes": 123
+            })
+        );
+        let a_id = "a".repeat(64);
+        let b_id = "b".repeat(64);
+        assert_eq!(
+            serde_json::to_value(AdminCommand::DeployUploadChunk {
+                upload_id: a_id.clone(),
+                chunk_base64: "YQ==".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "deploy_upload_chunk",
+                "upload_id": a_id.clone(),
+                "chunk_base64": "YQ=="
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::DeployUploadFinish {
+                upload_id: b_id.clone(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "deploy_upload_finish",
+                "upload_id": b_id
+            })
+        );
+        let start = AdminCommand::DeployStart {
+            request: DeployRequest {
+                source_dir: "/srv/source".into(),
+                app: "hello".into(),
+                domain: None,
+                engine_version: None,
+                entry: None,
+                artifact_root: None,
+                upstream: None,
+                deployment_id: None,
+                source: DeploymentSource::cli(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(start).unwrap(),
+            serde_json::json!({
+                "type": "deploy_start",
+                "request": { "source_dir": "/srv/source", "app": "hello" }
+            })
+        );
+
+        for (data, expected) in [
+            (
+                AdminData::DeployUploadBegun {
+                    upload_id: a_id.clone(),
+                },
+                serde_json::json!({"kind":"deploy_upload_begun","upload_id":a_id.clone()}),
+            ),
+            (
+                AdminData::DeployUploadChunked {
+                    upload_id: a_id.clone(),
+                    received_bytes: 12,
+                },
+                serde_json::json!({"kind":"deploy_upload_chunked","upload_id":a_id,"received_bytes":12}),
+            ),
+            (
+                AdminData::DeployUploadFinished {
+                    deployment_id: "deployment".into(),
+                    job_id: "job".into(),
+                },
+                serde_json::json!({"kind":"deploy_upload_finished","deployment_id":"deployment","job_id":"job"}),
+            ),
+            (
+                AdminData::DeployStarted {
+                    deployment_id: "deployment".into(),
+                    job_id: "job".into(),
+                },
+                serde_json::json!({"kind":"deploy_started","deployment_id":"deployment","job_id":"job"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(data).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -773,6 +919,33 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn deployment_view_uses_exact_nested_source_shape() {
+        let view = DeploymentView {
+            id: "deploy-1".into(),
+            app: "hello".into(),
+            source_hash: "a".repeat(64),
+            engine_version: "bun".into(),
+            created_ms: 1_700_000_000_000,
+            source: DeploymentSource::github(Some("main".into()), Some("b".repeat(64))),
+            artifact_hash: None,
+            status: "building".into(),
+            error: None,
+        };
+
+        let encoded = serde_json::to_value(view).unwrap();
+
+        assert_eq!(encoded["created_ms"], 1_700_000_000_000_i64);
+        assert_eq!(
+            encoded["source"],
+            serde_json::json!({
+                "kind": "github",
+                "branch": "main",
+                "commit": "b".repeat(64)
+            })
         );
     }
 

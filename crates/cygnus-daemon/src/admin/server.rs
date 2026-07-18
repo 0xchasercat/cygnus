@@ -11,9 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
 use super::protocol::{
     ADMIN_PROTOCOL_VERSION, AdminCommand, AdminErrorCode, AdminRequest, AdminResponse,
     MAX_ADMIN_FRAME_BYTES, MAX_LOG_CHUNK_BYTES, read_frame, write_frame,
+};
+use crate::deploy::upload::{
+    MAX_UPLOAD_BYTES, MAX_UPLOAD_CHUNK_BASE64_CHARS, MAX_UPLOAD_CHUNK_BYTES,
 };
 use crate::state::NodeConfig;
 
@@ -497,27 +503,66 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
                 "engine cage executable",
             )?;
         }
-        AdminCommand::Deploy { request } => {
-            validate_text(&request.app, MAX_ADMIN_APP_BYTES, "app")?;
-            validate_text(&request.domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
-            validate_text(
-                &request.engine_version,
-                MAX_ADMIN_APP_BYTES,
-                "engine version",
-            )?;
+        AdminCommand::Deploy { request } | AdminCommand::DeployStart { request } => {
+            validate_app_name(&request.app)?;
+            if let Some(domain) = request.domain.as_deref() {
+                validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            }
+            if let Some(engine_version) = request.engine_version.as_deref() {
+                validate_text(engine_version, MAX_ADMIN_APP_BYTES, "engine version")?;
+            }
             validate_path(
                 &request.source_dir,
                 MAX_ADMIN_DEPLOYMENT_BYTES,
                 "source directory",
             )?;
-            validate_path(&request.entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
-            validate_path(
-                &request.artifact_root,
-                MAX_ADMIN_DEPLOYMENT_BYTES,
-                "artifact root",
-            )?;
-            validate_path(&request.upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
+            if let Some(entry) = request.entry.as_deref() {
+                validate_path(entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            }
+            if let Some(artifact_root) = request.artifact_root.as_deref() {
+                validate_path(artifact_root, MAX_ADMIN_DEPLOYMENT_BYTES, "artifact root")?;
+            }
+            if let Some(upstream) = request.upstream.as_deref() {
+                validate_path(upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
+            }
         }
+        AdminCommand::DeployUploadBegin {
+            app,
+            domain,
+            engine_version,
+            entry,
+            total_bytes,
+        } => {
+            validate_app_name(app)?;
+            if let Some(domain) = domain.as_deref() {
+                validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            }
+            if let Some(engine_version) = engine_version.as_deref() {
+                validate_text(engine_version, MAX_ADMIN_APP_BYTES, "engine version")?;
+            }
+            if let Some(entry) = entry.as_deref() {
+                validate_relative_path(entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            }
+            if !(1..=MAX_UPLOAD_BYTES).contains(total_bytes) {
+                return Err("total_bytes must be between 1 byte and 64 MiB".into());
+            }
+        }
+        AdminCommand::DeployUploadChunk {
+            upload_id,
+            chunk_base64,
+        } => {
+            validate_upload_id(upload_id)?;
+            if chunk_base64.is_empty() || chunk_base64.len() > MAX_UPLOAD_CHUNK_BASE64_CHARS {
+                return Err("upload chunk exceeds the frame-safe base64 limit".into());
+            }
+            let decoded = BASE64_STANDARD
+                .decode(chunk_base64)
+                .map_err(|_| "upload chunk is not valid base64".to_owned())?;
+            if decoded.is_empty() || decoded.len() > MAX_UPLOAD_CHUNK_BYTES {
+                return Err("upload chunk must decode to between 1 byte and 48 KiB".into());
+            }
+        }
+        AdminCommand::DeployUploadFinish { upload_id } => validate_upload_id(upload_id)?,
         AdminCommand::MapDomain { app, domain } => {
             validate_text(app, MAX_ADMIN_APP_BYTES, "app")?;
             validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
@@ -535,13 +580,15 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             validate_text(&repository.name, MAX_ADMIN_APP_BYTES, "repository name")?;
             validate_text(&repository.branch, MAX_ADMIN_APP_BYTES, "repository branch")?;
             validate_text(&repository.app, MAX_ADMIN_APP_BYTES, "app")?;
-            validate_text(&repository.domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
-            validate_text(
-                &repository.engine_version,
-                MAX_ADMIN_APP_BYTES,
-                "engine version",
-            )?;
-            validate_path(&repository.entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            if let Some(domain) = repository.domain.as_deref() {
+                validate_text(domain, MAX_ADMIN_DOMAIN_BYTES, "domain")?;
+            }
+            if let Some(engine_version) = repository.engine_version.as_deref() {
+                validate_text(engine_version, MAX_ADMIN_APP_BYTES, "engine version")?;
+            }
+            if let Some(entry) = repository.entry.as_deref() {
+                validate_path(entry, MAX_ADMIN_DEPLOYMENT_BYTES, "entry")?;
+            }
             if repository.installation_id <= 0 || repository.repository_id <= 0 {
                 return Err("installation and repository ids must be positive".into());
             }
@@ -620,6 +667,7 @@ fn authorize_actor(role: AdminRole, request: &AdminRequest) -> Result<(), String
         AdminCommand::ApplyConfig(_)
             | AdminCommand::RegisterEngine { .. }
             | AdminCommand::Deploy { .. }
+            | AdminCommand::DeployStart { .. }
     );
     if host_only && role != AdminRole::Host {
         return Err("command is restricted to the host admin listener".into());
@@ -689,6 +737,31 @@ fn validate_text(value: &str, max_bytes: usize, field: &str) -> Result<(), Strin
 }
 fn validate_path(path: &Path, max_bytes: usize, field: &str) -> Result<(), String> {
     validate_text(&path.to_string_lossy(), max_bytes, field)
+}
+
+fn validate_relative_path(path: &Path, max_bytes: usize, field: &str) -> Result<(), String> {
+    validate_path(path, max_bytes, field)?;
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("{field} must be a relative path without traversal"));
+    }
+    Ok(())
+}
+
+fn validate_upload_id(upload_id: &str) -> Result<(), String> {
+    if !valid_sha256(upload_id) {
+        return Err("upload_id must be exactly 64 lowercase hexadecimal characters".into());
+    }
+    Ok(())
 }
 
 fn validate_node_config(config: &NodeConfig) -> Result<(), String> {
@@ -943,6 +1016,55 @@ mod tests {
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
         tenant.actor = Some("bad actor".into());
         assert!(authorize_actor(AdminRole::TenantZero, &tenant).is_err());
+    }
+
+    #[test]
+    fn upload_commands_allow_both_roles_but_deploy_start_is_host_only() {
+        let mut upload = request();
+        upload.command = AdminCommand::DeployUploadBegin {
+            app: "hello".into(),
+            domain: None,
+            engine_version: None,
+            entry: Some("src/index.ts".into()),
+            total_bytes: MAX_UPLOAD_BYTES,
+        };
+        assert!(authorize_actor(AdminRole::Host, &upload).is_ok());
+        assert!(validate_request(&upload).is_ok());
+        upload.actor = Some("tenant:operator".into());
+        assert!(authorize_actor(AdminRole::TenantZero, &upload).is_ok());
+
+        upload.command = AdminCommand::DeployUploadChunk {
+            upload_id: "a".repeat(64),
+            chunk_base64: BASE64_STANDARD.encode([7_u8; 32]),
+        };
+        assert!(authorize_actor(AdminRole::TenantZero, &upload).is_ok());
+        assert!(validate_request(&upload).is_ok());
+        if let AdminCommand::DeployUploadChunk { chunk_base64, .. } = &mut upload.command {
+            *chunk_base64 = "A".repeat(MAX_UPLOAD_CHUNK_BASE64_CHARS + 1);
+        }
+        assert!(validate_request(&upload).is_err());
+
+        upload.command = AdminCommand::DeployUploadFinish {
+            upload_id: "not-an-id".into(),
+        };
+        assert!(validate_request(&upload).is_err());
+
+        upload.command = AdminCommand::DeployStart {
+            request: crate::deploy::DeployRequest {
+                source_dir: "/host/source".into(),
+                app: "hello".into(),
+                domain: None,
+                engine_version: None,
+                entry: None,
+                artifact_root: None,
+                upstream: None,
+                deployment_id: None,
+                source: crate::state::DeploymentSource::cli(),
+            },
+        };
+        assert!(authorize_actor(AdminRole::TenantZero, &upload).is_err());
+        upload.actor = None;
+        assert!(authorize_actor(AdminRole::Host, &upload).is_ok());
     }
 
     #[test]

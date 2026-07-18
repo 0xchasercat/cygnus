@@ -30,7 +30,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 8;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const SHA256_HEX_LEN: usize = 64;
 const NODE_KEY_LEN: usize = 32;
@@ -73,6 +73,48 @@ pub struct EngineStatus {
     pub app_count: u32,
 }
 
+/// The system that supplied a deployment.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentSourceKind {
+    GitHub,
+    Upload,
+    #[default]
+    Cli,
+}
+
+/// Typed deployment provenance persisted with every deployment.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentSource {
+    pub kind: DeploymentSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl DeploymentSource {
+    pub fn cli() -> Self {
+        Self::default()
+    }
+
+    pub fn upload() -> Self {
+        Self {
+            kind: DeploymentSourceKind::Upload,
+            ..Self::default()
+        }
+    }
+
+    pub fn github(branch: Option<String>, commit: Option<String>) -> Self {
+        Self {
+            kind: DeploymentSourceKind::GitHub,
+            branch,
+            commit,
+        }
+    }
+}
+
 /// A deployment identity accepted from the caller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeploymentInput {
@@ -80,6 +122,8 @@ pub struct DeploymentInput {
     pub app: String,
     pub source_hash: String,
     pub engine_version: String,
+    #[serde(default)]
+    pub source: DeploymentSource,
 }
 
 /// Build output submitted when sealing a deployment.
@@ -111,10 +155,12 @@ pub struct DeploymentRecord {
     pub app: String,
     pub source_hash: String,
     pub engine_version: String,
+    pub source: DeploymentSource,
     pub artifact_hash: Option<String>,
     pub status: DeploymentStatus,
     pub error: Option<String>,
     pub created_at: String,
+    pub created_ms: i64,
     pub updated_at: String,
     pub log_path: Option<PathBuf>,
 }
@@ -553,9 +599,20 @@ pub enum GitHubJobKind {
     Preview,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Origin of a durable deployment queue item.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GitHubDeployJobStatus {
+pub enum DeployJobSource {
+    #[serde(rename = "github")]
+    GitHub,
+    Upload,
+    Cli,
+}
+
+/// Lifecycle state shared by every deployment source.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployJobStatus {
     Queued,
     Running,
     Succeeded,
@@ -563,6 +620,69 @@ pub enum GitHubDeployJobStatus {
     Retry,
     Cancelled,
 }
+
+/// Input for the source-neutral deployment queue. GitHub identity and reporting
+/// fields are optional so upload and CLI producers do not need synthetic values.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeployJobSpec {
+    pub id: String,
+    pub key: String,
+    pub source: DeployJobSource,
+    pub source_path: PathBuf,
+    pub source_ref: String,
+    pub app: String,
+    pub domain: String,
+    pub engine_version: String,
+    pub entry: PathBuf,
+    pub artifact_root: PathBuf,
+    pub upstream: PathBuf,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub installation_id: Option<i64>,
+    pub repository_id: Option<i64>,
+    pub owner: Option<String>,
+    pub name: Option<String>,
+    pub environment: Option<String>,
+    pub kind: Option<GitHubJobKind>,
+    pub pull_request: Option<i64>,
+}
+
+/// One persisted source-neutral deployment queue item.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeployJob {
+    pub id: String,
+    pub key: String,
+    pub source: DeployJobSource,
+    pub source_path: PathBuf,
+    pub source_ref: String,
+    pub app: String,
+    pub domain: String,
+    pub engine_version: String,
+    pub entry: PathBuf,
+    pub artifact_root: PathBuf,
+    pub upstream: PathBuf,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub installation_id: Option<i64>,
+    pub repository_id: Option<i64>,
+    pub owner: Option<String>,
+    pub name: Option<String>,
+    pub environment: Option<String>,
+    pub kind: Option<GitHubJobKind>,
+    pub pull_request: Option<i64>,
+    pub status: DeployJobStatus,
+    pub attempts: u32,
+    pub next_attempt_at: String,
+    pub error: Option<String>,
+    pub check_run_id: Option<i64>,
+    pub github_deployment_id: Option<i64>,
+    pub deployment_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Compatibility name retained for existing GitHub callers.
+pub type GitHubDeployJobStatus = DeployJobStatus;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubJobSpec {
@@ -595,9 +715,58 @@ pub struct GitHubDeployJob {
     pub next_attempt_at: String,
     pub error: Option<String>,
     pub check_run_id: Option<i64>,
+    /// GitHub's deployment-report id (not the local Cygnus deployment id).
     pub deployment_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl DeployJob {
+    /// Require and materialize the GitHub-only identity/reporting view.
+    pub fn into_github(self) -> Result<GitHubDeployJob, StateError> {
+        self.try_into()
+    }
+}
+
+impl TryFrom<DeployJob> for GitHubDeployJob {
+    type Error = StateError;
+
+    fn try_from(job: DeployJob) -> Result<Self, Self::Error> {
+        if job.source != DeployJobSource::GitHub {
+            return Err(StateError::InvalidRecord {
+                kind: "github job",
+                detail: "job source is not github".into(),
+            });
+        }
+        fn required<T>(value: Option<T>, id: &str, field: &'static str) -> Result<T, StateError> {
+            value.ok_or_else(|| {
+                StateError::IncompleteState(format!("github job {id:?} is missing {field}"))
+            })
+        }
+        let id = job.id.clone();
+        Ok(Self {
+            id: job.id,
+            key: job.key,
+            installation_id: required(job.installation_id, &id, "installation id")?,
+            repository_id: required(job.repository_id, &id, "repository id")?,
+            owner: required(job.owner, &id, "owner")?,
+            name: required(job.name, &id, "repository name")?,
+            environment: required(job.environment, &id, "environment")?,
+            kind: required(job.kind, &id, "job kind")?,
+            pull_request: job.pull_request,
+            sha: job.commit.ok_or_else(|| {
+                StateError::IncompleteState("github job is missing commit SHA".into())
+            })?,
+            status: job.status,
+            attempts: job.attempts,
+            next_attempt_at: job.next_attempt_at,
+            error: job.error,
+            check_run_id: job.check_run_id,
+            deployment_id: job.github_deployment_id,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+        })
+    }
 }
 
 /// Durable state and configuration errors.
@@ -669,6 +838,7 @@ pub struct State {
     connection: Connection,
     certificate_store: CertificateStore,
     node_key: [u8; NODE_KEY_LEN],
+    state_root: PathBuf,
 }
 
 impl State {
@@ -681,6 +851,13 @@ impl State {
         {
             fs::create_dir_all(parent)?;
         }
+        let state_root = match path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(parent) => fs::canonicalize(parent)?,
+            None => fs::canonicalize(".")?,
+        };
         let node_key = load_node_key(path)?;
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -712,6 +889,8 @@ impl State {
                 3 => migrate_v3_to_v4(&transaction)?,
                 4 => migrate_v4_to_v5(&transaction, &node_key)?,
                 5 => migrate_v5_to_v6(&transaction)?,
+                6 => migrate_v6_to_v7(&transaction)?,
+                7 => migrate_v7_to_v8(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -724,7 +903,23 @@ impl State {
             connection,
             certificate_store,
             node_key,
+            state_root,
         })
+    }
+
+    /// Canonical parent directory that owns daemon state and deployment data.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// Daemon-owned artifact root for an app deployment.
+    pub fn deployment_artifact_root(&self, app: &str) -> PathBuf {
+        self.state_root.join("artifacts").join(app)
+    }
+
+    /// Daemon-owned upstream base for an app deployment.
+    pub fn deployment_upstream(&self, app: &str) -> PathBuf {
+        self.state_root.join("upstreams").join(app)
     }
 
     /// Validate and atomically replace the complete persisted configuration.
@@ -1078,6 +1273,19 @@ impl State {
             .map_err(StateError::from)
     }
 
+    /// Return the operator-selected default engine, if one is registered.
+    pub fn default_engine(&self) -> Result<Option<EngineRecord>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT version, host_root, cage_executable, sha256, is_default
+                 FROM engines WHERE is_default = 1",
+                [],
+                engine_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
     /// List registered engines in stable version order with active app counts.
     pub fn engines(&self) -> Result<Vec<EngineStatus>, StateError> {
         let mut statement = self.connection.prepare(
@@ -1135,12 +1343,66 @@ impl State {
             });
         }
         self.connection.execute(
-            "INSERT INTO deployments (id, app, source_hash, engine_version, status, error) VALUES (?1, ?2, ?3, ?4, 'building', NULL)",
-            params![input.id, input.app, input.source_hash, input.engine_version],
+            "INSERT INTO deployments
+             (id, app, source_hash, engine_version, source_kind, source_branch, source_commit, status, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'building', NULL)",
+            params![
+                input.id,
+                input.app,
+                input.source_hash,
+                input.engine_version,
+                deployment_source_kind_name(input.source.kind),
+                input.source.branch,
+                input.source.commit,
+            ],
         )?;
         self.deployment(&input.id)?.ok_or_else(|| {
             StateError::IncompleteState(format!(
                 "deployment {:?} disappeared after insert",
+                input.id
+            ))
+        })
+    }
+
+    /// Resume a preassigned building deployment and replace its provisional
+    /// source hash with the hash computed during trusted source intake.
+    pub fn resume_building_deployment(
+        &mut self,
+        input: &DeploymentInput,
+    ) -> Result<DeploymentRecord, StateError> {
+        validate_deployment_input(input)?;
+        let current = self
+            .deployment(&input.id)?
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("preassigned deployment {:?} does not exist", input.id),
+            })?;
+        if current.status != DeploymentStatus::Building {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("preassigned deployment {:?} is not building", input.id),
+            });
+        }
+        if current.app != input.app
+            || current.engine_version != input.engine_version
+            || current.source != input.source
+        {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!(
+                    "preassigned deployment {:?} does not match app, engine, or source provenance",
+                    input.id
+                ),
+            });
+        }
+        self.connection.execute(
+            "UPDATE deployments SET source_hash = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status = 'building'",
+            params![input.id, input.source_hash],
+        )?;
+        self.deployment(&input.id)?.ok_or_else(|| {
+            StateError::IncompleteState(format!(
+                "deployment {:?} disappeared after source intake",
                 input.id
             ))
         })
@@ -1256,11 +1518,17 @@ impl State {
     }
 
     pub fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>, StateError> {
-        self.connection.query_row(
-            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path FROM deployments WHERE id = ?1",
-            [id],
-            deployment_from_row,
-        ).optional().map_err(StateError::from)
+        self.connection
+            .query_row(
+                "SELECT id, app, source_hash, engine_version, artifact_hash, status, error,
+                    created_at, unixepoch(created_at) * 1000, updated_at, log_path,
+                    source_kind, source_branch, source_commit
+             FROM deployments WHERE id = ?1",
+                [id],
+                deployment_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
     }
 
     /// List newest deployments, optionally scoped to one app.
@@ -1300,7 +1568,7 @@ impl State {
             None
         };
 
-        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path";
+        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, unixepoch(created_at) * 1000, updated_at, log_path, source_kind, source_branch, source_commit";
         let mut deployments = Vec::new();
         match (app, before) {
             (Some(app), Some(before)) => {
@@ -1941,6 +2209,47 @@ impl State {
         delivery: &GitHubDelivery,
         jobs: &[GitHubJobSpec],
     ) -> Result<bool, StateError> {
+        let mut generic = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            validate_github_job_spec(job)?;
+            let config = self
+                .github_repository(job.installation_id, job.repository_id)?
+                .ok_or_else(|| StateError::InvalidRecord {
+                    kind: "github job",
+                    detail: "repository mapping does not exist".into(),
+                })?;
+            generic.push(DeployJobSpec {
+                id: job.id.clone(),
+                key: job.key.clone(),
+                source: DeployJobSource::GitHub,
+                source_path: PathBuf::from(format!("{}/{}", job.owner, job.name)),
+                source_ref: job.sha.clone(),
+                app: config.app,
+                domain: config.domain,
+                engine_version: config.engine_version,
+                entry: config.entry,
+                artifact_root: config.artifact_root,
+                upstream: config.upstream,
+                branch: Some(config.branch),
+                commit: Some(job.sha.clone()),
+                installation_id: Some(job.installation_id),
+                repository_id: Some(job.repository_id),
+                owner: Some(job.owner.clone()),
+                name: Some(job.name.clone()),
+                environment: Some(job.environment.clone()),
+                kind: Some(job.kind.clone()),
+                pull_request: job.pull_request,
+            });
+        }
+        self.accept_github_delivery_jobs(delivery, &generic)
+    }
+
+    /// Atomically records a GitHub delivery and its already-generalized jobs.
+    pub fn accept_github_delivery_jobs(
+        &mut self,
+        delivery: &GitHubDelivery,
+        jobs: &[DeployJobSpec],
+    ) -> Result<bool, StateError> {
         validate_github_delivery(delivery)?;
         if jobs.len() > MAX_GITHUB_JOBS_PER_DELIVERY {
             return Err(StateError::InvalidRecord {
@@ -1949,7 +2258,13 @@ impl State {
             });
         }
         for job in jobs {
-            validate_github_job_spec(job)?;
+            validate_deploy_job_spec(job)?;
+            if job.source != DeployJobSource::GitHub {
+                return Err(StateError::InvalidRecord {
+                    kind: "github delivery",
+                    detail: "delivery contains a non-github job".into(),
+                });
+            }
         }
         let transaction = self.connection.transaction()?;
         let inserted = transaction.execute(
@@ -1961,59 +2276,330 @@ impl State {
             return Ok(false);
         }
         for job in jobs {
-            transaction.execute(
-                "INSERT OR IGNORE INTO github_deploy_jobs (id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', 0, CURRENT_TIMESTAMP)",
-                params![job.id, job.key, job.installation_id, job.repository_id, job.owner, job.name, job.environment, github_job_kind_name(&job.kind), job.pull_request, job.sha],
-            )?;
-            transaction.execute(
-                "UPDATE github_deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE job_key = ?1 AND sha <> ?2 AND status IN ('queued','retry') AND rowid < (SELECT rowid FROM github_deploy_jobs WHERE id = ?3)",
-                params![job.key, job.sha, job.id],
-            )?;
+            enqueue_deploy_job_tx(&transaction, job)?;
         }
         transaction.commit()?;
         Ok(true)
     }
 
+    /// Atomically precreate a building deployment and enqueue the job that will
+    /// resume it. The local deployment id is persisted while the job is queued.
+    /// Repeating the same job id is idempotent and never creates another
+    /// deployment row.
+    pub fn enqueue_preassigned_deployment(
+        &mut self,
+        deployment: &DeploymentInput,
+        job: &DeployJobSpec,
+    ) -> Result<bool, StateError> {
+        validate_deployment_input(deployment)?;
+        validate_deploy_job_spec(job)?;
+        let deployment_source = match deployment.source.kind {
+            DeploymentSourceKind::GitHub => DeployJobSource::GitHub,
+            DeploymentSourceKind::Upload => DeployJobSource::Upload,
+            DeploymentSourceKind::Cli => DeployJobSource::Cli,
+        };
+        if deployment.app != job.app
+            || deployment.engine_version != job.engine_version
+            || deployment_source != job.source
+        {
+            return Err(StateError::InvalidRecord {
+                kind: "deploy job",
+                detail: "job target does not match its preassigned deployment".into(),
+            });
+        }
+        if self.engine(&deployment.engine_version)?.is_none() {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("engine {:?} is not registered", deployment.engine_version),
+            });
+        }
+
+        let transaction = self.connection.transaction()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM deploy_jobs WHERE id = ?1",
+                [&job.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO deployments
+             (id, app, source_hash, engine_version, source_kind, source_branch, source_commit, status, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'building', NULL)",
+            params![
+                deployment.id,
+                deployment.app,
+                deployment.source_hash,
+                deployment.engine_version,
+                deployment_source_kind_name(deployment.source.kind),
+                deployment.source.branch,
+                deployment.source.commit,
+            ],
+        )?;
+        enqueue_deploy_job_tx(&transaction, job)?;
+        transaction.execute(
+            "UPDATE deploy_jobs SET deployment_id = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status = 'queued'",
+            params![job.id, deployment.id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Enqueue one source-neutral deployment. Duplicate ids are idempotent.
+    pub fn enqueue_deploy_job(&mut self, job: &DeployJobSpec) -> Result<bool, StateError> {
+        validate_deploy_job_spec(job)?;
+        let transaction = self.connection.transaction()?;
+        let inserted = enqueue_deploy_job_tx(&transaction, job)?;
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// List source-neutral deployment jobs in stable creation/id order.
+    pub fn deploy_jobs(
+        &self,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<Vec<DeployJob>, StateError> {
+        let limit = i64::from(limit.clamp(1, 200));
+        let mut statement = self.connection.prepare(&format!(
+            "{DEPLOY_JOB_SELECT} WHERE (?1 IS NULL OR id > ?1) ORDER BY created_at, id LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(params![cursor, limit], deploy_job_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    pub fn deploy_job(&self, id: &str) -> Result<Option<DeployJob>, StateError> {
+        self.connection
+            .query_row(
+                &format!("{DEPLOY_JOB_SELECT} WHERE id = ?1"),
+                [id],
+                deploy_job_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    pub fn current_deploy_job(
+        &self,
+        source: DeployJobSource,
+        key: &str,
+    ) -> Result<Option<DeployJob>, StateError> {
+        self.connection
+            .query_row(
+                &format!("{DEPLOY_JOB_SELECT} WHERE source_kind = ?1 AND job_key = ?2 AND status <> 'cancelled' ORDER BY created_at DESC, rowid DESC LIMIT 1"),
+                params![deploy_job_source_name(source), key],
+                deploy_job_from_row,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    pub fn recover_deploy_jobs(&mut self) -> Result<usize, StateError> {
+        let changed = self.connection.execute(
+            "UPDATE deploy_jobs SET status = CASE WHEN attempts >= ?1 THEN 'failed' ELSE 'retry' END, next_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, error = COALESCE(error, 'daemon restarted while job was running') WHERE status = 'running'",
+            [i64::from(MAX_GITHUB_ATTEMPTS)],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn claim_deploy_job(&mut self) -> Result<Option<DeployJob>, StateError> {
+        self.claim_deploy_job_inner(None)
+    }
+
+    pub fn claim_deploy_job_for_source(
+        &mut self,
+        source: DeployJobSource,
+    ) -> Result<Option<DeployJob>, StateError> {
+        self.claim_deploy_job_inner(Some(source))
+    }
+
+    fn claim_deploy_job_inner(
+        &mut self,
+        source: Option<DeployJobSource>,
+    ) -> Result<Option<DeployJob>, StateError> {
+        let transaction = self.connection.transaction()?;
+        let source = source.map(deploy_job_source_name);
+        let id = transaction.query_row(
+            "SELECT j.id FROM deploy_jobs j WHERE (?1 IS NULL OR j.source_kind = ?1) AND j.status IN ('queued','retry') AND datetime(j.next_attempt_at) <= CURRENT_TIMESTAMP AND (j.source_kind <> 'github' OR EXISTS (SELECT 1 FROM github_repositories r WHERE r.installation_id = j.installation_id AND r.repository_id = j.repository_id AND r.enabled = 1)) AND NOT EXISTS (SELECT 1 FROM deploy_jobs newer WHERE newer.source_kind = j.source_kind AND newer.job_key = j.job_key AND (newer.created_at > j.created_at OR (newer.created_at = j.created_at AND newer.rowid > j.rowid)) AND newer.status <> 'cancelled') ORDER BY j.next_attempt_at, j.created_at, j.rowid LIMIT 1",
+            [source],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        let Some(id) = id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let changed = transaction.execute(
+            "UPDATE deploy_jobs SET status = 'running', attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('queued','retry') AND attempts < ?2",
+            params![id, i64::from(MAX_GITHUB_ATTEMPTS)],
+        )?;
+        if changed == 0 {
+            transaction.rollback()?;
+            return Ok(None);
+        }
+        let job = transaction.query_row(
+            &format!("{DEPLOY_JOB_SELECT} WHERE id = ?1"),
+            [&id],
+            deploy_job_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(Some(job))
+    }
+
+    /// Attach the local Cygnus deployment identity to a running job.
+    pub fn attach_deployment_id(
+        &mut self,
+        id: &str,
+        deployment_id: &str,
+    ) -> Result<(), StateError> {
+        github_text(deployment_id, "deployment id")?;
+        self.connection.execute(
+            "UPDATE deploy_jobs SET deployment_id = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running'",
+            params![id, deployment_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_deploy_job(
+        &mut self,
+        id: &str,
+        status: DeployJobStatus,
+        error: Option<&str>,
+    ) -> Result<(), StateError> {
+        if !matches!(
+            status,
+            DeployJobStatus::Succeeded | DeployJobStatus::Failed | DeployJobStatus::Cancelled
+        ) {
+            return Err(StateError::InvalidRecord {
+                kind: "deploy job",
+                detail: "finish requires a terminal status".into(),
+            });
+        }
+        self.connection.execute(
+            "UPDATE deploy_jobs SET status = ?2, error = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM deploy_jobs newer WHERE newer.source_kind = deploy_jobs.source_kind AND newer.job_key = deploy_jobs.job_key AND (newer.created_at > deploy_jobs.created_at OR (newer.created_at = deploy_jobs.created_at AND newer.rowid > deploy_jobs.rowid)) AND newer.status <> 'cancelled')",
+            params![id, deploy_job_status_name(status), error],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_deploy_job_with_error(&mut self, id: &str, error: &str) -> Result<(), StateError> {
+        validate_job_error(error)?;
+        let attempts: i64 = self
+            .connection
+            .query_row(
+                "SELECT attempts FROM deploy_jobs WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StateError::InvalidRecord {
+                kind: "deploy job",
+                detail: format!("job {id:?} does not exist"),
+            })?;
+        let shift = attempts.saturating_sub(1).min(7) as u32;
+        let delay = RETRY_BASE_SECONDS
+            .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
+            .min(RETRY_MAX_SECONDS);
+        self.connection.execute(
+            "UPDATE deploy_jobs SET status = CASE WHEN attempts >= ?2 THEN 'failed' ELSE 'retry' END, next_attempt_at = datetime(CURRENT_TIMESTAMP, '+' || ?3 || ' seconds'), error = ?4, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM deploy_jobs newer WHERE newer.source_kind = deploy_jobs.source_kind AND newer.job_key = deploy_jobs.job_key AND (newer.created_at > deploy_jobs.created_at OR (newer.created_at = deploy_jobs.created_at AND newer.rowid > deploy_jobs.rowid)) AND newer.status <> 'cancelled')",
+            params![id, i64::from(MAX_GITHUB_ATTEMPTS), delay, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_deploy_job(&mut self, id: &str) -> Result<DeployJob, StateError> {
+        self.retry_deploy_job_inner(id, None)
+    }
+
+    pub fn retry_deploy_job_with_audit(
+        &mut self,
+        id: &str,
+        audit: &AuditContext,
+    ) -> Result<DeployJob, StateError> {
+        self.retry_deploy_job_inner(id, Some(audit))
+    }
+
+    fn retry_deploy_job_inner(
+        &mut self,
+        id: &str,
+        audit: Option<&AuditContext>,
+    ) -> Result<DeployJob, StateError> {
+        if let Some(audit) = audit {
+            validate_audit_context(audit)?;
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE deploy_jobs SET status = 'queued', attempts = 0, next_attempt_at = CURRENT_TIMESTAMP, error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('failed','retry','cancelled') AND NOT EXISTS (SELECT 1 FROM deploy_jobs newer WHERE newer.source_kind = deploy_jobs.source_kind AND newer.job_key = deploy_jobs.job_key AND (newer.created_at > deploy_jobs.created_at OR (newer.created_at = deploy_jobs.created_at AND newer.rowid > deploy_jobs.rowid)) AND newer.status <> 'cancelled')",
+            [id],
+        )?;
+        if changed == 0 {
+            transaction.rollback()?;
+            return Err(StateError::InvalidRecord {
+                kind: "deploy job",
+                detail: format!("job {id:?} cannot be retried"),
+            });
+        }
+        transaction.execute(
+            "UPDATE deployments SET status = 'building', error = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = (SELECT deployment_id FROM deploy_jobs WHERE id = ?1)
+               AND status = 'failed' AND artifact_hash IS NULL",
+            [id],
+        )?;
+        if let Some(audit) = audit {
+            append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        }
+        let job = transaction.query_row(
+            &format!("{DEPLOY_JOB_SELECT} WHERE id = ?1"),
+            [id],
+            deploy_job_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    // Thin GitHub adapters retained for the admin API and existing workers.
     pub fn github_jobs(
         &self,
         limit: u16,
         cursor: Option<&str>,
     ) -> Result<Vec<GitHubDeployJob>, StateError> {
-        let limit = i64::from(limit.clamp(1, 200));
-        let mut statement = self.connection.prepare("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE (?1 IS NULL OR id > ?1) ORDER BY created_at, id LIMIT ?2")?;
-        let rows = statement.query_map(params![cursor, limit], github_job_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StateError::from)
+        self.deploy_jobs(limit, cursor)?
+            .into_iter()
+            .filter(|job| job.source == DeployJobSource::GitHub)
+            .map(GitHubDeployJob::try_from)
+            .collect()
     }
 
     pub fn github_job(&self, id: &str) -> Result<Option<GitHubDeployJob>, StateError> {
-        self.connection.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [id], github_job_from_row).optional().map_err(StateError::from)
+        self.deploy_job(id)?
+            .map(GitHubDeployJob::try_from)
+            .transpose()
     }
 
     pub fn current_github_job(&self, key: &str) -> Result<Option<GitHubDeployJob>, StateError> {
-        self.connection.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE job_key = ?1 AND status <> 'cancelled' ORDER BY created_at DESC, rowid DESC LIMIT 1", [key], github_job_from_row).optional().map_err(StateError::from)
+        self.current_deploy_job(DeployJobSource::GitHub, key)?
+            .map(GitHubDeployJob::try_from)
+            .transpose()
     }
 
     pub fn recover_github_jobs(&mut self) -> Result<usize, StateError> {
-        let changed = self.connection.execute("UPDATE github_deploy_jobs SET status = CASE WHEN attempts >= ?1 THEN 'failed' ELSE 'retry' END, next_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, error = COALESCE(error, 'daemon restarted while job was running') WHERE status = 'running'", [i64::from(MAX_GITHUB_ATTEMPTS)])?;
-        Ok(changed)
+        self.connection
+            .execute(
+                "UPDATE deploy_jobs SET status = CASE WHEN attempts >= ?1 THEN 'failed' ELSE 'retry' END, next_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, error = COALESCE(error, 'daemon restarted while job was running') WHERE source_kind = 'github' AND status = 'running'",
+                [i64::from(MAX_GITHUB_ATTEMPTS)],
+            )
+            .map_err(StateError::from)
     }
 
     pub fn claim_github_job(&mut self) -> Result<Option<GitHubDeployJob>, StateError> {
-        let transaction = self.connection.transaction()?;
-        let id = transaction.query_row("SELECT j.id FROM github_deploy_jobs j JOIN github_repositories r ON r.installation_id = j.installation_id AND r.repository_id = j.repository_id AND r.enabled = 1 WHERE j.status IN ('queued','retry') AND datetime(j.next_attempt_at) <= CURRENT_TIMESTAMP AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = j.job_key AND (newer.created_at > j.created_at OR (newer.created_at = j.created_at AND newer.rowid > j.rowid)) AND newer.status <> 'cancelled') ORDER BY j.next_attempt_at, j.created_at, j.rowid LIMIT 1", [], |row| row.get::<_, String>(0)).optional()?;
-        let Some(id) = id else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let changed = transaction.execute("UPDATE github_deploy_jobs SET status = 'running', attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('queued','retry') AND attempts < ?2", params![id, i64::from(MAX_GITHUB_ATTEMPTS)])?;
-        if changed == 0 {
-            transaction.rollback()?;
-            return Ok(None);
-        }
-        let job = transaction.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [&id], github_job_from_row)?;
-        transaction.commit()?;
-        Ok(Some(job))
+        self.claim_deploy_job_for_source(DeployJobSource::GitHub)?
+            .map(GitHubDeployJob::try_from)
+            .transpose()
     }
 
     pub fn update_github_job_report(
@@ -2022,7 +2608,10 @@ impl State {
         check_run_id: Option<i64>,
         deployment_id: Option<i64>,
     ) -> Result<(), StateError> {
-        self.connection.execute("UPDATE github_deploy_jobs SET check_run_id = COALESCE(?2, check_run_id), deployment_id = COALESCE(?3, deployment_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", params![id, check_run_id, deployment_id])?;
+        self.connection.execute(
+            "UPDATE deploy_jobs SET check_run_id = COALESCE(?2, check_run_id), github_deployment_id = COALESCE(?3, github_deployment_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND source_kind = 'github' AND status = 'running'",
+            params![id, check_run_id, deployment_id],
+        )?;
         Ok(())
     }
 
@@ -2032,64 +2621,15 @@ impl State {
         status: GitHubDeployJobStatus,
         error: Option<&str>,
     ) -> Result<(), StateError> {
-        if !matches!(
-            status,
-            GitHubDeployJobStatus::Succeeded
-                | GitHubDeployJobStatus::Failed
-                | GitHubDeployJobStatus::Cancelled
-        ) {
-            return Err(StateError::InvalidRecord {
-                kind: "github job",
-                detail: "finish requires a terminal status".into(),
-            });
-        }
-        self.connection.execute("UPDATE github_deploy_jobs SET status = ?2, error = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", params![id, github_job_status_name(&status), error])?;
-        Ok(())
+        self.finish_deploy_job(id, status, error)
     }
 
     pub fn retry_github_job_with_error(&mut self, id: &str, error: &str) -> Result<(), StateError> {
-        if error.trim().is_empty()
-            || error.len() > MAX_GITHUB_TEXT_LEN
-            || error.chars().any(char::is_control)
-        {
-            return Err(StateError::InvalidRecord {
-                kind: "github job",
-                detail: "retry error must be printable".into(),
-            });
-        }
-        let attempts: i64 = self
-            .connection
-            .query_row(
-                "SELECT attempts FROM github_deploy_jobs WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StateError::InvalidRecord {
-                kind: "github job",
-                detail: format!("job {id:?} does not exist"),
-            })?;
-        let shift = attempts.saturating_sub(1).min(7) as u32;
-        let delay = RETRY_BASE_SECONDS
-            .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
-            .min(RETRY_MAX_SECONDS);
-        self.connection.execute("UPDATE github_deploy_jobs SET status = CASE WHEN attempts >= ?2 THEN 'failed' ELSE 'retry' END, next_attempt_at = datetime(CURRENT_TIMESTAMP, '+' || ?3 || ' seconds'), error = ?4, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'running' AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", params![id, i64::from(MAX_GITHUB_ATTEMPTS), delay, error])?;
-        Ok(())
+        self.retry_deploy_job_with_error(id, error)
     }
 
     pub fn retry_github_job(&mut self, id: &str) -> Result<GitHubDeployJob, StateError> {
-        let transaction = self.connection.transaction()?;
-        let changed = transaction.execute("UPDATE github_deploy_jobs SET status = 'queued', attempts = 0, next_attempt_at = CURRENT_TIMESTAMP, error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('failed','retry','cancelled') AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", [id])?;
-        if changed == 0 {
-            transaction.rollback()?;
-            return Err(StateError::InvalidRecord {
-                kind: "github job",
-                detail: format!("job {id:?} cannot be retried"),
-            });
-        }
-        let job = transaction.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [id], github_job_from_row)?;
-        transaction.commit()?;
-        Ok(job)
+        GitHubDeployJob::try_from(self.retry_deploy_job(id)?)
     }
 
     pub fn retry_github_job_with_audit(
@@ -2097,20 +2637,7 @@ impl State {
         id: &str,
         audit: &AuditContext,
     ) -> Result<GitHubDeployJob, StateError> {
-        validate_audit_context(audit)?;
-        let transaction = self.connection.transaction()?;
-        let changed = transaction.execute("UPDATE github_deploy_jobs SET status = 'queued', attempts = 0, next_attempt_at = CURRENT_TIMESTAMP, error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status IN ('failed','retry','cancelled') AND NOT EXISTS (SELECT 1 FROM github_deploy_jobs newer WHERE newer.job_key = github_deploy_jobs.job_key AND (newer.created_at > github_deploy_jobs.created_at OR (newer.created_at = github_deploy_jobs.created_at AND newer.rowid > github_deploy_jobs.rowid)) AND newer.status <> 'cancelled')", [id])?;
-        if changed == 0 {
-            transaction.rollback()?;
-            return Err(StateError::InvalidRecord {
-                kind: "github job",
-                detail: format!("job {id:?} cannot be retried"),
-            });
-        }
-        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
-        let job = transaction.query_row("SELECT id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at FROM github_deploy_jobs WHERE id = ?1", [id], github_job_from_row)?;
-        transaction.commit()?;
-        Ok(job)
+        GitHubDeployJob::try_from(self.retry_deploy_job_inner(id, Some(audit))?)
     }
 
     pub fn reconcile_github_event(
@@ -2126,7 +2653,7 @@ impl State {
                 "UPDATE github_repositories SET enabled = 0 WHERE installation_id = ?1",
                 [installation_id],
             )?;
-            transaction.execute("UPDATE github_deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE installation_id = ?1 AND status IN ('queued','retry')", [installation_id])?;
+            transaction.execute("UPDATE deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE source_kind = 'github' AND installation_id = ?1 AND status IN ('queued','retry')", [installation_id])?;
         } else if event == "installation"
             && matches!(
                 action,
@@ -2140,7 +2667,7 @@ impl State {
         } else if event == "installation_repositories" {
             for repository_id in removed_repository_ids {
                 transaction.execute("UPDATE github_repositories SET enabled = 0 WHERE installation_id = ?1 AND repository_id = ?2", params![installation_id, repository_id])?;
-                transaction.execute("UPDATE github_deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE installation_id = ?1 AND repository_id = ?2 AND status IN ('queued','retry')", params![installation_id, repository_id])?;
+                transaction.execute("UPDATE deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE source_kind = 'github' AND installation_id = ?1 AND repository_id = ?2 AND status IN ('queued','retry')", params![installation_id, repository_id])?;
             }
         }
         transaction.commit()?;
@@ -2387,8 +2914,23 @@ fn validate_github_repository(config: &GitHubRepositoryConfig) -> Result<(), Sta
     ] {
         github_text(value, field)?;
     }
+    if config.entry.as_os_str().is_empty()
+        || config.entry.is_absolute()
+        || config.entry.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "github repository",
+            detail: "entry must be a nonempty relative path without traversal".into(),
+        });
+    }
     for (path, field) in [
-        (&config.entry, "entry"),
         (&config.artifact_root, "artifact root"),
         (&config.upstream, "upstream"),
     ] {
@@ -2436,6 +2978,128 @@ fn validate_github_job_spec(job: &GitHubJobSpec) -> Result<(), StateError> {
     validate_hash(&job.sha, "github SHA")
 }
 
+fn validate_deploy_job_spec(job: &DeployJobSpec) -> Result<(), StateError> {
+    for (value, field) in [
+        (&job.id, "job id"),
+        (&job.key, "job key"),
+        (&job.source_ref, "source ref"),
+        (&job.app, "app"),
+        (&job.domain, "domain"),
+        (&job.engine_version, "engine version"),
+    ] {
+        github_text(value, field)?;
+    }
+    if job.source_path.as_os_str().is_empty()
+        || job.source_path.as_os_str().as_bytes().len() > 4096
+        || job.source_path.as_os_str().as_bytes().contains(&0)
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "deploy job",
+            detail: "source path must be nonempty and bounded".into(),
+        });
+    }
+    if job.entry.as_os_str().is_empty()
+        || job.entry.is_absolute()
+        || job.entry.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "deploy job",
+            detail: "entry must be a nonempty relative path without traversal".into(),
+        });
+    }
+    for (path, field) in [
+        (&job.artifact_root, "artifact root"),
+        (&job.upstream, "upstream"),
+    ] {
+        validate_absolute_path(path, field)?;
+    }
+    for (value, field) in [
+        (job.branch.as_deref(), "branch"),
+        (job.commit.as_deref(), "commit"),
+        (job.owner.as_deref(), "owner"),
+        (job.name.as_deref(), "name"),
+        (job.environment.as_deref(), "environment"),
+    ] {
+        if let Some(value) = value {
+            github_text(value, field)?;
+        }
+    }
+    if job.source == DeployJobSource::GitHub
+        && (job.installation_id.is_none()
+            || job.repository_id.is_none()
+            || job.owner.is_none()
+            || job.name.is_none()
+            || job.environment.is_none()
+            || job.kind.is_none()
+            || job.commit.is_none())
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "github job",
+            detail: "github identity fields are required for github sources".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_job_error(error: &str) -> Result<(), StateError> {
+    if error.trim().is_empty()
+        || error.len() > MAX_GITHUB_TEXT_LEN
+        || error.chars().any(char::is_control)
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "deploy job",
+            detail: "retry error must be printable".into(),
+        });
+    }
+    Ok(())
+}
+
+fn enqueue_deploy_job_tx(
+    transaction: &Transaction<'_>,
+    job: &DeployJobSpec,
+) -> Result<bool, StateError> {
+    validate_deploy_job_spec(job)?;
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO deploy_jobs (id, job_key, source_kind, source_path, source_ref, app, domain, engine_version, entry, artifact_root, upstream, branch, commit_sha, installation_id, repository_id, owner, name, environment, github_kind, pull_request, status, attempts, next_attempt_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 'queued', 0, CURRENT_TIMESTAMP)",
+        params![
+            job.id,
+            job.key,
+            deploy_job_source_name(job.source),
+            job.source_path.to_string_lossy(),
+            job.source_ref,
+            job.app,
+            job.domain,
+            job.engine_version,
+            job.entry.to_string_lossy(),
+            job.artifact_root.to_string_lossy(),
+            job.upstream.to_string_lossy(),
+            job.branch,
+            job.commit,
+            job.installation_id,
+            job.repository_id,
+            job.owner,
+            job.name,
+            job.environment,
+            job.kind.as_ref().map(github_job_kind_name),
+            job.pull_request,
+        ],
+    )?;
+    if inserted != 0 {
+        transaction.execute(
+            "UPDATE deploy_jobs SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE source_kind = ?1 AND job_key = ?2 AND source_ref <> ?3 AND status IN ('queued','retry') AND rowid < (SELECT rowid FROM deploy_jobs WHERE id = ?4)",
+            params![deploy_job_source_name(job.source), job.key, job.source_ref, job.id],
+        )?;
+    }
+    Ok(inserted != 0)
+}
+
 fn upsert_github_app_tx(
     transaction: &Transaction<'_>,
     app: &GitHubAppRecord,
@@ -2479,65 +3143,82 @@ fn github_job_kind_name(kind: &GitHubJobKind) -> &'static str {
         GitHubJobKind::Preview => "preview",
     }
 }
-fn github_job_status_name(status: &GitHubDeployJobStatus) -> &'static str {
-    match status {
-        GitHubDeployJobStatus::Queued => "queued",
-        GitHubDeployJobStatus::Running => "running",
-        GitHubDeployJobStatus::Succeeded => "succeeded",
-        GitHubDeployJobStatus::Failed => "failed",
-        GitHubDeployJobStatus::Retry => "retry",
-        GitHubDeployJobStatus::Cancelled => "cancelled",
+const DEPLOY_JOB_SELECT: &str = "SELECT id, job_key, source_kind, source_path, source_ref, app, domain, engine_version, entry, artifact_root, upstream, branch, commit_sha, installation_id, repository_id, owner, name, environment, github_kind, pull_request, status, attempts, next_attempt_at, error, check_run_id, github_deployment_id, deployment_id, created_at, updated_at FROM deploy_jobs";
+
+fn deploy_job_source_name(source: DeployJobSource) -> &'static str {
+    match source {
+        DeployJobSource::GitHub => "github",
+        DeployJobSource::Upload => "upload",
+        DeployJobSource::Cli => "cli",
     }
 }
 
-fn github_job_from_row(row: &rusqlite::Row<'_>) -> Result<GitHubDeployJob, rusqlite::Error> {
-    let kind: String = row.get(7)?;
-    let status: String = row.get(10)?;
-    let kind = match kind.as_str() {
-        "production" => GitHubJobKind::Production,
-        "preview" => GitHubJobKind::Preview,
-        _ => {
-            return Err(rusqlite::Error::InvalidColumnType(
-                7,
-                "kind".into(),
-                rusqlite::types::Type::Text,
-            ));
-        }
+fn deploy_job_status_name(status: DeployJobStatus) -> &'static str {
+    match status {
+        DeployJobStatus::Queued => "queued",
+        DeployJobStatus::Running => "running",
+        DeployJobStatus::Succeeded => "succeeded",
+        DeployJobStatus::Failed => "failed",
+        DeployJobStatus::Retry => "retry",
+        DeployJobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn deploy_job_from_row(row: &rusqlite::Row<'_>) -> Result<DeployJob, rusqlite::Error> {
+    let invalid = |index, name: &str| {
+        rusqlite::Error::InvalidColumnType(index, name.into(), rusqlite::types::Type::Text)
     };
-    let status = match status.as_str() {
-        "queued" => GitHubDeployJobStatus::Queued,
-        "running" => GitHubDeployJobStatus::Running,
-        "succeeded" => GitHubDeployJobStatus::Succeeded,
-        "failed" => GitHubDeployJobStatus::Failed,
-        "retry" => GitHubDeployJobStatus::Retry,
-        "cancelled" => GitHubDeployJobStatus::Cancelled,
-        _ => {
-            return Err(rusqlite::Error::InvalidColumnType(
-                10,
-                "status".into(),
-                rusqlite::types::Type::Text,
-            ));
-        }
+    let source = match row.get::<_, String>(2)?.as_str() {
+        "github" => DeployJobSource::GitHub,
+        "upload" => DeployJobSource::Upload,
+        "cli" => DeployJobSource::Cli,
+        _ => return Err(invalid(2, "source_kind")),
     };
-    Ok(GitHubDeployJob {
+    let kind = match row.get::<_, Option<String>>(18)?.as_deref() {
+        Some("production") => Some(GitHubJobKind::Production),
+        Some("preview") => Some(GitHubJobKind::Preview),
+        None => None,
+        _ => return Err(invalid(18, "github_kind")),
+    };
+    let status = match row.get::<_, String>(20)?.as_str() {
+        "queued" => DeployJobStatus::Queued,
+        "running" => DeployJobStatus::Running,
+        "succeeded" => DeployJobStatus::Succeeded,
+        "failed" => DeployJobStatus::Failed,
+        "retry" => DeployJobStatus::Retry,
+        "cancelled" => DeployJobStatus::Cancelled,
+        _ => return Err(invalid(20, "status")),
+    };
+    Ok(DeployJob {
         id: row.get(0)?,
         key: row.get(1)?,
-        installation_id: row.get(2)?,
-        repository_id: row.get(3)?,
-        owner: row.get(4)?,
-        name: row.get(5)?,
-        environment: row.get(6)?,
+        source,
+        source_path: PathBuf::from(row.get::<_, String>(3)?),
+        source_ref: row.get(4)?,
+        app: row.get(5)?,
+        domain: row.get(6)?,
+        engine_version: row.get(7)?,
+        entry: PathBuf::from(row.get::<_, String>(8)?),
+        artifact_root: PathBuf::from(row.get::<_, String>(9)?),
+        upstream: PathBuf::from(row.get::<_, String>(10)?),
+        branch: row.get(11)?,
+        commit: row.get(12)?,
+        installation_id: row.get(13)?,
+        repository_id: row.get(14)?,
+        owner: row.get(15)?,
+        name: row.get(16)?,
+        environment: row.get(17)?,
         kind,
-        pull_request: row.get(8)?,
-        sha: row.get(9)?,
+        pull_request: row.get(19)?,
         status,
-        attempts: row.get::<_, i64>(11)?.try_into().unwrap_or(u32::MAX),
-        next_attempt_at: row.get(12)?,
-        error: row.get(13)?,
-        check_run_id: row.get(14)?,
-        deployment_id: row.get(15)?,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        attempts: row.get::<_, i64>(21)?.try_into().unwrap_or(u32::MAX),
+        next_attempt_at: row.get(22)?,
+        error: row.get(23)?,
+        check_run_id: row.get(24)?,
+        github_deployment_id: row.get(25)?,
+        deployment_id: row.get(26)?,
+        created_at: row.get(27)?,
+        updated_at: row.get(28)?,
     })
 }
 
@@ -2761,6 +3442,77 @@ fn migrate_v5_to_v6(connection: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn migrate_v6_to_v7(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE deploy_jobs (
+             id TEXT PRIMARY KEY,
+             job_key TEXT NOT NULL,
+             source_kind TEXT NOT NULL CHECK (source_kind IN ('github','upload','cli')),
+             source_path TEXT NOT NULL,
+             source_ref TEXT NOT NULL,
+             app TEXT NOT NULL,
+             domain TEXT NOT NULL,
+             engine_version TEXT NOT NULL,
+             entry TEXT NOT NULL,
+             artifact_root TEXT NOT NULL,
+             upstream TEXT NOT NULL,
+             branch TEXT,
+             commit_sha TEXT,
+             installation_id INTEGER,
+             repository_id INTEGER,
+             owner TEXT,
+             name TEXT,
+             environment TEXT,
+             github_kind TEXT CHECK (github_kind IS NULL OR github_kind IN ('production','preview')),
+             pull_request INTEGER,
+             status TEXT NOT NULL CHECK (status IN ('queued','running','succeeded','failed','retry','cancelled')),
+             attempts INTEGER NOT NULL DEFAULT 0,
+             next_attempt_at TEXT NOT NULL,
+             error TEXT,
+             check_run_id INTEGER,
+             github_deployment_id INTEGER,
+             deployment_id TEXT,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         INSERT INTO deploy_jobs (
+             id, job_key, source_kind, source_path, source_ref,
+             app, domain, engine_version, entry, artifact_root, upstream, branch, commit_sha,
+             installation_id, repository_id, owner, name, environment, github_kind, pull_request,
+             status, attempts, next_attempt_at, error, check_run_id, github_deployment_id,
+             created_at, updated_at
+         )
+         SELECT j.id, j.job_key, 'github', j.owner || '/' || j.name, j.sha,
+                COALESCE(r.app, ''), COALESCE(r.domain, ''), COALESCE(r.engine_version, ''),
+                COALESCE(r.entry, ''), COALESCE(r.artifact_root, ''), COALESCE(r.upstream, ''),
+                r.branch, j.sha,
+                j.installation_id, j.repository_id, j.owner, j.name, j.environment, j.kind,
+                j.pull_request, j.status, j.attempts, j.next_attempt_at, j.error,
+                j.check_run_id, j.deployment_id, j.created_at, j.updated_at
+           FROM github_deploy_jobs j
+           LEFT JOIN github_repositories r
+             ON r.installation_id = j.installation_id AND r.repository_id = j.repository_id;
+         DROP TABLE github_deploy_jobs;
+         CREATE INDEX deploy_jobs_due ON deploy_jobs(status, next_attempt_at, created_at);
+         CREATE INDEX deploy_jobs_key ON deploy_jobs(source_kind, job_key, created_at DESC);
+         CREATE INDEX deploy_jobs_github_repository
+             ON deploy_jobs(installation_id, repository_id) WHERE source_kind = 'github';",
+    )?;
+    Ok(())
+}
+
+fn migrate_v7_to_v8(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "ALTER TABLE deployments
+             ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'cli'
+             CHECK (source_kind IN ('github', 'upload', 'cli'));
+         ALTER TABLE deployments ADD COLUMN source_branch TEXT;
+         ALTER TABLE deployments ADD COLUMN source_commit TEXT;
+         UPDATE deployments SET source_kind = 'cli';",
+    )?;
+    Ok(())
+}
+
 fn register_engine_tx(
     transaction: &Transaction<'_>,
     engine: &EngineRecord,
@@ -2937,6 +3689,21 @@ fn validate_deployment_input(input: &DeploymentInput) -> Result<(), StateError> 
             kind: "deployment",
             detail: "engine version must be nonempty".into(),
         });
+    }
+    for (value, field) in [
+        (input.source.branch.as_deref(), "source branch"),
+        (input.source.commit.as_deref(), "source commit"),
+    ] {
+        if value.is_some_and(|value| {
+            value.trim().is_empty()
+                || value.len() > MAX_GITHUB_TEXT_LEN
+                || value.chars().any(char::is_control)
+        }) {
+            return Err(StateError::InvalidRecord {
+                kind: "deployment",
+                detail: format!("{field} must be nonempty, printable, and bounded"),
+            });
+        }
     }
     Ok(())
 }
@@ -3308,6 +4075,23 @@ fn parse_status(status: &str) -> Result<DeploymentStatus, String> {
     }
 }
 
+fn deployment_source_kind_name(kind: DeploymentSourceKind) -> &'static str {
+    match kind {
+        DeploymentSourceKind::GitHub => "github",
+        DeploymentSourceKind::Upload => "upload",
+        DeploymentSourceKind::Cli => "cli",
+    }
+}
+
+fn parse_deployment_source_kind(value: &str) -> Result<DeploymentSourceKind, String> {
+    match value {
+        "github" => Ok(DeploymentSourceKind::GitHub),
+        "upload" => Ok(DeploymentSourceKind::Upload),
+        "cli" => Ok(DeploymentSourceKind::Cli),
+        other => Err(format!("unknown deployment source kind {other:?}")),
+    }
+}
+
 fn ensure_transition(
     id: &str,
     from: DeploymentStatus,
@@ -3348,7 +4132,10 @@ fn query_deployment_tx(
 ) -> Result<Option<DeploymentRecord>, StateError> {
     transaction
         .query_row(
-            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error, created_at, updated_at, log_path FROM deployments WHERE id = ?1",
+            "SELECT id, app, source_hash, engine_version, artifact_hash, status, error,
+                    created_at, unixepoch(created_at) * 1000, updated_at, log_path,
+                    source_kind, source_branch, source_commit
+             FROM deployments WHERE id = ?1",
             [id],
             deployment_from_row,
         )
@@ -3365,17 +4152,31 @@ fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusq
             Box::new(std::io::Error::other(error)),
         )
     })?;
+    let source_kind: String = row.get(11)?;
+    let source_kind = parse_deployment_source_kind(&source_kind).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(error)),
+        )
+    })?;
     Ok(DeploymentRecord {
         id: row.get(0)?,
         app: row.get(1)?,
         source_hash: row.get(2)?,
         engine_version: row.get(3)?,
+        source: DeploymentSource {
+            kind: source_kind,
+            branch: row.get(12)?,
+            commit: row.get(13)?,
+        },
         artifact_hash: row.get(4)?,
         status,
         error: row.get(6)?,
         created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-        log_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+        created_ms: row.get(8)?,
+        updated_at: row.get(9)?,
+        log_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
     })
 }
 
@@ -4596,6 +5397,7 @@ mod tests {
                     app: app.into(),
                     source_hash: source_hash.clone(),
                     engine_version: engine.version.clone(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
         }
@@ -4640,6 +5442,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source_hash.clone(),
                     engine_version: engine.version.clone(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state.seal_deployment(id, &artifact).unwrap();
@@ -4686,6 +5489,41 @@ mod tests {
     }
 
     #[test]
+    fn deployment_provenance_round_trips_and_preassigned_builds_resume() {
+        let path = temp_db("deployment-provenance");
+        let mut state = State::open(&path).unwrap();
+        let engine = register_test_engine(&mut state, "bun");
+        let source =
+            DeploymentSource::github(Some("main".into()), Some("a".repeat(SHA256_HEX_LEN)));
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "preassigned".into(),
+                app: "api".into(),
+                source_hash: "b".repeat(SHA256_HEX_LEN),
+                engine_version: engine.version.clone(),
+                source: source.clone(),
+            })
+            .unwrap();
+
+        let resumed = state
+            .resume_building_deployment(&DeploymentInput {
+                id: "preassigned".into(),
+                app: "api".into(),
+                source_hash: "c".repeat(SHA256_HEX_LEN),
+                engine_version: engine.version,
+                source: source.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(resumed.source_hash, "c".repeat(SHA256_HEX_LEN));
+        assert_eq!(resumed.source, source);
+        assert!(resumed.created_ms > 0);
+        assert_eq!(state.deployments(None, None, 1).unwrap(), [resumed]);
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn artifact_deployment_round_trip_and_activation_are_atomic() {
         let path = temp_db("activation");
         let mut state = State::open(&path).expect("open state");
@@ -4704,6 +5542,7 @@ mod tests {
             app: "api".into(),
             source_hash: source_hash.clone(),
             engine_version: engine.version.clone(),
+            source: DeploymentSource::cli(),
         };
         assert_eq!(
             state.begin_deployment(&input).unwrap().status,
@@ -4777,6 +5616,7 @@ mod tests {
                 app: "worker".into(),
                 source_hash: second_source_hash.clone(),
                 engine_version: engine.version.clone(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         state
@@ -4893,6 +5733,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source.clone(),
                     engine_version: "bun".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state.seal_deployment(id, &artifact).unwrap();
@@ -4907,6 +5748,7 @@ mod tests {
                 app: "other".into(),
                 source_hash: source.clone(),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let mut foreign = artifact.clone();
@@ -4921,6 +5763,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "d".repeat(64),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let mut mismatch = artifact;
@@ -4959,6 +5802,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source.clone(),
                     engine_version: "bun".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state
@@ -5033,6 +5877,7 @@ mod tests {
                     app: "api".into(),
                     source_hash: source.clone(),
                     engine_version: "bun".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .unwrap();
             state
@@ -5151,6 +5996,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "b".repeat(64),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         state
@@ -5190,6 +6036,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: source.clone(),
                 engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         let mut artifact = artifact_input(
@@ -5251,7 +6098,8 @@ mod tests {
                     id: "".into(),
                     app: "api".into(),
                     source_hash: "e".repeat(64),
-                    engine_version: "1".into()
+                    engine_version: "1".into(),
+                    source: DeploymentSource::cli(),
                 })
                 .is_err()
         );
@@ -5261,6 +6109,7 @@ mod tests {
                 app: "api".into(),
                 source_hash: "e".repeat(64),
                 engine_version: "1".into(),
+                source: DeploymentSource::cli(),
             })
             .unwrap();
         state.mark_deployment_failed("dep", "build failed").unwrap();
@@ -5486,7 +6335,7 @@ mod tests {
             app: "site".into(),
             domain: "site.example.com".into(),
             engine_version: "bun".into(),
-            entry: "/app/index.js".into(),
+            entry: "index.ts".into(),
             artifact_root: "/var/lib/cygnus/artifacts/site".into(),
             upstream: "/run/cygnus/site.sock".into(),
         }
@@ -5641,7 +6490,7 @@ mod tests {
             state.github_job("j1").unwrap().unwrap().status,
             GitHubDeployJobStatus::Retry
         );
-        state.connection.execute("UPDATE github_deploy_jobs SET next_attempt_at = datetime(CURRENT_TIMESTAMP, '-1 second') WHERE id = 'j1'", []).unwrap();
+        state.connection.execute("UPDATE deploy_jobs SET next_attempt_at = datetime(CURRENT_TIMESTAMP, '-1 second') WHERE id = 'j1'", []).unwrap();
         assert_eq!(state.claim_github_job().unwrap().unwrap().id, "j2");
         let _ = fs::remove_file(path.clone());
         let _ = fs::remove_file(path.parent().unwrap().join("node.key"));
@@ -5707,6 +6556,133 @@ mod tests {
         let key_path = path.parent().unwrap().join("node.key");
         let _ = fs::remove_file(path.clone());
         let _ = fs::remove_file(key_path);
+    }
+
+    fn deploy_job_fixture(
+        id: &str,
+        key: &str,
+        source: DeployJobSource,
+        source_ref: &str,
+    ) -> DeployJobSpec {
+        DeployJobSpec {
+            id: id.into(),
+            key: key.into(),
+            source,
+            source_path: format!("/tmp/{id}.tar").into(),
+            source_ref: source_ref.into(),
+            app: "site".into(),
+            domain: "site.example.com".into(),
+            engine_version: "bun".into(),
+            entry: "index.ts".into(),
+            artifact_root: "/var/lib/cygnus/artifacts/site".into(),
+            upstream: "/run/cygnus/site.sock".into(),
+            branch: None,
+            commit: None,
+            installation_id: None,
+            repository_id: None,
+            owner: None,
+            name: None,
+            environment: None,
+            kind: None,
+            pull_request: None,
+        }
+    }
+
+    #[test]
+    fn generic_deploy_queue_supports_all_source_neutral_transitions() {
+        let path = temp_db("generic-deploy-jobs");
+        let mut state = State::open(&path).unwrap();
+        let first = deploy_job_fixture("upload-1", "site", DeployJobSource::Upload, "one");
+        let second = deploy_job_fixture("upload-2", "site", DeployJobSource::Upload, "two");
+        let cli = deploy_job_fixture("cli-1", "other", DeployJobSource::Cli, "working-tree");
+        assert!(state.enqueue_deploy_job(&first).unwrap());
+        assert!(!state.enqueue_deploy_job(&first).unwrap());
+        assert!(state.enqueue_deploy_job(&second).unwrap());
+        assert!(state.enqueue_deploy_job(&cli).unwrap());
+        assert_eq!(
+            state.deploy_job("upload-1").unwrap().unwrap().status,
+            DeployJobStatus::Cancelled
+        );
+        let listed = state.deploy_jobs(20, None).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed.iter().all(|job| job.installation_id.is_none()));
+
+        let running = state.claim_deploy_job().unwrap().unwrap();
+        assert_eq!(running.id, "upload-2");
+        assert_eq!(running.status, DeployJobStatus::Running);
+        state
+            .attach_deployment_id(&running.id, "local-deployment-1")
+            .unwrap();
+        state
+            .finish_deploy_job(&running.id, DeployJobStatus::Succeeded, None)
+            .unwrap();
+        let finished = state.deploy_job(&running.id).unwrap().unwrap();
+        assert_eq!(finished.status, DeployJobStatus::Succeeded);
+        assert_eq!(
+            finished.deployment_id.as_deref(),
+            Some("local-deployment-1")
+        );
+
+        let running = state.claim_deploy_job().unwrap().unwrap();
+        assert_eq!(running.id, "cli-1");
+        assert_eq!(state.recover_deploy_jobs().unwrap(), 1);
+        assert_eq!(
+            state.deploy_job("cli-1").unwrap().unwrap().status,
+            DeployJobStatus::Retry
+        );
+        let retried = state.retry_deploy_job("cli-1").unwrap();
+        assert_eq!(retried.status, DeployJobStatus::Queued);
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(path.parent().unwrap().join("node.key"));
+    }
+
+    #[test]
+    fn migrates_v6_github_jobs_losslessly_into_generic_queue() {
+        let path = temp_db("github-v6-jobs-migrate");
+        let node_key = load_node_key(&path).unwrap();
+        {
+            let connection = Connection::open(&path).unwrap();
+            create_schema(&connection).unwrap();
+            migrate_v1_to_v2(&connection).unwrap();
+            migrate_v2_to_v3(&connection).unwrap();
+            create_github_schema_v4(&connection).unwrap();
+            migrate_v4_to_v5(&connection, &node_key).unwrap();
+            migrate_v5_to_v6(&connection).unwrap();
+            let repo = github_repo_fixture();
+            connection.execute(
+                "INSERT INTO github_repositories (installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                params![repo.installation_id, repo.repository_id, repo.owner, repo.name, repo.branch, repo.app, repo.domain, repo.engine_version, repo.entry.to_string_lossy(), repo.artifact_root.to_string_lossy(), repo.upstream.to_string_lossy()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO github_deploy_jobs (id, job_key, installation_id, repository_id, owner, name, environment, kind, pull_request, sha, status, attempts, next_attempt_at, error, check_run_id, deployment_id, created_at, updated_at) VALUES ('legacy', 'legacy-key', 7, 8, 'acme', 'site', 'production', 'production', NULL, ?1, 'retry', 3, '2026-01-02 03:04:05', 'temporary', 91, 92, '2026-01-01 01:02:03', '2026-01-01 02:03:04')",
+                [&"d".repeat(64)],
+            ).unwrap();
+            connection
+                .pragma_update(None, "user_version", 6_i32)
+                .unwrap();
+        }
+        let state = State::open(&path).unwrap();
+        let job = state.deploy_job("legacy").unwrap().unwrap();
+        assert_eq!(job.source, DeployJobSource::GitHub);
+        assert_eq!(job.source_path, PathBuf::from("acme/site"));
+        assert_eq!(job.source_ref, "d".repeat(64));
+        assert_eq!(job.app, "site");
+        assert_eq!(job.branch.as_deref(), Some("main"));
+        assert_eq!(job.commit.as_deref(), Some("d".repeat(64).as_str()));
+        assert_eq!(job.installation_id, Some(7));
+        assert_eq!(job.repository_id, Some(8));
+        assert_eq!(job.status, DeployJobStatus::Retry);
+        assert_eq!(job.attempts, 3);
+        assert_eq!(job.error.as_deref(), Some("temporary"));
+        assert_eq!(job.check_run_id, Some(91));
+        assert_eq!(job.github_deployment_id, Some(92));
+        assert_eq!(job.created_at, "2026-01-01 01:02:03");
+        assert_eq!(job.updated_at, "2026-01-01 02:03:04");
+        let github = state.github_job("legacy").unwrap().unwrap();
+        assert_eq!(github.sha, "d".repeat(64));
+        assert_eq!(github.deployment_id, Some(92));
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(path.parent().unwrap().join("node.key"));
     }
 
     #[test]

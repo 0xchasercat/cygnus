@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ACTOR_SUBJECT,
+  MAX_DEPLOY_ADMIN_CHUNK_BYTES,
+  MAX_DEPLOY_CHUNK_BYTES,
+  MAX_DEPLOY_CHUNK_JSON_BODY_BYTES,
+  MAX_DEPLOY_TOTAL_BYTES,
   MAX_JSON_BODY_BYTES,
   MAX_WEBHOOK_BODY_BYTES,
   MAX_WEBHOOK_CHUNK_BYTES,
@@ -14,6 +18,10 @@ import {
   configureRepositoryCommand,
   constantTimeTokenMatch,
   consumeManifestState,
+  deployUploadBeginCommand,
+  deployUploadChunk,
+  deployUploadFinishCommand,
+  deployUploadIngress,
   handleApi,
   mapDomainCommand,
   rollbackCommand,
@@ -337,5 +345,143 @@ describe("console request validation", () => {
 
   test("keeps JSON body limit bounded", () => {
     expect(MAX_JSON_BODY_BYTES).toBeLessThanOrEqual(32 * 1024);
+  });
+});
+
+describe("console deploy upload bridge", () => {
+  test("builds exact begin and finish commands while omitting optional defaults", () => {
+    expect(deployUploadBeginCommand({ app: "demo.api_v1", total_bytes: 1 })).toEqual({
+      type: "deploy_upload_begin",
+      app: "demo.api_v1",
+      total_bytes: 1,
+    });
+    expect(deployUploadBeginCommand({
+      app: "demo",
+      domain: "demo.test",
+      engine_version: "bun-1.2",
+      entry: "src/index.ts",
+      total_bytes: MAX_DEPLOY_TOTAL_BYTES,
+    })).toEqual({
+      type: "deploy_upload_begin",
+      app: "demo",
+      total_bytes: MAX_DEPLOY_TOTAL_BYTES,
+      domain: "demo.test",
+      engine_version: "bun-1.2",
+      entry: "src/index.ts",
+    });
+    expect(deployUploadFinishCommand({ upload_id: "upl_1" })).toEqual({
+      type: "deploy_upload_finish",
+      upload_id: "upl_1",
+    });
+    expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: 1, extra: true })).toThrow("unsupported fields");
+    expect(() => deployUploadFinishCommand({ upload_id: "upl_1", app: "demo" })).toThrow("unsupported fields");
+  });
+
+  test("enforces deploy byte bounds and canonical base64", () => {
+    expect(deployUploadBeginCommand({ app: "demo", total_bytes: MAX_DEPLOY_TOTAL_BYTES }).total_bytes).toBe(MAX_DEPLOY_TOTAL_BYTES);
+    expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: 0 })).toThrow("total_bytes");
+    expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: MAX_DEPLOY_TOTAL_BYTES + 1 })).toThrow("total_bytes");
+    expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: 1.5 })).toThrow("total_bytes");
+
+    const maximum = Buffer.alloc(MAX_DEPLOY_CHUNK_BYTES, 0xa5).toString("base64");
+    expect(deployUploadChunk({ upload_id: "upl_1", chunk_base64: maximum }).bytes.length).toBe(MAX_DEPLOY_CHUNK_BYTES);
+    const oversized = Buffer.alloc(MAX_DEPLOY_CHUNK_BYTES + 1, 0xa5).toString("base64");
+    expect(() => deployUploadChunk({ upload_id: "upl_1", chunk_base64: oversized })).toThrow("at most 1 MiB");
+    for (const chunk_base64 of ["", "YQ", "YR==", "YQ===", "YQ==\n", "not base64"]) {
+      expect(() => deployUploadChunk({ upload_id: "upl_1", chunk_base64 })).toThrow("canonical base64");
+    }
+  });
+
+  test("accepts a 1 MiB request through the dedicated cap and reframes it to 32 KiB admin commands", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session";
+    const url = new URL("https://cygnus.apps.test/api/v1/deploy/chunk");
+    const source = Buffer.alloc(MAX_DEPLOY_CHUNK_BYTES, 0x5a);
+    const body = JSON.stringify({ upload_id: "upl_1", chunk_base64: source.toString("base64") });
+    expect(Buffer.byteLength(body)).toBeGreaterThan(MAX_JSON_BODY_BYTES);
+    expect(Buffer.byteLength(body)).toBeLessThan(MAX_DEPLOY_CHUNK_JSON_BODY_BYTES);
+    const observed = [];
+    let received = 0;
+    const requestAdmin = async (socket, command, actor) => {
+      expect(socket).toBe("/admin.sock");
+      expect(actor).toBe(ACTOR_SUBJECT);
+      expect(command.type).toBe("deploy_upload_chunk");
+      expect(command.upload_id).toBe("upl_1");
+      const bytes = Buffer.from(command.chunk_base64, "base64");
+      expect(bytes.length).toBeLessThanOrEqual(MAX_DEPLOY_ADMIN_CHUNK_BYTES);
+      observed.push(bytes);
+      received += bytes.length;
+      return { data: { received_bytes: received }, requestId: `req-${observed.length}` };
+    };
+    const response = await deployUploadIngress(new Request(url, {
+      method: "POST",
+      headers: {
+        origin: url.origin,
+        cookie: signSession(),
+        "content-type": "application/json",
+      },
+      body,
+    }), url, requestAdmin, "/admin.sock");
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result.data).toEqual({ received_bytes: source.length });
+    expect(result.requestId).toBe(`req-${source.length / MAX_DEPLOY_ADMIN_CHUNK_BYTES}`);
+    expect(observed).toHaveLength(source.length / MAX_DEPLOY_ADMIN_CHUNK_BYTES);
+    expect(Buffer.concat(observed)).toEqual(source);
+  });
+
+  test("rejects deploy chunk JSON above its dedicated body cap", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session";
+    const url = new URL("https://cygnus.apps.test/api/v1/deploy/chunk");
+    const response = await deployUploadIngress(new Request(url, {
+      method: "POST",
+      headers: {
+        origin: url.origin,
+        cookie: signSession(),
+        "content-type": "application/json",
+        "content-length": String(MAX_DEPLOY_CHUNK_JSON_BODY_BYTES + 1),
+      },
+      body: "{}",
+    }), url, async () => { throw new Error("admin must not be called"); }, "/admin.sock");
+    expect(response.status).toBe(413);
+  });
+
+  test("requires POST, same origin, and authentication without changing the deploy tombstone", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session";
+    const url = new URL("https://cygnus.apps.test/api/v1/deploy/begin");
+    const send = async (request) => deployUploadIngress(request, url, async () => ({ data: { upload_id: "upl_1" }, requestId: "req-1" }), "/admin.sock");
+
+    const wrongMethod = await send(new Request(url, { method: "GET" }));
+    expect(wrongMethod.status).toBe(405);
+    expect(wrongMethod.headers.get("allow")).toBe("POST");
+    const crossOrigin = await send(new Request(url, {
+      method: "POST",
+      headers: { origin: "https://evil.test", cookie: signSession(), "content-type": "application/json" },
+      body: JSON.stringify({ app: "demo", total_bytes: 1 }),
+    }));
+    expect(crossOrigin.status).toBe(403);
+    const unauthenticated = await send(new Request(url, {
+      method: "POST",
+      headers: { origin: url.origin, "content-type": "application/json" },
+      body: JSON.stringify({ app: "demo", total_bytes: 1 }),
+    }));
+    expect(unauthenticated.status).toBe(401);
+    const authenticated = await send(new Request(url, {
+      method: "POST",
+      headers: { origin: url.origin, cookie: signSession(), "content-type": "application/json" },
+      body: JSON.stringify({ app: "demo", total_bytes: 1 }),
+    }));
+    expect(authenticated.status).toBe(200);
+
+    const tombstoneUrl = new URL("https://cygnus.apps.test/api/v1/deploy");
+    const tombstone = await handleApi(new Request(tombstoneUrl, {
+      method: "POST",
+      headers: { origin: tombstoneUrl.origin, cookie: signSession(), "content-type": "application/json" },
+      body: "{}",
+    }), tombstoneUrl);
+    expect(tombstone.status).toBe(404);
+    expect(await tombstone.json()).toEqual({ ok: false, error: { code: "not_found", message: "API route not found" } });
   });
 });

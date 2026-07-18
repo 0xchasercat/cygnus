@@ -26,8 +26,9 @@ use thiserror::Error;
 
 use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare};
 use crate::state::{
-    AuditContext, GitHubAppRecord, GitHubAppSecrets, GitHubDelivery, GitHubDeployJob,
-    GitHubDeployJobStatus, GitHubJobKind, GitHubJobSpec, GitHubRepositoryConfig, State, StateError,
+    AuditContext, DeployJobSource, DeployJobSpec, DeploymentSource, GitHubAppRecord,
+    GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind,
+    GitHubRepositoryConfig, State, StateError,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -121,9 +122,12 @@ pub struct GitHubRepositoryInput {
     pub name: String,
     pub branch: String,
     pub app: String,
-    pub domain: String,
-    pub engine_version: String,
-    pub entry: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -166,26 +170,6 @@ pub struct GitHubInstallationRepositoryView {
     pub full_name: String,
     pub default_branch: String,
     pub private: bool,
-}
-
-impl From<GitHubRepositoryInput> for GitHubRepositoryConfig {
-    fn from(value: GitHubRepositoryInput) -> Self {
-        let state_root = Path::new("/var/lib/cygnus");
-        let app = value.app.clone();
-        Self {
-            installation_id: value.installation_id,
-            repository_id: value.repository_id,
-            owner: value.owner,
-            name: value.name,
-            branch: value.branch,
-            app,
-            domain: value.domain,
-            engine_version: value.engine_version,
-            entry: value.entry,
-            artifact_root: state_root.join("github-artifacts").join(&value.app),
-            upstream: state_root.join("github-upstreams").join(&value.app),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -435,8 +419,10 @@ impl GitHubManager {
                 "app name is not a safe path component".into(),
             ));
         }
-        if input.entry.is_absolute()
-            || input.entry.components().any(|component| {
+        let mut state = State::open(&self.state_path)?;
+        let entry = input.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
+        if entry.is_absolute()
+            || entry.components().any(|component| {
                 matches!(
                     component,
                     Component::ParentDir | Component::RootDir | Component::Prefix(_)
@@ -447,11 +433,29 @@ impl GitHubManager {
                 "entry must be a relative path inside the repository".into(),
             ));
         }
-        let state_root = self
-            .state_path
-            .parent()
-            .unwrap_or_else(|| Path::new("/var/lib/cygnus"));
         let app = input.app.clone();
+        let domain = match input.domain {
+            Some(domain) if !domain.trim().is_empty() => domain,
+            _ => {
+                let apps_domain = state.load()?.edge.apps_domain.ok_or_else(|| {
+                    GitHubError::InvalidInput(
+                        "domain was omitted and edge.apps_domain is not configured".into(),
+                    )
+                })?;
+                format!("{app}.{apps_domain}")
+            }
+        };
+        let engine_version = match input.engine_version {
+            Some(version) if !version.trim().is_empty() => version,
+            _ => state
+                .default_engine()?
+                .map(|engine| engine.version)
+                .ok_or_else(|| {
+                    GitHubError::InvalidInput(
+                        "engine_version was omitted and no default engine is registered".into(),
+                    )
+                })?,
+        };
         let config = GitHubRepositoryConfig {
             installation_id: input.installation_id,
             repository_id: input.repository_id,
@@ -459,13 +463,12 @@ impl GitHubManager {
             name: input.name,
             branch: input.branch,
             app: app.clone(),
-            domain: input.domain,
-            engine_version: input.engine_version,
-            entry: input.entry,
-            artifact_root: state_root.join("github-artifacts").join(&app),
-            upstream: state_root.join("github-upstreams").join(&app),
+            domain,
+            engine_version,
+            entry,
+            artifact_root: state.deployment_artifact_root(&app),
+            upstream: state.deployment_upstream(&app),
         };
-        let mut state = State::open(&self.state_path)?;
         state.configure_github_repository_with_audit(&config, audit)?;
         Ok(config.into())
     }
@@ -872,7 +875,7 @@ impl GitHubManager {
                     }
                 }
             }
-            let accepted = state.accept_github_delivery(
+            let accepted = state.accept_github_delivery_jobs(
                 &GitHubDelivery {
                     delivery_id: session.delivery_id.clone(),
                     event: session.event.clone(),
@@ -1009,7 +1012,7 @@ fn derive_event_jobs(
     event: &str,
     action: Option<&str>,
     value: &Value,
-) -> Result<Vec<GitHubJobSpec>, GitHubError> {
+) -> Result<Vec<DeployJobSpec>, GitHubError> {
     match event {
         "push" => derive_push_job(state, value),
         "pull_request" => derive_pull_request_job(state, action, value),
@@ -1019,7 +1022,7 @@ fn derive_event_jobs(
     }
 }
 
-fn derive_push_job(state: &State, value: &Value) -> Result<Vec<GitHubJobSpec>, GitHubError> {
+fn derive_push_job(state: &State, value: &Value) -> Result<Vec<DeployJobSpec>, GitHubError> {
     if value
         .get("deleted")
         .and_then(Value::as_bool)
@@ -1058,17 +1061,27 @@ fn derive_push_job(state: &State, value: &Value) -> Result<Vec<GitHubJobSpec>, G
         .and_then(|o| o.get("login"))
         .and_then(Value::as_str)
         .unwrap_or(&config.owner);
-    Ok(vec![GitHubJobSpec {
+    Ok(vec![DeployJobSpec {
         id: job_id("production", installation_id, repository_id, None, sha),
         key: format!("{installation_id}:{repository_id}:production"),
-        installation_id,
-        repository_id,
-        owner: owner.to_owned(),
-        name: config.name,
-        environment: "production".into(),
-        kind: GitHubJobKind::Production,
+        source: DeployJobSource::GitHub,
+        source_path: PathBuf::from(format!("{owner}/{}", config.name)),
+        source_ref: sha.to_owned(),
+        app: config.app,
+        domain: config.domain,
+        engine_version: config.engine_version,
+        entry: config.entry,
+        artifact_root: config.artifact_root,
+        upstream: config.upstream,
+        branch: Some(config.branch),
+        commit: Some(sha.to_owned()),
+        installation_id: Some(installation_id),
+        repository_id: Some(repository_id),
+        owner: Some(owner.to_owned()),
+        name: Some(config.name),
+        environment: Some("production".into()),
+        kind: Some(GitHubJobKind::Production),
         pull_request: None,
-        sha: sha.to_owned(),
     }])
 }
 
@@ -1076,7 +1089,7 @@ fn derive_pull_request_job(
     state: &State,
     action: Option<&str>,
     value: &Value,
-) -> Result<Vec<GitHubJobSpec>, GitHubError> {
+) -> Result<Vec<DeployJobSpec>, GitHubError> {
     let Some(action) = action else {
         return Ok(Vec::new());
     };
@@ -1120,17 +1133,27 @@ fn derive_pull_request_job(
     if head_repo_id != repository_id || base_ref != config.branch {
         return Ok(Vec::new());
     }
-    Ok(vec![GitHubJobSpec {
+    Ok(vec![DeployJobSpec {
         id: job_id("preview", installation_id, repository_id, Some(number), sha),
         key: format!("{installation_id}:{repository_id}:pr:{number}"),
-        installation_id,
-        repository_id,
-        owner: config.owner,
-        name: config.name,
-        environment: format!("pr-{number}"),
-        kind: GitHubJobKind::Preview,
+        source: DeployJobSource::GitHub,
+        source_path: PathBuf::from(format!("{}/{}", config.owner, config.name)),
+        source_ref: sha.to_owned(),
+        app: config.app,
+        domain: config.domain,
+        engine_version: config.engine_version,
+        entry: config.entry,
+        artifact_root: config.artifact_root,
+        upstream: config.upstream,
+        branch: Some(config.branch),
+        commit: Some(sha.to_owned()),
+        installation_id: Some(installation_id),
+        repository_id: Some(repository_id),
+        owner: Some(config.owner),
+        name: Some(config.name),
+        environment: Some(format!("pr-{number}")),
+        kind: Some(GitHubJobKind::Preview),
         pull_request: Some(number),
-        sha: sha.to_owned(),
     }])
 }
 
@@ -1169,7 +1192,26 @@ fn http_status(operation: &str, status: u16, _body: &[u8]) -> GitHubError {
 }
 
 /// Extract a GitHub tarball without allowing traversal, links, or device nodes.
-pub fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(), GitHubError> {
+pub(crate) fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(), GitHubError> {
+    safe_extract_archive_reader(bytes, destination)
+}
+
+/// Safely extract a tar or gzip-compressed tar stream into `destination`.
+///
+/// This public reader-based entry point is shared by the library's GitHub
+/// ingestion and the daemon binary's upload worker. It rejects absolute and
+/// parent-traversing paths, links, special files, duplicate output files, and
+/// archives whose compressed or extracted size exceeds the configured bounds.
+/// Callers must provide a private, daemon-owned destination directory.
+pub fn safe_extract_archive_reader<R: Read>(
+    mut reader: R,
+    destination: &Path,
+) -> Result<(), GitHubError> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_ARCHIVE_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_ARCHIVE_BODY_BYTES {
         return Err(GitHubError::UnsafeArchive(
             "archive body exceeds 256 MiB".into(),
@@ -1177,9 +1219,9 @@ pub fn safe_extract_archive(bytes: &[u8], destination: &Path) -> Result<(), GitH
     }
     fs::create_dir_all(destination)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
-        extract_tar(GzDecoder::new(bytes), destination)
+        extract_tar(GzDecoder::new(bytes.as_slice()), destination)
     } else {
-        extract_tar(bytes, destination)
+        extract_tar(bytes.as_slice(), destination)
     }
 }
 
@@ -1296,7 +1338,7 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
     fn deploy(
         &self,
         state: &mut State,
-        _job: &GitHubDeployJob,
+        job: &GitHubDeployJob,
         config: &GitHubRepositoryConfig,
         source: &Path,
         audit: &AuditContext,
@@ -1311,7 +1353,11 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
                 &config.entry,
                 &config.artifact_root,
                 &config.upstream,
-            ),
+            )
+            .with_source(DeploymentSource::github(
+                Some(config.branch.clone()),
+                Some(job.sha.clone()),
+            )),
             audit,
             |_| Ok(crate::deploy::ActivationPreparation::new(|| {})),
         )
@@ -1606,13 +1652,7 @@ impl GitHubWorker {
                 &response.body,
             ));
         }
-        let workspace = self
-            .manager
-            .state_path
-            .parent()
-            .unwrap_or_else(|| Path::new("/var/lib/cygnus"))
-            .join("github-work")
-            .join(&job.id);
+        let workspace = state.state_root().join("github-work").join(&job.id);
         if workspace.exists() {
             fs::remove_dir_all(&workspace)?;
         }
@@ -1620,10 +1660,13 @@ impl GitHubWorker {
         let result = (|| {
             safe_extract_archive(&response.body, &workspace)?;
             let audit = worker_audit(job);
-            self.executor
+            let deployment_id = self
+                .executor
                 .deploy(state, job, &config, &workspace, &audit)
                 .map(|result| result.deployment_id)
-                .map_err(|error| GitHubError::Deploy(error.to_string()))
+                .map_err(|error| GitHubError::Deploy(error.to_string()))?;
+            state.attach_deployment_id(&job.id, &deployment_id)?;
+            Ok(deployment_id)
         })();
         let _ = fs::remove_dir_all(&workspace);
         result
