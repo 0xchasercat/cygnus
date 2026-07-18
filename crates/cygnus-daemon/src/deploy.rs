@@ -1564,7 +1564,7 @@ fn publish_or_reuse(
     match rename_noreplace(building, final_path) {
         Ok(()) => {
             if let Some(parent) = final_path.parent() {
-                File::open(parent)?.sync_all()?;
+                sync_best_effort(&File::open(parent)?)?;
             }
             Ok(false)
         }
@@ -1653,7 +1653,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> Result<(), io::Error> {
 fn sync_tree(path: &Path) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_file() {
-        return File::open(path)?.sync_all();
+        return sync_best_effort(&File::open(path)?);
     }
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(io::Error::other("artifact contains unsupported file type"));
@@ -1661,7 +1661,27 @@ fn sync_tree(path: &Path) -> Result<(), io::Error> {
     for entry in fs::read_dir(path)? {
         sync_tree(&entry?.path())?;
     }
-    File::open(path)?.sync_all()
+    sync_best_effort(&File::open(path)?)
+}
+
+/// Flush to stable storage where the platform allows it. Some platforms
+/// refuse full syncs on read-only descriptors (macOS `F_FULLFSYNC`) — a
+/// durability opportunity lost, not a correctness failure, so those errors
+/// are absorbed rather than failing the publication.
+fn sync_best_effort(file: &File) -> Result<(), io::Error> {
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_read_only_tree(path: &Path) -> Result<(), DeployError> {
