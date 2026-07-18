@@ -31,6 +31,8 @@ jobs:
 
   rust-macos:
     runs-on: namespace-profile-cygnus-macos-arm64
+    env:
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
