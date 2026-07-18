@@ -27,6 +27,7 @@ pub struct Route {
 pub struct RouteTable {
     exact: HashMap<String, Arc<Route>>,
     wildcards: Vec<(String, Arc<Route>)>,
+    default: Option<Arc<Route>>,
 }
 
 impl RouteTable {
@@ -52,7 +53,17 @@ impl RouteTable {
         }
     }
 
+    /// Set the fallback route used when a host matches no exact or wildcard
+    /// pattern. This is how the control-plane console stays reachable at the
+    /// node's own address (a bare IP, an SSH-forwarded `localhost`, or a
+    /// not-yet-mapped custom domain) before any application domains exist.
+    /// Pass `None` to clear it.
+    pub fn set_default(&mut self, route: Option<Route>) {
+        self.default = route.map(Arc::new);
+    }
+
     /// Resolve a request host (as received, possibly with a port) to a route.
+    /// Exact hosts win, then single-label wildcards, then the default route.
     pub fn resolve(&self, host: &str) -> Option<Arc<Route>> {
         let host = normalize_host(host);
         if let Some(route) = self.exact.get(&host) {
@@ -66,7 +77,7 @@ impl RouteTable {
                 return Some(Arc::clone(route));
             }
         }
-        None
+        self.default.as_ref().map(Arc::clone)
     }
 
     /// Whether no request still holds a route cloned from this table.
@@ -74,6 +85,7 @@ impl RouteTable {
         self.exact
             .values()
             .chain(self.wildcards.iter().map(|(_, route)| route))
+            .chain(self.default.iter())
             .all(|route| Arc::strong_count(route) == 1)
     }
 }
@@ -164,6 +176,30 @@ mod tests {
         // The apex and deeper names do not match a single-label wildcard.
         assert!(table.resolve("apps.example.com").is_none());
         assert!(table.resolve("a.b.apps.example.com").is_none());
+    }
+
+    #[test]
+    fn default_route_catches_unmatched_hosts_but_yields_to_matches() {
+        let mut table = table();
+        assert!(table.resolve("nope.example.com").is_none());
+        table.set_default(Some(route("console")));
+        // Unmatched hosts — a bare IP, an SSH-forwarded localhost, an
+        // unmapped domain — all reach the default.
+        assert_eq!(table.resolve("203.0.113.7:3000").unwrap().app, "console");
+        assert_eq!(table.resolve("localhost:3000").unwrap().app, "console");
+        assert_eq!(
+            table.resolve("dashboard.example.net").unwrap().app,
+            "console"
+        );
+        // Explicit routes still win over the default.
+        assert_eq!(table.resolve("api.example.com").unwrap().app, "api");
+        assert_eq!(
+            table.resolve("blog.apps.example.com").unwrap().app,
+            "preview"
+        );
+        // Clearing the default restores 404 behavior.
+        table.set_default(None);
+        assert!(table.resolve("nope.example.com").is_none());
     }
 
     #[test]

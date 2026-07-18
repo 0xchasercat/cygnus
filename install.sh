@@ -184,21 +184,40 @@ if [[ -z $bundle_dir ]]; then
     bundle_dir="$downloaded_bundle"
   fi
 fi
-if [[ -z $listen && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
-  printf 'HTTP listen address [127.0.0.1:3000]: ' >&2; IFS= read -r answer || true; listen=${answer:-127.0.0.1:3000}
+# A server binds to every interface so the console is reachable over the
+# network; a developer's Mac stays on loopback. The console is auth-gated
+# either way, and the daemon routes any unmatched host to it, so reaching the
+# box by IP lands on the login screen.
+if [[ $OS == Linux ]]; then default_listen=0.0.0.0:3000; else default_listen=127.0.0.1:3000; fi
+
+# `curl | bash` leaves stdin bound to the piped script, so the wizard would
+# never see a terminal. Read prompts straight from the controlling terminal
+# (/dev/tty) when one exists — the trick rustup and Homebrew use — so a piped
+# install is still interactive. With no terminal at all (cloud-init, CI), fall
+# back to reachable defaults instead of prompting.
+tty_in=""
+if (( ! noninteractive )); then
+  if [[ -t 0 ]]; then
+    tty_in=/dev/stdin
+  elif [[ -r /dev/tty ]]; then
+    tty_in=/dev/tty
+  fi
 fi
-if [[ -z $https_listen && $https_set -eq 0 && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
-  printf 'HTTPS listen address [disabled]: ' >&2; IFS= read -r answer || true; https_listen=$answer
+prompt() {
+  local message=$1 default=$2 answer=""
+  if [[ -n $tty_in ]]; then
+    printf '%s' "$message" >&2
+    IFS= read -r answer <"$tty_in" || answer=""
+  fi
+  printf '%s' "${answer:-$default}"
+}
+[[ -n $listen ]] || listen=$(prompt "HTTP listen address [$default_listen]: " "$default_listen")
+if [[ -z $https_listen && $https_set -eq 0 ]]; then
+  https_listen=$(prompt 'HTTPS listen address [disabled]: ' '')
 fi
-if [[ -z $apps_domain && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
-  printf 'Applications domain [apps.localhost]: ' >&2; IFS= read -r answer || true; apps_domain=${answer:-apps.localhost}
-fi
-if [[ -z $acme_email && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
-  printf 'ACME email [optional]: ' >&2; IFS= read -r answer || true; acme_email=$answer
-fi
-if [[ -z $dns_provider && $noninteractive -eq 0 && -t 0 && -t 1 ]]; then
-  printf 'DNS provider [none]: ' >&2; IFS= read -r answer || true; dns_provider=${answer:-none}
-fi
+[[ -n $apps_domain ]] || apps_domain=$(prompt 'Applications domain [apps.localhost]: ' 'apps.localhost')
+[[ -n $acme_email ]] || acme_email=$(prompt 'ACME email [optional]: ' '')
+[[ -n $dns_provider ]] || dns_provider=$(prompt 'DNS provider [none]: ' 'none')
 
 if [[ -n $bundle_dir && $bundle_dir != /* ]]; then
   [[ $bundle_dir != .. && $bundle_dir != ../* && $bundle_dir != */../* && $bundle_dir != */.. ]] || fail "bundle path traversal is not allowed"
@@ -888,12 +907,50 @@ if [[ $console_listener =~ :([0-9]+)$ ]]; then
   console_port=${BASH_REMATCH[1]}
   [[ $console_port == 80 || $console_port == 443 ]] || console_port_suffix=":$console_port"
 fi
+
+# Pick a host the operator can actually reach. A configured apps domain is the
+# real answer; otherwise (the apps.localhost default) point at the machine's
+# own address, since the daemon routes any unmatched host to the console.
+listen_host=${console_listener%:*}
+console_host="cygnus.${apps_domain}"
+access_note=""
+if [[ $apps_domain == apps.localhost ]]; then
+  primary_ip=""
+  if [[ $listen_host == 0.0.0.0 || $listen_host == "::" || $listen_host == "[::]" ]]; then
+    if [[ $OS == Linux ]]; then
+      # Guard every stage: under `set -o pipefail` an empty grep would abort
+      # the installer right before the success banner.
+      local_ips=$(hostname -I 2>/dev/null || true)
+      for candidate in $local_ips; do
+        [[ $candidate == *:* ]] && continue
+        primary_ip=$candidate
+        break
+      done
+    else
+      primary_ip=$(ipconfig getifaddr en0 2>/dev/null || true)
+    fi
+  fi
+  if [[ -n $primary_ip ]]; then
+    console_host=$primary_ip
+    access_note="reachable at any hostname pointed here; set --apps-domain for clean app URLs"
+  else
+    console_host=localhost
+    access_note="loopback only; re-run with --listen 0.0.0.0:PORT and --apps-domain to expose it"
+  fi
+fi
+
 if [[ $OS == Darwin && :$PATH: != *:$HOME/.cygnus/bin:* ]]; then
   log 'Add Cygnus to PATH: export PATH="$HOME/.cygnus/bin:$PATH"'
 fi
 log ""
 log "Cygnus is running."
 log ""
-log "  console   ${console_scheme}://cygnus.${apps_domain}${console_port_suffix}"
+log "  console   ${console_scheme}://${console_host}${console_port_suffix}"
+[[ -n $access_note ]] && log "            ($access_note)"
 log "  token     $bootstrap_hex   (rotate: install.sh --rotate-secrets)"
 log "  cli       cygnus status"
+if [[ $console_scheme == http && $apps_domain != apps.localhost ]]; then
+  log ""
+  log "  Enable HTTPS + push-to-deploy: re-run with"
+  log "    --https-listen 0.0.0.0:443 --acme-email you@example.com"
+fi

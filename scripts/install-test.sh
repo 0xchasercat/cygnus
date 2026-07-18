@@ -348,7 +348,8 @@ grep -q '^bootstrap gui/' "$CYGNUS_TEST_LAUNCHCTL_LOG" || { echo 'launchctl boot
 grep -q 'engine register.*--host-root .*\.cygnus/state/engines/bun-1.3.14.*--default' "$CYGNUS_TEST_CTL_LOG" || { echo 'darwin default engine registration missing' >&2; exit 1; }
 grep -q 'apply ' "$CYGNUS_TEST_CTL_LOG" || { echo 'darwin config apply missing' >&2; exit 1; }
 [[ $(grep -c '^macOS runs cages as plain processes: no namespaces, no cgroups, no seccomp\.$' "$DARWIN_ROOT/install-output") == 1 ]] || { echo 'canonical macOS platform line missing or repeated' >&2; exit 1; }
-grep -q '  console   http://cygnus.apps.localhost:3000' "$DARWIN_ROOT/install-output" || { echo 'darwin console URL missing' >&2; exit 1; }
+grep -q '  console   http://localhost:3000' "$DARWIN_ROOT/install-output" || { echo 'darwin console URL missing' >&2; exit 1; }
+grep -q 'loopback only' "$DARWIN_ROOT/install-output" || { echo 'darwin loopback access note missing' >&2; exit 1; }
 grep -Eq '  token     [[:xdigit:]]{64}   \(rotate: install.sh --rotate-secrets\)' "$DARWIN_ROOT/install-output" || { echo 'darwin token output missing' >&2; exit 1; }
 grep -Fq 'Add Cygnus to PATH: export PATH="$HOME/.cygnus/bin:$PATH"' "$DARWIN_ROOT/install-output" || { echo 'darwin PATH hint missing' >&2; exit 1; }
 
@@ -396,5 +397,29 @@ unset CYGNUS_TEST_LAUNCHCTL_BOOTSTRAP_STATUS CYGNUS_TEST_LAUNCHCTL_LOAD_STATUS
 run_darwin_install --rotate-secrets >/dev/null 2>&1
 [[ $(hash_file "$DARWIN_SECRETS/bootstrap.token") != "$darwin_bootstrap_before" ]] || { echo 'darwin bootstrap token did not rotate' >&2; exit 1; }
 [[ $(hash_file "$DARWIN_SECRETS/session.key") != "$darwin_session_before" ]] || { echo 'darwin session key did not rotate' >&2; exit 1; }
+
+# A non-interactive Linux install with no --listen must bind every interface
+# so the console is reachable over the network out of the box, not loopback.
+# Rebuild the five-member Linux bundle (the darwin section stripped cygnus-init).
+make_bundle
+write_checksums
+DEFAULT_ROOT=$ROOT/default-listen
+mkdir -p "$DEFAULT_ROOT/run/cygnus/tenant-0"
+env CYGNUS_INSTALL_TEST_MODE=1 CYGNUS_INSTALL_TEST_ROOT="$DEFAULT_ROOT" \
+  CYGNUS_INSTALL_TEST_UNAME=Linux \
+  CYGNUS_TEST_CTL_LOG="$DEFAULT_ROOT/ctl.log" \
+  CYGNUS_TEST_SYSTEMCTL_LOG="$DEFAULT_ROOT/systemctl.log" \
+  CYGNUS_TEST_READY_FILE="$DEFAULT_ROOT/run/cygnus/admin.sock" \
+  CYGNUS_TEST_TENANT_READY_FILE="$DEFAULT_ROOT/run/cygnus/tenant-0/admin.sock" \
+  PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE" \
+    --prefix "$DEFAULT_ROOT/usr/local/bin" --config-dir "$DEFAULT_ROOT/etc/cygnus" \
+    --state-dir "$DEFAULT_ROOT/var/lib/cygnus" --runtime-dir "$DEFAULT_ROOT/run/cygnus" \
+    --bun-version 1.3.14 >/dev/null 2>&1 || { echo 'default-listen install failed' >&2; exit 1; }
+python3 - "$DEFAULT_ROOT/etc/cygnus/node.json" <<'PY'
+import json, sys
+node = json.loads(open(sys.argv[1]).read())
+assert node["listen"] == "0.0.0.0:3000", node["listen"]
+PY
 
 printf '%s\n' 'installer tests passed'

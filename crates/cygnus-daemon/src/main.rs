@@ -951,6 +951,17 @@ fn route_table(snapshot: &Snapshot) -> RouteTable {
                 },
             );
         }
+        // Tenant Zero is the node's control plane: make it the fallback route
+        // so the console answers at the node's own address — a bare IP, an
+        // SSH-forwarded localhost, or a domain not yet mapped to an app —
+        // instead of returning 404. It stays auth-gated, so this exposes no
+        // data; it only guarantees the operator can always reach the console.
+        if app.tenant_admin {
+            routes.set_default(Some(Route {
+                app: app.spec.name.clone(),
+                upstream: app.upstream.clone(),
+            }));
+        }
     }
     routes
 }
