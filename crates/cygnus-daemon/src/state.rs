@@ -710,6 +710,7 @@ pub struct GitHubDeployJob {
     pub kind: GitHubJobKind,
     pub pull_request: Option<i64>,
     pub sha: String,
+    pub entry: PathBuf,
     pub status: GitHubDeployJobStatus,
     pub attempts: u32,
     pub next_attempt_at: String,
@@ -757,6 +758,7 @@ impl TryFrom<DeployJob> for GitHubDeployJob {
             sha: job.commit.ok_or_else(|| {
                 StateError::IncompleteState("github job is missing commit SHA".into())
             })?,
+            entry: job.entry,
             status: job.status,
             attempts: job.attempts,
             next_attempt_at: job.next_attempt_at,
@@ -2914,20 +2916,20 @@ fn validate_github_repository(config: &GitHubRepositoryConfig) -> Result<(), Sta
     ] {
         github_text(value, field)?;
     }
-    if config.entry.as_os_str().is_empty()
-        || config.entry.is_absolute()
-        || config.entry.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir
-                    | std::path::Component::ParentDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+    if !config.entry.as_os_str().is_empty()
+        && (config.entry.is_absolute()
+            || config.entry.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            }))
     {
         return Err(StateError::InvalidRecord {
             kind: "github repository",
-            detail: "entry must be a nonempty relative path without traversal".into(),
+            detail: "entry must be automatic or a relative path without traversal".into(),
         });
     }
     for (path, field) in [
@@ -2998,20 +3000,20 @@ fn validate_deploy_job_spec(job: &DeployJobSpec) -> Result<(), StateError> {
             detail: "source path must be nonempty and bounded".into(),
         });
     }
-    if job.entry.as_os_str().is_empty()
-        || job.entry.is_absolute()
-        || job.entry.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir
-                    | std::path::Component::ParentDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+    if !job.entry.as_os_str().is_empty()
+        && (job.entry.is_absolute()
+            || job.entry.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                )
+            }))
     {
         return Err(StateError::InvalidRecord {
             kind: "deploy job",
-            detail: "entry must be a nonempty relative path without traversal".into(),
+            detail: "entry must be automatic or a relative path without traversal".into(),
         });
     }
     for (path, field) in [
@@ -5243,7 +5245,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_default_switching_keeps_registration_immutable_and_audited() {
+    fn explicit_default_switching_survives_idempotent_registration() {
         let path = temp_db("explicit-engine-default");
         let mut state = State::open(&path).unwrap();
         let first = state
@@ -5268,8 +5270,10 @@ mod tests {
         assert_eq!(state.audit_records().unwrap().len(), 1);
 
         let duplicate = test_engine_record("bun-1", true);
-        assert!(state.register_engine(&duplicate).is_err());
-        assert!(state.engine("bun-1").unwrap().unwrap().is_default);
+        let updated = state.register_engine(&duplicate).unwrap();
+        assert!(updated.is_default);
+        assert_eq!(updated.host_root, duplicate.host_root);
+        assert_eq!(updated.sha256, duplicate.sha256);
         drop(state);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -6506,6 +6510,7 @@ mod tests {
         );
         let running = state.claim_github_job().unwrap().unwrap();
         assert_eq!(running.id, "j1");
+        assert_eq!(running.entry, PathBuf::from("index.ts"));
         assert!(
             state
                 .accept_github_delivery(&delivery("d2"), &[github_job_fixture("j2", &second)])

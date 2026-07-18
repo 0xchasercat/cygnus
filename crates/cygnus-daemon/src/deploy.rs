@@ -44,8 +44,10 @@ const FAILED_REL: &str = "failed";
 const SHIM_REL: &str = "cygnus/shim.js";
 const BUILD_RUNNER_REL: &str = "cygnus/build-runner.js";
 const BUILD_CONFIG_REL: &str = "cygnus/build.bunfig.toml";
+const STATIC_SERVER_REL: &str = "cygnus/cygnus-static-server.ts";
 const BUILD_RUNNER_CAGE_PATH: &str = "/cygnus/build-runner.js";
 const BUILD_CONFIG_CAGE_PATH: &str = "/cygnus/build.bunfig.toml";
+const STATIC_SERVER_CAGE_PATH: &str = "/cygnus/cygnus-static-server.ts";
 const BUILD_WORKDIR_CAGE_PATH: &str = "/cygnus";
 const BUILD_WORKSPACE_CAGE_PATH: &str = "/workspace";
 const BUILD_OUTPUT_CAGE_PATH: &str = "/cygnus/output/app";
@@ -67,10 +69,27 @@ const LOG_REL: &str = "logs";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARTIFACT_INODES: u64 = 8_192;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BuildMode {
+    Server { entry: PathBuf },
+    Static { build_script: Option<String> },
+}
+
+impl BuildMode {
+    fn generated_entry(&self) -> &Path {
+        match self {
+            Self::Server { entry } => entry,
+            Self::Static { .. } => Path::new("cygnus-static-server.ts"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BuildPlan {
     install: bool,
     frozen: bool,
+    mode: BuildMode,
+    detection: String,
 }
 /// Inputs to one source deployment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -135,6 +154,7 @@ pub struct ResolvedDeployRequest {
     pub domain: String,
     pub engine_version: String,
     pub entry: PathBuf,
+    pub entry_explicit: bool,
     pub artifact_root: PathBuf,
     pub upstream: PathBuf,
     pub deployment_id: Option<String>,
@@ -384,6 +404,7 @@ pub fn resolve_deploy_request(
             format!("{}.{}", request.app, apps_domain)
         }
     };
+    let entry_explicit = request.entry.is_some();
     let entry = request.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
     let artifact_root = request
         .artifact_root
@@ -404,6 +425,7 @@ pub fn resolve_deploy_request(
         domain,
         engine_version,
         entry,
+        entry_explicit,
         artifact_root,
         upstream,
         deployment_id: request.deployment_id,
@@ -445,7 +467,7 @@ where
     verify_engine(&engine)?;
     let source_root = canonical_source_root(&request.source_dir)?;
     let artifact_root = prepare_artifact_root(&request.artifact_root)?;
-    let entry = request.entry.clone();
+    let requested_entry = request.entry.clone();
     let deployment_id = request
         .deployment_id
         .clone()
@@ -465,7 +487,10 @@ where
             return Err(error);
         }
     };
-    let build_plan = match preflight_workspace(&workspace) {
+    let build_plan = match preflight_workspace(
+        &workspace,
+        request.entry_explicit.then_some(requested_entry.as_path()),
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             let _ = remove_work(&artifact_root, &deployment_id);
@@ -532,9 +557,8 @@ where
             &engine,
             &workspace,
             publish.path(),
-            &entry,
             &deployment_id,
-            build_plan,
+            &build_plan,
         );
         let job_result = match run_build_job(job, build_plan.install, stdout_log, stderr_log) {
             Ok(result) => result,
@@ -585,7 +609,11 @@ where
         let close_result = publish.close();
         close_result?;
         staging_result?;
-        let generated = expected_generated_entry(&building.join("app"), &entry)?;
+        let app_output = building.join("app");
+        if matches!(&build_plan.mode, BuildMode::Static { .. }) {
+            validate_static_public_root(&app_output)?;
+        }
+        let generated = expected_generated_entry(&app_output, &build_plan.mode)?;
         let sidecar = generated.with_extension("js.jsc");
         let sidecar_meta = fs::symlink_metadata(&sidecar).map_err(|error| {
             io::Error::new(
@@ -734,9 +762,8 @@ fn build_job(
     engine: &EngineRecord,
     workspace: &Path,
     publish: &Path,
-    entry: &Path,
     deployment_id: &str,
-    plan: BuildPlan,
+    plan: &BuildPlan,
 ) -> JobConfig {
     let linux = cfg!(target_os = "linux");
     let relative = engine
@@ -753,28 +780,38 @@ fn build_job(
     // (macOS plain processes) address the same files where they actually
     // live on the host.
     let staging_root = workspace.parent().unwrap_or(workspace).to_path_buf();
-    let (config_path, runner_path, home_path, tmpdir_path, cache_path, workspace_path, output_path) =
-        if linux {
-            (
-                PathBuf::from(BUILD_CONFIG_CAGE_PATH),
-                PathBuf::from(BUILD_RUNNER_CAGE_PATH),
-                PathBuf::from(BUILD_HOME_CAGE_PATH),
-                PathBuf::from(BUILD_TMPDIR_CAGE_PATH),
-                PathBuf::from(BUILD_CACHE_CAGE_PATH),
-                PathBuf::from(BUILD_WORKSPACE_CAGE_PATH),
-                PathBuf::from(BUILD_OUTPUT_CAGE_PATH),
-            )
-        } else {
-            (
-                staging_root.join(BUILD_CONFIG_REL),
-                staging_root.join(BUILD_RUNNER_REL),
-                staging_root.join("cygnus/home"),
-                staging_root.join("cygnus/tmp"),
-                workspace.join(".cygnus-cache"),
-                workspace.to_path_buf(),
-                publish.join("app"),
-            )
-        };
+    let (
+        config_path,
+        runner_path,
+        static_server_path,
+        home_path,
+        tmpdir_path,
+        cache_path,
+        workspace_path,
+        output_path,
+    ) = if linux {
+        (
+            PathBuf::from(BUILD_CONFIG_CAGE_PATH),
+            PathBuf::from(BUILD_RUNNER_CAGE_PATH),
+            PathBuf::from(STATIC_SERVER_CAGE_PATH),
+            PathBuf::from(BUILD_HOME_CAGE_PATH),
+            PathBuf::from(BUILD_TMPDIR_CAGE_PATH),
+            PathBuf::from(BUILD_CACHE_CAGE_PATH),
+            PathBuf::from(BUILD_WORKSPACE_CAGE_PATH),
+            PathBuf::from(BUILD_OUTPUT_CAGE_PATH),
+        )
+    } else {
+        (
+            staging_root.join(BUILD_CONFIG_REL),
+            staging_root.join(BUILD_RUNNER_REL),
+            staging_root.join(STATIC_SERVER_REL),
+            staging_root.join("cygnus/home"),
+            staging_root.join("cygnus/tmp"),
+            workspace.join(".cygnus-cache"),
+            workspace.to_path_buf(),
+            publish.join("app"),
+        )
+    };
     job.args = vec![
         OsString::from("--no-env-file"),
         OsString::from(format!("--config={}", config_path.display())),
@@ -787,7 +824,10 @@ fn build_job(
             "--install-latest"
         }));
     }
-    job.args.push(entry.as_os_str().to_owned());
+    match &plan.mode {
+        BuildMode::Server { entry } => job.args.push(entry.as_os_str().to_owned()),
+        BuildMode::Static { .. } => job.args.push(OsString::from("--static")),
+    }
     job.env.insert("HOME".into(), home_path.into_os_string());
     job.env
         .insert("TMPDIR".into(), tmpdir_path.into_os_string());
@@ -804,6 +844,20 @@ fn build_job(
     );
     job.env
         .insert("CYGNUS_BUILD_OUTPUT".into(), output_path.into_os_string());
+    job.env.insert(
+        "CYGNUS_BUILD_DETECTION".into(),
+        OsString::from(&plan.detection),
+    );
+    if let BuildMode::Static { build_script } = &plan.mode {
+        job.env.insert(
+            "CYGNUS_STATIC_SERVER_SOURCE".into(),
+            static_server_path.into_os_string(),
+        );
+        job.env.insert(
+            "CYGNUS_STATIC_BUILD_SCRIPT".into(),
+            OsString::from(build_script.as_deref().unwrap_or("")),
+        );
+    }
     job.egress = if plan.install {
         EgressMode::BuildDomains {
             allow: vec![DomainEgressRule {
@@ -925,13 +979,16 @@ fn deploy_request_digest(request: &DeployRequest) -> String {
     hex_digest(hasher)
 }
 
-fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
+fn preflight_workspace(
+    workspace: &Path,
+    explicit_entry: Option<&Path>,
+) -> Result<BuildPlan, DeployError> {
     reject_workspace_path(workspace, ".npmrc", false)?;
     reject_workspace_path(workspace, "bunfig.toml", false)?;
     reject_workspace_path(workspace, "bun.lockb", false)?;
 
     let package_path = workspace.join("package.json");
-    let has_dependencies = match fs::symlink_metadata(&package_path) {
+    let (has_dependencies, build_script, framework) = match fs::symlink_metadata(&package_path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(DeployError::InvalidInput(
@@ -945,42 +1002,126 @@ fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
             let package = value.as_object().ok_or_else(|| {
                 DeployError::InvalidInput("package.json must contain a JSON object".into())
             })?;
-            dependency_section_nonempty(package, "dependencies")?
+            let has_dependencies = dependency_section_nonempty(package, "dependencies")?
                 || dependency_section_nonempty(package, "devDependencies")?
-                || dependency_section_nonempty(package, "optionalDependencies")?
+                || dependency_section_nonempty(package, "optionalDependencies")?;
+            (
+                has_dependencies,
+                package_build_script(package)?,
+                frontend_framework(package)?,
+            )
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return preflight_lock_only(workspace);
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None, None),
         Err(error) => return Err(error.into()),
     };
 
-    let lock_path = workspace.join("bun.lock");
-    let frozen = match fs::symlink_metadata(&lock_path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                return Err(DeployError::InvalidInput(
-                    "bun.lock must be a regular text file".into(),
-                ));
-            }
-            let bytes = read_control_file(&lock_path, MAX_BUN_LOCK_BYTES, "bun.lock")?;
-            validate_bun_lock(&bytes)?;
-            true
+    let frozen = validate_workspace_lock(workspace)?;
+    let (mode, detection) = if let Some(entry) = explicit_entry {
+        require_workspace_file(workspace, entry, "explicit server entry")?;
+        (
+            BuildMode::Server {
+                entry: entry.to_path_buf(),
+            },
+            format!("server app ({})", slash_path(entry)),
+        )
+    } else {
+        let has_index_html = workspace_file_exists(workspace, Path::new("index.html"))?;
+        if has_index_html || (build_script.is_some() && framework.is_some()) {
+            let reason = framework.as_deref().unwrap_or("index.html");
+            (
+                BuildMode::Static { build_script },
+                format!("static site ({reason})"),
+            )
+        } else if let Some(entry) = first_server_entry(workspace)? {
+            let detection = format!("server app ({})", slash_path(&entry));
+            (BuildMode::Server { entry }, detection)
+        } else {
+            return Err(DeployError::InvalidInput(
+                "could not detect app type: looked for a package.json build script with a known frontend framework dependency, root index.html, or server entry index.ts, index.js, src/index.ts, or server.ts; pass --entry for a server app"
+                    .into(),
+            ));
         }
-        // No committed lockfile: the install resolves versions fresh, the
-        // same way hosted platforms build lockless projects. Bun migrates
-        // package-lock.json and yarn.lock automatically when present.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
     };
 
     Ok(BuildPlan {
         install: has_dependencies,
-        frozen,
+        frozen: has_dependencies && frozen,
+        mode,
+        detection,
     })
 }
 
-fn preflight_lock_only(workspace: &Path) -> Result<BuildPlan, DeployError> {
+fn package_build_script(
+    package: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, DeployError> {
+    let Some(scripts) = package.get("scripts") else {
+        return Ok(None);
+    };
+    let scripts = scripts.as_object().ok_or_else(|| {
+        DeployError::InvalidInput("package.json scripts must be a JSON object".into())
+    })?;
+    let Some(build) = scripts.get("build") else {
+        return Ok(None);
+    };
+    let build = build.as_str().ok_or_else(|| {
+        DeployError::InvalidInput("package.json scripts.build must be a string".into())
+    })?;
+    if build.trim().is_empty() {
+        return Err(DeployError::InvalidInput(
+            "package.json scripts.build must not be empty".into(),
+        ));
+    }
+    Ok(Some("build".into()))
+}
+
+fn frontend_framework(
+    package: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, DeployError> {
+    let mut dependencies = Vec::new();
+    for section in ["dependencies", "devDependencies"] {
+        let Some(value) = package.get(section) else {
+            continue;
+        };
+        let values = value.as_object().ok_or_else(|| {
+            DeployError::InvalidInput(format!("package.json {section} must be a JSON object"))
+        })?;
+        dependencies.extend(values.keys().map(String::as_str));
+    }
+
+    let known = [
+        ("vite", "vite"),
+        ("react-scripts", "react-scripts"),
+        ("next", "next"),
+        ("@sveltejs/kit", "sveltekit"),
+        ("svelte", "svelte"),
+        ("astro", "astro"),
+        ("nuxt", "nuxt"),
+        ("vue", "vue"),
+        ("@angular/core", "angular"),
+        ("parcel", "parcel"),
+        ("gatsby", "gatsby"),
+    ];
+    for (dependency, label) in known {
+        if dependencies.contains(&dependency) {
+            return Ok(Some(label.into()));
+        }
+    }
+    if dependencies
+        .iter()
+        .any(|dependency| dependency.starts_with("@vitejs/plugin-"))
+    {
+        return Ok(Some("vite".into()));
+    }
+    if dependencies
+        .iter()
+        .any(|dependency| dependency.starts_with("@remix-run/"))
+    {
+        return Ok(Some("remix".into()));
+    }
+    Ok(None)
+}
+
+fn validate_workspace_lock(workspace: &Path) -> Result<bool, DeployError> {
     let lock_path = workspace.join("bun.lock");
     match fs::symlink_metadata(&lock_path) {
         Ok(metadata) => {
@@ -991,14 +1132,49 @@ fn preflight_lock_only(workspace: &Path) -> Result<BuildPlan, DeployError> {
             }
             let bytes = read_control_file(&lock_path, MAX_BUN_LOCK_BYTES, "bun.lock")?;
             validate_bun_lock(&bytes)?;
+            Ok(true)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    Ok(BuildPlan {
-        install: false,
-        frozen: false,
-    })
+}
+
+fn workspace_file_exists(workspace: &Path, relative: &Path) -> Result<bool, DeployError> {
+    let path = workspace.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(DeployError::InvalidInput(format!(
+            "{} must be a regular file",
+            relative.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn require_workspace_file(
+    workspace: &Path,
+    relative: &Path,
+    description: &str,
+) -> Result<(), DeployError> {
+    if workspace_file_exists(workspace, relative)? {
+        Ok(())
+    } else {
+        Err(DeployError::InvalidInput(format!(
+            "{description} {} does not exist",
+            relative.display()
+        )))
+    }
+}
+
+fn first_server_entry(workspace: &Path) -> Result<Option<PathBuf>, DeployError> {
+    for candidate in ["index.ts", "index.js", "src/index.ts", "server.ts"] {
+        let candidate = PathBuf::from(candidate);
+        if workspace_file_exists(workspace, &candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 fn reject_workspace_path(workspace: &Path, name: &str, directory: bool) -> Result<(), DeployError> {
@@ -1132,6 +1308,10 @@ fn stage_build_controls(rootfs: &Path) -> Result<(), DeployError> {
     write_control_asset(
         &control_dir.join(BUILD_CONFIG_REL.strip_prefix("cygnus/").unwrap()),
         include_bytes!("../../../assets/build.bunfig.toml"),
+    )?;
+    write_control_asset(
+        &control_dir.join(STATIC_SERVER_REL.strip_prefix("cygnus/").unwrap()),
+        include_bytes!("../../../assets/cygnus-static-server.ts"),
     )?;
     Ok(())
 }
@@ -1398,11 +1578,46 @@ fn copy_output_tree(source: &Path, destination: &Path) -> Result<(), DeployError
     Ok(())
 }
 
-fn expected_generated_entry(app: &Path, entry: &Path) -> Result<PathBuf, DeployError> {
-    let expected = app.join(entry.with_extension("js"));
-    if fs::symlink_metadata(&expected).is_ok() {
-        return Ok(expected);
+fn validate_static_public_root(app: &Path) -> Result<(), DeployError> {
+    let public = app.join("public");
+    let metadata = fs::symlink_metadata(&public).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "expected static public directory {}: {error}",
+                public.display()
+            ),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(DeployError::InvalidInput(format!(
+            "static public root {} must be a regular directory",
+            public.display()
+        )));
     }
+    Ok(())
+}
+
+fn expected_generated_entry(app: &Path, mode: &BuildMode) -> Result<PathBuf, DeployError> {
+    let expected = app.join(mode.generated_entry().with_extension("js"));
+    match fs::symlink_metadata(&expected) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(expected),
+        Ok(_) => {
+            return Err(DeployError::InvalidInput(format!(
+                "Bun build entry {} must be a regular file",
+                expected.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if matches!(mode, BuildMode::Static { .. }) {
+        return Err(DeployError::InvalidInput(format!(
+            "static build did not produce generated server entry {}",
+            expected.display()
+        )));
+    }
+
     let mut candidates = Vec::new();
     collect_files_with_suffix(app, ".js", &mut candidates)?;
     if candidates.len() == 1 {
@@ -1992,6 +2207,7 @@ mod tests {
         assert_eq!(resolved.domain, "hello.apps.example.com");
         assert_eq!(resolved.engine_version, "bun-default");
         assert_eq!(resolved.entry, PathBuf::from("index.ts"));
+        assert!(!resolved.entry_explicit);
         assert_eq!(
             resolved.artifact_root,
             state.state_root().join("artifacts/hello")
@@ -2057,79 +2273,99 @@ mod tests {
     }
 
     #[test]
-    fn dependency_preflight_matrix_is_strict_and_offline_without_deps() {
-        let root = temp_dir("preflight");
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        assert_eq!(
-            preflight_workspace(&workspace).unwrap(),
-            BuildPlan {
-                install: false,
-                frozen: false
-            }
-        );
-
+    fn vite_app_detects_static_build_with_server_side_install() {
+        let workspace = temp_dir("detect-vite");
         fs::write(
             workspace.join("package.json"),
-            br#"{"name":"app","dependencies":{}}"#,
+            br#"{"scripts":{"build":"vite build"},"devDependencies":{"vite":"^7.0.0"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            preflight_workspace(&workspace).unwrap(),
-            BuildPlan {
-                install: false,
-                frozen: false
-            }
-        );
-        fs::write(
-            workspace.join("package.json"),
-            br#"{"name":"app","dependencies":{"left-pad":"1.3.0"}}"#,
-        )
-        .unwrap();
-        // No committed lockfile: the install still runs, resolving fresh.
-        assert_eq!(
-            preflight_workspace(&workspace).unwrap(),
-            BuildPlan {
-                install: true,
-                frozen: false
-            }
-        );
         fs::write(
             workspace.join("bun.lock"),
             br#"{"lockfileVersion":1,"workspaces":{},}"#,
         )
         .unwrap();
+
         assert_eq!(
-            preflight_workspace(&workspace).unwrap(),
+            preflight_workspace(&workspace, None).unwrap(),
             BuildPlan {
                 install: true,
-                frozen: true
+                frozen: true,
+                mode: BuildMode::Static {
+                    build_script: Some("build".into())
+                },
+                detection: "static site (vite)".into(),
             }
         );
-        // Foreign lockfiles no longer block deploys — Bun migrates them.
-        fs::write(workspace.join("package-lock.json"), b"{}\n").unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn plain_server_detects_conventional_entry() {
+        let workspace = temp_dir("detect-server");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/index.ts"), b"export default {};\n").unwrap();
+
+        let plan = preflight_workspace(&workspace, None).unwrap();
         assert_eq!(
-            preflight_workspace(&workspace).unwrap(),
-            BuildPlan {
-                install: true,
-                frozen: true
+            plan.mode,
+            BuildMode::Server {
+                entry: PathBuf::from("src/index.ts")
             }
         );
-        fs::remove_file(workspace.join("package-lock.json")).unwrap();
-        fs::write(workspace.join("bun.lock"), b"not a lock\n").unwrap();
-        assert!(preflight_workspace(&workspace).is_err());
-        fs::remove_file(workspace.join("bun.lock")).unwrap();
-        // A stray node_modules in the workspace is tolerated: intake excludes
-        // it from source copies, and server-side installs own the real one.
-        fs::create_dir(workspace.join("node_modules")).unwrap();
+        assert_eq!(plan.detection, "server app (src/index.ts)");
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn explicit_entry_forces_server_mode() {
+        let workspace = temp_dir("detect-explicit");
+        fs::write(workspace.join("index.ts"), b"export default {};\n").unwrap();
+        fs::write(workspace.join("index.html"), b"<!doctype html>\n").unwrap();
+        fs::write(
+            workspace.join("package.json"),
+            br#"{"scripts":{"build":"vite build"},"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+
+        let plan = preflight_workspace(&workspace, Some(Path::new("index.ts"))).unwrap();
         assert_eq!(
-            preflight_workspace(&workspace).unwrap(),
-            BuildPlan {
-                install: true,
-                frozen: false
+            plan.mode,
+            BuildMode::Server {
+                entry: PathBuf::from("index.ts")
             }
         );
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(plan.detection, "server app (index.ts)");
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn plain_static_folder_detects_no_build_mode() {
+        let workspace = temp_dir("detect-static-folder");
+        fs::write(workspace.join("index.html"), b"<!doctype html>\n").unwrap();
+
+        let plan = preflight_workspace(&workspace, None).unwrap();
+        assert_eq!(plan.mode, BuildMode::Static { build_script: None });
+        assert_eq!(plan.detection, "static site (index.html)");
+        assert!(!plan.install);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn unknown_workspace_reports_detection_markers() {
+        let workspace = temp_dir("detect-unknown");
+        fs::write(
+            workspace.join("package.json"),
+            br#"{"scripts":{"test":"bun test"},"dependencies":{}}"#,
+        )
+        .unwrap();
+
+        let error = preflight_workspace(&workspace, None).unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("root index.html"));
+        assert!(detail.contains("server entry index.ts"));
+        assert!(detail.contains("pass --entry"));
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
@@ -2142,10 +2378,10 @@ mod tests {
             vec![b'a'; (MAX_PACKAGE_JSON_BYTES + 1) as usize],
         )
         .unwrap();
-        assert!(preflight_workspace(&workspace).is_err());
+        assert!(preflight_workspace(&workspace, None).is_err());
         fs::remove_file(workspace.join("package.json")).unwrap();
         fs::write(workspace.join(".npmrc"), b"registry=https://evil.invalid\n").unwrap();
-        assert!(preflight_workspace(&workspace).is_err());
+        assert!(preflight_workspace(&workspace, None).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2158,6 +2394,7 @@ mod tests {
         stage_build_controls(&rootfs).unwrap();
         assert!(rootfs.join(BUILD_RUNNER_REL).is_file());
         assert!(rootfs.join(BUILD_CONFIG_REL).is_file());
+        assert!(rootfs.join(STATIC_SERVER_REL).is_file());
         assert!(!workspace.join("build-runner.js").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2179,11 +2416,14 @@ mod tests {
             &engine,
             &workspace,
             &publish,
-            Path::new("index.ts"),
             "id",
-            BuildPlan {
+            &BuildPlan {
                 install: true,
                 frozen: true,
+                mode: BuildMode::Server {
+                    entry: PathBuf::from("index.ts"),
+                },
+                detection: "server app (index.ts)".into(),
             },
         );
         // Rooted (Linux) builds address the fixed cage layout; rootless
@@ -2237,6 +2477,74 @@ mod tests {
             );
         }
         fs::remove_dir_all(workspace.ancestors().nth(2).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn static_job_uses_reserved_runner_mode_and_platform_paths() {
+        let root = temp_dir("static-job");
+        let workspace = root.join("rootfs/workspace");
+        let publish = root.join("rootfs/publish");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&publish).unwrap();
+        let engine = EngineRecord {
+            version: "bun".into(),
+            host_root: PathBuf::from("/engine"),
+            cage_executable: PathBuf::from("/usr/local/bin/bun"),
+            sha256: "0".repeat(64),
+            is_default: false,
+        };
+        let job = build_job(
+            &engine,
+            &workspace,
+            &publish,
+            "id",
+            &BuildPlan {
+                install: false,
+                frozen: false,
+                mode: BuildMode::Static {
+                    build_script: Some("build".into()),
+                },
+                detection: "static site (vite)".into(),
+            },
+        );
+        assert_eq!(job.args.last(), Some(&OsString::from("--static")));
+        assert_eq!(
+            job.env.get(OsStr::new("CYGNUS_STATIC_BUILD_SCRIPT")),
+            Some(&OsString::from("build"))
+        );
+        assert_eq!(
+            job.env.get(OsStr::new("CYGNUS_BUILD_DETECTION")),
+            Some(&OsString::from("static site (vite)"))
+        );
+        let expected_server = if cfg!(target_os = "linux") {
+            PathBuf::from(STATIC_SERVER_CAGE_PATH)
+        } else {
+            workspace.parent().unwrap().join(STATIC_SERVER_REL)
+        };
+        assert_eq!(
+            job.env.get(OsStr::new("CYGNUS_STATIC_SERVER_SOURCE")),
+            Some(&expected_server.into_os_string())
+        );
+        assert!(matches!(job.egress, EgressMode::None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn static_payload_uses_reserved_entry_with_browser_assets() {
+        let app = temp_dir("static-entry");
+        fs::create_dir_all(app.join("public/assets")).unwrap();
+        fs::write(app.join("public/index.html"), b"<!doctype html>").unwrap();
+        fs::write(app.join("public/assets/app.js"), b"browser").unwrap();
+        fs::write(app.join("cygnus-static-server.js"), b"server").unwrap();
+        fs::write(app.join("cygnus-static-server.js.jsc"), b"bytecode").unwrap();
+        let mode = BuildMode::Static { build_script: None };
+
+        validate_static_public_root(&app).unwrap();
+        assert_eq!(
+            expected_generated_entry(&app, &mode).unwrap(),
+            app.join("cygnus-static-server.js")
+        );
+        fs::remove_dir_all(app).unwrap();
     }
 
     #[test]

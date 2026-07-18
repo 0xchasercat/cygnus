@@ -420,7 +420,9 @@ impl GitHubManager {
             ));
         }
         let mut state = State::open(&self.state_path)?;
-        let entry = input.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
+        // An empty stored entry means zero-config detection. Existing mappings
+        // with index.ts remain explicit server deployments.
+        let entry = input.entry.unwrap_or_default();
         if entry.is_absolute()
             || entry.components().any(|component| {
                 matches!(
@@ -1345,19 +1347,20 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
     ) -> Result<DeployResult, DeployError> {
         deploy_with_audit_and_prepare(
             state,
-            DeployRequest::new(
-                source,
-                &config.app,
-                &config.domain,
-                &config.engine_version,
-                &config.entry,
-                &config.artifact_root,
-                &config.upstream,
-            )
-            .with_source(DeploymentSource::github(
-                Some(config.branch.clone()),
-                Some(job.sha.clone()),
-            )),
+            DeployRequest {
+                source_dir: source.to_path_buf(),
+                app: config.app.clone(),
+                domain: Some(config.domain.clone()),
+                engine_version: Some(config.engine_version.clone()),
+                entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
+                artifact_root: Some(config.artifact_root.clone()),
+                upstream: Some(config.upstream.clone()),
+                deployment_id: None,
+                source: DeploymentSource::github(
+                    Some(config.branch.clone()),
+                    Some(job.sha.clone()),
+                ),
+            },
             audit,
             |_| Ok(crate::deploy::ActivationPreparation::new(|| {})),
         )
@@ -1771,11 +1774,11 @@ mod tests {
         }
     }
     fn tmp() -> PathBuf {
-        let id = AtomicUsize::new(0);
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "cygnus-github-test-{}-{}",
             std::process::id(),
-            id.fetch_add(1, Ordering::Relaxed)
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();

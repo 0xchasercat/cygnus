@@ -312,22 +312,27 @@ impl GitHubDeployExecutor for ProductionGitHubDeployExecutor {
     fn deploy(
         &self,
         state: &mut State,
-        _job: &cygnus_daemon::state::GitHubDeployJob,
+        job: &cygnus_daemon::state::GitHubDeployJob,
         config: &cygnus_daemon::state::GitHubRepositoryConfig,
         source: &Path,
         audit: &AuditContext,
     ) -> Result<DeployResult, DeployError> {
         self.runtime.deploy(
             state,
-            DeployRequest::new(
-                source,
-                &config.app,
-                &config.domain,
-                &config.engine_version,
-                &config.entry,
-                &config.artifact_root,
-                &config.upstream,
-            ),
+            DeployRequest {
+                source_dir: source.to_path_buf(),
+                app: config.app.clone(),
+                domain: Some(config.domain.clone()),
+                engine_version: Some(config.engine_version.clone()),
+                entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
+                artifact_root: Some(config.artifact_root.clone()),
+                upstream: Some(config.upstream.clone()),
+                deployment_id: None,
+                source: DeploymentSource::github(
+                    Some(config.branch.clone()),
+                    Some(job.sha.clone()),
+                ),
+            },
             audit,
         )
     }
@@ -457,7 +462,7 @@ fn generic_deploy_request(job: &DeployJob, source_dir: PathBuf) -> Result<Deploy
         app: job.app.clone(),
         domain: Some(job.domain.clone()),
         engine_version: Some(job.engine_version.clone()),
-        entry: Some(job.entry.clone()),
+        entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
         artifact_root: Some(job.artifact_root.clone()),
         upstream: Some(job.upstream.clone()),
         deployment_id: Some(deployment_id),

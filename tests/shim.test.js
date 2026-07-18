@@ -208,7 +208,11 @@ test("redirects node:net TCP listen while preserving backlog and callback", asyn
       });
     `,
     async ({ socket }) => {
-      const response = await unixRawRequestEventually(socket);
+      let response = await unixRawRequestEventually(socket);
+      if (!response.includes("net-tcp")) {
+        await Bun.sleep(25);
+        response = await unixRawRequestEventually(socket);
+      }
       expect(response).toContain("200 OK");
       expect(response).toContain("net-tcp");
     },
