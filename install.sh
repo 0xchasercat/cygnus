@@ -745,13 +745,34 @@ if [[ $OS == Darwin ]]; then
   service_started=0
   if [[ -n $launchctl_bin ]]; then
     # Reinstalls and crashed runs leave the label registered; bootout is the
-    # idempotent way to clear it before bootstrapping the fresh definition.
+    # idempotent way to clear it, and repeated failures can leave the label
+    # disabled, which makes bootstrap fail with an opaque I/O error — enable
+    # clears that override. Both are no-ops on a clean host.
+    if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$service_file" >>"$diag_file" 2>&1; then
+      fail "generated launchd plist failed validation: $service_file; diagnostics: $diag_file"
+    fi
     "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
+    "$launchctl_bin" enable "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
     if "$launchctl_bin" bootstrap "gui/$(id -u)" "$service_file" >>"$diag_file" 2>&1; then
       service_started=1
     elif "$launchctl_bin" load -w "$service_file" >>"$diag_file" 2>&1; then
       service_started=1
+    else
+      # Record what launchd thinks of the label for the diagnostics file.
+      "$launchctl_bin" print "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
+      "$launchctl_bin" print-disabled "gui/$(id -u)" >>"$diag_file" 2>&1 || true
     fi
+  fi
+  if (( ! service_started )) && (( ! TEST_MODE )); then
+    # launchd refused the job. Do not strand the user: run the daemon
+    # directly so this install still finishes; it will not restart at login
+    # until launchd accepts the service (rerun the installer to retry).
+    echo "launchd did not accept the service; starting the daemon directly (no restart at login). Diagnostics: $diag_file" >&2
+    nohup "$prefix/cygnus-daemon" --state "$state_dir/state.db" \
+      --admin-socket "$admin_socket" --tenant-admin-socket "$tenant_admin_socket" serve \
+      >>"$log_dir/daemon.log" 2>>"$log_dir/daemon.error.log" </dev/null &
+    disown %% 2>/dev/null || true
+    service_started=1
   fi
   if (( ! service_started )); then
     printf 'Launch Cygnus with: %q --state %q --admin-socket %q --tenant-admin-socket %q serve\n' \
