@@ -1575,7 +1575,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        // Canonicalize so paths derived from here satisfy the daemon's
+        // canonical-path record checks on hosts whose temp directory sits
+        // behind a symlink (macOS /var -> private/var).
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp dir");
+        base.join(format!(
             "cygnus-daemon-{label}-{}-{nonce}",
             std::process::id()
         ))

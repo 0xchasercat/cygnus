@@ -408,7 +408,10 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
+            // Canonicalize so ancestor symlinks (macOS /var -> private/var)
+            // don't trip the symlink-refusing directory walk under test.
+            let base = std::env::temp_dir().canonicalize().unwrap();
+            let path = base.join(format!(
                 "cygnus-runtime-logs-{label}-{}-{nonce}",
                 std::process::id()
             ));
