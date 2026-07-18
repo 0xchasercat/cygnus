@@ -47,6 +47,8 @@ const BUILD_CONFIG_REL: &str = "cygnus/build.bunfig.toml";
 const BUILD_RUNNER_CAGE_PATH: &str = "/cygnus/build-runner.js";
 const BUILD_CONFIG_CAGE_PATH: &str = "/cygnus/build.bunfig.toml";
 const BUILD_WORKDIR_CAGE_PATH: &str = "/cygnus";
+const BUILD_WORKSPACE_CAGE_PATH: &str = "/workspace";
+const BUILD_OUTPUT_CAGE_PATH: &str = "/cygnus/output/app";
 const BUILD_CACHE_CAGE_PATH: &str = "/workspace/.cygnus-cache";
 const BUILD_HOME_CAGE_PATH: &str = "/cygnus/home";
 const BUILD_TMPDIR_CAGE_PATH: &str = "/cygnus/tmp";
@@ -68,6 +70,7 @@ const MAX_ARTIFACT_INODES: u64 = 8_192;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BuildPlan {
     install: bool,
+    frozen: bool,
 }
 /// Inputs to one source deployment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -746,23 +749,61 @@ fn build_job(
         engine.host_root.join(relative)
     };
     let mut job = JobConfig::new(format!("cygnus-build-{deployment_id}"), command);
+    // Rooted builds (Linux) see the fixed in-cage layout; rootless builds
+    // (macOS plain processes) address the same files where they actually
+    // live on the host.
+    let staging_root = workspace.parent().unwrap_or(workspace).to_path_buf();
+    let (config_path, runner_path, home_path, tmpdir_path, cache_path, workspace_path, output_path) =
+        if linux {
+            (
+                PathBuf::from(BUILD_CONFIG_CAGE_PATH),
+                PathBuf::from(BUILD_RUNNER_CAGE_PATH),
+                PathBuf::from(BUILD_HOME_CAGE_PATH),
+                PathBuf::from(BUILD_TMPDIR_CAGE_PATH),
+                PathBuf::from(BUILD_CACHE_CAGE_PATH),
+                PathBuf::from(BUILD_WORKSPACE_CAGE_PATH),
+                PathBuf::from(BUILD_OUTPUT_CAGE_PATH),
+            )
+        } else {
+            (
+                staging_root.join(BUILD_CONFIG_REL),
+                staging_root.join(BUILD_RUNNER_REL),
+                staging_root.join("cygnus/home"),
+                staging_root.join("cygnus/tmp"),
+                workspace.join(".cygnus-cache"),
+                workspace.to_path_buf(),
+                publish.join("app"),
+            )
+        };
     job.args = vec![
         OsString::from("--no-env-file"),
-        OsString::from(format!("--config={BUILD_CONFIG_CAGE_PATH}")),
-        OsString::from(BUILD_RUNNER_CAGE_PATH),
+        OsString::from(format!("--config={}", config_path.display())),
+        runner_path.into_os_string(),
     ];
     if plan.install {
-        job.args.push(OsString::from("--install"));
+        job.args.push(OsString::from(if plan.frozen {
+            "--install"
+        } else {
+            "--install-latest"
+        }));
     }
     job.args.push(entry.as_os_str().to_owned());
-    job.env.insert("HOME".into(), BUILD_HOME_CAGE_PATH.into());
+    job.env.insert("HOME".into(), home_path.into_os_string());
     job.env
-        .insert("TMPDIR".into(), BUILD_TMPDIR_CAGE_PATH.into());
+        .insert("TMPDIR".into(), tmpdir_path.into_os_string());
     job.env.insert("PATH".into(), BUILD_PATH.into());
     job.env
-        .insert("BUN_INSTALL_CACHE_DIR".into(), BUILD_CACHE_CAGE_PATH.into());
+        .insert("BUN_INSTALL_CACHE_DIR".into(), cache_path.into_os_string());
     job.env
         .insert("NPM_CONFIG_REGISTRY".into(), BUILD_REGISTRY.into());
+    job.env
+        .insert("CYGNUS_BUILD_CONFIG".into(), config_path.into_os_string());
+    job.env.insert(
+        "CYGNUS_BUILD_WORKSPACE".into(),
+        workspace_path.into_os_string(),
+    );
+    job.env
+        .insert("CYGNUS_BUILD_OUTPUT".into(), output_path.into_os_string());
     job.egress = if plan.install {
         EgressMode::BuildDomains {
             allow: vec![DomainEgressRule {
@@ -885,7 +926,6 @@ fn deploy_request_digest(request: &DeployRequest) -> String {
 }
 
 fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
-    reject_workspace_path(workspace, "node_modules", true)?;
     reject_workspace_path(workspace, ".npmrc", false)?;
     reject_workspace_path(workspace, "bunfig.toml", false)?;
     reject_workspace_path(workspace, "bun.lockb", false)?;
@@ -916,7 +956,7 @@ fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
     };
 
     let lock_path = workspace.join("bun.lock");
-    match fs::symlink_metadata(&lock_path) {
+    let frozen = match fs::symlink_metadata(&lock_path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(DeployError::InvalidInput(
@@ -925,29 +965,18 @@ fn preflight_workspace(workspace: &Path) -> Result<BuildPlan, DeployError> {
             }
             let bytes = read_control_file(&lock_path, MAX_BUN_LOCK_BYTES, "bun.lock")?;
             validate_bun_lock(&bytes)?;
+            true
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound && has_dependencies => {
-            return Err(DeployError::InvalidInput(
-                "package dependencies require a regular text bun.lock".into(),
-            ));
-        }
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-        Err(_) => {}
-    }
+        // No committed lockfile: the install resolves versions fresh, the
+        // same way hosted platforms build lockless projects. Bun migrates
+        // package-lock.json and yarn.lock automatically when present.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
 
-    if has_dependencies {
-        for name in [
-            "package-lock.json",
-            "npm-shrinkwrap.json",
-            "yarn.lock",
-            "pnpm-lock.yaml",
-            "pnpm-lock.yml",
-        ] {
-            reject_workspace_path(workspace, name, false)?;
-        }
-    }
     Ok(BuildPlan {
         install: has_dependencies,
+        frozen,
     })
 }
 
@@ -966,7 +995,10 @@ fn preflight_lock_only(workspace: &Path) -> Result<BuildPlan, DeployError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    Ok(BuildPlan { install: false })
+    Ok(BuildPlan {
+        install: false,
+        frozen: false,
+    })
 }
 
 fn reject_workspace_path(workspace: &Path, name: &str, directory: bool) -> Result<(), DeployError> {
@@ -1270,6 +1302,13 @@ fn collect_source_files(
     });
     for entry in entries {
         let name = entry.file_name();
+        // Install artifacts and VCS internals never ship: builds install
+        // dependencies server-side, so a local node_modules (full of
+        // platform-specific symlinks and binaries) is dead weight, and .git
+        // is history, not source.
+        if name == "node_modules" || name == ".git" || name == ".DS_Store" {
+            continue;
+        }
         let child_relative = relative.join(&name);
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
@@ -1996,13 +2035,38 @@ mod tests {
     }
 
     #[test]
+    fn intake_excludes_install_artifacts_and_vcs_internals() {
+        let root = temp_dir("intake-excludes");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/index.ts"), b"export default 1;\n").unwrap();
+        fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::os::unix::fs::symlink("../pkg/cli.js", root.join("node_modules/.bin/tool")).unwrap();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(root.join(".DS_Store"), b"junk").unwrap();
+
+        let destination = temp_dir("intake-excludes-out");
+        fs::create_dir_all(&destination).unwrap();
+        copy_source(&root, &destination).expect("intake succeeds despite install artifacts");
+        assert!(destination.join("src/index.ts").exists());
+        assert!(!destination.join("node_modules").exists());
+        assert!(!destination.join(".git").exists());
+        assert!(!destination.join(".DS_Store").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
     fn dependency_preflight_matrix_is_strict_and_offline_without_deps() {
         let root = temp_dir("preflight");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
         assert_eq!(
             preflight_workspace(&workspace).unwrap(),
-            BuildPlan { install: false }
+            BuildPlan {
+                install: false,
+                frozen: false
+            }
         );
 
         fs::write(
@@ -2012,14 +2076,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             preflight_workspace(&workspace).unwrap(),
-            BuildPlan { install: false }
+            BuildPlan {
+                install: false,
+                frozen: false
+            }
         );
         fs::write(
             workspace.join("package.json"),
             br#"{"name":"app","dependencies":{"left-pad":"1.3.0"}}"#,
         )
         .unwrap();
-        assert!(preflight_workspace(&workspace).is_err());
+        // No committed lockfile: the install still runs, resolving fresh.
+        assert_eq!(
+            preflight_workspace(&workspace).unwrap(),
+            BuildPlan {
+                install: true,
+                frozen: false
+            }
+        );
         fs::write(
             workspace.join("bun.lock"),
             br#"{"lockfileVersion":1,"workspaces":{},}"#,
@@ -2027,16 +2101,34 @@ mod tests {
         .unwrap();
         assert_eq!(
             preflight_workspace(&workspace).unwrap(),
-            BuildPlan { install: true }
+            BuildPlan {
+                install: true,
+                frozen: true
+            }
         );
+        // Foreign lockfiles no longer block deploys — Bun migrates them.
         fs::write(workspace.join("package-lock.json"), b"{}\n").unwrap();
-        assert!(preflight_workspace(&workspace).is_err());
+        assert_eq!(
+            preflight_workspace(&workspace).unwrap(),
+            BuildPlan {
+                install: true,
+                frozen: true
+            }
+        );
         fs::remove_file(workspace.join("package-lock.json")).unwrap();
         fs::write(workspace.join("bun.lock"), b"not a lock\n").unwrap();
         assert!(preflight_workspace(&workspace).is_err());
         fs::remove_file(workspace.join("bun.lock")).unwrap();
+        // A stray node_modules in the workspace is tolerated: intake excludes
+        // it from source copies, and server-side installs own the real one.
         fs::create_dir(workspace.join("node_modules")).unwrap();
-        assert!(preflight_workspace(&workspace).is_err());
+        assert_eq!(
+            preflight_workspace(&workspace).unwrap(),
+            BuildPlan {
+                install: true,
+                frozen: false
+            }
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2089,7 +2181,10 @@ mod tests {
             &publish,
             Path::new("index.ts"),
             "id",
-            BuildPlan { install: true },
+            BuildPlan {
+                install: true,
+                frozen: true,
+            },
         );
         assert_eq!(
             job.args,

@@ -6,14 +6,17 @@ import { mkdir } from "node:fs/promises";
 // may request one workspace-relative entrypoint and, when preflight says so,
 // the fixed install phase.
 
-const TRUSTED_CONFIG = "/cygnus/build.bunfig.toml";
-const WORKSPACE = "/workspace";
-const OUTPUT = "/cygnus/output/app";
-const CACHE = "/workspace/.cygnus-cache";
+// Paths come from the daemon, which knows whether this build runs inside a
+// rooted cage (Linux: the fixed /cygnus layout) or as a plain process
+// (macOS: host staging paths). The cage layout stays as the fallback.
+const TRUSTED_CONFIG = process.env.CYGNUS_BUILD_CONFIG ?? "/cygnus/build.bunfig.toml";
+const WORKSPACE = process.env.CYGNUS_BUILD_WORKSPACE ?? "/workspace";
+const OUTPUT = process.env.CYGNUS_BUILD_OUTPUT ?? "/cygnus/output/app";
+const CACHE = process.env.BUN_INSTALL_CACHE_DIR ?? "/workspace/.cygnus-cache";
 const REGISTRY = "https://registry.npmjs.org";
-const HOME = "/cygnus/home";
-const TMPDIR = "/cygnus/tmp";
-const PATH = "/usr/local/bin:/usr/bin:/bin";
+const HOME = process.env.HOME ?? "/cygnus/home";
+const TMPDIR = process.env.TMPDIR ?? "/cygnus/tmp";
+const PATH = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
 
 const CONTROL_ENV = Object.freeze({
   HOME,
@@ -40,17 +43,18 @@ function isSafeEntry(entry) {
 
 export function parseRunnerArgs(argv) {
   if (!Array.isArray(argv) || (argv.length !== 1 && argv.length !== 2)) {
-    fail("runner accepts [entry] or [--install, entry]");
+    fail("runner accepts [entry], [--install, entry], or [--install-latest, entry]");
   }
   const install = argv.length === 2;
-  if (install && argv[0] !== "--install") {
+  if (install && argv[0] !== "--install" && argv[0] !== "--install-latest") {
     fail(`unknown runner argument ${JSON.stringify(argv[0])}`);
   }
+  const frozen = install && argv[0] === "--install";
   const entry = argv[install ? 1 : 0];
   if (!isSafeEntry(entry)) {
     fail("runner entry must be a safe workspace-relative path");
   }
-  return { install, entry };
+  return { install, frozen, entry };
 }
 
 function phaseLog(phase, message) {
@@ -64,19 +68,27 @@ async function ensureDirectories() {
   await mkdir(OUTPUT, { recursive: true });
 }
 
-async function installDependencies() {
-  phaseLog("install", "starting frozen dependency install");
+async function installDependencies(frozen) {
+  phaseLog(
+    "install",
+    frozen
+      ? "starting frozen dependency install"
+      : "no lockfile committed; resolving dependency versions fresh",
+  );
+  const args = [
+    process.execPath,
+    "--no-env-file",
+    `--config=${TRUSTED_CONFIG}`,
+    "install",
+    "--ignore-scripts",
+    `--registry=${REGISTRY}`,
+    `--cache-dir=${CACHE}`,
+  ];
+  if (frozen) {
+    args.splice(4, 0, "--frozen-lockfile");
+  }
   const child = Bun.spawn(
-    [
-      process.execPath,
-      "--no-env-file",
-      `--config=${TRUSTED_CONFIG}`,
-      "install",
-      "--frozen-lockfile",
-      "--ignore-scripts",
-      `--registry=${REGISTRY}`,
-      `--cache-dir=${CACHE}`,
-    ],
+    args,
     {
       cwd: WORKSPACE,
       env: CONTROL_ENV,
@@ -118,10 +130,10 @@ async function buildBundle(entry) {
 }
 
 export async function runRunner(argv) {
-  const { install, entry } = parseRunnerArgs(argv);
+  const { install, frozen, entry } = parseRunnerArgs(argv);
   await ensureDirectories();
   if (install) {
-    const status = await installDependencies();
+    const status = await installDependencies(frozen);
     if (status !== 0) return status;
   }
   return buildBundle(entry);
