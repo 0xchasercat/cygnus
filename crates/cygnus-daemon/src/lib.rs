@@ -1284,9 +1284,33 @@ console.log("ready", server.hostname);"#,
     fn serve_once(frontend: Arc<Frontend>, request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        // Bind the listener before the client connects so the kernel completes
+        // the handshake immediately. On busy CI runners a connection can race
+        // ahead of the spawned worker and surface as NotConnected/Aborted at
+        // accept time; retry until the worker has caught up.
+        listener.set_nonblocking(false).unwrap();
         let worker = thread::spawn(move || {
-            let (client, _) = listener.accept().unwrap();
-            frontend.serve_connection(client);
+            loop {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        frontend.serve_connection(client);
+                        return;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOTCONN) | Some(libc::ECONNABORTED)
+                        ) =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
         });
         let mut client = TcpStream::connect(address).unwrap();
         client.write_all(request).unwrap();
