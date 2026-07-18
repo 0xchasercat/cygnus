@@ -2,29 +2,60 @@
   import { store } from '../live.svelte.js';
   import SwanMark from '../components/SwanMark.svelte';
 
+  // Primary auth is the admin account (email + password). The bootstrap token
+  // stays as a recovery affordance — the backend keeps token login as a
+  // fallback so a locked-out admin can re-enter with the installer token.
+  let email = $state('');
+  let password = $state('');
   let token = $state('');
-  let inputEl = $state();
   let error = $state('');
   let submitting = $state(false);
+  let recovering = $state(false);
+  let emailEl = $state();
+  let tokenEl = $state();
 
   $effect(() => {
-    if (store.auth === 'signin') queueMicrotask(() => inputEl?.focus());
+    if (store.auth === 'signin') queueMicrotask(() => emailEl?.focus());
   });
 
   async function submit(e) {
     e.preventDefault();
-    if (submitting || !token) return;
+    if (submitting || !email || !password) return;
     submitting = true;
     error = '';
-    const r = await store.signIn(token.trim());
+    const r = await store.signIn({ email: email.trim(), password });
     submitting = false;
     if (!r.ok) {
       error = r.error ?? 'Sign-in failed';
+      password = '';
+      queueMicrotask(() => emailEl?.focus());
+    } else {
+      email = '';
+      password = '';
+    }
+  }
+
+  async function submitToken(e) {
+    e.preventDefault();
+    if (submitting || !token) return;
+    submitting = true;
+    error = '';
+    const r = await store.signInWithToken(token.trim());
+    submitting = false;
+    if (!r.ok) {
+      error = r.error ?? 'Token sign-in failed';
       token = '';
-      queueMicrotask(() => inputEl?.focus());
+      queueMicrotask(() => tokenEl?.focus());
     } else {
       token = '';
     }
+  }
+
+  function toggleRecover() {
+    recovering = !recovering;
+    error = '';
+    if (recovering) queueMicrotask(() => tokenEl?.focus());
+    else queueMicrotask(() => emailEl?.focus());
   }
 </script>
 
@@ -38,16 +69,16 @@
       <p class="line">Tenant zero console</p>
       <p class="locked">Console credentials are not configured on this host.</p>
       <p class="env mono">Set <code>CYGNUS_CONSOLE_BOOTSTRAP_TOKEN</code> and <code>CYGNUS_CONSOLE_SESSION_KEY</code> on the host, then reload.</p>
-    {:else}
+    {:else if recovering}
       <div class="mark"><SwanMark size={28} /></div>
       <h1 id="login-title" class="word">CYGNUS</h1>
-      <p class="line">Tenant zero console</p>
+      <p class="line">Recover access with the bootstrap token</p>
 
-      <form onsubmit={submit} class="form">
+      <form onsubmit={submitToken} class="form">
         <label for="bootstrap-token">Bootstrap token</label>
         <input
           id="bootstrap-token"
-          bind:this={inputEl}
+          bind:this={tokenEl}
           bind:value={token}
           type="password"
           autocomplete="current-password"
@@ -58,11 +89,46 @@
         />
         {#if error}<p class="err" role="alert">{error}</p>{/if}
         <button class="btn cobalt primary" type="submit" disabled={submitting || !token}>
+          {submitting ? 'Unlocking…' : 'Unlock with token'}
+        </button>
+      </form>
+
+      <button class="back-link" onclick={toggleRecover}>← Back to sign in</button>
+      <p class="hint mono">Token printed by the installer · rotate with install.sh --rotate-secrets</p>
+    {:else}
+      <div class="mark"><SwanMark size={28} /></div>
+      <h1 id="login-title" class="word">CYGNUS</h1>
+      <p class="line">Tenant zero console</p>
+
+      <form onsubmit={submit} class="form">
+        <label for="login-email">Admin email</label>
+        <input
+          id="login-email"
+          bind:this={emailEl}
+          bind:value={email}
+          type="email"
+          autocomplete="email"
+          autocapitalize="off"
+          spellcheck="false"
+          maxlength="254"
+          required
+        />
+        <label for="login-pw" class="pwlab">Password</label>
+        <input
+          id="login-pw"
+          bind:value={password}
+          type="password"
+          autocomplete="current-password"
+          maxlength="1024"
+          required
+        />
+        {#if error}<p class="err" role="alert">{error}</p>{/if}
+        <button class="btn cobalt primary" type="submit" disabled={submitting || !email || !password}>
           {submitting ? 'Unlocking…' : 'Unlock console'}
         </button>
       </form>
 
-      <p class="hint mono">Token printed by the installer · rotate with install.sh --rotate-secrets</p>
+      <button class="recover" onclick={toggleRecover}>Lost access? Reset with the bootstrap token</button>
     {/if}
   </section>
 </main>
@@ -120,6 +186,7 @@
     text-transform: uppercase;
     color: var(--ink-3);
   }
+  .pwlab { margin-top: 2px; }
   input {
     width: 100%;
     box-sizing: border-box;
@@ -135,6 +202,7 @@
     outline: 2px solid var(--cobalt);
     outline-offset: 1px;
   }
+  input::placeholder { color: var(--ink-4); }
   .btn.cobalt.primary {
     width: 100%;
     height: 38px;
@@ -149,8 +217,29 @@
     text-align: left;
     overflow-wrap: anywhere;
   }
+
+  .recover {
+    margin-top: 16px;
+    font-size: 11px;
+    color: var(--ink-4);
+    font-family: var(--mono);
+    letter-spacing: 0.02em;
+    transition: color 0.14s ease;
+  }
+  .recover:hover { color: var(--ink-2); }
+
+  .back-link {
+    margin-top: 16px;
+    font-size: 11px;
+    color: var(--ink-4);
+    font-family: var(--mono);
+    letter-spacing: 0.02em;
+    transition: color 0.14s ease;
+  }
+  .back-link:hover { color: var(--ink-2); }
+
   .hint {
-    margin-top: 18px;
+    margin-top: 14px;
     font-size: 10px;
     color: var(--ink-4);
     line-height: 1.6;

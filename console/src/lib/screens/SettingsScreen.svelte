@@ -50,6 +50,72 @@
   let repoConfig = $state({});
   let repoErrors = $state({});
 
+  // ——— dashboard domain + SSL ———
+  let dashEditOpen = $state(false);
+  let dashDomain = $state('');
+  let dashApex = $state('');
+  let dashError = $state('');
+  let dashBusy = $state(false);
+  let tlsBusy = $state(false);
+
+  const dashboardDomain = $derived(store.node?.dashboard_domain ?? '');
+  const apexDomain = $derived(store.node?.apex_domain ?? '');
+  const sslMode = $derived(store.node?.ssl_mode ?? ''); // 'acme' | 'self_signed' | ''
+  const sslAuto = $derived(sslMode === 'acme');
+
+  // Dashboard's own cert status, from the node's certificate list when present.
+  const dashboardCert = $derived.by(() => {
+    const certs = store.node?.certificates ?? [];
+    if (!dashboardDomain) return null;
+    return certs.find((c) => c.domain === dashboardDomain) ?? null;
+  });
+  const dashboardCertPill = $derived.by(() => {
+    if (!dashboardDomain) return null;
+    if (dashboardCert?.ok) return { cls: 'live', text: 'trusted' };
+    if (sslAuto) return { cls: 'build', text: 'issuing' };
+    return { cls: 'ghost', text: 'self-signed' };
+  });
+
+  function openDashEdit() {
+    dashDomain = dashboardDomain;
+    dashApex = apexDomain;
+    dashError = '';
+    dashEditOpen = true;
+  }
+
+  async function saveDash(e) {
+    e.preventDefault();
+    if (dashBusy) return;
+    const dom = dashDomain.trim().toLowerCase();
+    const apex = dashApex.trim().toLowerCase();
+    if (dom && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(dom)) {
+      dashError = 'Enter a domain like dashboard.example.com.';
+      return;
+    }
+    if (apex && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(apex)) {
+      dashError = 'Apps domain looks off — check the spelling.';
+      return;
+    }
+    dashBusy = true;
+    dashError = '';
+    const r = await store.setDashboardDomain(dom, apex);
+    dashBusy = false;
+    if (!r.ok) {
+      dashError = r.error ?? 'Could not update dashboard domain';
+      return;
+    }
+    dashEditOpen = false;
+  }
+
+  async function toggleDashboardTls() {
+    if (tlsBusy || !sslMode) return;
+    tlsBusy = true;
+    const next = sslAuto ? 'self_signed' : 'acme';
+    const r = await store.setDashboardTls(next);
+    tlsBusy = false;
+    if (!r.ok) dashError = r.error ?? 'Could not change dashboard TLS';
+  }
+
   async function connectGithub(e) {
     e.preventDefault();
     if (githubBusy) return;
@@ -248,17 +314,88 @@
     </div>
 
     <div class="col">
+      <!-- dashboard domain + SSL -->
+      <section class="card">
+        <div class="cardhead">
+          <span class="label">Dashboard domain</span>
+          {#if dashboardCertPill}
+            <span class="pill {dashboardCertPill.cls}">{dashboardCertPill.text}</span>
+          {/if}
+        </div>
+        <div class="pad">
+          <div class="dash-row">
+            <div class="dash-domain">
+              <span class="mname num">{dashboardDomain || 'unset'}</span>
+              <span class="tmeta num">
+                {#if dashboardDomain}
+                  {#if apexDomain}apps at *.{apexDomain}{/if}
+                {:else}
+                  reachable by IP
+                {/if}
+              </span>
+            </div>
+            <button class="btn sm" onclick={openDashEdit}>{dashEditOpen ? 'Cancel' : 'Edit'}</button>
+          </div>
+
+          {#if dashEditOpen}
+            <form class="dash-form" onsubmit={saveDash}>
+              <label>Dashboard domain
+                <input bind:value={dashDomain} maxlength="253" placeholder="dashboard.example.com" />
+              </label>
+              <label>Apps domain
+                <input bind:value={dashApex} maxlength="253" placeholder="example.com" />
+              </label>
+              <button class="btn cobalt sm" type="submit" disabled={dashBusy}>
+                {dashBusy ? 'Saving…' : 'Save domain'}
+              </button>
+              {#if dashError}<p class="inline-error" role="alert">{dashError}</p>{/if}
+            </form>
+          {/if}
+
+          <div class="hairline-h dash-hl"></div>
+
+          <div class="tls-row">
+            <div class="tls-meta">
+              <span class="tls-title">Automatic HTTPS</span>
+              <span class="tmeta num">
+                {#if !sslMode}not configured{:else if sslAuto}Let's Encrypt · trusted certificate{:else}self-signed · browsers will warn{/if}
+              </span>
+            </div>
+            {#if sslMode}
+              <button
+                type="button"
+                class="toggle {sslAuto ? 'on' : ''}"
+                onclick={toggleDashboardTls}
+                aria-pressed={sslAuto}
+                disabled={tlsBusy}
+              >
+                <span class="track"><span class="thumb"></span></span>
+              </button>
+            {/if}
+          </div>
+          {#if sslMode}
+            <p class="dash-note mono">
+              {#if sslAuto}
+                Cygnus issues a trusted certificate once DNS resolves here. Until then a self-signed certificate keeps the dashboard reachable.
+              {:else}
+                Switch to automatic HTTPS to issue a trusted certificate from Let's Encrypt.
+              {/if}
+            </p>
+          {/if}
+        </div>
+      </section>
+
       <!-- access -->
       <section class="card">
         <div class="cardhead"><span class="label">Access</span></div>
         <div class="pad">
           <div class="access-row">
             <span class="mname">Console</span>
-            <span class="tmeta num">bootstrap token session · 12h</span>
+            <span class="tmeta num">admin account · email + password</span>
           </div>
           <div class="access-row">
             <span class="mname">Break-glass</span>
-            <span class="tmeta num">cygnus --admin-socket /run/cygnus/admin.sock on the host</span>
+            <span class="tmeta num">bootstrap token · cygnus --admin-socket /run/cygnus/admin.sock on the host</span>
           </div>
           {#if store.mode === 'live'}
             <button class="btn sm danger" onclick={signOut}>Sign out</button>
@@ -465,6 +602,93 @@
   .access-row + .access-row { border-top: 1px solid var(--line-2); }
   .access-row .tmeta { flex: 1; text-align: right; overflow-wrap: anywhere; }
 
+  /* dashboard domain + SSL card */
+  .dash-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 4px 0 14px;
+  }
+  .dash-domain { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .dash-domain .mname { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+  .dash-form {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 10px;
+    align-items: end;
+    padding: 12px 0 14px;
+    border-top: 1px solid var(--line-2);
+    margin-top: -4px;
+  }
+  .dash-form label {
+    display: grid;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .dash-form input {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 9px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .dash-form .inline-error { grid-column: 1 / -1; }
+  .dash-hl { margin: 4px 0 0; }
+  .tls-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 12px 0 4px;
+  }
+  .tls-meta { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .tls-title { font-size: 13px; font-weight: 600; }
+  .dash-note {
+    margin: 8px 0 0;
+    font-size: 10.5px;
+    line-height: 1.6;
+    color: var(--ink-4);
+  }
+  .toggle {
+    flex: none;
+    width: 38px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+  }
+  .toggle:disabled { cursor: not-allowed; opacity: 0.5; }
+  .track {
+    display: block;
+    width: 38px;
+    height: 22px;
+    border-radius: 22px;
+    background: var(--line-strong);
+    position: relative;
+    transition: background 0.18s ease;
+  }
+  .toggle.on .track { background: var(--cobalt); }
+  .thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(13, 18, 28, 0.2);
+    transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .toggle.on .thumb { transform: translateX(16px); }
+
   .empty {
     padding: 28px 18px;
     text-align: center;
@@ -476,7 +700,7 @@
 
   @media (max-width: 1080px) {
     .grid { grid-template-columns: 1fr; }
-    .addform, .install-form { grid-template-columns: 1fr; }
+    .addform, .install-form, .dash-form { grid-template-columns: 1fr; }
     .repo-row { grid-template-columns: 1fr; }
   }
 </style>

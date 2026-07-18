@@ -29,6 +29,84 @@
       : 'cold'
   );
 
+  // ——— domains ———
+  // Live domain list comes from store.appDomains (cached) once the app is open.
+  // In preview the fixtures seed a per-app domain map so the card renders.
+  const domains = $derived(app ? (store.appDomains(app.name) ?? previewAppDomains(app.name)) : null);
+
+  const DOMAIN_PILL = {
+    active: { cls: 'live', text: 'active' },
+    fallback_active: { cls: 'build', text: 'fallback' },
+    issuing: { cls: 'cobalt', text: 'issuing' },
+    pending: { cls: 'ghost', text: 'pending' },
+    failed: { cls: 'fail', text: 'failed' },
+  };
+
+  function domainPill(d) {
+    return DOMAIN_PILL[d.status] ?? { cls: 'ghost', text: d.status ?? '—' };
+  }
+
+  let addDomainOpen = $state(false);
+  let newHost = $state('');
+  let domainError = $state('');
+  let domainBusy = $state(false);
+  let hostEl = $state();
+  let pendingTls = $state({}); // host -> true while toggling
+
+  // Fetch the live domain list when an app is open (and again when navigating
+  // between apps). Preview mode skips the fetch — fixtures render the card.
+  $effect(() => {
+    const name = app?.name;
+    if (name && store.mode === 'live') {
+      store.refreshAppDomains(name);
+    }
+  });
+
+  async function submitDomain(e) {
+    e.preventDefault();
+    if (domainBusy || !app) return;
+    const host = newHost.trim().toLowerCase();
+    if (!host) return;
+    if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(host) || !host.includes('.')) {
+      domainError = 'Enter a domain like app.example.com (letters, digits, dots, hyphens).';
+      return;
+    }
+    domainBusy = true;
+    domainError = '';
+    const r = await store.addDomain(app.name, host);
+    domainBusy = false;
+    if (!r.ok) {
+      domainError = r.error ?? 'Could not add domain';
+      return;
+    }
+    newHost = '';
+    addDomainOpen = false;
+  }
+
+  async function removeHost(d) {
+    if (!app) return;
+    pendingTls = { ...pendingTls, [d.host + ':rm']: true };
+    const r = await store.removeDomain(app.name, d.host);
+    pendingTls = { ...pendingTls, [d.host + ':rm']: false };
+    if (!r.ok) domainError = r.error ?? 'Could not remove domain';
+  }
+
+  async function toggleTls(d) {
+    if (!app) return;
+    const next = d.tls === 'acme' ? 'self_signed' : 'acme';
+    pendingTls = { ...pendingTls, [d.host]: true };
+    const r = await store.setDomainTls(app.name, d.host, next);
+    pendingTls = { ...pendingTls, [d.host]: false };
+    if (!r.ok) domainError = r.error ?? 'Could not change TLS';
+  }
+
+  // Preview-mode per-app domain fixtures keyed by app name. The live store
+  // replaces these with real data once the backend branch lands; until then
+  // the card renders the same shape.
+  function previewAppDomains(name) {
+    return PREVIEW_DOMAINS[name] ?? null;
+  }
+
   // rollback
   let rollbackOpen = $state(false);
   let rollbackTarget = $state(null);
@@ -70,6 +148,21 @@
     if (!ms) return 'pinned warm';
     return `${Math.round(ms / 60000)}m idle`;
   }
+
+  // Per-app preview domain fixtures. Mixed statuses so the card shows a green
+  // active native domain, a yellow fallback_active custom domain (DNS not
+  // pointed here yet), and one issuing. The live store overrides these.
+  const PREVIEW_DOMAINS = {
+    atelier: [
+      { host: 'atelier.swan.host', kind: 'native', tls: 'acme', status: 'active', dns: { expected_ip: '203.0.113.10', resolves_to: '203.0.113.10', ok: true }, expires_unix: 1762675200 },
+      { host: 'atelier.studio', kind: 'custom', tls: 'acme', status: 'active', dns: { expected_ip: '203.0.113.10', resolves_to: '203.0.113.10', ok: true }, expires_unix: 1761062400 },
+      { host: 'shop.atelier.dev', kind: 'custom', tls: 'acme', status: 'fallback_active', dns: { expected_ip: '203.0.113.10', resolves_to: '198.51.100.4', ok: false } },
+    ],
+    'helios-api': [
+      { host: 'helios-api.swan.host', kind: 'native', tls: 'acme', status: 'active', dns: { expected_ip: '203.0.113.10', resolves_to: '203.0.113.10', ok: true }, expires_unix: 1762675200 },
+      { host: 'helios.dev', kind: 'custom', tls: 'acme', status: 'issuing', dns: { expected_ip: '203.0.113.10', resolves_to: '203.0.113.10', ok: true } },
+    ],
+  };
 </script>
 
 {#if app}
@@ -175,6 +268,85 @@
       </div>
 
       <aside class="side">
+        <!-- ————— domains ————— -->
+        <section class="card">
+          <div class="cardhead">
+            <span class="label">Domains</span>
+            <button class="btn sm" onclick={() => (addDomainOpen = !addDomainOpen)}>
+              <Icon name="plus" size={12} />{addDomainOpen ? 'Cancel' : 'Add domain'}
+            </button>
+          </div>
+
+          {#if addDomainOpen}
+            <form class="dom-add" onsubmit={submitDomain}>
+              <input
+                bind:this={hostEl}
+                bind:value={newHost}
+                type="text"
+                autocapitalize="off"
+                spellcheck="false"
+                maxlength="253"
+                placeholder="app.example.com"
+                required
+              />
+              <button class="btn cobalt sm" type="submit" disabled={domainBusy || !newHost.trim()}>
+                {domainBusy ? 'Adding…' : 'Add'}
+              </button>
+              {#if domainError}<p class="dom-err" role="alert">{domainError}</p>{/if}
+            </form>
+          {/if}
+
+          {#if domains && domains.length}
+            <div class="dom-list">
+              {#each domains as d (d.host)}
+                {@const pill = domainPill(d)}
+                {@const removing = pendingTls[d.host + ':rm']}
+                {@const toggling = pendingTls[d.host]}
+                <div class="dom-row" class:native={d.kind === 'native'}>
+                  <div class="dom-host">
+                    <a href={`https://${d.host}`} target="_blank" rel="noopener noreferrer" class="dh-link num">{d.host}</a>
+                    <span class="dom-tag">{d.kind}</span>
+                  </div>
+                  <span class="pill {pill.cls}" title={d.status === 'fallback_active' ? 'DNS not pointing here yet — using a self-signed certificate, will upgrade automatically' : ''}>
+                    {pill.text}
+                  </span>
+                  <div class="dom-actions">
+                    <button
+                      type="button"
+                      class="tls-toggle {d.tls === 'acme' ? 'on' : ''}"
+                      onclick={() => toggleTls(d)}
+                      disabled={toggling}
+                      aria-label="Toggle HTTPS mode"
+                      title={d.tls === 'acme' ? 'Automatic HTTPS · click for self-signed' : 'Self-signed · click for automatic HTTPS'}
+                    >
+                      <span class="tls-dot"></span>
+                    </button>
+                    {#if d.kind === 'custom'}
+                      <button type="button" class="dom-remove" onclick={() => removeHost(d)} disabled={removing} aria-label="Remove domain" title="Remove domain">
+                        <Icon name="x" size={13} />
+                      </button>
+                    {/if}
+                  </div>
+                  {#if d.kind === 'custom' && d.dns && !d.dns.ok}
+                    <div class="dns-hint mono">
+                      Point an A record for <b>{d.host}</b> to <b>{d.dns.expected_ip}</b>
+                      {#if d.dns.resolves_to}· currently {d.dns.resolves_to}{/if}
+                    </div>
+                  {/if}
+                  {#if d.status === 'failed'}
+                    <div class="dns-hint mono fail">Certificate issuance failed — check DNS, then retry from the TLS toggle.</div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {:else if domains}
+            <div class="empty mono">no custom domains · add one above</div>
+          {:else}
+            <div class="empty mono">loading domains…</div>
+          {/if}
+          <div class="dom-foot num">native domain is always present · custom domains issue a certificate once DNS resolves</div>
+        </section>
+
         <!-- ————— the cage ————— -->
         <section class="card">
           <div class="cardhead">
@@ -455,6 +627,119 @@
     font-family: var(--mono);
     color: var(--ink-4);
     border-top: 1px solid var(--line-2);
+  }
+
+  /* domains card */
+  .dom-add {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 9px;
+    align-items: center;
+    padding: 12px 16px 14px;
+    border-bottom: 1px solid var(--line-2);
+  }
+  .dom-add input {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 9px 11px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .dom-add input:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
+  .dom-add .dom-err { grid-column: 1 / -1; color: var(--red); font-size: 11px; margin: 0; }
+
+  .dom-list { padding: 4px 10px 6px; }
+  .dom-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    column-gap: 10px;
+    row-gap: 6px;
+    align-items: center;
+    padding: 10px 8px;
+  }
+  .dom-row + .dom-row { border-top: 1px solid var(--line-2); }
+  .dom-host { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .dh-link {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: color 0.12s ease;
+  }
+  .dh-link:hover { color: var(--cobalt-deep); }
+  .dom-tag {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface-3);
+    border: 1px solid var(--line-2);
+    border-radius: 6px;
+    padding: 2px 6px;
+    flex: none;
+  }
+  .dom-actions { display: flex; align-items: center; gap: 6px; }
+  .tls-toggle {
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    display: grid;
+    place-items: center;
+    transition: border-color 0.14s ease, background 0.14s ease;
+  }
+  .tls-toggle:hover { border-color: var(--ink-4); }
+  .tls-toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+  .tls-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ink-4);
+    transition: background 0.14s ease, box-shadow 0.14s ease;
+  }
+  .tls-toggle.on { border-color: color-mix(in srgb, var(--cobalt) 35%, var(--line)); background: var(--cobalt-ghost); }
+  .tls-toggle.on .tls-dot { background: var(--cobalt); box-shadow: 0 0 0 3px var(--cobalt-soft); }
+  .dom-remove {
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--ink-4);
+    display: grid;
+    place-items: center;
+    transition: color 0.14s ease, background 0.14s ease;
+  }
+  .dom-remove:hover { color: var(--red); background: var(--red-soft); }
+  .dom-remove:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .dns-hint {
+    grid-column: 1 / -1;
+    font-size: 10.5px;
+    line-height: 1.55;
+    color: var(--ink-3);
+    letter-spacing: 0.01em;
+    padding: 8px 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--line-2);
+    border-radius: 8px;
+  }
+  .dns-hint b { color: var(--ink); font-weight: 600; }
+  .dns-hint.fail { color: #b02c23; background: var(--red-soft); border-color: color-mix(in srgb, var(--red) 25%, var(--line-2)); }
+
+  .dom-foot {
+    padding: 10px 16px 13px;
+    font-size: 10px;
+    color: var(--ink-4);
+    border-top: 1px solid var(--line-2);
+    line-height: 1.55;
   }
 
   @media (max-width: 1080px) {
