@@ -1,102 +1,114 @@
 # Cygnus
 
-A single-binary, self-hosted serverless platform. Cygnus runs unmodified
-Bun/Node apps in kernel-sandboxed, scale-to-zero *cages* — full runtime
-compatibility with sub-100ms revival, on hardware you own.
+**Self-hosted serverless for Bun and Node apps.** One binary. Scale-to-zero.
+Sub-100ms revival. No containers, no registry, no YAML.
 
-V8-isolate platforms bought fast cold starts by giving up Node compatibility.
-Container platforms kept compatibility but gave up cold starts and density.
-Cygnus uses kernel primitives (namespaces, seccomp, cgroups v2), a
-page-cache-shared runtime, and bytecode artifacts to recover most of both.
+Cygnus runs unmodified Bun/Node apps in kernel-sandboxed, scale-to-zero
+*cages* on hardware you own. V8-isolate platforms bought fast cold starts by
+giving up Node compatibility; container platforms kept compatibility but gave
+up cold starts and density. Cygnus uses kernel primitives — namespaces,
+seccomp, cgroups v2 — plus a page-cache-shared runtime and bytecode artifacts
+to recover most of both.
 
 A cage is a warm, per-app **server**, not a function instance: it handles
 concurrent requests, holds WebSocket/SSE connections, and keeps in-memory
-state between requests. Idle apps scale to zero and cost disk only; revival
-is a page-cache exec, not an image pull.
+state between requests. Idle apps scale to zero and cost disk only; revival is
+a page-cache exec, not an image pull.
 
-## Status
+## Install
 
-Pre-alpha. The single-node source path now runs end to end: the daemon copies a
-source directory into owned staging, builds Bun bytecode in a finite offline
-cage, seals a read-only content-addressed artifact, atomically activates its
-route in SQLite, and cold-boots the rooted app on the first request. Build
-publication is quota-backed; logs, manifests, engine hashes, crash recovery,
-and scale-to-zero state are daemon-owned. TLS, replacement/rollback, the typed
-Tenant 0 bridge, and the public setup/deploy experience are still under
-construction; the commands below are control-plane primitives, not the final UX.
-
-## Layout
-
-```
-crates/cygnus-cage        isolation stack: namespaces, cgroups, mounts, network, seccomp
-crates/cygnus-init        static PID 1 for signal forwarding and orphan reaping
-crates/cygnus-supervisor  cold boot, exit reconciliation, backoff, and scale-to-zero
-crates/cygnus-router      lock-free Host-to-app routing table
-crates/cygnus-daemon      source builds, artifact/SQLite state, runnable front, and UDS relay
-crates/cygnus-proxy       io_uring/splice data-path benchmark and primitives
-console/                  self-contained Tenant 0 Bun app (offline/read-only bridge mode)
-docs/spec.md              the technical specification, ground truth for design
-```
-
-## Run the source path
-
-Register a prepared, read-only Bun engine root, then deploy a source directory.
-`--cage-executable` is the absolute path *inside* that root; the daemon hashes
-the corresponding host file before trusting it. Projects with `dependencies`,
-`devDependencies`, or `optionalDependencies` must include a text `bun.lock`.
-The build cage runs a frozen, script-free install with egress restricted to the
-npm registry, then bundles dependencies into the sealed runtime artifact.
+One command on a Linux host (kernel 5.15+, systemd):
 
 ```sh
-cargo run -p cygnus-daemon -- --state ./state.db engine register \
-  --version 1.3.14 \
-  --host-root /opt/cygnus/engines/bun-1.3.14 \
-  --cage-executable /usr/local/bin/bun
-
-cargo run -p cygnus-daemon -- --state ./state.db deploy \
-  --source-dir ./my-app \
-  --app my-app \
-  --domain my-app.localhost \
-  --engine-version 1.3.14 \
-  --artifact-root /var/lib/cygnus/artifacts \
-  --upstream /run/cygnus/my-app.sock
-
-cargo run -p cygnus-daemon -- --state ./state.db serve
-curl -H 'Host: my-app.localhost' http://127.0.0.1:3000/
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash
 ```
 
-The lower-level `apply` command remains available for manually provisioned
-apps and request-path development. Its command must bind and accept HTTP on
-the absolute `upstream` Unix socket; rooted apps receive the socket parent at
-`/cygnus/io`.
+The installer downloads the latest release, walks you through listeners and
+domains, starts the daemon, and prints your console URL and bootstrap token.
+Open the console, paste the token, and ship your first app from the dashboard
+— upload a folder or connect a GitHub repository for push-to-deploy.
 
-```json
-{
-  "listen": "127.0.0.1:3000",
-  "apps": [{
-    "name": "api",
-    "domains": ["api.localhost"],
-    "upstream": "/tmp/cygnus/api.sock",
-    "command": "/absolute/path/to/server",
-    "env": { "CYGNUS_SOCKET": "/tmp/cygnus/api.sock" }
-  }]
-}
+macOS runs the same platform for development, with cages as plain processes:
+no namespaces, no cgroups, no seccomp. Your machine, your call. The installer
+sets everything up under `~/.cygnus` — no root required.
+
+## Deploy
+
+Three ways in:
+
+- **Dashboard** — upload a folder or connect a Git repository; watch the
+  build stream live and the app go active.
+- **Git push** — the console sets up a GitHub App for your account; pushes to
+  a configured branch build and deploy automatically, PRs get preview
+  deployments.
+- **CLI** — `cygnus deploy --source-dir . --app my-app` streams the server
+  side build to your terminal and prints the live URL.
+
+Builds always run server-side in a locked-down build cage: frozen installs,
+lifecycle scripts disabled, egress limited to the package registry. The build
+produces a content-addressed artifact — bundled source plus JSC bytecode —
+that boots straight from the page cache.
+
+## How it works
+
+```text
+[ client HTTP/HTTPS ]
+        |
+[ cygnus daemon — one Rust binary ]
+  ├─ TLS termination (rustls) + ACME
+  ├─ Host routing (lock-free)
+  ├─ request logs · metrics · limits
+  ├─ cage supervisor (boot, drain, reap, backoff)
+  └─ admin API (root UDS) + Tenant 0 bridge
+        |  HTTP/1.1 over per-app unix sockets
+[ cage: userns · mntns · pidns · netns · cgroups · seccomp ]
+  └─ bun --preload shim.js bundle.js   (bytecode, RO artifact)
 ```
+
+- The daemon is the only privileged process; cages hold no certs, no admin
+  capability, no host mounts.
+- Apps need zero changes: the preload shim redirects `Bun.serve`, `node:http`
+  and `app.listen(3000)` onto the cage's unix socket.
+- Egress is real networking (veth + nftables) with SSRF containment by
+  default: no metadata service, no cage-to-cage traffic, no RFC1918.
+- Deploys are blue-green with instant rollback; the dashboard (Tenant 0) is
+  itself a caged Cygnus app.
+- Everything lives in one SQLite state file; `cygnus` on the host is the
+  break-glass path when you break your own dashboard.
+
+## The console
+
+The dashboard streams build logs live, charts request latency and cold-start
+anatomy from the daemon's in-memory telemetry, and manages domains, GitHub
+repositories, and rollbacks. It is served by the platform itself as app
+`tenant-0`.
+
+## CLI
+
+```
+cygnus status                 node, engines, certificates
+cygnus apps                   registered apps and their cages
+cygnus deploy --source-dir .  server-side build, streamed
+cygnus logs <deployment>      build output
+cygnus rollback <app> <dep>   instant blue-green rollback
+```
+
+## Building from source
 
 ```sh
-cargo run -p cygnus-daemon -- --state ./state.db apply ./node.json
-cargo run -p cygnus-daemon -- --state ./state.db serve
-curl -H 'Host: api.localhost' http://127.0.0.1:3000/
+cargo build --release            # daemon, CLI, init
+cd console && bun install && bun run build   # dashboard
+cargo test --workspace           # unit + integration (cage tests need Linux)
 ```
 
-## Requirements
+The workspace builds and tests on macOS; the full isolation stack needs
+Linux 5.15+ with cgroups v2.
 
-- Cage isolation is built from Linux kernel primitives; the full sandbox
-  needs Linux 5.15+ (cgroups v2, io_uring, core scheduling).
-- The same workspace builds, tests, and runs on macOS, with cages as plain
-  processes: no namespaces, no cgroups, no seccomp. Your machine, your call.
-- Rust (stable) to build.
+## Documentation
+
+- [Getting started](docs/getting-started.md)
+- [Technical specification](docs/spec.md) — architecture ground truth
 
 ## License
 
-[AGPL-3.0](LICENSE).
+[AGPL-3.0](LICENSE)
