@@ -3526,10 +3526,20 @@ fn register_engine_tx(
     if is_default {
         transaction.execute("UPDATE engines SET is_default = 0 WHERE is_default = 1", [])?;
     }
+    // Re-registering a version updates its host root, executable, and hash in
+    // place instead of failing. Every reinstall or upgrade ships a fresh bundled
+    // engine binary (new sha256), so idempotent registration is what lets the
+    // installer run repeatedly. The version is the stable key that artifacts and
+    // deployments reference, so it is never rewritten here.
     transaction.execute(
         "INSERT INTO engines
              (version, host_root, cage_executable, sha256, is_default)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(version) DO UPDATE SET
+             host_root = excluded.host_root,
+             cage_executable = excluded.cage_executable,
+             sha256 = excluded.sha256,
+             is_default = excluded.is_default OR engines.is_default",
         params![
             engine.version,
             engine.host_root.to_string_lossy(),
@@ -5173,6 +5183,34 @@ mod tests {
 
         assert!(registered.is_default);
         assert!(state.engine("bun-1").unwrap().unwrap().is_default);
+        drop(state);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reregistering_a_version_updates_it_in_place_and_keeps_default() {
+        let path = temp_db("reregister-engine");
+        let mut state = State::open(&path).unwrap();
+        state
+            .register_engine(&test_engine_record("bundled", false))
+            .unwrap();
+        assert!(state.engine("bundled").unwrap().unwrap().is_default);
+
+        // A reinstall ships a fresh engine binary: same version, new hash and
+        // root. Registering again must succeed (idempotent upgrade) and keep
+        // the default marker rather than raising a UNIQUE conflict.
+        let upgraded = EngineRecord {
+            version: "bundled".into(),
+            host_root: "/".into(),
+            cage_executable: "/usr/bin/true".into(),
+            sha256: "b".repeat(64),
+            is_default: false,
+        };
+        let registered = state.register_engine(&upgraded).unwrap();
+        assert!(registered.is_default);
+        let stored = state.engine("bundled").unwrap().unwrap();
+        assert_eq!(stored.sha256, "b".repeat(64));
+        assert_eq!(state.engines().unwrap().len(), 1);
         drop(state);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
