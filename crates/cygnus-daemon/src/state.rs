@@ -710,6 +710,7 @@ pub struct GitHubDeployJob {
     pub kind: GitHubJobKind,
     pub pull_request: Option<i64>,
     pub sha: String,
+    pub entry: PathBuf,
     pub status: GitHubDeployJobStatus,
     pub attempts: u32,
     pub next_attempt_at: String,
@@ -757,6 +758,7 @@ impl TryFrom<DeployJob> for GitHubDeployJob {
             sha: job.commit.ok_or_else(|| {
                 StateError::IncompleteState("github job is missing commit SHA".into())
             })?,
+            entry: job.entry,
             status: job.status,
             attempts: job.attempts,
             next_attempt_at: job.next_attempt_at,
@@ -6508,6 +6510,7 @@ mod tests {
         );
         let running = state.claim_github_job().unwrap().unwrap();
         assert_eq!(running.id, "j1");
+        assert_eq!(running.entry, PathBuf::from("index.ts"));
         assert!(
             state
                 .accept_github_delivery(&delivery("d2"), &[github_job_fixture("j2", &second)])

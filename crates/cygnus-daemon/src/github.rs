@@ -1352,7 +1352,7 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
                 app: config.app.clone(),
                 domain: Some(config.domain.clone()),
                 engine_version: Some(config.engine_version.clone()),
-                entry: (!config.entry.as_os_str().is_empty()).then(|| config.entry.clone()),
+                entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
                 artifact_root: Some(config.artifact_root.clone()),
                 upstream: Some(config.upstream.clone()),
                 deployment_id: None,
