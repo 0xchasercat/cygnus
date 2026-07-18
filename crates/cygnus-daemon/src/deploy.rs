@@ -2480,6 +2480,74 @@ mod tests {
     }
 
     #[test]
+    fn static_job_uses_reserved_runner_mode_and_platform_paths() {
+        let root = temp_dir("static-job");
+        let workspace = root.join("rootfs/workspace");
+        let publish = root.join("rootfs/publish");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&publish).unwrap();
+        let engine = EngineRecord {
+            version: "bun".into(),
+            host_root: PathBuf::from("/engine"),
+            cage_executable: PathBuf::from("/usr/local/bin/bun"),
+            sha256: "0".repeat(64),
+            is_default: false,
+        };
+        let job = build_job(
+            &engine,
+            &workspace,
+            &publish,
+            "id",
+            &BuildPlan {
+                install: false,
+                frozen: false,
+                mode: BuildMode::Static {
+                    build_script: Some("build".into()),
+                },
+                detection: "static site (vite)".into(),
+            },
+        );
+        assert_eq!(job.args.last(), Some(&OsString::from("--static")));
+        assert_eq!(
+            job.env.get(OsStr::new("CYGNUS_STATIC_BUILD_SCRIPT")),
+            Some(&OsString::from("build"))
+        );
+        assert_eq!(
+            job.env.get(OsStr::new("CYGNUS_BUILD_DETECTION")),
+            Some(&OsString::from("static site (vite)"))
+        );
+        let expected_server = if cfg!(target_os = "linux") {
+            PathBuf::from(STATIC_SERVER_CAGE_PATH)
+        } else {
+            workspace.parent().unwrap().join(STATIC_SERVER_REL)
+        };
+        assert_eq!(
+            job.env.get(OsStr::new("CYGNUS_STATIC_SERVER_SOURCE")),
+            Some(&expected_server.into_os_string())
+        );
+        assert!(matches!(job.egress, EgressMode::None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn static_payload_uses_reserved_entry_with_browser_assets() {
+        let app = temp_dir("static-entry");
+        fs::create_dir(app.join("public/assets")).unwrap();
+        fs::write(app.join("public/index.html"), b"<!doctype html>").unwrap();
+        fs::write(app.join("public/assets/app.js"), b"browser").unwrap();
+        fs::write(app.join("cygnus-static-server.js"), b"server").unwrap();
+        fs::write(app.join("cygnus-static-server.js.jsc"), b"bytecode").unwrap();
+        let mode = BuildMode::Static { build_script: None };
+
+        validate_static_public_root(&app).unwrap();
+        assert_eq!(
+            expected_generated_entry(&app, &mode).unwrap(),
+            app.join("cygnus-static-server.js")
+        );
+        fs::remove_dir_all(app).unwrap();
+    }
+
+    #[test]
     fn published_payload_rejects_build_controlled_namespaces() {
         let root = temp_dir("published-namespace");
         fs::create_dir(root.join("app")).unwrap();

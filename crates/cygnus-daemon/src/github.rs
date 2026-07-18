@@ -1774,11 +1774,11 @@ mod tests {
         }
     }
     fn tmp() -> PathBuf {
-        let id = AtomicUsize::new(0);
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "cygnus-github-test-{}-{}",
             std::process::id(),
-            id.fetch_add(1, Ordering::Relaxed)
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();

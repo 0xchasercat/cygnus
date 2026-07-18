@@ -1,7 +1,10 @@
 import { realpath, stat } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 
-export const PUBLIC_ROOT = resolve(import.meta.dir, "public");
+// Bun inlines import.meta.dir to the daemon staging path when producing CJS
+// bytecode. Resolve from the launched artifact entry so content-addressed moves
+// and macOS host paths keep the public root beside the generated server.
+export const PUBLIC_ROOT = resolve(dirname(process.argv[1]), "public");
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = Object.freeze({
   ".html": "text/html; charset=utf-8",

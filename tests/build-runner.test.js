@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   access,
+  copyFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -10,9 +11,12 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import http from "node:http";
 import { parseRunnerArgs } from "../assets/build-runner.js";
 
 const RUNNER = join(import.meta.dir, "..", "assets", "build-runner.js");
+const STATIC_SERVER = join(import.meta.dir, "..", "assets", "cygnus-static-server.ts");
+const SHIM = join(import.meta.dir, "..", "assets", "shim.js");
 const BUN = process.execPath;
 
 async function run(args, env = {}) {
@@ -37,6 +41,29 @@ async function exists(path) {
   }
 }
 
+async function unixRequestEventually(socketPath, path) {
+  const deadline = Date.now() + 4_000;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = http.get({ path, socketPath, timeout: 250 }, (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => (body += chunk));
+          response.on("end", () => resolve({ status: response.statusCode, body }));
+        });
+        request.on("timeout", () => request.destroy(new Error("request timed out")));
+        request.on("error", reject);
+      });
+    } catch (error) {
+      lastError = error;
+      await Bun.sleep(25);
+    }
+  }
+  throw new Error(`timed out waiting for ${socketPath}: ${lastError}`);
+}
+
 async function staticFixture(buildScript = "") {
   const root = await mkdtemp(join(tmpdir(), "cygnus-build-runner-"));
   const workspace = join(root, "workspace");
@@ -56,7 +83,7 @@ async function staticFixture(buildScript = "") {
   const config = join(controls, "build.bunfig.toml");
   const server = join(controls, "cygnus-static-server.ts");
   await writeFile(config, "");
-  await writeFile(server, 'console.log("static server");\n');
+  await copyFile(STATIC_SERVER, server);
   return {
     root,
     workspace,
@@ -163,8 +190,24 @@ test("plain static mode copies the workspace root and emits server bytecode", as
     expect(await exists(join(fixture.output, "public", "node_modules"))).toBe(false);
     expect(await exists(join(fixture.output, "public", ".git"))).toBe(false);
     expect(await exists(join(fixture.output, "public", ".cygnus-cache"))).toBe(false);
-    expect(await exists(join(fixture.output, "cygnus-static-server.js"))).toBe(true);
+    const generatedServer = join(fixture.output, "cygnus-static-server.js");
+    expect(await exists(generatedServer)).toBe(true);
     expect(await exists(join(fixture.output, "cygnus-static-server.js.jsc"))).toBe(true);
+
+    const socket = join(fixture.root, "app.sock");
+    const server = Bun.spawn([BUN, "--no-env-file", "--preload", SHIM, generatedServer], {
+      env: { ...process.env, CYGNUS_SOCKET: socket },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const response = await unixRequestEventually(socket, "/client/route");
+      expect(response.status).toBe(200);
+      expect(response.body).toBe("root index");
+    } finally {
+      server.kill();
+      await server.exited;
+    }
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

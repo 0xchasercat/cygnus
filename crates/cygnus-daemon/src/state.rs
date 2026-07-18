@@ -5243,7 +5243,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_default_switching_keeps_registration_immutable_and_audited() {
+    fn explicit_default_switching_survives_idempotent_registration() {
         let path = temp_db("explicit-engine-default");
         let mut state = State::open(&path).unwrap();
         let first = state
@@ -5268,8 +5268,10 @@ mod tests {
         assert_eq!(state.audit_records().unwrap().len(), 1);
 
         let duplicate = test_engine_record("bun-1", true);
-        assert!(state.register_engine(&duplicate).is_err());
-        assert!(state.engine("bun-1").unwrap().unwrap().is_default);
+        let updated = state.register_engine(&duplicate).unwrap();
+        assert!(updated.is_default);
+        assert_eq!(updated.host_root, duplicate.host_root);
+        assert_eq!(updated.sha256, duplicate.sha256);
         drop(state);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
