@@ -1561,8 +1561,20 @@ fn publish_or_reuse(
     sync_tree(building)?;
     make_read_only(building)?;
     sync_tree(building)?;
+    // macOS refuses to rename a directory it cannot write (EACCES), so the
+    // staging root keeps its write bit through the rename and is sealed at
+    // the final path. `validate_reusable_artifact` heals the root mode if a
+    // crash lands between the rename and the final chmod.
+    let root_metadata = fs::symlink_metadata(building)?;
+    let mut writable_root = root_metadata.permissions();
+    writable_root.set_mode(writable_root.mode() | 0o200);
+    fs::set_permissions(building, writable_root)?;
     match rename_noreplace(building, final_path) {
         Ok(()) => {
+            let mut sealed_root = fs::symlink_metadata(final_path)?.permissions();
+            sealed_root.set_mode(sealed_root.mode() & !0o222);
+            fs::set_permissions(final_path, sealed_root)?;
+            sync_best_effort(&File::open(final_path)?)?;
             if let Some(parent) = final_path.parent() {
                 sync_best_effort(&File::open(parent)?)?;
             }
@@ -1583,6 +1595,15 @@ fn validate_reusable_artifact(
     metadata_json: &str,
 ) -> Result<(), DeployError> {
     validate_tree(path)?;
+    // A crash between publication's rename and the final root chmod leaves a
+    // sealed tree behind a still-writable root: heal the root mode instead of
+    // condemning a valid artifact.
+    let root_metadata = fs::symlink_metadata(path)?;
+    if root_metadata.file_type().is_dir() && root_metadata.permissions().mode() & 0o222 != 0 {
+        let mut sealed = root_metadata.permissions();
+        sealed.set_mode(sealed.mode() & !0o222);
+        fs::set_permissions(path, sealed)?;
+    }
     validate_read_only_tree(path)?;
     let actual_hash = hash_manifest(&build_manifest(path)?);
     if actual_hash != artifact_hash {
