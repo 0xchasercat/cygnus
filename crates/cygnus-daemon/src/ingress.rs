@@ -328,75 +328,6 @@ impl BodyGuard {
     }
 }
 
-const MAX_RESPONSE_STATUS_LINE_BYTES: usize = 1_024;
-
-#[derive(Debug)]
-pub(crate) struct ResponseStatus {
-    line: [u8; MAX_RESPONSE_STATUS_LINE_BYTES],
-    len: usize,
-    complete: bool,
-    status: Option<u16>,
-}
-
-impl Default for ResponseStatus {
-    fn default() -> Self {
-        Self {
-            line: [0; MAX_RESPONSE_STATUS_LINE_BYTES],
-            len: 0,
-            complete: false,
-            status: None,
-        }
-    }
-}
-
-impl ResponseStatus {
-    pub(crate) fn observe(&mut self, bytes: &[u8]) {
-        if self.complete {
-            return;
-        }
-        for &byte in bytes {
-            if self.len == self.line.len() {
-                self.complete = true;
-                return;
-            }
-            self.line[self.len] = byte;
-            self.len += 1;
-            if byte.is_ascii_whitespace()
-                && let Some(status) = parse_response_status(&self.line[..self.len])
-            {
-                self.status = Some(status);
-                self.complete = true;
-                return;
-            }
-            if byte == b'\n' {
-                self.complete = true;
-                return;
-            }
-        }
-    }
-
-    pub(crate) fn status(&self) -> Option<u16> {
-        self.status
-    }
-}
-
-fn parse_response_status(line: &[u8]) -> Option<u16> {
-    let line = std::str::from_utf8(line)
-        .ok()?
-        .trim_end_matches(['\r', '\n']);
-    let mut fields = line.split_ascii_whitespace();
-    let version = fields.next()?;
-    let status = fields.next()?;
-    if !version.starts_with("HTTP/")
-        || status.len() != 3
-        || !status.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let status = status.parse().ok()?;
-    (100..=599).contains(&status).then_some(status)
-}
-
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Serialize)]
@@ -668,23 +599,5 @@ mod tests {
         assert_eq!(request.bytes_in, 74);
         assert_eq!(request.bytes_out, 20);
         assert_eq!(request.outcome, "proxied");
-    }
-
-    #[test]
-    fn response_status_observer_handles_split_and_unobservable_lines() {
-        let mut status = ResponseStatus::default();
-        status.observe(b"HTTP/1.1 4");
-        assert_eq!(status.status(), None);
-        status.observe(b"29 Too Many Requests\r\ncontent-length: 0\r\n\r\n");
-        assert_eq!(status.status(), Some(429));
-
-        let mut invalid = ResponseStatus::default();
-        invalid.observe(b"not-http\r\n");
-        assert_eq!(invalid.status(), None);
-
-        let mut bounded = ResponseStatus::default();
-        bounded.observe(&[b'x'; MAX_RESPONSE_STATUS_LINE_BYTES + 1]);
-        bounded.observe(b"HTTP/1.1 200 OK\r\n");
-        assert_eq!(bounded.status(), None);
     }
 }
