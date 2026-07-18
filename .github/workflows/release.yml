@@ -17,16 +17,30 @@ jobs:
     strategy:
       matrix:
         include:
+          # Linux bundles build inside debian:11 so the produced binaries
+          # only require glibc 2.31 — the practical floor for self-hosters
+          # (Debian 11+, Ubuntu 20.04+, RHEL 9, Amazon Linux 2023).
           - target: x86_64-unknown-linux-gnu
             runner: namespace-profile-cygnus-linux-x86
+            container: debian:11
           - target: aarch64-unknown-linux-gnu
             runner: namespace-profile-cygnus-linux-arm64
+            container: debian:11
           - target: aarch64-apple-darwin
             runner: namespace-profile-cygnus-macos-arm64
-            
+            container: ''
+
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install container build tools
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git file unzip xz-utils
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
