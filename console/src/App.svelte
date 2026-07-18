@@ -7,6 +7,7 @@
   import Palette from './lib/components/Palette.svelte';
   import ShipModal from './lib/components/ShipModal.svelte';
   import Login from './lib/screens/Login.svelte';
+  import Setup from './lib/screens/Setup.svelte';
   import Overview from './lib/screens/Overview.svelte';
   import AppDetail from './lib/screens/AppDetail.svelte';
   import DeployDetail from './lib/screens/DeployDetail.svelte';
@@ -28,9 +29,10 @@
   const Screen = $derived(SCREENS[ui.screen] ?? Overview);
   const screenKey = $derived(`${ui.screen}·${ui.appId ?? ''}·${ui.deployId ?? ''}`);
 
-  // One shell for live and preview. Login owns live+!ready; everything else
-  // renders the polished screens off the store.
+  // One shell for live and preview. Setup owns live+setup; Login owns
+  // live+!ready (signin/locked); everything else renders the polished screens.
   const ready = $derived(store.mode !== 'loading' && store.auth === 'ready');
+  const needsSetup = $derived(store.mode !== 'loading' && store.auth === 'setup');
 
   const footer = $derived.by(() => {
     if (store.mode === 'preview') {
@@ -63,6 +65,8 @@
 
 {#if store.mode === 'loading'}
   <div class="loading num">LOCATING TENANT ZERO…</div>
+{:else if needsSetup}
+  <Setup />
 {:else if store.mode === 'live' && !ready}
   <Login />
 {:else}

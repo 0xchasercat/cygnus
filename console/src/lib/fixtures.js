@@ -18,14 +18,20 @@ export const previewNode = {
   uptime_seconds: 41 * 86400 + 7 * 3600,
   isolation: 'userns mntns pidns netns · seccomp v14',
   warm_count: 5,
+  // Dashboard + apex domains + SSL baseline (onboarding contract). Preview is
+  // a configured system, so these are set and dashboard TLS is automatic.
+  dashboard_domain: 'console.swan.host',
+  apex_domain: 'swan.host',
+  ssl_mode: 'acme',
   engines: [
     { version: 'bun 1.2.19', sha256: '9f2c1a4b8e11d7a0c3f2e11a', default: true, apps: 6 },
     { version: 'bun 1.1.34', sha256: 'a1b2c3d4e5f6a7b8c9d0e1f2', default: false, apps: 1 },
   ],
   certificates: [
     { domain: '*.swan.host', kind: 'wildcard · DNS-01', ok: true, expires_unix: ts(60 * 24 * 61) / 1000 },
+    { domain: 'console.swan.host', kind: 'dashboard · HTTP-01', ok: true, expires_unix: ts(60 * 24 * 47) / 1000 },
     { domain: 'atelier.studio', kind: 'custom · HTTP-01', ok: true, expires_unix: ts(60 * 24 * 34) / 1000 },
-    { domain: 'helios.dev', kind: 'custom · HTTP-01', ok: true, expires_unix: ts(60 * 24 * 9) / 1000 },
+    { domain: 'helios.dev', kind: 'custom · HTTP-01', ok: false, expires_unix: ts(60 * 24 * 9) / 1000 },
   ],
   memory: {
     total_bytes: 32 * 1024 * 1024 * 1024,

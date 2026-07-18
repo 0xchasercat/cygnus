@@ -18,10 +18,11 @@ import {
 
 const POLL_MS = 4000;
 const GITHUB_EVERY = 3; // every 3rd tick
+const DOMAIN_POLL_MS = 5000; // per-app domain status while non-terminal
 
 class Store {
   mode = $state('loading'); // 'loading' | 'live' | 'preview'
-  auth = $state('unknown'); // 'unknown' | 'locked' | 'signin' | 'ready'
+  auth = $state('unknown'); // 'unknown' | 'locked' | 'setup' | 'signin' | 'ready'
   node = $state(null);
   apps = $state([]);
   deployments = $state([]);
@@ -33,10 +34,13 @@ class Store {
   lastSync = $state(0);
   notice = $state(''); // transient GitHub callback / mutation notice
   buildLogByDeploy = $state({}); // deploymentId -> string[] (preview fallback)
+  domainsByApp = $state({}); // appName -> {domains:[...], at:number} (live cache)
+  #domainTimer = null; // polls per-app domain status while non-terminal
 
   #timer = null;
   #tick = 0;
   #booted = false;
+  #domainPollApp = null;
 
   async boot() {
     if (this.#booted) return;
@@ -55,6 +59,13 @@ class Store {
         return;
       }
       this.mode = 'live';
+      // First-run: no admin account yet. Surface the setup wizard instead of
+      // the login screen. setupRequired may be absent on older daemons — fall
+      // through to the normal session resolve so auth degrades gracefully.
+      if (health?.setupRequired === true) {
+        this.auth = 'setup';
+        return;
+      }
       await this.#resolveAuth();
       this.#handleGithubCallback();
     } catch {
@@ -65,7 +76,14 @@ class Store {
 
   seedPreview() {
     this.mode = 'preview';
-    this.auth = 'ready';
+    // ?setup=1 dev hook lets reviewers see the first-run wizard in preview.
+    const forceSetup = typeof URLSearchParams !== 'undefined'
+      && new URLSearchParams(window.location.search).get('setup') === '1';
+    if (forceSetup) {
+      this.auth = 'setup';
+    } else {
+      this.auth = 'ready';
+    }
     this.node = previewNode;
     this.apps = previewApps;
     this.deployments = previewDeployments;
@@ -81,6 +99,10 @@ class Store {
   async #resolveAuth() {
     try {
       const session = await api('/api/v1/session');
+      if (session?.setupRequired === true) {
+        this.auth = 'setup';
+        return;
+      }
       if (session?.locked || !session?.configured) {
         this.auth = 'locked';
         return;
@@ -188,7 +210,54 @@ class Store {
   }
 
   // ——— mutations ———
-  async signIn(token) {
+  // First-run setup: create the admin account, store the dashboard/apex
+  // domains + SSL baseline, and log in. The backend sets the session cookie.
+  // 409 means an admin already exists — fall back to the login screen.
+  async setup({ email, password, dashboardDomain, apexDomain, ssl }) {
+    try {
+      await post('/api/v1/setup', {
+        email,
+        password,
+        dashboard_domain: dashboardDomain || '',
+        apex_domain: apexDomain || '',
+        ssl: ssl || 'acme',
+      });
+      this.auth = 'ready';
+      this.start();
+      return { ok: true };
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 409) {
+        this.auth = 'signin';
+        return { ok: false, error: 'already_setup', status: 409 };
+      }
+      const msg = cause instanceof Error ? cause.message : 'Setup failed';
+      return { ok: false, error: msg };
+    }
+  }
+
+  async signIn({ email, password }) {
+    try {
+      const session = await post('/api/v1/session', { email, password });
+      if (!session?.authenticated) {
+        return { ok: false, error: 'Authentication did not complete.' };
+      }
+      this.auth = 'ready';
+      this.start();
+      return { ok: true };
+    } catch (cause) {
+      if (cause instanceof ApiError) {
+        if (cause.status === 401) return { ok: false, error: 'Invalid email or password' };
+        // 429 already shaped as "Too many attempts — retry in Ns" by api.js.
+        if (cause.status === 429) return { ok: false, error: cause.message };
+      }
+      const msg = cause instanceof Error ? cause.message : 'Sign-in failed';
+      return { ok: false, error: msg };
+    }
+  }
+
+  // Recovery affordance: the backend keeps bootstrap-token login as a
+  // fallback so a locked-out admin can re-enter with the installer token.
+  async signInWithToken(token) {
     try {
       const session = await post('/api/v1/session', { token });
       if (!session?.authenticated) {
@@ -212,6 +281,7 @@ class Store {
     }
     this.auth = 'signin';
     this.stop();
+    this.#stopDomainPoll();
     this.node = null;
     this.apps = [];
     this.deployments = [];
@@ -219,7 +289,137 @@ class Store {
     this.events = [];
     this.requests = [];
     this.github = { configured: false, app: null, repositories: [], jobs: [] };
+    this.domainsByApp = {};
     return { ok: true };
+  }
+
+  // ——— per-app domains ———
+  // Fetch + cache a domain list for an app. The endpoint may 404 on a
+  // backend branch that hasn't landed yet — degrade to [] like metrics do.
+  appDomains(appName) {
+    const entry = this.domainsByApp[appName];
+    return entry?.domains ?? null;
+  }
+
+  async refreshAppDomains(appName) {
+    if (!appName) return null;
+    try {
+      const data = await api(`/api/v1/apps/${encodeURIComponent(appName)}/domains`);
+      const domains = Array.isArray(data?.domains) ? data.domains : [];
+      this.domainsByApp = { ...this.domainsByApp, [appName]: { domains, at: Date.now() } };
+      this.#maybePollDomains(appName);
+      return domains;
+    } catch (cause) {
+      if (cause instanceof ApiError && (cause.status === 404 || cause.status === 405)) {
+        // Branch not merged yet — keep last cache (or empty) and stay quiet.
+        if (!this.domainsByApp[appName]) {
+          this.domainsByApp = { ...this.domainsByApp, [appName]: { domains: [], at: Date.now() } };
+        }
+        return this.domainsByApp[appName].domains;
+      }
+      if (cause instanceof ApiError && cause.status === 401) {
+        this.auth = 'signin';
+        this.stop();
+      }
+      return this.domainsByApp[appName]?.domains ?? null;
+    }
+  }
+
+  async addDomain(appName, host) {
+    try {
+      await post(`/api/v1/apps/${encodeURIComponent(appName)}/domains`, { host });
+      this.notice = `Domain ${host} added for ${appName}.`;
+      await this.refreshAppDomains(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not add domain' };
+    }
+  }
+
+  async removeDomain(appName, host) {
+    try {
+      await api(`/api/v1/apps/${encodeURIComponent(appName)}/domains/${encodeURIComponent(host)}`, {
+        method: 'DELETE',
+      });
+      this.notice = `Domain ${host} removed from ${appName}.`;
+      await this.refreshAppDomains(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not remove domain' };
+    }
+  }
+
+  async setDomainTls(appName, host, mode) {
+    try {
+      await post(
+        `/api/v1/apps/${encodeURIComponent(appName)}/domains/${encodeURIComponent(host)}/tls`,
+        { mode },
+      );
+      this.notice = `TLS set to ${mode === 'acme' ? 'automatic' : 'self-signed'} for ${host}.`;
+      await this.refreshAppDomains(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not change TLS' };
+    }
+  }
+
+  // ——— dashboard domain + SSL (settings) ———
+  async setDashboardDomain(domain, apex) {
+    try {
+      await post('/api/v1/settings/dashboard-domain', { domain, apex });
+      this.notice = 'Dashboard domain updated.';
+      await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not update dashboard domain' };
+    }
+  }
+
+  async setDashboardTls(mode) {
+    try {
+      await post('/api/v1/settings/dashboard-tls', { mode });
+      this.notice = `Dashboard TLS set to ${mode === 'acme' ? 'automatic' : 'self-signed'}.`;
+      await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not change dashboard TLS' };
+    }
+  }
+
+  // Poll per-app domain status every ~5s while any domain is non-terminal
+  // (issuing / pending / fallback_active), so pills update live as DNS
+  // propagates and certs issue. Stops once everything reaches a terminal
+  // state or the app changes.
+  #maybePollDomains(appName) {
+    const entry = this.domainsByApp[appName];
+    if (!entry) return;
+    const pending = entry.domains.some((d) =>
+      d.status === 'issuing' || d.status === 'pending' || d.status === 'fallback_active'
+    );
+    if (pending) {
+      this.#startDomainPoll(appName);
+    } else {
+      this.#stopDomainPoll();
+    }
+  }
+
+  #startDomainPoll(appName) {
+    this.#domainPollApp = appName;
+    if (this.#domainTimer) return;
+    this.#domainTimer = setInterval(() => {
+      if (this.mode !== 'live' || this.auth !== 'ready') {
+        this.#stopDomainPoll();
+        return;
+      }
+      const app = this.#domainPollApp;
+      if (app) this.refreshAppDomains(app);
+    }, DOMAIN_POLL_MS);
+  }
+
+  #stopDomainPoll() {
+    if (this.#domainTimer) clearInterval(this.#domainTimer);
+    this.#domainTimer = null;
+    this.#domainPollApp = null;
   }
 
   async mapDomain(app, domain) {
