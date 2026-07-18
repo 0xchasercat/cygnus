@@ -52,6 +52,11 @@ if (import.meta.main) {
   if (!(await indexFile.exists())) {
     throw new Error(`Built console not found at ${indexPath}; run bun run build first`);
   }
+  // The console is one self-contained document. Serve it from memory: file
+  // streaming fast paths differ per platform (macOS sendfile over unix
+  // sockets truncates large bodies) and a buffered body behaves identically
+  // everywhere.
+  const indexBytes = new Uint8Array(await indexFile.arrayBuffer());
   server = Bun.serve({
     ...(socketPath ? { unix: socketPath } : { port }),
     async fetch(request) {
@@ -91,7 +96,7 @@ if (import.meta.main) {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return methodNotAllowed("GET, HEAD");
       }
-      return new Response(request.method === "HEAD" ? null : indexFile, {
+      return new Response(request.method === "HEAD" ? null : indexBytes, {
         headers: {
           "cache-control": "no-store",
           "content-type": "text/html; charset=utf-8",

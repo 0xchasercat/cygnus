@@ -38,9 +38,10 @@ use owo_colors::OwoColorize;
     styles = cygnus_styles(),
 )]
 struct Cli {
-    /// Root-only daemon administration socket.
-    #[arg(long, global = true, default_value = DEFAULT_HOST_ADMIN_SOCKET)]
-    admin_socket: PathBuf,
+    /// Daemon administration socket (default: $CYGNUS_ADMIN_SOCKET, then
+    /// ~/.cygnus/run/admin.sock when present, then /var/run/cygnus/admin.sock).
+    #[arg(long, global = true)]
+    admin_socket: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -193,7 +194,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Apply { .. } | Command::Engine { .. } => Duration::from_secs(120),
         _ => Duration::from_secs(10),
     };
-    let client = AdminClient::new(cli.admin_socket).with_timeout(timeout)?;
+    let admin_socket = resolve_admin_socket(cli.admin_socket);
+    let client = AdminClient::new(&admin_socket).with_timeout(timeout)?;
+    ADMIN_SOCKET_IN_USE
+        .set(admin_socket)
+        .expect("admin socket resolved once");
     let theme = Theme::detect();
     match cli.command {
         Command::Apply { config } => {
@@ -362,6 +367,30 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+static ADMIN_SOCKET_IN_USE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The socket to talk to, in order of intent: explicit flag, environment
+/// (set for caged consoles and scripts), the per-user install location when
+/// it exists (macOS), then the system-wide default.
+fn resolve_admin_socket(flag: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = flag {
+        return path;
+    }
+    if let Some(env_path) = std::env::var_os("CYGNUS_ADMIN_SOCKET") {
+        let env_path = PathBuf::from(env_path);
+        if env_path.is_absolute() {
+            return env_path;
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_socket = PathBuf::from(home).join(".cygnus/run/admin.sock");
+        if user_socket.exists() {
+            return user_socket;
+        }
+    }
+    PathBuf::from(DEFAULT_HOST_ADMIN_SOCKET)
+}
+
 fn call(client: &AdminClient, command: AdminCommand) -> Result<AdminData, Box<dyn Error>> {
     let request = AdminRequest {
         version: ADMIN_PROTOCOL_VERSION,
@@ -370,13 +399,21 @@ fn call(client: &AdminClient, command: AdminCommand) -> Result<AdminData, Box<dy
         command,
     };
     let response = client.request(&request).map_err(|error| {
-        if matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        ) {
-            Box::<dyn Error>::from("timed out waiting for the daemon to answer")
-        } else {
-            Box::<dyn Error>::from(error)
+        let socket = ADMIN_SOCKET_IN_USE
+            .get()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the admin socket".to_owned());
+        match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                Box::<dyn Error>::from("timed out waiting for the daemon to answer")
+            }
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Box::<dyn Error>::from(
+                format!("cannot reach the Cygnus daemon at {socket} (is it running?)"),
+            ),
+            io::ErrorKind::PermissionDenied => Box::<dyn Error>::from(format!(
+                "permission denied for {socket} (on Linux the admin socket is root-only — try sudo)"
+            )),
+            _ => Box::<dyn Error>::from(error),
         }
     })?;
     match response {
