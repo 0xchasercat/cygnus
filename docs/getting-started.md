@@ -110,3 +110,9 @@ macOS uses `~/.cygnus/{state,run,etc}` for the same roles.
   `cygnus logs <deployment>` shows the build output.
 - **Lost the bootstrap token** — `install.sh --rotate-secrets` regenerates
   it and prints the new value.
+- **macOS: sockets never become ready after an accidental `sudo` install** —
+  a root copy of the service may still be registered with launchd (it
+  survives deleting the plist). Remove it and start clean:
+  `sudo launchctl bootout system/com.cygnus.daemon`, then
+  `sudo rm -rf ~/.cygnus ~/Library/LaunchAgents/com.cygnus.daemon.plist`,
+  then rerun the installer without sudo.

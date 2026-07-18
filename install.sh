@@ -123,15 +123,30 @@ if [[ $OS == Darwin ]]; then
     fail "macOS installs run as your user, not root. Rerun without sudo:
   curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | bash"
   fi
-  # A previous run under sudo leaves root-owned files in ~/.cygnus that a
-  # user install cannot replace. Say exactly how to recover.
-  for owned_path in "$HOME/.cygnus" "$HOME/Library/LaunchAgents/com.cygnus.daemon.plist"; do
-    if [[ -e $owned_path && ! -w $owned_path ]]; then
-      fail "$owned_path is not writable by $(id -un) (a previous sudo run?). Recover with:
+  # A previous run under sudo leaves two kinds of residue a user install
+  # cannot fix itself: root-owned files under ~/.cygnus, and a cygnus service
+  # half-registered in launchd's system domain that keeps respawning as root
+  # (it survives deleting the plist until bootout or reboot). Detect both and
+  # say exactly how to recover.
+  if (( ! TEST_MODE )); then
+    if command -v launchctl >/dev/null 2>&1 && launchctl print system/com.cygnus.daemon >/dev/null 2>&1; then
+      fail "a cygnus service from a previous sudo run is still registered as root. Recover with:
+  sudo launchctl bootout system/com.cygnus.daemon
   sudo rm -rf \"$HOME/.cygnus\" \"$HOME/Library/LaunchAgents/com.cygnus.daemon.plist\"
 then rerun this installer without sudo."
     fi
-  done
+    foreign_owned=""
+    [[ -e $HOME/.cygnus ]] && foreign_owned=$(find "$HOME/.cygnus" ! -user "$(id -un)" -print -quit 2>/dev/null)
+    if [[ -z $foreign_owned && -e $HOME/Library/LaunchAgents/com.cygnus.daemon.plist && ! -w $HOME/Library/LaunchAgents/com.cygnus.daemon.plist ]]; then
+      foreign_owned=$HOME/Library/LaunchAgents/com.cygnus.daemon.plist
+    fi
+    if [[ -n $foreign_owned ]]; then
+      fail "$foreign_owned is not owned by $(id -un) (a previous sudo run?). Recover with:
+  sudo launchctl bootout system/com.cygnus.daemon 2>/dev/null
+  sudo rm -rf \"$HOME/.cygnus\" \"$HOME/Library/LaunchAgents/com.cygnus.daemon.plist\"
+then rerun this installer without sudo."
+    fi
+  fi
 fi
 
 downloaded_bundle=""
@@ -729,6 +744,9 @@ if [[ $OS == Darwin ]]; then
   launchctl_bin=$(command -v launchctl || true)
   service_started=0
   if [[ -n $launchctl_bin ]]; then
+    # Reinstalls and crashed runs leave the label registered; bootout is the
+    # idempotent way to clear it before bootstrapping the fresh definition.
+    "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
     if "$launchctl_bin" bootstrap "gui/$(id -u)" "$service_file" >>"$diag_file" 2>&1; then
       service_started=1
     elif "$launchctl_bin" load -w "$service_file" >>"$diag_file" 2>&1; then
@@ -763,7 +781,7 @@ if (( ! ready )); then
     log "Cygnus is installed; start it with the foreground command above to finish configuration."
     exit 0
   fi
-  fail "daemon admin sockets did not become ready at $admin_socket and $tenant_admin_socket; diagnostics: $diag_file"
+  fail "daemon admin sockets did not become ready at $admin_socket and $tenant_admin_socket; diagnostics: $diag_file$([[ $OS == Darwin ]] && printf '%s' '. If a previous sudo run is fighting this install, check: sudo launchctl print system/com.cygnus.daemon (remove with sudo launchctl bootout system/com.cygnus.daemon), then rerun')"
 fi
 
 "$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun --default >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
