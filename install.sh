@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cygnus local-bundle installer.  This script deliberately does not fetch code.
+# Cygnus release installer.
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -8,6 +8,12 @@ TEST_MODE=0
 if [[ ${CYGNUS_INSTALL_TEST_MODE:-0} == 1 || ${CYGNUS_INSTALL_TEST:-0} == 1 || ${CYGNUS_TEST_MODE:-0} == 1 ]]; then
   TEST_MODE=1
 fi
+OS=$(uname -s)
+if (( TEST_MODE )) && [[ -n ${CYGNUS_INSTALL_TEST_UNAME:-} ]]; then OS=$CYGNUS_INSTALL_TEST_UNAME; fi
+case $OS in
+  Linux|Darwin) ;;
+  *) printf 'cygnus installer: ERROR: Unsupported OS: %s\n' "$OS" >&2; exit 1 ;;
+esac
 TEST_ROOT=${CYGNUS_INSTALL_TEST_ROOT:-${CYGNUS_TEST_ROOT:-}}
 if (( TEST_MODE )) && [[ -z $TEST_ROOT ]]; then
   TEST_ROOT=${TMPDIR:-/tmp}/cygnus-installer-test-root
@@ -49,10 +55,10 @@ architecture. Interactive installs prompt for values not supplied on the command
 
 Options:
   --bundle-dir DIR       Install from a local bundle instead of downloading
-  --prefix DIR           Binary destination (default: /usr/local/bin)
-  --config-dir DIR       Configuration/secrets destination (default: /etc/cygnus)
-  --state-dir DIR        Durable state/artifacts destination (default: /var/lib/cygnus)
-  --runtime-dir DIR      Runtime sockets destination (default: /run/cygnus)
+  --prefix DIR           Binary destination (Linux: /usr/local/bin; macOS: ~/.cygnus/bin)
+  --config-dir DIR       Configuration/secrets destination (Linux: /etc/cygnus; macOS: ~/.cygnus/etc)
+  --state-dir DIR        Durable state/artifacts destination (Linux: /var/lib/cygnus; macOS: ~/.cygnus/state)
+  --runtime-dir DIR      Runtime sockets destination (Linux: /run/cygnus; macOS: ~/.cygnus/run)
   --listen ADDR          HTTP listener (default: 127.0.0.1:3000)
   --https-listen ADDR    Optional HTTPS listener (default: disabled)
   --apps-domain DOMAIN   Default application domain (default: apps.localhost)
@@ -61,7 +67,7 @@ Options:
   --bun-version VERSION  Registered Bun engine version (default: bundled)
   --noninteractive       Never prompt; fail when required input is absent
   --reconfigure          Permit replacing changed existing files/configuration
-  --rotate-secrets       Generate and atomically install a new console secret
+  --rotate-secrets       Generate and atomically install new console secrets
   -h, --help             Show this help
 
 For focused tests only, set CYGNUS_INSTALL_TEST_MODE=1 (and optionally
@@ -99,9 +105,20 @@ while (($#)); do
   esac
 done
 
+if [[ $OS == Darwin ]]; then
+  (( prefix_set )) || prefix=$HOME/.cygnus/bin
+  (( config_set )) || config_dir=$HOME/.cygnus/etc
+  (( state_set )) || state_dir=$HOME/.cygnus/state
+  (( runtime_set )) || runtime_dir=$HOME/.cygnus/run
+fi
+
+echo "cygnus installer" >&2
+if [[ $OS == Darwin ]]; then
+  echo "macOS runs cages as plain processes: no namespaces, no cgroups, no seccomp." >&2
+fi
+
 downloaded_bundle=""
 if [[ -z $bundle_dir ]]; then
-  OS=$(uname -s)
   ARCH=$(uname -m)
   case $OS in
     Linux) OS_LOWER="unknown-linux-gnu" ;;
@@ -119,7 +136,7 @@ if [[ -z $bundle_dir ]]; then
     # In tests, fallback to local build to avoid hitting the network
     bundle_dir="$SCRIPT_DIR/release"
   else
-    echo "Fetching latest release for $TARGET..." >&2
+    echo "Download release for $TARGET" >&2
     downloaded_bundle=$(mktemp -d "${TMPDIR:-/tmp}/cygnus-download.XXXXXX")
     TAR_URL="https://github.com/0xchasercat/cygnus/releases/latest/download/cygnus-${TARGET}.tar.gz"
 
@@ -158,7 +175,7 @@ fi
 # A test root maps only default destinations. Explicit paths are never rewritten.
 map_default_path() {
   local value=$1 was_set=$2
-  if (( TEST_MODE )) && [[ -n $TEST_ROOT ]] && (( ! was_set )) && [[ $value == /* ]]; then
+  if (( TEST_MODE )) && [[ $OS == Linux && -n $TEST_ROOT ]] && (( ! was_set )) && [[ $value == /* ]]; then
     printf '%s%s' "${TEST_ROOT%/}" "$value"
   else
     printf '%s' "$value"
@@ -193,9 +210,8 @@ if [[ -n $acme_email && ! $acme_email =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:spa
 fi
 [[ -z $acme_email || -n $https_listen ]] || fail "--acme-email requires --https-listen"
 
-if (( ! TEST_MODE )); then
+if (( ! TEST_MODE )) && [[ $OS == Linux ]]; then
   [[ $(id -u) -eq 0 ]] || fail "root is required (or set CYGNUS_INSTALL_TEST_MODE=1 only for tests)"
-  [[ $(uname -s) == Linux ]] || fail "Cygnus installation requires Linux"
 fi
 
 check_host() {
@@ -216,12 +232,12 @@ check_host() {
   [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] || fail "cannot determine Linux kernel version"
   (( major > 5 || (major == 5 && minor >= 15) )) || fail "Linux 5.15 or newer is required"
 }
-if (( ! TEST_MODE )); then check_host; fi
+if (( ! TEST_MODE )) && [[ $OS == Linux ]]; then check_host; fi
 
 # All source checks happen before any destination mkdir/write.  The staging
 # directory and diagnostics are outside installation destinations.
 stage=$(mktemp -d "${TMPDIR:-/tmp}/cygnus-install.XXXXXX")
-diag_file=${TMPDIR:-/tmp}/cygnus-install-$BASHPID.log
+diag_file=${TMPDIR:-/tmp}/cygnus-install-$$.log
 : >"$diag_file"
 chmod 0600 "$diag_file"
 exec 3>>"$diag_file"
@@ -236,13 +252,22 @@ cleanup() {
 trap cleanup EXIT
 log() { printf '%s\n' "$*" | tee -a /dev/fd/3 >&2; }
 
+log "Verify release bundle"
 [[ -d $bundle_dir && ! -L $bundle_dir ]] || fail "bundle directory is not a real directory: $bundle_dir"
 sums_file=$bundle_dir/SHA256SUMS
 [[ -f $sums_file && ! -L $sums_file ]] || fail "bundle SHA256SUMS is missing or not regular"
 command -v sha256sum >/dev/null 2>&1 && hash_tool=sha256sum || hash_tool=shasum
 command -v "$hash_tool" >/dev/null 2>&1 || fail "sha256 checksum tool is missing"
-required=(cygnus-daemon cygnus cygnus-init bun cygnus-console.tar)
-declare -A expected=()
+if [[ $OS == Darwin ]]; then
+  required=(cygnus-daemon cygnus bun cygnus-console.tar)
+  allowed_bundle_member='cygnus-daemon|cygnus|bun|cygnus-console.tar'
+  [[ ! -e $bundle_dir/cygnus-init ]] || fail "unexpected Darwin bundle member: cygnus-init"
+else
+  required=(cygnus-daemon cygnus cygnus-init bun cygnus-console.tar)
+  allowed_bundle_member='cygnus-daemon|cygnus|cygnus-init|bun|cygnus-console.tar'
+fi
+expected_file=$stage/expected-checksums
+: >"$expected_file"
 while IFS= read -r sum_line || [[ -n $sum_line ]]; do
   [[ -z $sum_line ]] && continue
   # Checksums are intentionally strict: only a hash and one bundle basename.
@@ -250,22 +275,34 @@ while IFS= read -r sum_line || [[ -n $sum_line ]]; do
   [[ -n ${sum:-} && -n ${name:-} && -z ${extra:-} ]] || fail "malformed checksum line"
   if [[ $name == \** ]]; then name=${name#\*}; fi
   [[ $sum =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid checksum in SHA256SUMS"
-  case $name in cygnus-daemon|cygnus|cygnus-init|bun|cygnus-console.tar) ;; *) fail "unexpected or unsafe checksum path: $name" ;; esac
-  [[ -z ${expected[$name]+present} ]] || fail "duplicate checksum entry: $name"
-  expected[$name]=${sum,,}
+  [[ $name =~ ^($allowed_bundle_member)$ ]] || fail "unexpected or unsafe checksum path: $name"
+  duplicate=0
+  while IFS=$'\t' read -r _ existing_name; do
+    if [[ $existing_name == "$name" ]]; then duplicate=1; break; fi
+  done <"$expected_file"
+  (( ! duplicate )) || fail "duplicate checksum entry: $name"
+  sum=$(printf '%s' "$sum" | tr '[:upper:]' '[:lower:]')
+  printf '%s\t%s\n' "$sum" "$name" >>"$expected_file"
 done < "$sums_file"
 checksum_file() {
   local file=$1 result
   if [[ $hash_tool == sha256sum ]]; then result=$(sha256sum -- "$file"); else result=$(shasum -a 256 -- "$file"); fi
   printf '%s' "${result%% *}"
 }
+expected_checksum() {
+  local wanted=$1 stored_sum stored_name
+  while IFS=$'\t' read -r stored_sum stored_name; do
+    if [[ $stored_name == "$wanted" ]]; then printf '%s' "$stored_sum"; return 0; fi
+  done <"$expected_file"
+  return 1
+}
 for name in "${required[@]}"; do
   src=$bundle_dir/$name
-  [[ -n ${expected[$name]+present} ]] || fail "SHA256SUMS has no entry for required binary: $name"
+  expected_sum=$(expected_checksum "$name") || fail "SHA256SUMS has no entry for required binary: $name"
   [[ -f $src && ! -L $src ]] || fail "bundle input is not a regular file: $name"
   if [[ $name != cygnus-console.tar ]]; then [[ -x $src ]] || fail "bundle input is not executable: $name"; fi
-  actual=$(checksum_file "$src")
-  [[ ${expected[$name]} == "${actual,,}" ]] || fail "checksum verification failed for $name"
+  actual=$(checksum_file "$src" | tr '[:upper:]' '[:lower:]')
+  [[ $expected_sum == "$actual" ]] || fail "checksum verification failed for $name"
 done
 
 console_archive=$bundle_dir/cygnus-console.tar
@@ -312,17 +349,29 @@ done < <(find "$console_stage" -print0)
 
 config_file=$config_dir/node.json
 secrets_env=$config_dir/secrets.env
-service_file=$systemd_dir/cygnus.service
 admin_socket=$runtime_dir/admin.sock
 tenant_admin_socket=$runtime_dir/tenant-0/admin.sock
 engine_root=$state_dir/engines/bun-$bun_version
-console_root=$state_dir/artifacts/tenant-0
-secret_root=$state_dir/artifacts/tenant-0-secrets
-secret_bootstrap_file=$secret_root/cygnus/secrets/bootstrap.token
-secret_session_file=$secret_root/cygnus/secrets/session.key
 console_socket=$runtime_dir/tenant-0/console.sock
-secret_bootstrap_path=/cygnus/secrets/bootstrap.token
-secret_session_path=/cygnus/secrets/session.key
+if [[ $OS == Darwin ]]; then
+  launchd_dir=$HOME/Library/LaunchAgents
+  log_dir=$HOME/.cygnus/log
+  service_file=$launchd_dir/com.cygnus.daemon.plist
+  console_root=$HOME/.cygnus/console
+  secret_root=$config_dir/secrets
+  secret_bootstrap_file=$secret_root/bootstrap.token
+  secret_session_file=$secret_root/session.key
+  secret_bootstrap_path=$secret_bootstrap_file
+  secret_session_path=$secret_session_file
+else
+  service_file=$systemd_dir/cygnus.service
+  console_root=$state_dir/artifacts/tenant-0
+  secret_root=$state_dir/artifacts/tenant-0-secrets
+  secret_bootstrap_file=$secret_root/cygnus/secrets/bootstrap.token
+  secret_session_file=$secret_root/cygnus/secrets/session.key
+  secret_bootstrap_path=/cygnus/secrets/bootstrap.token
+  secret_session_path=/cygnus/secrets/session.key
+fi
 
 json_safe_string() {
   [[ $1 != *'"'* && $1 != *'\\'* && $1 != *$'\n'* && $1 != *$'\r'* ]] || fail "value cannot be represented safely in generated JSON"
@@ -330,7 +379,7 @@ json_safe_string() {
 }
 json_listen=$(json_safe_string "$listen")
 # Preserve each credential independently unless rotation is explicit. Raw files
-# are exactly 32 bytes; the rooted cage lowerdir carries them read-only.
+# are exactly 32 bytes.
 for credential_file in "$secret_bootstrap_file" "$secret_session_file"; do
   if [[ -e $credential_file ]]; then
     [[ ! -L $credential_file && -f $credential_file ]] || fail "existing credential is not a regular file: $credential_file"
@@ -344,7 +393,7 @@ if [[ -e $secret_root ]]; then
 fi
 if (( ! rotate_secrets )); then
   if [[ -e $secret_bootstrap_file || -e $secret_session_file || -e $secret_root ]]; then
-    [[ -e $secret_bootstrap_file && -e $secret_session_file ]] || fail "secret lowerdir credentials are incomplete; use --rotate-secrets"
+    [[ -e $secret_bootstrap_file && -e $secret_session_file ]] || fail "console credentials are incomplete; use --rotate-secrets"
     cp -- "$secret_bootstrap_file" "$stage/bootstrap.token"
     cp -- "$secret_session_file" "$stage/session.key"
   else
@@ -359,11 +408,19 @@ bootstrap_hex=$(od -An -N32 -tx1 "$stage/bootstrap.token" | tr -d ' \n')
 session_hex=$(od -An -N32 -tx1 "$stage/session.key" | tr -d ' \n')
 [[ $bootstrap_hex =~ ^[[:xdigit:]]{64}$ && $session_hex =~ ^[[:xdigit:]]{64}$ ]] || fail "unable to generate 32-byte console credentials"
 secret_stage=$stage/secrets-root
-mkdir -p "$secret_stage/cygnus/secrets"
-cp -- "$stage/bootstrap.token" "$secret_stage/cygnus/secrets/bootstrap.token"
-cp -- "$stage/session.key" "$secret_stage/cygnus/secrets/session.key"
-chmod 0700 "$secret_stage" "$secret_stage/cygnus" "$secret_stage/cygnus/secrets"
-chmod 0600 "$secret_stage/cygnus/secrets/bootstrap.token" "$secret_stage/cygnus/secrets/session.key"
+if [[ $OS == Darwin ]]; then
+  mkdir -p "$secret_stage"
+  cp -- "$stage/bootstrap.token" "$secret_stage/bootstrap.token"
+  cp -- "$stage/session.key" "$secret_stage/session.key"
+  chmod 0700 "$secret_stage"
+  chmod 0600 "$secret_stage/bootstrap.token" "$secret_stage/session.key"
+else
+  mkdir -p "$secret_stage/cygnus/secrets"
+  cp -- "$stage/bootstrap.token" "$secret_stage/cygnus/secrets/bootstrap.token"
+  cp -- "$stage/session.key" "$secret_stage/cygnus/secrets/session.key"
+  chmod 0700 "$secret_stage" "$secret_stage/cygnus" "$secret_stage/cygnus/secrets"
+  chmod 0600 "$secret_stage/cygnus/secrets/bootstrap.token" "$secret_stage/cygnus/secrets/session.key"
+fi
 
 json_listen=$(json_safe_string "$listen")
 json_https='null'
@@ -374,6 +431,8 @@ json_engine_root=$(json_safe_string "$engine_root")
 json_console_root=$(json_safe_string "$console_root")
 json_secret_root=$(json_safe_string "$secret_root")
 json_console_upstream=$(json_safe_string "$console_socket")
+json_secret_bootstrap_path=$(json_safe_string "$secret_bootstrap_path")
+json_secret_session_path=$(json_safe_string "$secret_session_path")
 json_email=$(json_safe_string "$acme_email")
 json_dns='null'
 [[ -z $acme_email || $dns_provider == none ]] || json_dns="\"$(json_safe_string "$dns_provider")\""
@@ -382,9 +441,18 @@ if [[ -n $acme_email ]]; then
   json_acme="{\"email\":\"$json_email\",\"directory_url\":\"https://acme-v02.api.letsencrypt.org/directory\",\"dns_provider\":$json_dns}"
 fi
 
-cat >"$stage/node.json" <<EOF
-{"listen":"$json_listen","edge":{"https_listen":$json_https,"apps_domain":"$json_domain","acme":$json_acme},"apps":[{"name":"tenant-0","domains":["$json_console_domain"],"tenant_admin":true,"upstream":"$json_console_upstream","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"$secret_bootstrap_path","CYGNUS_CONSOLE_SESSION_KEY_FILE":"$secret_session_path"},"rootfs":{"lowerdirs":["$json_engine_root","$json_console_root","$json_secret_root"]},"lifecycle":{"min_instances":1}}]}
+log "Configure Cygnus"
+if [[ $OS == Darwin ]]; then
+  json_command=$(json_safe_string "$prefix/bun")
+  json_console_script=$(json_safe_string "$console_root/opt/cygnus-console/server.js")
+  cat >"$stage/node.json" <<EOF
+{"listen":"$json_listen","edge":{"https_listen":$json_https,"apps_domain":"$json_domain","acme":$json_acme},"apps":[{"name":"tenant-0","domains":["$json_console_domain"],"tenant_admin":true,"upstream":"$json_console_upstream","command":"$json_command","args":["$json_console_script"],"env":{"CYGNUS_SOCKET":"$json_console_upstream","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"$json_secret_bootstrap_path","CYGNUS_CONSOLE_SESSION_KEY_FILE":"$json_secret_session_path"},"lifecycle":{"min_instances":1}}]}
 EOF
+else
+  cat >"$stage/node.json" <<EOF
+{"listen":"$json_listen","edge":{"https_listen":$json_https,"apps_domain":"$json_domain","acme":$json_acme},"apps":[{"name":"tenant-0","domains":["$json_console_domain"],"tenant_admin":true,"upstream":"$json_console_upstream","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"$json_secret_bootstrap_path","CYGNUS_CONSOLE_SESSION_KEY_FILE":"$json_secret_session_path"},"rootfs":{"lowerdirs":["$json_engine_root","$json_console_root","$json_secret_root"]},"lifecycle":{"min_instances":1}}]}
+EOF
+fi
 cat >"$stage/secrets.env" <<EOF
 # Cygnus console credentials; keep this file mode 0600.
 CYGNUS_APPS_DOMAIN=$apps_domain
@@ -392,7 +460,47 @@ CYGNUS_HTTPS_LISTEN=$https_listen
 CYGNUS_ACME_EMAIL=$acme_email
 CYGNUS_DNS_PROVIDER=$dns_provider
 EOF
-cat >"$stage/cygnus.service" <<EOF
+if [[ $OS == Darwin ]]; then
+  xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+  }
+  plist_daemon=$(xml_escape "$prefix/cygnus-daemon")
+  plist_state=$(xml_escape "$state_dir/state.db")
+  plist_admin=$(xml_escape "$admin_socket")
+  plist_tenant_admin=$(xml_escape "$tenant_admin_socket")
+  plist_stdout=$(xml_escape "$log_dir/daemon.log")
+  plist_stderr=$(xml_escape "$log_dir/daemon.error.log")
+  cat >"$stage/com.cygnus.daemon.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cygnus.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$plist_daemon</string>
+    <string>--state</string>
+    <string>$plist_state</string>
+    <string>--admin-socket</string>
+    <string>$plist_admin</string>
+    <string>--tenant-admin-socket</string>
+    <string>$plist_tenant_admin</string>
+    <string>serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$plist_stdout</string>
+  <key>StandardErrorPath</key>
+  <string>$plist_stderr</string>
+</dict>
+</plist>
+EOF
+else
+  cat >"$stage/cygnus.service" <<EOF
 [Unit]
 Description=Cygnus request plane
 Wants=network-online.target
@@ -413,6 +521,9 @@ ReadWritePaths=$state_dir $runtime_dir $config_dir
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+service_stage=$stage/cygnus.service
+[[ $OS == Darwin ]] && service_stage=$stage/com.cygnus.daemon.plist
 
 # Existing paths are never replaced without --reconfigure (or secret rotation).
 existing_diff() { [[ -e $1 ]] && { [[ ! -L $1 && -f $1 ]] || fail "existing path is not a regular file: $1"; } && ! cmp -s "$2" "$1"; }
@@ -423,7 +534,7 @@ check_change_allowed() {
   fi
 }
 check_change_allowed "$config_file" "$stage/node.json"
-check_change_allowed "$service_file" "$stage/cygnus.service"
+check_change_allowed "$service_file" "$service_stage"
 if [[ -e $secrets_env ]]; then
   [[ ! -L $secrets_env && -f $secrets_env ]] || fail "existing secrets env is not a regular file"
   if (( ! rotate_secrets )); then
@@ -451,7 +562,11 @@ elif [[ -e $secret_root ]]; then
   fi
 fi
 
-binaries=(cygnus-daemon cygnus cygnus-init bun)
+if [[ $OS == Darwin ]]; then
+  binaries=(cygnus-daemon cygnus bun)
+else
+  binaries=(cygnus-daemon cygnus cygnus-init bun)
+fi
 for name in "${binaries[@]}"; do
   src=$bundle_dir/$name
   cp -- "$src" "$stage/$name"
@@ -471,12 +586,17 @@ if [[ -e $prefix/cygnusctl || -L $prefix/cygnusctl ]]; then
 fi
 mkdir -p "$stage/engine/usr/local/bin"
 cp -- "$bundle_dir/bun" "$stage/engine/usr/local/bin/bun"
-cp -- "$bundle_dir/cygnus-init" "$stage/engine/usr/local/bin/cygnus-init"
-chmod 0755 "$stage/engine/usr/local/bin/bun" "$stage/engine/usr/local/bin/cygnus-init"
+chmod 0755 "$stage/engine/usr/local/bin/bun"
+if [[ $OS == Linux ]]; then
+  cp -- "$bundle_dir/cygnus-init" "$stage/engine/usr/local/bin/cygnus-init"
+  chmod 0755 "$stage/engine/usr/local/bin/cygnus-init"
+fi
 if [[ -e $engine_root ]]; then
   [[ -d $engine_root && ! -L $engine_root ]] || fail "existing engine root is not a directory"
   [[ -f $engine_root/usr/local/bin/bun && ! -L $engine_root/usr/local/bin/bun ]] || fail "existing engine executable is invalid"
-  [[ -f $engine_root/usr/local/bin/cygnus-init && ! -L $engine_root/usr/local/bin/cygnus-init ]] || fail "existing cage init executable is invalid"
+  if [[ $OS == Linux ]]; then
+    [[ -f $engine_root/usr/local/bin/cygnus-init && ! -L $engine_root/usr/local/bin/cygnus-init ]] || fail "existing cage init executable is invalid"
+  fi
   if ! cmp -s "$bundle_dir/bun" "$engine_root/usr/local/bin/bun" && (( ! reconfigure )); then
     fail "existing engine differs; re-run with --reconfigure"
   fi
@@ -512,8 +632,8 @@ atomic_install_dir() {
     [[ $kind == secrets && $rotate_secrets -eq 1 ]] && allow_replace=1
     (( allow_replace )) || fail "existing $dest differs; re-run with $([[ $kind == secrets ]] && printf '%s' --rotate-secrets || printf '%s' --reconfigure)"
   fi
-  tmp=$parent/.$(basename "$dest").staging-$BASHPID
-  old=$parent/.$(basename "$dest").previous-$BASHPID
+  tmp=$parent/.$(basename "$dest").staging-$$
+  old=$parent/.$(basename "$dest").previous-$$
   rm -rf -- "$tmp" "$old"
   mkdir -p -- "$tmp"
   chmod "$mode" "$tmp"
@@ -529,19 +649,22 @@ atomic_install_dir() {
   [[ ! -e $old ]] || rm -rf -- "$old"
 }
 
-log "Installing verified Cygnus release from $bundle_dir"
+log "Install Cygnus"
 ensure_dir "$prefix" 0755
 ensure_dir "$config_dir" 0700
 ensure_dir "$state_dir" 0700
 ensure_dir "$runtime_dir" 0700
 ensure_dir "$runtime_dir/tenant-0" 0700
-ensure_dir "$systemd_dir" 0755
-ensure_dir "$state_dir/artifacts" 0700
-ensure_dir "$state_dir/logs" 0700
+if [[ $OS == Darwin ]]; then
+  ensure_dir "$launchd_dir" 0755
+  ensure_dir "$log_dir" 0700
+else
+  ensure_dir "$systemd_dir" 0755
+  ensure_dir "$state_dir/artifacts" 0700
+  ensure_dir "$state_dir/logs" 0700
+fi
 atomic_install_dir "$console_stage" "$console_root"
 atomic_install_dir "$secret_stage" "$secret_root" secrets
-# Enforce least-privilege modes on the secret lowerdir regardless of how cp
-# handled them (GNU cp without -p, umask, container filesystems, etc.).
 find "$secret_root" -type d -exec chmod 0700 {} +
 find "$secret_root" -type f -exec chmod 0600 {} +
 ensure_dir "$state_dir/engines" 0700
@@ -561,8 +684,11 @@ if [[ ! -e $engine_root || $reconfigure -eq 1 ]]; then
   mkdir -p "$engine_tmp/usr/local/bin"
   chmod 0755 "$engine_tmp" "$engine_tmp/usr" "$engine_tmp/usr/local" "$engine_tmp/usr/local/bin"
   cp -- "$stage/engine/usr/local/bin/bun" "$engine_tmp/usr/local/bin/bun"
-  cp -- "$stage/engine/usr/local/bin/cygnus-init" "$engine_tmp/usr/local/bin/cygnus-init"
-  chmod 0755 "$engine_tmp/usr/local/bin/bun" "$engine_tmp/usr/local/bin/cygnus-init"
+  chmod 0755 "$engine_tmp/usr/local/bin/bun"
+  if [[ $OS == Linux ]]; then
+    cp -- "$stage/engine/usr/local/bin/cygnus-init" "$engine_tmp/usr/local/bin/cygnus-init"
+    chmod 0755 "$engine_tmp/usr/local/bin/cygnus-init"
+  fi
   old_engine=""
   if [[ -e $engine_root ]]; then
     [[ -d $engine_root && ! -L $engine_root ]] || fail "engine root is not a real directory"
@@ -578,14 +704,32 @@ if [[ ! -e $engine_root || $reconfigure -eq 1 ]]; then
 fi
 atomic_copy "$stage/node.json" "$config_file" 0600
 atomic_copy "$stage/secrets.env" "$secrets_env" 0600
-atomic_copy "$stage/cygnus.service" "$service_file" 0644
+atomic_copy "$service_stage" "$service_file" 0644
 
-systemctl_bin=$(command -v systemctl || true)
-[[ -n $systemctl_bin ]] || fail "systemctl is required"
-"$systemctl_bin" daemon-reload >>"$diag_file" 2>&1 || fail "systemd daemon-reload failed; diagnostics: $diag_file"
-"$systemctl_bin" enable cygnus.service >>"$diag_file" 2>&1 || fail "could not enable cygnus.service; diagnostics: $diag_file"
-if ! "$systemctl_bin" restart cygnus.service >>"$diag_file" 2>&1; then
-  fail "could not start cygnus.service; diagnostics: $diag_file"
+log "Start Cygnus"
+service_started=1
+if [[ $OS == Darwin ]]; then
+  launchctl_bin=$(command -v launchctl || true)
+  service_started=0
+  if [[ -n $launchctl_bin ]]; then
+    if "$launchctl_bin" bootstrap "gui/$(id -u)" "$service_file" >>"$diag_file" 2>&1; then
+      service_started=1
+    elif "$launchctl_bin" load -w "$service_file" >>"$diag_file" 2>&1; then
+      service_started=1
+    fi
+  fi
+  if (( ! service_started )); then
+    printf 'Launch Cygnus with: %q --state %q --admin-socket %q --tenant-admin-socket %q serve\n' \
+      "$prefix/cygnus-daemon" "$state_dir/state.db" "$admin_socket" "$tenant_admin_socket" >&2
+  fi
+else
+  systemctl_bin=$(command -v systemctl || true)
+  [[ -n $systemctl_bin ]] || fail "systemctl is required"
+  "$systemctl_bin" daemon-reload >>"$diag_file" 2>&1 || fail "systemd daemon-reload failed; diagnostics: $diag_file"
+  "$systemctl_bin" enable cygnus.service >>"$diag_file" 2>&1 || fail "could not enable cygnus.service; diagnostics: $diag_file"
+  if ! "$systemctl_bin" restart cygnus.service >>"$diag_file" 2>&1; then
+    fail "could not start cygnus.service; diagnostics: $diag_file"
+  fi
 fi
 
 ready=0
@@ -597,9 +741,15 @@ for ((attempt=1; attempt<=50; attempt++)); do
   fi
   sleep 0.1
 done
-(( ready )) || fail "daemon admin sockets did not become ready at $admin_socket and $tenant_admin_socket; diagnostics: $diag_file"
+if (( ! ready )); then
+  if [[ $OS == Darwin && $service_started -eq 0 ]]; then
+    log "Cygnus is installed; start it with the foreground command above to finish configuration."
+    exit 0
+  fi
+  fail "daemon admin sockets did not become ready at $admin_socket and $tenant_admin_socket; diagnostics: $diag_file"
+fi
 
-"$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
+"$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun --default >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
 "$prefix/cygnus" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "node configuration apply failed; diagnostics: $diag_file"
 
 console_scheme=http
@@ -610,8 +760,12 @@ if [[ $console_listener =~ :([0-9]+)$ ]]; then
   console_port=${BASH_REMATCH[1]}
   [[ $console_port == 80 || $console_port == 443 ]] || console_port_suffix=":$console_port"
 fi
-log "Cygnus is installed and configured. Console URL: ${console_scheme}://cygnus.${apps_domain}${console_port_suffix}"
-log "Bootstrap token: $bootstrap_hex"
-log "Bootstrap token file: $secret_bootstrap_file (hex-encode its 32 bytes to recover the token)"
-log "Next action: log in to the host and deploy with cygnus --admin-socket $admin_socket."
-if [[ -n $https_listen ]]; then log "HTTPS is configured at $https_listen; ACME/DNS provider settings are in $secrets_env."; fi
+if [[ $OS == Darwin && :$PATH: != *:$HOME/.cygnus/bin:* ]]; then
+  log 'Add Cygnus to PATH: export PATH="$HOME/.cygnus/bin:$PATH"'
+fi
+log ""
+log "Cygnus is running."
+log ""
+log "  console   ${console_scheme}://cygnus.${apps_domain}${console_port_suffix}"
+log "  token     $bootstrap_hex   (rotate: install.sh --rotate-secrets)"
+log "  cli       cygnus status"
