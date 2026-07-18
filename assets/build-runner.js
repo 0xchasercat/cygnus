@@ -27,7 +27,16 @@ const STATIC_SERVER_SOURCE =
 const REGISTRY = "https://registry.npmjs.org";
 const HOME = process.env.HOME ?? "/cygnus/home";
 const TMPDIR = process.env.TMPDIR ?? "/cygnus/tmp";
-const PATH = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
+// Framework build scripts commonly shell out to `bun`/`bunx` by name (e.g.
+// "bun x vite build"). Put the running engine's own directory on PATH so those
+// resolve to the same Bun that drives the build — on rooted Linux this is
+// already /usr/local/bin, on rootless macOS it is the host engine dir that
+// would otherwise be absent from PATH.
+const ENGINE_DIR = dirname(process.execPath);
+const BASE_PATH = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
+const PATH = BASE_PATH.split(":").includes(ENGINE_DIR)
+  ? BASE_PATH
+  : `${ENGINE_DIR}:${BASE_PATH}`;
 const STATIC_OUTPUT_DIRECTORIES = Object.freeze([
   "dist",
   "build",

@@ -1134,6 +1134,12 @@ function safeErrorMessage(code, message) {
     // turns a precise explanation into a dead end. Pass them through.
     return message || "request was rejected";
   }
+  // Transport/timeout failures already carry the OS error code (e.g. ENOENT,
+  // ECONNREFUSED) from the admin client — surface it so a broken bridge is
+  // diagnosable instead of an opaque "unavailable".
+  if (code === "transport" || code === "timeout") {
+    return message || "daemon admin bridge unavailable";
+  }
   return "daemon admin bridge unavailable";
 }
 

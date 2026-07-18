@@ -997,6 +997,10 @@ fn serve(
             tenant_admin_socket,
             AdminRole::TenantZero,
         )?);
+        eprintln!(
+            "cygnus-daemon: Tenant Zero admin listening on {}",
+            tenant_admin_socket.display()
+        );
     }
 
     let router = Arc::new(Router::new(RouteTable::new()));
