@@ -2,7 +2,7 @@
   import { store } from '../live.svelte.js';
   import { openApp, go, ui } from '../stores.svelte.js';
   import { relativeTime } from '../time.js';
-  import { rate, percent } from '../fmt.js';
+  import { rate, percent, millis } from '../fmt.js';
   import { eventIcon, eventStyle } from '../events.js';
   import Identicon from '../components/Identicon.svelte';
   import Icon from '../components/Icon.svelte';
@@ -64,9 +64,9 @@
     <div class="cell">
       <span class="label">Revival · p99</span>
       <div class="row">
-        <span class="readout big">{bootP99 == null ? '—' : `${bootP99}`}<span class="unit">ms</span></span>
+        <span class="readout big">{bootP99 == null ? '—' : `${Math.round(bootP99)}`}<span class="unit">ms</span></span>
       </div>
-      <span class="sub num">{bootP50 == null ? 'collecting…' : `p50 ${bootP50} ms · budget ≤ 150`}</span>
+      <span class="sub num">{bootP50 == null ? 'collecting…' : `p50 ${Math.round(bootP50)} ms · budget ≤ 150`}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
@@ -122,7 +122,7 @@
                 {:else if a.lifecycle_state === 'cold'}
                   cold · revives on next request
                 {:else}
-                  {rate(am?.rps_1m ?? 0)} rps · {am ? `${am.p50_ms} ms p50` : '—'}
+                  {rate(am?.rps_1m ?? 0)} rps · {am ? `${millis(am.p50_ms)} p50` : '—'}
                 {/if}
               </span>
               {#if store.appRequestSeries(a.name).some((v) => v > 0)}

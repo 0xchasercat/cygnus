@@ -1,4 +1,5 @@
 <script>
+  import { millis } from '../fmt.js';
   import { store } from '../live.svelte.js';
   import { relativeTime } from '../time.js';
   import { eventIcon, eventStyle } from '../events.js';
@@ -38,7 +39,7 @@
       <div class="legend num">
         <span><i class="sw p50"></i>p50</span>
         <span><i class="sw p99"></i>p99</span>
-        {#if store.metrics}<span class="dim">{store.metrics.totals.p50_ms} / {store.metrics.totals.p99_ms} ms</span>{/if}
+        {#if store.metrics}<span class="dim">{millis(store.metrics.totals.p50_ms)} / {millis(store.metrics.totals.p99_ms)}</span>{/if}
       </div>
     </div>
     <div class="chartwrap">
