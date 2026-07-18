@@ -73,20 +73,7 @@ if (import.meta.main) {
         return handleApi(request, url);
       }
       if (url.pathname === "/healthz") {
-        if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
-        return jsonResponse(
-          {
-            ok: true,
-            service: "cygnus-console",
-            tenant: "tenant-0",
-            mode: adminSocketPath ? "live" : "preview",
-            dataSource: adminSocketPath ? "daemon" : "unavailable",
-            daemonBridge: adminSocketPath ? "configured" : "offline",
-            auth: authStatus(),
-            locked: Boolean(adminSocketPath && !authStatus().configured),
-          },
-          request.method === "HEAD",
-        );
+        return healthResponse(request);
       }
 
       if (url.pathname.startsWith("/api/v1/")) {
@@ -106,21 +93,51 @@ if (import.meta.main) {
   });
 }
 
-export async function handleApi(request, url) {
+export async function healthResponse(request, requestAdmin = adminRequest, socket = adminSocketPath) {
+  if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
+  const auth = authStatus();
+  const value = {
+    ok: true,
+    service: "cygnus-console",
+    tenant: "tenant-0",
+    mode: socket ? "live" : "preview",
+    dataSource: socket ? "daemon" : "unavailable",
+    daemonBridge: socket ? "configured" : "offline",
+    auth,
+    locked: Boolean(socket && !auth.configured),
+    setupRequired: false,
+  };
+  if (socket) {
+    try {
+      const { data } = await requestAdmin(socket, { type: "account_status" });
+      if (typeof data?.configured === "boolean") value.setupRequired = !data.configured;
+    } catch {
+      // Health remains available when the daemon bridge cannot answer.
+    }
+  }
+  return jsonResponse(value, request.method === "HEAD");
+}
+
+export async function handleApi(request, url, requestAdmin = adminRequest, socket = adminSocketPath) {
   const path = url.pathname;
   if (path === "/api/v1/session") {
     if (request.method === "GET" || request.method === "HEAD") {
-      return jsonResponse(sessionStatus(request), request.method === "HEAD");
+      return sessionResponse(request, request.method === "HEAD", requestAdmin, socket);
     }
     if (request.method === "POST") {
       if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
-      return login(request);
+      return login(request, requestAdmin, socket);
     }
     if (request.method === "DELETE") {
       if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
       return logout(request);
     }
     return methodNotAllowed("GET, HEAD, POST, DELETE");
+  }
+  if (path === "/api/v1/setup") {
+    if (request.method !== "POST") return methodNotAllowed("POST");
+    if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
+    return setup(request, requestAdmin, socket);
   }
   if (path === "/api/v1/logout" || path === "/api/v1/session/logout") {
     if (request.method !== "POST") return methodNotAllowed("POST");
@@ -137,7 +154,12 @@ export async function handleApi(request, url) {
     "/api/v1/deploy/chunk",
     "/api/v1/deploy/finish",
   ].includes(path);
-  const mutationRoute = deployUploadRoute || [
+  const dashboardDomainRoute = path === "/api/v1/settings/dashboard-domain";
+  const dashboardTlsRoute = path === "/api/v1/settings/dashboard-tls";
+  const appDomainsRoute = /^\/api\/v1\/apps\/[^/]+\/domains$/u.test(path);
+  const appDomainRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+$/u.test(path);
+  const appDomainTlsRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+\/tls$/u.test(path);
+  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
@@ -147,24 +169,28 @@ export async function handleApi(request, url) {
     || /^\/api\/v1\/(?:metrics|requests|events)$/u.test(path)
     || /^\/api\/v1\/(?:apps|deployments)\/[^/]+\/logs$/u.test(path);
   if (mutationRoute && request.method !== "POST") return methodNotAllowed("POST");
-  if (readRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
+  if (appDomainsRoute && !["GET", "HEAD", "POST"].includes(request.method)) return methodNotAllowed("GET, HEAD, POST");
+  if (appDomainRoute && request.method !== "DELETE") return methodNotAllowed("DELETE");
+  if (appDomainTlsRoute && request.method !== "POST") return methodNotAllowed("POST");
+  if (readRoute && !appDomainsRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
   }
   if (path === "/api/v1/deploy") return apiError(404, "not_found", "API route not found");
-  if (deployUploadRoute) return deployUploadIngress(request, url);
+  if (deployUploadRoute) return deployUploadIngress(request, url, requestAdmin, socket);
 
   const auth = authStatus();
-  if (!auth.configured) {
+  if (!auth.sessionConfigured) {
     return apiError(503, "misconfigured", "console authentication is misconfigured");
   }
   const sessionCookie = request.headers.get("cookie");
-  if (!verifySessionCookie(sessionCookie)) {
+  const session = verifySessionCookie(sessionCookie);
+  if (!session) {
     return apiError(401, "unauthorized", "authentication required");
   }
   if (path === "/api/v1/github/manifest") return manifestStart(request, url, sessionCookie);
-  if (!adminSocketPath) {
+  if (!socket) {
     return apiError(503, "unavailable", "daemon admin bridge unavailable");
   }
 
@@ -179,7 +205,7 @@ export async function handleApi(request, url) {
   if (!command) return apiError(404, "not_found", "API route not found");
 
   try {
-    const { data, requestId } = await adminRequest(adminSocketPath, command, ACTOR_SUBJECT);
+    const { data, requestId } = await requestAdmin(socket, command, session.sub);
     const publicData = path.startsWith("/api/v1/github/") ? sanitizeGithubData(data) : data;
     return jsonResponse({ ok: true, data: publicData, requestId }, request.method === "HEAD");
   } catch (error) {
@@ -190,7 +216,7 @@ export async function handleApi(request, url) {
   }
 }
 
-async function login(request) {
+async function login(request, requestAdmin = adminRequest, socket = adminSocketPath) {
   const ip = requestIp(request);
   const now = Date.now();
   const throttle = loginThrottle(ip, now);
@@ -200,46 +226,67 @@ async function login(request) {
     });
   }
 
-  let token = "";
+  let body;
   try {
-    const body = await readJsonBody(request);
-    assertExactKeys(body, ["token"]);
-    if (typeof body.token !== "string" || body.token.length > 1024) {
-      throw new HttpInputError(422, "validation", "token is invalid");
-    }
-    token = body.token;
+    body = await readJsonBody(request);
   } catch (error) {
-    // Hash an empty value too, keeping malformed and incorrect credentials on the
-    // same comparison path without ever reflecting the submitted secret.
-    constantTimeTokenMatch(token);
-    return apiError(
-      error instanceof HttpInputError ? error.status : 422,
-      error instanceof HttpInputError ? error.code : "validation",
-      error instanceof Error ? error.message : "invalid request",
-    );
+    constantTimeTokenMatch("");
+    return inputErrorResponse(error);
   }
 
-  const validToken = constantTimeTokenMatch(token);
   const auth = authStatus();
-  if (!auth.configured) {
+  if (!auth.sessionConfigured) {
     return apiError(503, "misconfigured", "console authentication is misconfigured");
   }
-  if (!validToken) {
-    const state = recordLoginFailure(ip, now);
-    const headers = state.blocked
-      ? { "retry-after": String(Math.max(1, Math.ceil((state.retryAt - now) / 1000))) }
-      : {};
-    return apiError(401, "unauthorized", "invalid credentials", headers);
+
+  let subject;
+  try {
+    const keys = body && typeof body === "object" && !Array.isArray(body) ? Object.keys(body) : [];
+    if (keys.length === 1 && keys[0] === "token") {
+      assertExactKeys(body, ["token"]);
+      if (typeof body.token !== "string" || body.token.length > 1024) {
+        throw new HttpInputError(422, "validation", "token is invalid");
+      }
+      if (!constantTimeTokenMatch(body.token)) return invalidCredentials(ip, now);
+      subject = ACTOR_SUBJECT;
+    } else {
+      assertExactKeys(body, ["email", "password"]);
+      const email = safeEmail(body.email);
+      const password = safePassword(body.password);
+      if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
+      let verified;
+      try {
+        verified = await requestAdmin(socket, { type: "verify_credentials", email, password });
+      } catch (error) {
+        const code = error instanceof AdminProtocolError ? error.code : "internal";
+        return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code, error instanceof AdminProtocolError ? error.message : undefined));
+      }
+      if (verified?.data?.ok !== true || !safeAccountSubject(verified?.data?.subject)) {
+        return invalidCredentials(ip, now);
+      }
+      subject = verified.data.subject;
+    }
+  } catch (error) {
+    constantTimeTokenMatch("");
+    return inputErrorResponse(error);
   }
 
   loginAttempts.delete(ip);
-  const cookie = signSession();
+  const cookie = signSession({ sub: subject });
   return jsonResponse(
-    { ok: true, data: { authenticated: true, actor: ACTOR_SUBJECT } },
+    { ok: true, data: { authenticated: true, actor: subject } },
     false,
     200,
     { "set-cookie": sessionSetCookie(cookie) },
   );
+}
+
+function invalidCredentials(ip, now) {
+  const state = recordLoginFailure(ip, now);
+  const headers = state.blocked
+    ? { "retry-after": String(Math.max(1, Math.ceil((state.retryAt - now) / 1000))) }
+    : {};
+  return apiError(401, "unauthorized", "invalid credentials", headers);
 }
 
 function logout() {
@@ -251,25 +298,80 @@ function logout() {
   );
 }
 
-function sessionStatus(request) {
+export async function sessionResponse(request, head = false, requestAdmin = adminRequest, socket = adminSocketPath) {
   const auth = authStatus();
   const session = verifySessionCookie(request.headers.get("cookie"));
-  return {
-    ok: true,
-    data: {
-      authenticated: Boolean(session),
-      actor: session ? ACTOR_SUBJECT : undefined,
-      configured: auth.configured,
-      locked: !auth.configured,
-    },
+  const data = {
+    authenticated: Boolean(session),
+    actor: session?.sub,
+    configured: auth.sessionConfigured,
+    locked: !auth.sessionConfigured,
+    setupRequired: false,
   };
+  if (socket) {
+    try {
+      const status = await requestAdmin(socket, { type: "account_status" });
+      if (typeof status?.data?.configured === "boolean") data.setupRequired = !status.data.configured;
+    } catch {
+      // Session authentication state remains useful while the daemon is offline.
+    }
+  }
+  return jsonResponse({ ok: true, data }, head);
+}
+
+export async function setup(request, requestAdmin = adminRequest, socket = adminSocketPath) {
+  if (!authStatus().sessionConfigured) return apiError(503, "misconfigured", "console authentication is misconfigured");
+  if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
+  let body;
+  try {
+    body = await readJsonBody(request);
+    assertExactKeys(body, ["email", "password", "dashboard_domain", "apex_domain", "ssl"]);
+    safeEmail(body.email);
+    safePassword(body.password);
+    safeDomain(body.dashboard_domain);
+    safeDomain(body.apex_domain);
+    if (typeof body.ssl !== "boolean") throw new HttpInputError(422, "validation", "ssl must be a boolean");
+  } catch (error) {
+    return inputErrorResponse(error);
+  }
+
+  try {
+    const status = await requestAdmin(socket, { type: "account_status" });
+    if (status?.data?.configured !== false) return apiError(409, "conflict", "initial account is already configured");
+    const created = await requestAdmin(socket, {
+      type: "create_initial_account",
+      email: body.email,
+      password: body.password,
+    });
+    const subject = created?.data?.subject;
+    if (!safeAccountSubject(subject)) throw new Error("daemon returned an invalid account subject");
+    await requestAdmin(socket, {
+      type: "set_dashboard_domain",
+      domain: body.dashboard_domain,
+      apex: body.apex_domain,
+    }, subject);
+    await requestAdmin(socket, {
+      type: "set_dashboard_tls",
+      mode: body.ssl ? "acme" : "self_signed",
+    }, subject);
+    const cookie = signSession({ sub: subject });
+    return jsonResponse(
+      { ok: true, data: { apex_domain: body.apex_domain, dashboard_domain: body.dashboard_domain } },
+      false,
+      200,
+      { "set-cookie": sessionSetCookie(cookie) },
+    );
+  } catch (error) {
+    const code = error instanceof AdminProtocolError ? error.code : "internal";
+    return apiError(statusForDaemonCode(code), publicDaemonCode(code), safeErrorMessage(code, error instanceof AdminProtocolError ? error.message : undefined));
+  }
 }
 
 export function authStatus() {
   const bootstrap = credential("CYGNUS_CONSOLE_BOOTSTRAP_TOKEN", "CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE");
   const sessionKey = credential("CYGNUS_CONSOLE_SESSION_KEY", "CYGNUS_CONSOLE_SESSION_KEY_FILE");
   return {
-    configured: bootstrap.length > 0 && sessionKey.length > 0,
+    configured: sessionKey.length > 0,
     bootstrapConfigured: bootstrap.length > 0,
     sessionConfigured: sessionKey.length > 0,
   };
@@ -313,7 +415,7 @@ export function verifySessionCookie(cookie, now = Date.now()) {
   }
   if (
     !payload ||
-    payload.sub !== ACTOR_SUBJECT ||
+    (payload.sub !== ACTOR_SUBJECT && !safeAccountSubject(payload.sub)) ||
     !Number.isSafeInteger(payload.iat) ||
     !Number.isSafeInteger(payload.exp) ||
     payload.exp <= payload.iat ||
@@ -371,12 +473,40 @@ export async function commandForRequest(request, url) {
   if (request.method === "GET" || request.method === "HEAD") {
     return commandForRead(url, parts);
   }
+  if (request.method === "DELETE" && parts.length === 6 && parts[2] === "apps" && parts[4] === "domains") {
+    assertQueryKeys(url, []);
+    await assertEmptyBody(request);
+    return removeAppDomainCommand(
+      decodeSegment(parts[3], "app"),
+      decodeDomainSegment(parts[5], "host"),
+    );
+  }
   if (request.method !== "POST") return null;
   if (parts.length === 3 && parts[2] === "map-domain") {
     return mapDomainCommand(await readJsonBody(request));
   }
   if (parts.length === 3 && parts[2] === "rollback") {
     return rollbackCommand(await readJsonBody(request));
+  }
+  if (parts.length === 4 && parts[2] === "settings" && parts[3] === "dashboard-domain") {
+    assertQueryKeys(url, []);
+    return dashboardDomainCommand(await readJsonBody(request));
+  }
+  if (parts.length === 4 && parts[2] === "settings" && parts[3] === "dashboard-tls") {
+    assertQueryKeys(url, []);
+    return dashboardTlsCommand(await readJsonBody(request));
+  }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "domains") {
+    assertQueryKeys(url, []);
+    return addAppDomainCommand(decodeSegment(parts[3], "app"), await readJsonBody(request));
+  }
+  if (parts.length === 7 && parts[2] === "apps" && parts[4] === "domains" && parts[6] === "tls") {
+    assertQueryKeys(url, []);
+    return appDomainTlsCommand(
+      decodeSegment(parts[3], "app"),
+      decodeDomainSegment(parts[5], "host"),
+      await readJsonBody(request),
+    );
   }
   if (parts.length === 4 && parts[2] === "github" && parts[3] === "repositories") {
     return configureRepositoryCommand(await readJsonBody(request));
@@ -391,19 +521,20 @@ export async function commandForRequest(request, url) {
 export async function deployUploadIngress(request, url, requestAdmin = adminRequest, socket = adminSocketPath) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
-  if (!authStatus().configured) return apiError(503, "misconfigured", "console authentication is misconfigured");
-  if (!verifySessionCookie(request.headers.get("cookie"))) return apiError(401, "unauthorized", "authentication required");
+  if (!authStatus().sessionConfigured) return apiError(503, "misconfigured", "console authentication is misconfigured");
+  const session = verifySessionCookie(request.headers.get("cookie"));
+  if (!session) return apiError(401, "unauthorized", "authentication required");
   if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
 
   try {
     if (url.pathname === "/api/v1/deploy/begin") {
       const command = deployUploadBeginCommand(await readJsonBody(request));
-      const result = await requestAdmin(socket, command, ACTOR_SUBJECT);
+      const result = await requestAdmin(socket, command, session.sub);
       return jsonResponse({ ok: true, data: result?.data, requestId: result?.requestId });
     }
     if (url.pathname === "/api/v1/deploy/finish") {
       const command = deployUploadFinishCommand(await readJsonBody(request));
-      const result = await requestAdmin(socket, command, ACTOR_SUBJECT);
+      const result = await requestAdmin(socket, command, session.sub);
       return jsonResponse({ ok: true, data: result?.data, requestId: result?.requestId });
     }
     if (url.pathname === "/api/v1/deploy/chunk") {
@@ -416,7 +547,7 @@ export async function deployUploadIngress(request, url, requestAdmin = adminRequ
           type: "deploy_upload_chunk",
           upload_id: uploadId,
           chunk_base64: chunk.toString("base64"),
-        }, ACTOR_SUBJECT);
+        }, session.sub);
       }
       return jsonResponse({
         ok: true,
@@ -503,6 +634,10 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
       limit: logLimit(url),
     };
   }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "domains") {
+    assertQueryKeys(url, []);
+    return { type: "list_app_domains", app: safeApp(decodeSegment(parts[3], "app")) };
+  }
   if (parts.length === 3 && parts[2] === "deployments") {
     assertQueryKeys(url, ["app", "cursor", "limit"]);
     const app = optionalQuery(url, "app");
@@ -544,6 +679,39 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
     return listDeployJobsCommand(optionalQuery(url, "cursor"), listLimit(url));
   }
   return null;
+}
+
+export function dashboardDomainCommand(body) {
+  assertExactKeys(body, ["domain", "apex"]);
+  return {
+    type: "set_dashboard_domain",
+    domain: nullableDomain(body.domain, "domain"),
+    apex: nullableDomain(body.apex, "apex"),
+  };
+}
+
+export function dashboardTlsCommand(body) {
+  assertExactKeys(body, ["mode"]);
+  return { type: "set_dashboard_tls", mode: safeTlsMode(body.mode) };
+}
+
+export function addAppDomainCommand(app, body) {
+  assertExactKeys(body, ["host"]);
+  return { type: "add_app_domain", app: safeApp(app), host: safeDomain(body.host) };
+}
+
+export function removeAppDomainCommand(app, host) {
+  return { type: "remove_app_domain", app: safeApp(app), host: safeDomain(host) };
+}
+
+export function appDomainTlsCommand(app, host, body) {
+  assertExactKeys(body, ["mode"]);
+  return {
+    type: "set_app_domain_tls",
+    app: safeApp(app),
+    host: safeDomain(host),
+    mode: safeTlsMode(body.mode),
+  };
 }
 
 export function mapDomainCommand(body) {
@@ -698,6 +866,36 @@ function safeDomain(value) {
   }
   return value;
 }
+function nullableDomain(value, name) {
+  if (value === null) return null;
+  try {
+    return safeDomain(value);
+  } catch {
+    throw new HttpInputError(422, "validation", `${name} is invalid`);
+  }
+}
+function safeTlsMode(value) {
+  if (value !== "acme" && value !== "self_signed") {
+    throw new HttpInputError(422, "validation", "mode must be acme or self_signed");
+  }
+  return value;
+}
+function safeEmail(value) {
+  if (typeof value !== "string" || Buffer.byteLength(value) < 1 || Buffer.byteLength(value) > 254 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new HttpInputError(422, "validation", "email is invalid");
+  }
+  return value;
+}
+function safePassword(value) {
+  const bytes = typeof value === "string" ? Buffer.byteLength(value) : 0;
+  if (typeof value !== "string" || bytes < 12 || bytes > 1024 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new HttpInputError(422, "validation", "password is invalid");
+  }
+  return value;
+}
+function safeAccountSubject(value) {
+  return typeof value === "string" && value.length <= MAX_IDENTIFIER_LENGTH && /^account:[1-9]\d*$/u.test(value);
+}
 function safeEntry(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 4096 || value.startsWith("/") || value.includes("\\") || /[\u0000-\u001f\u007f]/u.test(value)) {
     throw new HttpInputError(422, "validation", "entry must be a workspace-relative path");
@@ -762,6 +960,26 @@ function decodeSegment(value, name = "path identifier") {
   }
   if (!decoded || decoded.length > MAX_IDENTIFIER_LENGTH || /[\u0000-\u001f\u007f/\\]/u.test(decoded)) throw new HttpInputError(422, "validation", `${name} is invalid`);
   return decoded;
+}
+function decodeDomainSegment(value, name = "domain") {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    throw new HttpInputError(422, "validation", `${name} is invalid`);
+  }
+  try {
+    return safeDomain(decoded);
+  } catch {
+    throw new HttpInputError(422, "validation", `${name} is invalid`);
+  }
+}
+function inputErrorResponse(error) {
+  return apiError(
+    error instanceof HttpInputError ? error.status : 422,
+    error instanceof HttpInputError ? error.code : "validation",
+    error instanceof Error ? error.message : "invalid request",
+  );
 }
 
 async function readJsonBody(request, maxBytes = MAX_JSON_BODY_BYTES) {

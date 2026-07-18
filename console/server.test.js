@@ -12,24 +12,33 @@ import {
   MAX_JSON_BODY_BYTES,
   MAX_WEBHOOK_BODY_BYTES,
   MAX_WEBHOOK_CHUNK_BYTES,
+  addAppDomainCommand,
+  appDomainTlsCommand,
   buildGithubManifest,
   clearManifestStates,
   commandForRequest,
   configureRepositoryCommand,
   constantTimeTokenMatch,
   consumeManifestState,
+  dashboardDomainCommand,
+  dashboardTlsCommand,
   deployUploadBeginCommand,
   deployUploadChunk,
   deployUploadFinishCommand,
   deployUploadIngress,
   handleApi,
+  healthResponse,
   mapDomainCommand,
+  removeAppDomainCommand,
   rollbackCommand,
+  sessionResponse,
+  setup,
   signSession,
   statusForDaemonCode,
   verifySessionCookie,
   webhookIngress,
 } from "./server.js";
+import { AdminProtocolError } from "./admin-client.js";
 
 const previousBootstrap = process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
 const previousSessionKey = process.env.CYGNUS_CONSOLE_SESSION_KEY;
@@ -82,6 +91,35 @@ describe("console session primitives", () => {
     expect(verifySessionCookie(cookie, 100_000)?.sub).toBe(ACTOR_SUBJECT);
     rmSync(directory, { recursive: true, force: true });
   });
+  test("authenticates account credentials through the daemon and preserves bootstrap recovery", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session-key";
+    const url = new URL("https://console.example/api/v1/session");
+    const commands = [];
+    const requestAdmin = async (socket, command, actor) => {
+      commands.push({ socket, command, actor });
+      if (command.type === "verify_credentials" && command.password === "correct horse battery") {
+        return { data: { ok: true, subject: "account:7" } };
+      }
+      return { data: { ok: false, subject: null } };
+    };
+    const login = (body) => handleApi(new Request(url, {
+      method: "POST",
+      headers: { origin: url.origin, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }), url, requestAdmin, "/admin.sock");
+
+    const account = await login({ email: "admin@example.com", password: "correct horse battery" });
+    expect(account.status).toBe(200);
+    expect(verifySessionCookie(account.headers.get("set-cookie"))?.sub).toBe("account:7");
+    expect(commands).toEqual([{ socket: "/admin.sock", command: { type: "verify_credentials", email: "admin@example.com", password: "correct horse battery" }, actor: undefined }]);
+
+    expect((await login({ email: "admin@example.com", password: "wrong password value" })).status).toBe(401);
+    const recovery = await login({ token: "bootstrap" });
+    expect(recovery.status).toBe(200);
+    expect(verifySessionCookie(recovery.headers.get("set-cookie"))?.sub).toBe(ACTOR_SUBJECT);
+  });
+
   test("sets a signed cookie and bounds repeated failures", async () => {
     process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
     process.env.CYGNUS_CONSOLE_SESSION_KEY = "session-key";
@@ -98,6 +136,75 @@ describe("console session primitives", () => {
       expect((await handleApi(request("wrong"), url)).status).toBe(401);
     }
     expect((await handleApi(request("wrong"), url)).status).toBe(429);
+  });
+});
+
+describe("console first-run setup", () => {
+  test("creates the account, applies dashboard settings, and mints an account session", async () => {
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "setup-session-key";
+    delete process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
+    const url = new URL("https://console.example/api/v1/setup");
+    const calls = [];
+    const requestAdmin = async (socket, command, actor) => {
+      calls.push({ socket, command, actor });
+      if (command.type === "account_status") return { data: { configured: false } };
+      if (command.type === "create_initial_account") return { data: { subject: "account:1" } };
+      return { data: { ok: true } };
+    };
+    const response = await setup(new Request(url, {
+      method: "POST",
+      headers: { origin: url.origin, "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "admin@example.com",
+        password: "correct horse battery staple",
+        dashboard_domain: "dashboard.cygnus.run",
+        apex_domain: "cygnus.run",
+        ssl: true,
+      }),
+    }), requestAdmin, "/admin.sock");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, data: { apex_domain: "cygnus.run", dashboard_domain: "dashboard.cygnus.run" } });
+    expect(verifySessionCookie(response.headers.get("set-cookie"))?.sub).toBe("account:1");
+    expect(calls).toEqual([
+      { socket: "/admin.sock", command: { type: "account_status" }, actor: undefined },
+      { socket: "/admin.sock", command: { type: "create_initial_account", email: "admin@example.com", password: "correct horse battery staple" }, actor: undefined },
+      { socket: "/admin.sock", command: { type: "set_dashboard_domain", domain: "dashboard.cygnus.run", apex: "cygnus.run" }, actor: "account:1" },
+      { socket: "/admin.sock", command: { type: "set_dashboard_tls", mode: "acme" }, actor: "account:1" },
+    ]);
+  });
+
+  test("returns conflict when setup already exists or loses the first-run race", async () => {
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "setup-session-key";
+    const url = new URL("https://console.example/api/v1/setup");
+    const request = () => new Request(url, {
+      method: "POST",
+      headers: { origin: url.origin, "content-type": "application/json" },
+      body: JSON.stringify({ email: "admin@example.com", password: "correct horse battery staple", dashboard_domain: "dashboard.cygnus.run", apex_domain: "cygnus.run", ssl: false }),
+    });
+    const configured = await setup(request(), async () => ({ data: { configured: true } }), "/admin.sock");
+    expect(configured.status).toBe(409);
+
+    let calls = 0;
+    const raced = await setup(request(), async (_socket, command) => {
+      calls += 1;
+      if (command.type === "account_status") return { data: { configured: false } };
+      throw new AdminProtocolError("initial account setup has already been completed", "conflict");
+    }, "/admin.sock");
+    expect(calls).toBe(2);
+    expect(raced.status).toBe(409);
+  });
+
+  test("reports setupRequired on health and session, including HEAD", async () => {
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "setup-session-key";
+    const requestAdmin = async () => ({ data: { configured: false } });
+    const health = await healthResponse(new Request("https://console.example/healthz"), requestAdmin, "/admin.sock");
+    expect((await health.json()).setupRequired).toBe(true);
+    const session = await sessionResponse(new Request("https://console.example/api/v1/session"), false, requestAdmin, "/admin.sock");
+    expect((await session.json()).data.setupRequired).toBe(true);
+    const head = await sessionResponse(new Request("https://console.example/api/v1/session", { method: "HEAD" }), true, async () => ({ data: { configured: true } }), "/admin.sock");
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
   });
 });
 
@@ -203,6 +310,54 @@ describe("console request validation", () => {
     await expect(command("/api/v1/metrics?limit=1")).rejects.toThrow("query contains unsupported fields");
     await expect(command("/api/v1/requests?cursor=next")).rejects.toThrow("query contains unsupported fields");
     await expect(command("/api/v1/apps/demo/logs?stream=stdout&cursor=next")).rejects.toThrow("query contains unsupported fields");
+  });
+
+  test("maps dashboard and app-domain routes to exact admin commands", async () => {
+    const command = async (path, method = "GET", body) => {
+      const url = new URL(`https://console.example${path}`);
+      const request = new Request(url, {
+        method,
+        ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+      });
+      return commandForRequest(request, url);
+    };
+
+    expect(await command("/api/v1/settings/dashboard-domain", "POST", { domain: "dashboard.cygnus.run", apex: "cygnus.run" })).toEqual({ type: "set_dashboard_domain", domain: "dashboard.cygnus.run", apex: "cygnus.run" });
+    expect(await command("/api/v1/settings/dashboard-tls", "POST", { mode: "acme" })).toEqual({ type: "set_dashboard_tls", mode: "acme" });
+    expect(await command("/api/v1/apps/demo/domains")).toEqual({ type: "list_app_domains", app: "demo" });
+    expect(await command("/api/v1/apps/demo/domains", "POST", { host: "www.example.com" })).toEqual({ type: "add_app_domain", app: "demo", host: "www.example.com" });
+    expect(await command("/api/v1/apps/demo/domains/www.example.com", "DELETE")).toEqual({ type: "remove_app_domain", app: "demo", host: "www.example.com" });
+    expect(await command("/api/v1/apps/demo/domains/www.example.com/tls", "POST", { mode: "self_signed" })).toEqual({ type: "set_app_domain_tls", app: "demo", host: "www.example.com", mode: "self_signed" });
+    expect(await command("/api/v1/apps/demo/domains/www%2Eexample%2Ecom/tls", "POST", { mode: "acme" })).toEqual({ type: "set_app_domain_tls", app: "demo", host: "www.example.com", mode: "acme" });
+  });
+
+  test("strictly validates domain lifecycle inputs and empty deletes", async () => {
+    expect(() => dashboardDomainCommand({ domain: "dashboard.example.com", apex: "example.com", extra: true })).toThrow("unsupported fields");
+    expect(() => dashboardTlsCommand({ mode: "auto" })).toThrow("acme or self_signed");
+    expect(() => addAppDomainCommand("../demo", { host: "www.example.com" })).toThrow("app is invalid");
+    expect(() => removeAppDomainCommand("demo", "https://example.com")).toThrow("domain is invalid");
+    expect(() => appDomainTlsCommand("demo", "www.example.com", { mode: "off" })).toThrow("acme or self_signed");
+
+    const url = new URL("https://console.example/api/v1/apps/demo/domains/www.example.com");
+    await expect(commandForRequest(new Request(url, { method: "DELETE", body: "x" }), url)).rejects.toThrow("body must be empty");
+    const encodedSlash = new URL("https://console.example/api/v1/apps/demo/domains/www%2Fexample.com");
+    await expect(commandForRequest(new Request(encodedSlash, { method: "DELETE" }), encodedSlash)).rejects.toThrow("host is invalid");
+  });
+
+  test("enforces methods and same origin for authenticated domain mutations", async () => {
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session-key";
+    const getSettings = new URL("https://console.example/api/v1/settings/dashboard-domain");
+    const wrongMethod = await handleApi(new Request(getSettings), getSettings, async () => { throw new Error("not called"); }, "/admin.sock");
+    expect(wrongMethod.status).toBe(405);
+    expect(wrongMethod.headers.get("allow")).toBe("POST");
+
+    const add = new URL("https://console.example/api/v1/apps/demo/domains");
+    const crossOrigin = await handleApi(new Request(add, {
+      method: "POST",
+      headers: { origin: "https://evil.example", cookie: signSession(), "content-type": "application/json" },
+      body: JSON.stringify({ host: "www.example.com" }),
+    }), add, async () => { throw new Error("not called"); }, "/admin.sock");
+    expect(crossOrigin.status).toBe(403);
   });
 
   test("builds exact public manifest and consumes session-bound state once", async () => {
