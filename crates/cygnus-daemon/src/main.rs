@@ -1158,6 +1158,12 @@ fn route_table(snapshot: &Snapshot) -> RouteTable {
     routes
 }
 
+/// Application edge / ingress HTTP address. Always bound; this is the public
+/// reverse-proxy port that routes by Host header to app UNIX sockets.
+fn edge_http_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 80))
+}
+
 fn serve(
     state_path: &Path,
     admin_socket: &Path,
@@ -1169,12 +1175,45 @@ fn serve(
     let state = State::open(state_path)?;
     let mut snapshot = state.load()?;
     drop(state);
-    let https_listener = snapshot
-        .edge
-        .https_listen
+    // HTTPS edge: explicit https_listen wins; ACME mode defaults to :443 so
+    // setup-wizard SSL opens a real TLS listener without a separate flag.
+    let https_bind = snapshot.edge.https_listen.or_else(|| {
+        if snapshot.edge.ssl_mode == SslMode::Acme {
+            Some(SocketAddr::from(([0, 0, 0, 0], 443)))
+        } else {
+            None
+        }
+    });
+    let https_listener = https_bind
         .map(TcpListener::bind)
-        .transpose()?;
-    let listener = TcpListener::bind(snapshot.listen)?;
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "failed to bind HTTPS ingress on {https_bind:?}: {error}. \
+                 Cygnus must run with permission to bind port 443 (e.g. as root)."
+            )
+        })?;
+    // Edge ingress is mandatory on :80. No fallback to the management port —
+    // without this bind Cygnus is not an edge router.
+    let edge_addr = edge_http_listen();
+    let edge_listener = TcpListener::bind(edge_addr).map_err(|error| {
+        format!(
+            "failed to bind application ingress on {edge_addr}: {error}. \
+             Cygnus must run with permission to bind port 80 (e.g. as root)."
+        )
+    })?;
+    // Management / dashboard listener (typically :3000). Same Frontend and
+    // host-based router as the edge; only omitted when already covered by :80.
+    let management_listener = if snapshot.listen.port() == 80 {
+        None
+    } else {
+        Some(TcpListener::bind(snapshot.listen).map_err(|error| {
+            format!(
+                "failed to bind management listener on {}: {error}",
+                snapshot.listen
+            )
+        })?)
+    };
     if admin_socket == tenant_admin_socket {
         return Err("host and Tenant Zero admin sockets must be distinct".into());
     }
@@ -1257,17 +1296,31 @@ fn serve(
     let frontend = Arc::new(
         Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)).with_metrics(metrics.clone()),
     );
-    let http_address = local_addr(&listener);
-    let http_frontend = Arc::clone(&frontend);
-    let http_shutdown = Arc::clone(&shutdown);
-    let http_failure = Arc::clone(&shutdown);
-    eprintln!("cygnus-daemon: HTTP listening on {http_address}");
-    let http_thread = thread::spawn(move || {
-        let result = http_frontend.serve_until(listener, &http_shutdown);
+    let edge_address = local_addr(&edge_listener);
+    let edge_frontend = Arc::clone(&frontend);
+    let edge_shutdown = Arc::clone(&shutdown);
+    let edge_failure = Arc::clone(&shutdown);
+    eprintln!("cygnus-daemon: edge HTTP listening on {edge_address}");
+    let edge_thread = thread::spawn(move || {
+        let result = edge_frontend.serve_until(edge_listener, &edge_shutdown);
         if result.is_err() {
-            http_failure.store(true, Ordering::Release);
+            edge_failure.store(true, Ordering::Release);
         }
         result
+    });
+    let management_thread = management_listener.map(|listener| {
+        let address = local_addr(&listener);
+        let front = Arc::clone(&frontend);
+        let stop = Arc::clone(&shutdown);
+        let fail = Arc::clone(&shutdown);
+        eprintln!("cygnus-daemon: management HTTP listening on {address}");
+        thread::spawn(move || {
+            let result = front.serve_until(listener, &stop);
+            if result.is_err() {
+                fail.store(true, Ordering::Release);
+            }
+            result
+        })
     });
     let http01_challenges = frontend.http01_challenges();
     if https_listener.is_some() {
@@ -1412,9 +1465,14 @@ fn serve(
         thread::sleep(Duration::from_millis(100));
     }
     shutdown.store(true, Ordering::Release);
-    let http_result = http_thread
+    let edge_result = edge_thread
         .join()
-        .map_err(|_| io::Error::other("HTTP server thread panicked"))?;
+        .map_err(|_| io::Error::other("edge HTTP server thread panicked"))?;
+    if let Some(thread) = management_thread {
+        thread
+            .join()
+            .map_err(|_| io::Error::other("management HTTP server thread panicked"))??;
+    }
     let admin_result = admin_thread
         .join()
         .map_err(|_| io::Error::other("admin server thread panicked"))?;
@@ -1439,10 +1497,11 @@ fn serve(
     if let Some(result) = tls_result {
         result?;
     }
-    http_result?;
+    edge_result?;
     admin_result?;
     Ok(())
 }
+
 fn system_domain_audit(host: &str, command: &str) -> AuditContext {
     let mut digest = Sha256::new();
     digest.update(command.as_bytes());

@@ -583,7 +583,8 @@ impl Theme {
             ),
         );
         kv(&mut out, "isolation", &node.isolation);
-        kv(&mut out, "listener", &node.listen);
+        kv(&mut out, "edge", "0.0.0.0:80");
+        kv(&mut out, "management", &node.listen);
         if let Some(https) = node.https_listen.as_deref() {
             kv(&mut out, "https", https);
         }

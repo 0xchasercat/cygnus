@@ -61,7 +61,7 @@ Options:
   --config-dir DIR       Configuration/secrets destination (Linux: /etc/cygnus; macOS: ~/.cygnus/etc)
   --state-dir DIR        Durable state/artifacts destination (Linux: /var/lib/cygnus; macOS: ~/.cygnus/state)
   --runtime-dir DIR      Runtime sockets destination (Linux: /run/cygnus; macOS: ~/.cygnus/run)
-  --listen ADDR          HTTP listener (default: 127.0.0.1:3000)
+  --listen ADDR          Management/dashboard HTTP listener (default: 0.0.0.0:3000 Linux, 127.0.0.1:3000 macOS). Application ingress always binds :80.
   --https-listen ADDR    Optional HTTPS listener (default: disabled)
   --apps-domain DOMAIN   Default application domain (default: apps.localhost)
   --acme-email EMAIL     ACME account email (optional unless HTTPS is enabled)
