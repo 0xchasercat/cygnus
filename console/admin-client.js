@@ -2,7 +2,10 @@ import { randomBytes } from "node:crypto";
 
 export const ADMIN_PROTOCOL_VERSION = 1;
 export const MAX_ADMIN_FRAME_BYTES = 64 * 1024;
-const ADMIN_TIMEOUT_MS = 5_000;
+// Deploy builds and large upload finishes can take longer than a UI poll.
+// Keep the default short enough to surface dead daemons quickly, but well
+// above a busy SQLite busy_timeout (5s) so concurrent admin traffic survives.
+const ADMIN_TIMEOUT_MS = 30_000;
 
 export class AdminProtocolError extends Error {
   constructor(message, code = "transport") {

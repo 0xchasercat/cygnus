@@ -51,7 +51,7 @@ pub trait AdminHandler: Send + Sync + 'static {
     ) -> AdminResponse;
 }
 
-pub const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_ADMIN_WORKERS: usize = 4;
 pub const DEFAULT_ADMIN_QUEUE_CAPACITY: usize = 64;
 pub const MAX_ADMIN_ACTOR_BYTES: usize = 128;

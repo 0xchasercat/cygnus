@@ -917,6 +917,10 @@ pub struct State {
     certificate_store: CertificateStore,
     node_key: [u8; NODE_KEY_LEN],
     state_root: PathBuf,
+    /// Absolute path to the SQLite database file. Used by long-running deploy
+    /// workers to drop and re-open the connection around the build phase so
+    /// dashboard admin polls are not blocked for the entire build duration.
+    db_path: PathBuf,
 }
 
 impl State {
@@ -979,17 +983,47 @@ impl State {
             version = next;
         }
         connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let db_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         Ok(Self {
             connection,
             certificate_store,
             node_key,
             state_root,
+            db_path,
         })
     }
 
     /// Canonical parent directory that owns daemon state and deployment data.
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    /// Absolute path to the on-disk SQLite database.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Release the on-disk SQLite connection (and its locks) while keeping the
+    /// rest of `State` identity. Used by long-running deploy builds so admin
+    /// polls can open the database without waiting on the build worker.
+    ///
+    /// Call [`State::unpark`] before any further state method.
+    pub fn park(&mut self) -> Result<(), StateError> {
+        // Best-effort checkpoint so readers see committed work; ignore errors
+        // from concurrent checkpoints.
+        let _ = self
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+        // Opening an in-memory database replaces the file-backed connection
+        // and drops its file descriptors / locks.
+        self.connection = Connection::open_in_memory()?;
+        Ok(())
+    }
+
+    /// Re-open the on-disk database after [`State::park`].
+    pub fn unpark(&mut self) -> Result<(), StateError> {
+        *self = Self::open(&self.db_path)?;
+        Ok(())
     }
 
     /// Report whether the node has an account configured for password authentication.

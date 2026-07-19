@@ -548,6 +548,22 @@ where
             error.to_string(),
         ));
     }
+
+    // Drop the SQLite connection for the entire cage build. The worker otherwise
+    // holds the database open (and, on some paths, write locks) for the full
+    // install+compile duration, which makes dashboard admin polls time out with
+    // "daemon admin request timed out". Re-open after the build finishes.
+    if let Err(error) = state.park() {
+        return Err(fail_build(
+            state,
+            &artifact_root,
+            &building,
+            &log_path,
+            &deployment_id,
+            format!("could not park state during build: {error}"),
+        ));
+    }
+
     let result = (|| {
         let publish = PublishDir::create(
             &artifact_root,
@@ -570,14 +586,11 @@ where
                     error.to_string().as_bytes(),
                 )?;
                 publish.close()?;
-                return Err(fail_build(
-                    state,
-                    &artifact_root,
-                    &building,
-                    &log_path,
-                    &deployment_id,
-                    format!("Bun build pipeline cage could not start: {error}"),
-                ));
+                return Err(DeployError::BuildFailed {
+                    id: deployment_id.clone(),
+                    detail: format!("Bun build pipeline cage could not start: {error}"),
+                    logs: log_path.clone(),
+                });
             }
         };
         if !job_result.success() {
@@ -594,14 +607,11 @@ where
                 }
             };
             publish.close()?;
-            return Err(fail_build(
-                state,
-                &artifact_root,
-                &building,
-                &log_path,
-                &deployment_id,
+            return Err(DeployError::BuildFailed {
+                id: deployment_id.clone(),
                 detail,
-            ));
+                logs: log_path.clone(),
+            });
         }
 
         let staging_result = (|| {
@@ -671,6 +681,13 @@ where
         publish_or_reuse(&building, &final_path, &artifact_hash, &metadata_json)?;
         let _ = remove_work(&artifact_root, &deployment_id);
 
+        // Re-open the database before seal/activate so admin traffic can resume
+        // concurrent access under WAL and we hold a live connection again.
+        state.unpark().map_err(|error| DeployError::ActivationFailed {
+            id: deployment_id.clone(),
+            detail: format!("could not reopen state after build: {error}"),
+        })?;
+
         let artifact = ArtifactInput {
             app: request.app.clone(),
             source_hash: source_hash.clone(),
@@ -724,11 +741,29 @@ where
         })
     })();
 
+    // Always restore a live DB connection before returning so callers can
+    // still mark jobs failed / finish queue rows.
+    if let Err(error) = state.unpark() {
+        // Prefer the original build/activation error if both failed.
+        if result.is_ok() {
+            return Err(DeployError::ActivationFailed {
+                id: deployment_id,
+                detail: format!("could not reopen state after build: {error}"),
+            });
+        }
+    }
+
     match result {
         Ok(result) => Ok(result),
-        Err(error @ (DeployError::BuildFailed { .. } | DeployError::ActivationFailed { .. })) => {
-            Err(error)
-        }
+        Err(error @ DeployError::ActivationFailed { .. }) => Err(error),
+        Err(DeployError::BuildFailed { id, detail, logs }) => Err(fail_build(
+            state,
+            &artifact_root,
+            &building,
+            &logs,
+            &id,
+            detail,
+        )),
         Err(error) => {
             let detail = error.to_string();
             Err(fail_build(
