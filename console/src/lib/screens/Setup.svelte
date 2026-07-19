@@ -116,7 +116,7 @@
       password,
       dashboardDomain: dash,
       apexDomain: effectiveApex,
-      ssl: sslAuto ? 'acme' : 'self_signed',
+      ssl: sslAuto,
     });
     submitting = false;
     if (!r.ok) {
@@ -130,7 +130,7 @@
   }
 
   function onKeydown(e) {
-    if (e.key === 'Enter' && step === 0 && adminValid) {
+    if (e.key === 'Enter' && adminValid) {
       e.preventDefault();
       nextFromAdmin();
     }
@@ -160,12 +160,13 @@
     {#if step === 0}
       <div class="body screen-enter">
         <p class="lede">You're the first person here. Create the admin account that owns this node — there's only one, and it's all you need.</p>
-        <form class="form" onsubmit={(e) => { e.preventDefault(); nextFromAdmin(); }} onkeydown={onKeydown}>
+        <form class="form" onsubmit={(e) => { e.preventDefault(); nextFromAdmin(); }}>
           <label for="su-email">Admin email
             <input
               id="su-email"
               bind:this={emailEl}
               bind:value={email}
+              onkeydown={onKeydown}
               type="email"
               autocomplete="email"
               autocapitalize="off"
@@ -337,7 +338,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 10px;
+    gap: 14px;
     margin: 22px 0 20px;
   }
   .seg {
@@ -347,6 +348,7 @@
     color: var(--ink-4);
     transition: color 0.18s ease;
   }
+  .seg-label { font-size: 11.5px; font-weight: 500; white-space: nowrap; }
   .seg-bar {
     width: 22px;
     height: 2px;
@@ -355,7 +357,6 @@
     transition: background 0.18s ease;
   }
   .seg-num { font-size: 11px; font-weight: 600; }
-  .seg-label { font-size: 11.5px; font-weight: 500; }
   .seg.done { color: var(--ink-3); }
   .seg.done .seg-bar { background: var(--ink-3); }
   .seg.on { color: var(--ink); }

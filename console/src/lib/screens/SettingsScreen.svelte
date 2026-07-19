@@ -367,6 +367,7 @@
                 class="toggle {sslAuto ? 'on' : ''}"
                 onclick={toggleDashboardTls}
                 aria-pressed={sslAuto}
+                aria-label={sslAuto ? 'Disable automatic HTTPS' : 'Enable automatic HTTPS'}
                 disabled={tlsBusy}
               >
                 <span class="track"><span class="thumb"></span></span>

@@ -154,7 +154,7 @@ class Store {
     const fetchGithub = this.#tick % GITHUB_EVERY === 0;
 
     const reads = [
-      this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node)),
+      this.#safeGet('/api/v1/status', (d) => (this.node = d ?? this.node)),
       this.#safeGet('/api/v1/apps?limit=50', (d) => (this.apps = Array.isArray(d?.apps) ? d.apps : [])),
       this.#safeGet('/api/v1/deployments?limit=50', (d) => (this.deployments = Array.isArray(d?.deployments) ? d.deployments : [])),
       this.#safeGet('/api/v1/metrics', (d) => (this.metrics = d ?? null), true),
@@ -220,7 +220,7 @@ class Store {
         password,
         dashboard_domain: dashboardDomain || '',
         apex_domain: apexDomain || '',
-        ssl: ssl || 'acme',
+        ssl,
       });
       this.auth = 'ready';
       this.start();
