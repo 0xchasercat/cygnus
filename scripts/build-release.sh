@@ -226,7 +226,15 @@ if [[ $target == *-linux-* ]]; then
   else
     fail "unsupported Linux target for static init: $target"
   fi
-  CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$init_target" \
+  # Prefer musl-gcc when present so the link is truly static; fall back to
+  # cargo's default linker for fixture builds that never invoke a real rustc.
+  init_env=(CARGO_TARGET_DIR="$cargo_target_dir")
+  if command -v musl-gcc >/dev/null 2>&1; then
+    # Convert x86_64-unknown-linux-musl -> CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+    init_linker_var=CARGO_TARGET_$(printf '%s' "$init_target" | tr 'a-z-' 'A-Z_')_LINKER
+    init_env+=("$init_linker_var=musl-gcc")
+  fi
+  env "${init_env[@]}" "$cargo_bin" build --release --locked --target "$init_target" \
     --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-init --bin cygnus-init
 fi
 
