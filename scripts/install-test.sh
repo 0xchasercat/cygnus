@@ -137,6 +137,21 @@ run_install >"$ROOT/install-output" 2>&1
 [[ -L $ROOT/usr/local/bin/cygnusctl ]] || { echo 'cygnusctl compatibility symlink missing' >&2; exit 1; }
 [[ $(readlink "$ROOT/usr/local/bin/cygnusctl") == cygnus ]] || { echo 'cygnusctl symlink does not point at cygnus' >&2; exit 1; }
 [[ -x $ROOT/var/lib/cygnus/engines/bun-1.3.14/usr/local/bin/bun && -x $ROOT/var/lib/cygnus/engines/bun-1.3.14/usr/local/bin/cygnus-init ]] || { echo 'engine lowerdir missing executable/init' >&2; exit 1; }
+# The hostlib lowerdir carries the dynamic loader and the glibc libraries bun
+# depends on. Without it the cage's execve would fail with ENOENT for the
+# loader; that regression used to ship and was caught only by smoke-testing on
+# a live host, so we now assert the artifacts landed.
+case "$(uname -m)" in
+  x86_64) hostlib_loader_rel=lib64/ld-linux-x86-64.so.2; hostlib_lib_dir_rel=lib/x86_64-linux-gnu ;;
+  aarch64) hostlib_loader_rel=lib64/ld-linux-aarch64.so.1; hostlib_lib_dir_rel=lib/aarch64-linux-gnu ;;
+  *) hostlib_loader_rel=; hostlib_lib_dir_rel= ;;
+esac
+if [[ -n $hostlib_loader_rel ]]; then
+  [[ -f $ROOT/var/lib/cygnus/hostlib/$hostlib_loader_rel ]] || { echo "hostlib missing loader: $hostlib_loader_rel" >&2; exit 1; }
+  for lib in libc.so.6 libpthread.so.0 libdl.so.2 libm.so.6 libgcc_s.so.1 libstdc++.so.6; do
+    [[ -f $ROOT/var/lib/cygnus/hostlib/$hostlib_lib_dir_rel/$lib ]] || { echo "hostlib missing library: $lib" >&2; exit 1; }
+  done
+fi
 [[ -f $ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js ]] || { echo 'console server missing from lowerdir' >&2; exit 1; }
 [[ -f $ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/admin-client.js ]] || { echo 'console admin client missing from lowerdir' >&2; exit 1; }
 [[ -f $ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/dist/index.html ]] || { echo 'console dist missing from lowerdir' >&2; exit 1; }
@@ -171,7 +186,7 @@ assert app["env"]["CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE"] == "/cygnus/secrets/boo
 assert app["env"]["CYGNUS_CONSOLE_SESSION_KEY_FILE"] == "/cygnus/secrets/session.key"
 assert "CYGNUS_CONSOLE_BOOTSTRAP_TOKEN" not in app["env"]
 assert "CYGNUS_CONSOLE_SESSION_KEY" not in app["env"]
-assert app["rootfs"]["lowerdirs"] == [str(root / "var/lib/cygnus/engines/bun-1.3.14"), str(root / "var/lib/cygnus/artifacts/tenant-0"), str(root / "var/lib/cygnus/artifacts/tenant-0-secrets")]
+assert app["rootfs"]["lowerdirs"] == [str(root / "var/lib/cygnus/hostlib"), str(root / "var/lib/cygnus/engines/bun-1.3.14"), str(root / "var/lib/cygnus/artifacts/tenant-0"), str(root / "var/lib/cygnus/artifacts/tenant-0-secrets")]
 secret_root = root / "var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets"
 assert secret_root.joinpath("bootstrap.token").stat().st_mode & 0o777 == 0o600
 assert secret_root.joinpath("session.key").stat().st_mode & 0o777 == 0o600

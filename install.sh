@@ -51,7 +51,9 @@ usage() {
 Usage: install.sh [options]
 
 Install Cygnus. By default, this downloads the latest release from GitHub for your
-architecture. Interactive installs prompt for values not supplied on the command line.
+architecture. The listen address, HTTPS listener, application domain, ACME email,
+and DNS provider are not prompted at install time; configure them after install
+through the Cygnus dashboard (or pass the matching flags to override here).
 
 Options:
   --bundle-dir DIR       Install from a local bundle instead of downloading
@@ -65,7 +67,8 @@ Options:
   --acme-email EMAIL     ACME account email (optional unless HTTPS is enabled)
   --dns-provider NAME    DNS provider (default: none)
   --bun-version VERSION  Registered Bun engine version (default: bundled)
-  --noninteractive       Never prompt; fail when required input is absent
+  --noninteractive       Reserved for compatibility; the installer never prompts
+                         for network/domain values (they are dashboard-managed).
   --reconfigure          Permit replacing changed config/service files
   --rotate-secrets       Generate and atomically install new console secrets
   -h, --help             Show this help
@@ -190,34 +193,14 @@ fi
 # box by IP lands on the login screen.
 if [[ $OS == Linux ]]; then default_listen=0.0.0.0:3000; else default_listen=127.0.0.1:3000; fi
 
-# `curl | bash` leaves stdin bound to the piped script, so the wizard would
-# never see a terminal. Read prompts straight from the controlling terminal
-# (/dev/tty) when one exists — the trick rustup and Homebrew use — so a piped
-# install is still interactive. With no terminal at all (cloud-init, CI), fall
-# back to reachable defaults instead of prompting.
-tty_in=""
-if (( ! noninteractive )); then
-  if [[ -t 0 ]]; then
-    tty_in=/dev/stdin
-  elif [[ -r /dev/tty ]]; then
-    tty_in=/dev/tty
-  fi
-fi
-prompt() {
-  local message=$1 default=$2 answer=""
-  if [[ -n $tty_in ]]; then
-    printf '%s' "$message" >&2
-    IFS= read -r answer <"$tty_in" || answer=""
-  fi
-  printf '%s' "${answer:-$default}"
-}
-[[ -n $listen ]] || listen=$(prompt "HTTP listen address [$default_listen]: " "$default_listen")
-if [[ -z $https_listen && $https_set -eq 0 ]]; then
-  https_listen=$(prompt 'HTTPS listen address [disabled]: ' '')
-fi
-[[ -n $apps_domain ]] || apps_domain=$(prompt 'Applications domain [apps.localhost]: ' 'apps.localhost')
-[[ -n $acme_email ]] || acme_email=$(prompt 'ACME email [optional]: ' '')
-[[ -n $dns_provider ]] || dns_provider=$(prompt 'DNS provider [none]: ' 'none')
+# Network and domain defaults are baked in here; the operator can override any
+# of them via the matching flag. Configuration is dashboard-driven post-install,
+# so the installer never prompts for these values, even in interactive mode.
+[[ -n $listen ]] || listen=$default_listen
+[[ -n $apps_domain ]] || apps_domain=apps.localhost
+[[ -n $dns_provider ]] || dns_provider=none
+# https_listen and acme_email are intentionally left empty when not set on the
+# command line; the dashboard owns them after install.
 
 if [[ -n $bundle_dir && $bundle_dir != /* ]]; then
   [[ $bundle_dir != .. && $bundle_dir != ../* && $bundle_dir != */../* && $bundle_dir != */.. ]] || fail "bundle path traversal is not allowed"
@@ -422,6 +405,17 @@ else
   secret_session_file=$secret_root/cygnus/secrets/session.key
   secret_bootstrap_path=/cygnus/secrets/bootstrap.token
   secret_session_path=/cygnus/secrets/session.key
+  # The cage overlay rootfs only carries engine + console + secrets, so the
+  # dynamic linker and glibc that `bun` needs must be staged as a dedicated
+  # lowerdir. cygnus-init is statically linked with musl (see build-release.sh)
+  # so this lowerdir is only responsible for satisfying the engine binary's
+  # dynamic dependencies, not for cygnus-init's.
+  hostlib_root=$state_dir/hostlib
+  case $(uname -m) in
+    x86_64) hostlib_loader=/lib64/ld-linux-x86-64.so.2; hostlib_lib_dir=/lib/x86_64-linux-gnu ;;
+    aarch64) hostlib_loader=/lib64/ld-linux-aarch64.so.1; hostlib_lib_dir=/lib/aarch64-linux-gnu ;;
+    *) fail "unsupported architecture for host lib staging: $(uname -m)" ;;
+  esac
 fi
 
 json_safe_string() {
@@ -481,6 +475,10 @@ json_console_domain=$(json_safe_string "cygnus.$apps_domain")
 json_engine_root=$(json_safe_string "$engine_root")
 json_console_root=$(json_safe_string "$console_root")
 json_secret_root=$(json_safe_string "$secret_root")
+# hostlib_root is only populated on Linux (the cage lowerdir that supplies the
+# dynamic loader and glibc). On Darwin the cage shares the host filesystem,
+# so this variable is unset and the JSON field is omitted.
+json_hostlib_root=$(json_safe_string "${hostlib_root:-}")
 json_console_upstream=$(json_safe_string "$console_socket")
 json_secret_bootstrap_path=$(json_safe_string "$secret_bootstrap_path")
 json_secret_session_path=$(json_safe_string "$secret_session_path")
@@ -499,8 +497,8 @@ if [[ $OS == Darwin ]]; then
   printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"%s","args":["%s"],"env":{"CYGNUS_SOCKET":"%s","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"lifecycle":{"min_instances":1}}]}\n' \
     "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_command" "$json_console_script" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" >"$stage/node.json"
 else
-  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
-    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" "$json_engine_root" "$json_console_root" "$json_secret_root" >"$stage/node.json"
+  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
+    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" "$json_hostlib_root" "$json_engine_root" "$json_console_root" "$json_secret_root" >"$stage/node.json"
 fi
 printf '%s\n' \
   '# Cygnus console credentials; keep this file mode 0600.' \
@@ -799,6 +797,69 @@ if (( engine_needs_install )); then
     fail "unable to install engine root atomically"
   fi
   [[ -n $old_engine ]] && rm -rf -- "$old_engine"
+fi
+
+# Stage a curated snapshot of the host glibc so the cage overlay's loader and
+# libraries are deterministic and don't change when the host's package manager
+# upgrades. This is the only lowerdir that is allowed to vary across hosts;
+# the engine and console layers are reproducible from the bundle.
+stage_hostlib() {
+  local stage=$1
+  # Loader may be a symlink on Ubuntu/Debian merged-usr layouts; cp -L below
+  # resolves it to the real file before copying.
+  [[ -e $hostlib_loader ]] || fail "host loader is missing: $hostlib_loader"
+  [[ -d $hostlib_lib_dir && ! -L $hostlib_lib_dir ]] || fail "host lib dir is not a real directory: $hostlib_lib_dir"
+  mkdir -p "$stage/lib64" "$stage/$hostlib_lib_dir"
+  chmod 0755 "$stage" "$stage/lib64" "$stage/$hostlib_lib_dir"
+  cp -L -- "$hostlib_loader" "$stage/lib64/$(basename -- "$hostlib_loader")"
+  chmod 0755 "$stage/lib64/$(basename -- "$hostlib_loader")"
+  # The exact set bun depends on; verified on a clean Ubuntu 24.04 host for
+  # the glibc Bun build. Future Bun releases that pull in additional libs
+  # would surface here as ENOENT at execve time.
+  local libs=(
+    libc.so.6
+    libpthread.so.0
+    libdl.so.2
+    libm.so.6
+    libgcc_s.so.1
+    libstdc++.so.6
+  )
+  local lib src
+  for lib in "${libs[@]}"; do
+    src=$hostlib_lib_dir/$lib
+    [[ -e $src ]] || fail "required host library is missing: $src"
+    # Most libs are direct files; some distros ship libstdc++.so.6 as a
+    # versioned symlink. cp -L resolves to the real file in either case.
+    cp -L -- "$src" "$stage/$hostlib_lib_dir/$lib"
+    chmod 0755 "$stage/$hostlib_lib_dir/$lib"
+  done
+}
+if [[ $OS == Linux ]]; then
+  hostlib_stage=$stage/hostlib
+  rm -rf -- "$hostlib_stage"
+  stage_hostlib "$hostlib_stage"
+  # Always replace atomically: the hostlib is tiny (~5 MB) and we want it to
+  # track any host-side loader changes that could break a future cage.
+  hostlib_tmp="$state_dir/.hostlib.staging-$$"
+  rm -rf -- "$hostlib_tmp"
+  cp -Rp -- "$hostlib_stage/." "$hostlib_tmp/" || fail "unable to stage hostlib"
+  chmod 0755 "$hostlib_tmp"
+  [[ -d $hostlib_tmp && ! -L $hostlib_tmp ]] || fail "staged hostlib is invalid"
+  if [[ -e $hostlib_root ]]; then
+    [[ -d $hostlib_root && ! -L $hostlib_root ]] || fail "existing hostlib is not a real directory: $hostlib_root"
+    old_hostlib="$state_dir/.hostlib.previous-$$"
+    rm -rf -- "$old_hostlib"
+    mv -- "$hostlib_root" "$old_hostlib" || fail "unable to stage existing hostlib for replacement"
+    if ! mv -- "$hostlib_tmp" "$hostlib_root"; then
+      [[ -e $old_hostlib ]] && mv -- "$old_hostlib" "$hostlib_root" || true
+      fail "unable to install hostlib atomically"
+    fi
+    rm -rf -- "$old_hostlib"
+  else
+    if ! mv -- "$hostlib_tmp" "$hostlib_root"; then
+      fail "unable to install hostlib atomically"
+    fi
+  fi
 fi
 atomic_copy "$stage/node.json" "$config_file" 0600
 atomic_copy "$stage/secrets.env" "$secrets_env" 0600
