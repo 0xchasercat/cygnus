@@ -1314,10 +1314,35 @@ console.log("ready", server.hostname);"#,
         });
         let mut client = TcpStream::connect(address).unwrap();
         client.write_all(request).unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
+        // The server may already have answered and closed (e.g. a 429 that
+        // never reads the body). On some platforms that leaves the client
+        // half-closed with ENOTCONN/ECONNRESET/EPIPE at shutdown; treat those
+        // the same as a successful half-close so the subsequent read can still
+        // drain whatever response bytes arrived.
+        if let Err(error) = client.shutdown(Shutdown::Write) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::NotConnected
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                ),
+                "unexpected shutdown error: {error}"
+            );
+        }
         let mut response = Vec::new();
         if let Err(error) = client.read_to_end(&mut response) {
-            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::NotConnected
+                ),
+                "unexpected read error: {error}"
+            );
         }
         worker.join().unwrap();
         response
