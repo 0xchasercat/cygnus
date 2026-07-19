@@ -489,7 +489,13 @@ fn fail_preassigned_deployment(
         .deployment(deployment_id)
         .map_err(|state_error| state_error.to_string())?
         .ok_or_else(|| "preassigned deployment no longer exists".to_owned())?;
-    if deployment.status == DeploymentStatus::Building {
+    // Building: the pipeline never sealed. Sealed: build succeeded but
+    // activation failed (socket path, boot, CAS). Either way the operator
+    // should see a terminal failure rather than a permanent pending seal.
+    if matches!(
+        deployment.status,
+        DeploymentStatus::Building | DeploymentStatus::Sealed
+    ) {
         state
             .mark_deployment_failed(deployment_id, error)
             .map_err(|state_error| state_error.to_string())?;

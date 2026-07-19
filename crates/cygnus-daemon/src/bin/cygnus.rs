@@ -1044,8 +1044,10 @@ fn render_deploy(
         let AdminData::Deployment { deployment } = data else {
             return Err("daemon returned an unexpected response to GetDeployment".into());
         };
+        // Sealed is intermediate: the build finished but activation may still
+        // be running (or may fail). Keep polling until active or failed.
         match deployment.status.as_str() {
-            "building" => {}
+            "building" | "sealed" => {}
             _ => break deployment,
         }
         thread::sleep(Duration::from_millis(400));
@@ -1054,7 +1056,7 @@ fn render_deploy(
     let elapsed = started.elapsed();
 
     match deployment.status.as_str() {
-        "active" | "sealed" => {
+        "active" => {
             let stdout = io::stdout();
             let mut out = stdout.lock();
             let _ = writeln!(
@@ -1068,18 +1070,22 @@ fn render_deploy(
                 write_kv(&mut out, theme, "artifact", &short_hash(artifact));
             }
             write_kv(&mut out, theme, "engine", &deployment.engine_version);
-            let domain = requested_domain.or_else(|| {
-                // The daemon defaulted the domain; derive it the same way for
-                // the printed URL when the node has an apps domain.
-                match call(client, AdminCommand::Status) {
-                    Ok(AdminData::Status { node }) => node
-                        .apps_domain
-                        .map(|apps_domain| format!("{app}.{apps_domain}")),
-                    _ => None,
-                }
+            let status = call(client, AdminCommand::Status).ok();
+            let domain = requested_domain.or_else(|| match &status {
+                Some(AdminData::Status { node }) => node
+                    .apps_domain
+                    .as_ref()
+                    .map(|apps_domain| format!("{app}.{apps_domain}")),
+                _ => None,
             });
             if let Some(domain) = domain {
-                write_kv(&mut out, theme, "url", &format!("https://{domain}"));
+                // Prefer https when the node is listening for it; otherwise
+                // local/dev installs only have plain HTTP (apps.localhost).
+                let scheme = match &status {
+                    Some(AdminData::Status { node }) if node.https_listen.is_some() => "https",
+                    _ => "http",
+                };
+                write_kv(&mut out, theme, "url", &format!("{scheme}://{domain}"));
             }
             write_kv(
                 &mut out,
@@ -1113,9 +1119,10 @@ fn render_deploy(
                     let _ = out.flush();
                 }
             }
+            let status = deployment.status.clone();
             let message = deployment
                 .error
-                .unwrap_or_else(|| "build failed".to_owned());
+                .unwrap_or_else(|| format!("deploy ended in {status}"));
             Err(format!("deploy failed: {message}").into())
         }
     }

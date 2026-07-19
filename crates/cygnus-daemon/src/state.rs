@@ -1960,7 +1960,14 @@ impl State {
         loaded.spec.readiness_uds = Some(upstream.clone());
         loaded.spec.env.insert(
             OsString::from("CYGNUS_SOCKET"),
-            runtime_socket_path(&upstream).into_os_string(),
+            // Linux cages see the socket through the ingress bind mount at
+            // INGRESS_CAGE_DIR; plain-process backends (macOS) share the host
+            // view and must bind the host path directly.
+            if cfg!(target_os = "linux") {
+                runtime_socket_path(&upstream).into_os_string()
+            } else {
+                upstream.as_os_str().to_owned()
+            },
         );
         validate_snapshot(&Snapshot {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
@@ -1988,7 +1995,11 @@ impl State {
         let expected_runtime_key = format!("r-{}", plan.target_artifact_hash);
         let expected_upstream =
             revision_upstream(&plan.candidate.upstream, &plan.target_artifact_hash)?;
-        let expected_runtime_socket = runtime_socket_path(&expected_upstream).into_os_string();
+        let expected_runtime_socket = if cfg!(target_os = "linux") {
+            runtime_socket_path(&expected_upstream).into_os_string()
+        } else {
+            expected_upstream.as_os_str().to_owned()
+        };
         if plan.candidate.name != plan.logical_app
             || plan.runtime_key != expected_runtime_key
             || plan.candidate.spec.name != expected_runtime_key
@@ -2257,7 +2268,32 @@ impl State {
         let runtime_entry = metadata_runtime_entry(&artifact.metadata_json)?;
         candidate.args = vec!["--preload".into(), "/cygnus/shim.js".into(), runtime_entry];
         let mut rootfs = candidate.rootfs.unwrap_or_default();
-        rootfs.lowerdirs = vec![engine.host_root, artifact.host_path];
+        // Preserve hostlib (if present) and rebuild lowerdirs around the
+        // selected engine + artifact. Order: hostlib → engine → artifact.
+        let hostlib = rootfs
+            .lowerdirs
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.as_bytes() == b"hostlib")
+            })
+            .cloned()
+            .or_else(|| {
+                engine
+                    .host_root
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|state_root| state_root.join("hostlib"))
+            });
+        let mut lowerdirs = Vec::with_capacity(3);
+        if cfg!(target_os = "linux") {
+            if let Some(hostlib) = hostlib {
+                lowerdirs.push(hostlib);
+            }
+        }
+        lowerdirs.push(engine.host_root);
+        lowerdirs.push(artifact.host_path);
+        rootfs.lowerdirs = lowerdirs;
         candidate.rootfs = Some(rootfs);
         self.plan_activation(
             target_deployment_id,
@@ -4556,13 +4592,25 @@ fn metadata_runtime_entry(metadata_json: &str) -> Result<String, StateError> {
     Ok(entry.to_owned())
 }
 
+/// Bytes of the artifact hash used in the on-disk socket filename.
+///
+/// The full 64-hex hash is retained as the runtime key, but Unix domain
+/// sockets have a short `sun_path` limit (~104 on macOS, 108 on Linux). A
+/// macOS home-path state root plus `upstreams/` plus the full hash exceeds
+/// that limit and leaves deployments stuck in `sealed`. Sixteen hex chars
+/// (64 bits) keeps paths well under the limit while remaining unique for
+/// content-addressed artifacts in practice.
+const REVISION_SOCKET_HASH_CHARS: usize = 16;
+
 fn revision_upstream(base: &Path, artifact_hash: &str) -> Result<PathBuf, StateError> {
     validate_hash(artifact_hash, "runtime artifact hash")?;
     let parent = base.parent().ok_or_else(|| {
         StateError::InvalidConfig("activation upstream has no parent directory".into())
     })?;
-    let upstream = parent.join(format!("r-{artifact_hash}.sock"));
+    let short = &artifact_hash[..REVISION_SOCKET_HASH_CHARS];
+    let upstream = parent.join(format!("r-{short}.sock"));
     validate_absolute_path(&upstream, "activation upstream")?;
+    // Leave headroom under the platform sun_path limit (104 macOS / 108 Linux).
     if upstream.as_os_str().as_bytes().len() > 100 {
         return Err(StateError::InvalidConfig(
             "activation upstream exceeds Unix socket path limit".into(),
@@ -4834,7 +4882,14 @@ fn ensure_transition(
         (
             DeploymentStatus::Building,
             DeploymentStatus::Failed | DeploymentStatus::Sealed
-        ) | (DeploymentStatus::Sealed, DeploymentStatus::Active)
+        ) | (
+            // Activation can fail after the artifact is sealed (socket path
+            // limits, engine mismatch, boot failure). Surface that as failed
+            // so the console and CLI do not leave a permanent "pending
+            // activation" corpse.
+            DeploymentStatus::Sealed,
+            DeploymentStatus::Active | DeploymentStatus::Failed
+        )
     );
     if legal {
         Ok(())
@@ -6441,7 +6496,10 @@ mod tests {
         assert_eq!(loaded.apps[0].spec.name, format!("r-{artifact_hash}"));
         assert_eq!(
             loaded.apps[0].upstream,
-            PathBuf::from(format!("/run/r-{artifact_hash}.sock"))
+            PathBuf::from(format!(
+                "/run/r-{}.sock",
+                &artifact_hash[..REVISION_SOCKET_HASH_CHARS]
+            ))
         );
         assert_eq!(
             state
@@ -6879,7 +6937,10 @@ mod tests {
         assert_eq!(plan.candidate.spec.name, format!("r-{second_hash}"));
         assert_eq!(
             plan.candidate.upstream,
-            PathBuf::from(format!("/run/r-{second_hash}.sock"))
+            PathBuf::from(format!(
+                "/run/r-{}.sock",
+                &second_hash[..REVISION_SOCKET_HASH_CHARS]
+            ))
         );
         assert_eq!(
             plan.candidate.spec.args.last().map(OsString::as_os_str),

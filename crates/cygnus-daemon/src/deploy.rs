@@ -965,7 +965,22 @@ fn runtime_config(
         ],
         env,
         rootfs: Some(RootfsConfig {
-            lowerdirs: vec![engine.host_root.clone(), artifact_path.to_path_buf()],
+            // Linux cages need the curated hostlib lowerdir (dynamic linker +
+            // glibc) ahead of the engine and artifact layers; without it
+            // execve fails with ENOENT for ld-linux. macOS plain-process
+            // cages ignore rootfs.
+            lowerdirs: {
+                let mut dirs = Vec::with_capacity(3);
+                if linux {
+                    // engine.host_root is $state_root/engines/<version>.
+                    if let Some(state_root) = engine.host_root.parent().and_then(|p| p.parent()) {
+                        dirs.push(state_root.join("hostlib"));
+                    }
+                }
+                dirs.push(engine.host_root.clone());
+                dirs.push(artifact_path.to_path_buf());
+                dirs
+            },
             ..RootfsConfig::default()
         }),
         init: linux.then(|| PathBuf::from(INIT_CAGE_PATH)),
