@@ -216,12 +216,16 @@ CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --tar
 if [[ $target == *-linux-* ]]; then
   # cygnus-init is statically linked with musl so the cage's PID 1 has no
   # dependency on the host's glibc layout (the engine layer only carries the
-  # bun binary, so the init must be self-contained).
-  case $target in
-    x86_64-unknown-linux-gnu) init_target=x86_64-unknown-linux-musl ;;
-    aarch64-unknown-linux-gnu) init_target=aarch64-unknown-linux-musl ;;
-    *) fail "unsupported Linux target for static init: $target" ;;
-  esac
+  # bun binary, so the init must be self-contained). Map any *-linux-gnu*
+  # triple to the matching musl triple (including fixture suffixes used by
+  # build-release-test.sh); a target already on musl is used as-is.
+  if [[ $target == *linux-gnu* ]]; then
+    init_target=${target/linux-gnu/linux-musl}
+  elif [[ $target == *linux-musl* ]]; then
+    init_target=$target
+  else
+    fail "unsupported Linux target for static init: $target"
+  fi
   CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$init_target" \
     --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-init --bin cygnus-init
 fi

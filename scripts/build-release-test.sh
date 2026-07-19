@@ -165,11 +165,18 @@ if env FAKE_FILE_FORMAT='Mach-O 64-bit executable arm64' bash "$BUILDER" \
   echo 'builder accepted a non-Linux Bun executable' >&2
   exit 1
 fi
-cargo_flag_seen=0
+# Daemon/CLI stay on the requested glibc triple; cygnus-init is rebuilt for
+# the matching musl triple so the cage PID 1 is self-contained.
+gnu_seen=0
+musl_seen=0
 while IFS= read -r cargo_command || [[ -n $cargo_command ]]; do
   if [[ $cargo_command == *'--release --locked --target x86_64-unknown-linux-gnu-fixture'* ]]; then
-    cargo_flag_seen=$((cargo_flag_seen + 1))
+    gnu_seen=$((gnu_seen + 1))
+  fi
+  if [[ $cargo_command == *'--release --locked --target x86_64-unknown-linux-musl-fixture'* ]]; then
+    musl_seen=$((musl_seen + 1))
   fi
 done <"$FAKE_CARGO_LOG"
-[[ $cargo_flag_seen == 2 ]] || { echo 'cargo target/release flags missing' >&2; exit 1; }
+[[ $gnu_seen == 1 ]] || { echo "expected one glibc cargo build, got $gnu_seen" >&2; exit 1; }
+[[ $musl_seen == 1 ]] || { echo "expected one musl cargo build for cygnus-init, got $musl_seen" >&2; exit 1; }
 printf '%s\n' 'release bundle fixture test passed'
