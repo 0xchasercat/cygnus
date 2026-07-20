@@ -94,13 +94,31 @@ if (existingState) {
 
       // Node's options overload uses `path` for Unix sockets. Preserve all
       // non-address options (backlog, exclusive, signal, and permissions).
-      if (first !== null && typeof first === "object") {
+      if (first !== null && typeof first === "object" && !Array.isArray(first)) {
         const options = { ...first };
         delete options.port;
         delete options.host;
         delete options.hostname;
-        options.path = socket;
-        redirectedArgs = [options, ...rest];
+        // Prefer the classic path overload (path, backlog?, callback?) when the
+        // only remaining knob is backlog. Bun on Linux has been observed to
+        // accept connections on `{ path, backlog }` before the listening
+        // callback runs; the path overload is more reliable for readiness.
+        const backlog =
+          typeof options.backlog === "number" ? options.backlog : undefined;
+        delete options.backlog;
+        if (Object.keys(options).length === 0) {
+          redirectedArgs = [socket];
+          if (backlog !== undefined) redirectedArgs.push(backlog);
+          for (const value of rest) {
+            if (typeof value === "number" || typeof value === "function") {
+              redirectedArgs.push(value);
+            }
+          }
+        } else {
+          if (backlog !== undefined) options.backlog = backlog;
+          options.path = socket;
+          redirectedArgs = [options, ...rest];
+        }
       } else {
         // Port/path overloads accept host/path strings, an optional backlog,
         // and a callback. Drop host/path strings but retain those meaningful

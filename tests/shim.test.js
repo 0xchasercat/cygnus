@@ -155,7 +155,13 @@ test("redirects node:http listen overloads and keeps the callback", async () => 
     `
       import http from "node:http";
       let callbackRan = false;
-      const server = http.createServer((request, response) => {
+      const server = http.createServer(async (request, response) => {
+        // Bun may accept the first request before the listen callback runs.
+        // Wait briefly so we assert the callback was wired, not callback-vs-accept order.
+        const deadline = Date.now() + 2_000;
+        while (!callbackRan && Date.now() < deadline) {
+          await Bun.sleep(5);
+        }
         response.end(callbackRan ? "node-http" : "callback-missed");
       });
       server.listen({ port: 3211, host: "127.0.0.1", backlog: 7 }, () => {
