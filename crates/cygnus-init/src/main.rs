@@ -1,4 +1,4 @@
-//! Static PID 1 for a Cygnus cage.
+//! PID 1 for a Cygnus cage.
 //!
 //! A cage runs in its own PID namespace, so the first process it execs becomes
 //! PID 1 — and PID 1 has special kernel semantics. It must reap orphaned
@@ -8,9 +8,9 @@
 //! termination signals to it, and reaps every process that exits in the cage.
 //!
 //! The cage boot path execs this init with the app as its arguments
-//! (`cygnus-init /path/to/app arg...`); wiring that into the cage is a separate
-//! change. Static/musl linking for the small-binary target is a packaging-time
-//! concern and is not addressed here.
+//! (`cygnus-init /path/to/app arg...`). Packaging links it against the same
+//! glibc hostlib as Bun (loader at `/lib64/ld-linux-*.so.*`); no separate musl
+//! static build is required.
 
 use std::env;
 use std::ffi::{CString, OsString};

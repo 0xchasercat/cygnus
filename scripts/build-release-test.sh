@@ -165,18 +165,18 @@ if env FAKE_FILE_FORMAT='Mach-O 64-bit executable arm64' bash "$BUILDER" \
   echo 'builder accepted a non-Linux Bun executable' >&2
   exit 1
 fi
-# Daemon/CLI stay on the requested glibc triple; cygnus-init is rebuilt for
-# the matching musl triple so the cage PID 1 is self-contained.
+# Daemon/CLI and cygnus-init all stay on the requested glibc triple so the
+# cage PID 1 shares the staged hostlib loader with Bun.
 gnu_seen=0
-musl_seen=0
 while IFS= read -r cargo_command || [[ -n $cargo_command ]]; do
   if [[ $cargo_command == *'--release --locked --target x86_64-unknown-linux-gnu-fixture'* ]]; then
     gnu_seen=$((gnu_seen + 1))
   fi
-  if [[ $cargo_command == *'--release --locked --target x86_64-unknown-linux-musl-fixture'* ]]; then
-    musl_seen=$((musl_seen + 1))
+  if [[ $cargo_command == *linux-musl* ]]; then
+    echo "unexpected musl cargo build: $cargo_command" >&2
+    exit 1
   fi
 done <"$FAKE_CARGO_LOG"
-[[ $gnu_seen == 1 ]] || { echo "expected one glibc cargo build, got $gnu_seen" >&2; exit 1; }
-[[ $musl_seen == 1 ]] || { echo "expected one musl cargo build for cygnus-init, got $musl_seen" >&2; exit 1; }
+# One for daemon+cli, one for cygnus-init.
+[[ $gnu_seen == 2 ]] || { echo "expected two glibc cargo builds (daemon/cli + init), got $gnu_seen" >&2; exit 1; }
 printf '%s\n' 'release bundle fixture test passed'

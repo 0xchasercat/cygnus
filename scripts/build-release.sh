@@ -211,30 +211,14 @@ printf 'build-release: installing frozen console dependencies and building dist/
 # Keep cargo's target directory explicit, so output lookup never depends on the
 # caller's current directory or an implicit cargo configuration.
 CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
-  --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-daemon --bin cygnus-daemon --bin cygnus
-
+  --manifest-path "$REPO_ROOT/Cargo.toml" \
+  -p cygnus-daemon --bin cygnus-daemon --bin cygnus
+# On Linux the cage PID 1 (cygnus-init) shares the hostlib lowerdir that already
+# stages glibc for Bun — same dynamic linker and libc. A separate musl build is
+# unnecessary and actively harmful: a non-static musl binary looks for
+# /lib/ld-musl-*.so.1, which is never present inside the cage.
 if [[ $target == *-linux-* ]]; then
-  # cygnus-init is statically linked with musl so the cage's PID 1 has no
-  # dependency on the host's glibc layout (the engine layer only carries the
-  # bun binary, so the init must be self-contained). Map any *-linux-gnu*
-  # triple to the matching musl triple (including fixture suffixes used by
-  # build-release-test.sh); a target already on musl is used as-is.
-  if [[ $target == *linux-gnu* ]]; then
-    init_target=${target/linux-gnu/linux-musl}
-  elif [[ $target == *linux-musl* ]]; then
-    init_target=$target
-  else
-    fail "unsupported Linux target for static init: $target"
-  fi
-  # Prefer musl-gcc when present so the link is truly static; fall back to
-  # cargo's default linker for fixture builds that never invoke a real rustc.
-  init_env=(CARGO_TARGET_DIR="$cargo_target_dir")
-  if command -v musl-gcc >/dev/null 2>&1; then
-    # Convert x86_64-unknown-linux-musl -> CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
-    init_linker_var=CARGO_TARGET_$(printf '%s' "$init_target" | tr 'a-z-' 'A-Z_')_LINKER
-    init_env+=("$init_linker_var=musl-gcc")
-  fi
-  env "${init_env[@]}" "$cargo_bin" build --release --locked --target "$init_target" \
+  CARGO_TARGET_DIR="$cargo_target_dir" "$cargo_bin" build --release --locked --target "$target" \
     --manifest-path "$REPO_ROOT/Cargo.toml" -p cygnus-init --bin cygnus-init
 fi
 
@@ -250,9 +234,17 @@ release_bin_dir=$cargo_target_dir/$target/release
 copy_binary cygnus-daemon "$release_bin_dir/cygnus-daemon"
 copy_binary cygnus "$release_bin_dir/cygnus"
 if [[ $target == *-linux-* ]]; then
-  # cygnus-init was built with the musl target above; pull it from there.
-  init_bin_dir=$cargo_target_dir/$init_target/release
-  copy_binary cygnus-init "$init_bin_dir/cygnus-init"
+  copy_binary cygnus-init "$release_bin_dir/cygnus-init"
+  # Refuse to ship a musl-dynamic binary: the cage hostlib only stages the
+  # glibc loader under /lib64/ld-linux-*.so.* (same path Bun uses).
+  init_file=$(file -b -- "$bundle_out/cygnus-init" 2>/dev/null || true)
+  case $init_file in
+    *ld-musl-*)
+      fail "cygnus-init is musl-dynamic ($init_file); rebuild against the glibc target so it shares the cage hostlib with bun"
+      ;;
+  esac
+  [[ $init_file == *ELF* || $init_file == ELF* ]] \
+    || fail "cygnus-init is not a recognized ELF binary: $init_file"
 fi
 copy_binary bun "$bun_bin"
 

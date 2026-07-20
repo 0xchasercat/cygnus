@@ -79,7 +79,7 @@
 
 Layered, root-supervisor model.
 
-**Namespaces:** `user` (cage root → unprivileged host UID range per app), `mnt`, `pid` (cage PID 1 is a ~50KB static init that reaps zombies and forwards signals), `ipc`, `uts`, `net` (veth, §7), `cgroup`.
+**Namespaces:** `user` (cage root → unprivileged host UID range per app), `mnt`, `pid` (cage PID 1 is a small init that reaps zombies and forwards signals; glibc-linked, shares the staged hostlib with Bun), `ipc`, `uts`, `net` (veth, §7), `cgroup`.
 
 **Filesystem (mntns):** overlayfs — lowerdir = minimal RO base (CA certs, tzdata, resolv.conf) + engine dir + artifact dir; upperdir = per-cage tmpfs (`size=` capped, `noexec,nosuid,nodev`). Policy: **writable mounts are noexec; RO artifact mount is exec-allowed** — this preserves native addons (`.node` dlopen needs file-backed PROT_EXEC) while ensuring nothing *written at runtime* is executable. `/proc` masked, no `/sys` write, no host paths.
 

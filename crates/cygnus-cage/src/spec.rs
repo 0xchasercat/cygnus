@@ -221,11 +221,12 @@ pub struct CageSpec {
     /// Egress network policy. The Linux backend wires the veth and nftables;
     /// the plain-process backend ignores it.
     pub egress: EgressMode,
-    /// Optional static PID-1 init to exec as the cage's first process, with the
+    /// Optional PID-1 init to exec as the cage's first process, with the
     /// command and its arguments passed through to it. The init reaps orphaned
     /// descendants and forwards signals — the correct behaviour for PID 1.
     /// `None` execs the command directly. The path is exec'd verbatim, so it
-    /// must resolve inside the cage's filesystem view. Honored by the Linux
+    /// must resolve inside the cage's filesystem view (glibc-linked init
+    /// shares the staged hostlib with the engine). Honored by the Linux
     /// backend; the plain-process backend ignores it.
     pub init: Option<PathBuf>,
     pub readiness_uds: Option<PathBuf>,

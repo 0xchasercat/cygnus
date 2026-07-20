@@ -138,9 +138,9 @@ impl JobConfig {
             ));
         }
         if self.init.is_some() {
-            // The static init is meaningful for long-running server cages but
-            // is intentionally not accepted for finite jobs: the direct child
-            // is the process whose exit outcome is reported.
+            // A PID-1 init is meaningful for long-running server cages but is
+            // intentionally not accepted for finite jobs: the direct child is
+            // the process whose exit outcome is reported.
             return Err(CageError::InvalidSpec(
                 "finite jobs do not support a PID-1 init".into(),
             ));

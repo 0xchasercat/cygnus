@@ -406,10 +406,9 @@ else
   secret_bootstrap_path=/cygnus/secrets/bootstrap.token
   secret_session_path=/cygnus/secrets/session.key
   # The cage overlay rootfs only carries engine + console + secrets, so the
-  # dynamic linker and glibc that `bun` needs must be staged as a dedicated
-  # lowerdir. cygnus-init is statically linked with musl (see build-release.sh)
-  # so this lowerdir is only responsible for satisfying the engine binary's
-  # dynamic dependencies, not for cygnus-init's.
+  # dynamic linker and glibc that both `bun` and `cygnus-init` need must be
+  # staged as a dedicated lowerdir. Both binaries are glibc-linked against the
+  # same loader path (/lib64/ld-linux-*.so.*); hostlib is their shared ABI root.
   hostlib_root=$state_dir/hostlib
   case $(uname -m) in
     x86_64) hostlib_loader=/lib64/ld-linux-x86-64.so.2; hostlib_lib_dir=/lib/x86_64-linux-gnu ;;
@@ -635,6 +634,16 @@ chmod 0755 "$stage/engine/usr/local/bin/bun"
 if [[ $OS == Linux ]]; then
   cp -- "$bundle_dir/cygnus-init" "$stage/engine/usr/local/bin/cygnus-init"
   chmod 0755 "$stage/engine/usr/local/bin/cygnus-init"
+  # Cage hostlib only stages the glibc loader. A musl-dynamic init fails at
+  # execve with ENOENT looking for /lib/ld-musl-*.so.1 — catch it at install.
+  if command -v file >/dev/null 2>&1; then
+    init_file=$(file -b -- "$stage/engine/usr/local/bin/cygnus-init" 2>/dev/null || true)
+    case $init_file in
+      *ld-musl-*)
+        fail "cygnus-init is musl-dynamic ($init_file); the cage hostlib only provides the glibc loader. Rebuild the release against the glibc target."
+        ;;
+    esac
+  fi
 fi
 if [[ -e $engine_root ]]; then
   [[ -d $engine_root && ! -L $engine_root ]] || fail "existing engine root is not a directory"
@@ -813,9 +822,10 @@ stage_hostlib() {
   chmod 0755 "$stage" "$stage/lib64" "$stage/$hostlib_lib_dir"
   cp -L -- "$hostlib_loader" "$stage/lib64/$(basename -- "$hostlib_loader")"
   chmod 0755 "$stage/lib64/$(basename -- "$hostlib_loader")"
-  # The exact set bun depends on; verified on a clean Ubuntu 24.04 host for
-  # the glibc Bun build. Future Bun releases that pull in additional libs
-  # would surface here as ENOENT at execve time.
+  # Shared glibc ABI for both `bun` and `cygnus-init` (same loader path).
+  # Verified against a glibc Bun build on Ubuntu 24.04; a Rust glibc init only
+  # needs a subset (libc/pthread/dl/m/gcc_s). Missing libs surface as ENOENT
+  # at execve time inside the cage.
   local libs=(
     libc.so.6
     libpthread.so.0

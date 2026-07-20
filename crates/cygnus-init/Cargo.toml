@@ -1,6 +1,6 @@
 [package]
 name = "cygnus-init"
-description = "Static PID 1 for Cygnus cages"
+description = "PID 1 for Cygnus cages (glibc-linked; shares hostlib with the engine)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

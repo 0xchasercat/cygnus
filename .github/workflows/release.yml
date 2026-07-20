@@ -20,18 +20,15 @@ jobs:
           # Linux bundles build inside debian:11 so the produced binaries
           # only require glibc 2.31 — the practical floor for self-hosters
           # (Debian 11+, Ubuntu 20.04+, RHEL 9, Amazon Linux 2023).
-          # cygnus-init is rebuilt for the matching musl target so the cage
-          # PID 1 is statically linked and needs no host glibc layout.
+          # cygnus-init is built for the same glibc target as the daemon and
+          # Bun; the cage hostlib lowerdir stages the shared loader + libs.
           - target: x86_64-unknown-linux-gnu
-            musl_target: x86_64-unknown-linux-musl
             runner: namespace-profile-cygnus-linux-x86
             container: debian:11
           - target: aarch64-unknown-linux-gnu
-            musl_target: aarch64-unknown-linux-musl
             runner: namespace-profile-cygnus-linux-arm64
             container: debian:11
           - target: aarch64-apple-darwin
-            musl_target: ''
             runner: namespace-profile-cygnus-macos-arm64
             container: ''
 
@@ -45,15 +42,12 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential curl ca-certificates git file unzip xz-utils \
-            musl-tools
+            build-essential curl ca-certificates git file unzip xz-utils
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Always install the primary target; on Linux also install the musl
-          # target used for the static cygnus-init binary.
-          targets: ${{ matrix.musl_target != '' && format('{0},{1}', matrix.target, matrix.musl_target) || matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
