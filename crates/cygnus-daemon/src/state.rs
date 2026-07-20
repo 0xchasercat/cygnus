@@ -2521,15 +2521,50 @@ impl State {
     }
 
     /// Update the node SSL baseline and reset native domains for reconciliation.
+    ///
+    /// When enabling ACME, `email` seeds or refreshes the Let's Encrypt contact
+    /// address. Without a stored email, ACME issuance is a no-op (self-signed
+    /// fallback remains). Self-signed mode keeps any existing ACME config so
+    /// flipping back does not require re-entering the email.
     pub fn update_ssl_mode(
         &mut self,
         mode: SslMode,
+        email: Option<&str>,
         audit: &AuditContext,
     ) -> Result<EdgeConfig, StateError> {
         validate_audit_context(audit)?;
         let snapshot = self.load()?;
         let mut edge = snapshot.edge;
         edge.ssl_mode = mode;
+        if mode == SslMode::Acme {
+            let contact = email
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .or_else(|| edge.acme.as_ref().map(|config| config.email.clone()));
+            let Some(contact) = contact else {
+                return Err(StateError::InvalidConfig(
+                    "ACME requires a contact email (pass email when enabling automatic HTTPS)"
+                        .into(),
+                ));
+            };
+            if !contact.contains('@') || contact.contains(char::is_whitespace) {
+                return Err(StateError::InvalidConfig(
+                    "ACME contact email is invalid".into(),
+                ));
+            }
+            let dns_provider = edge.acme.as_ref().and_then(|c| c.dns_provider.clone());
+            let directory_url = edge
+                .acme
+                .as_ref()
+                .map(|c| c.directory_url.clone())
+                .unwrap_or_else(|| crate::edge::DEFAULT_ACME_DIRECTORY.into());
+            edge.acme = Some(AcmeConfig {
+                email: contact,
+                directory_url,
+                dns_provider,
+            });
+        }
         let transaction = self.connection.transaction()?;
         store_edge_config_tx(&transaction, &edge)?;
         transaction.execute(

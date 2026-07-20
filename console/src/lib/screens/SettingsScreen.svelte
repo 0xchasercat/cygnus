@@ -57,11 +57,14 @@
   let dashError = $state('');
   let dashBusy = $state(false);
   let tlsBusy = $state(false);
+  let acmeEmail = $state('');
+  let acmeEmailOpen = $state(false);
 
   const dashboardDomain = $derived(store.node?.dashboard_domain ?? '');
   const apexDomain = $derived(store.node?.apex_domain ?? '');
   const sslMode = $derived(store.node?.ssl_mode ?? ''); // 'acme' | 'self_signed' | ''
   const sslAuto = $derived(sslMode === 'acme');
+  const acmeEmailKnown = $derived(Boolean(store.node?.acme_email));
 
   // Dashboard's own cert status, from the node's certificate list when present.
   const dashboardCert = $derived.by(() => {
@@ -71,7 +74,9 @@
   });
   const dashboardCertPill = $derived.by(() => {
     if (!dashboardDomain) return null;
-    if (dashboardCert?.ok) return { cls: 'live', text: 'trusted' };
+    if (!dashboardCert) return sslAuto ? { cls: 'build', text: 'issuing' } : { cls: 'ghost', text: 'self-signed' };
+    if (dashboardCert.kind === 'self_signed') return { cls: 'ghost', text: 'self-signed' };
+    if (dashboardCert.ok) return { cls: 'live', text: 'trusted' };
     if (sslAuto) return { cls: 'build', text: 'issuing' };
     return { cls: 'ghost', text: 'self-signed' };
   });
@@ -109,11 +114,30 @@
 
   async function toggleDashboardTls() {
     if (tlsBusy || !sslMode) return;
+    // Enabling ACME needs a contact email. Prefer the stored one; otherwise
+    // open the inline field so we don't silently leave self-signed fallback.
+    if (!sslAuto && !acmeEmailKnown && !acmeEmailOpen) {
+      acmeEmailOpen = true;
+      dashError = 'Enter a contact email for Let\'s Encrypt, then enable again.';
+      return;
+    }
     tlsBusy = true;
+    dashError = '';
     const next = sslAuto ? 'self_signed' : 'acme';
-    const r = await store.setDashboardTls(next);
+    const email = !sslAuto ? (acmeEmail.trim() || undefined) : undefined;
+    if (next === 'acme' && !acmeEmailKnown && !email) {
+      tlsBusy = false;
+      acmeEmailOpen = true;
+      dashError = 'Let\'s Encrypt needs a contact email.';
+      return;
+    }
+    const r = await store.setDashboardTls(next, email);
     tlsBusy = false;
-    if (!r.ok) dashError = r.error ?? 'Could not change dashboard TLS';
+    if (!r.ok) {
+      dashError = r.error ?? 'Could not change dashboard TLS';
+      return;
+    }
+    acmeEmailOpen = false;
   }
 
   async function connectGithub(e) {
@@ -374,12 +398,25 @@
               </button>
             {/if}
           </div>
+          {#if acmeEmailOpen && !sslAuto}
+            <label class="dash-form" style="margin-top:10px">
+              Let's Encrypt contact email
+              <input
+                bind:value={acmeEmail}
+                type="email"
+                autocomplete="email"
+                placeholder="ops@example.com"
+                maxlength="254"
+              />
+            </label>
+          {/if}
+          {#if dashError && !dashEditOpen}<p class="inline-error" role="alert">{dashError}</p>{/if}
           {#if sslMode}
             <p class="dash-note mono">
               {#if sslAuto}
-                Cygnus issues a trusted certificate once DNS resolves here. Until then a self-signed certificate keeps the dashboard reachable.
+                DNS A record must point at this node, and ports 80/443 must be reachable from the public internet. Until ACME succeeds, a self-signed cert (CN "Cygnus self-signed fallback") is served.
               {:else}
-                Switch to automatic HTTPS to issue a trusted certificate from Let's Encrypt.
+                Switch to automatic HTTPS to issue a trusted certificate from Let's Encrypt. You will need a contact email.
               {/if}
             </p>
           {/if}

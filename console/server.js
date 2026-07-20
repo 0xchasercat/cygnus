@@ -16,6 +16,10 @@ const port = Number(requestedPort);
 
 export const ACTOR_SUBJECT = "local:operator";
 export const SESSION_COOKIE = "__Host-cygnus_session";
+// Used when the console is reached over plain HTTP (IP:3000, local LAN). Browsers
+// refuse Secure/__Host- cookies outside a secure context — localhost is special-
+// cased by browsers, which is why macOS local worked while remote Linux HTTP did not.
+export const SESSION_COOKIE_INSECURE = "cygnus_session";
 export const SESSION_TTL_SECONDS = 12 * 60 * 60;
 export const MAX_JSON_BODY_BYTES = 32 * 1024;
 export const MAX_DEPLOY_CHUNK_JSON_BODY_BYTES = 2 * 1024 * 1024;
@@ -277,7 +281,7 @@ async function login(request, requestAdmin = adminRequest, socket = adminSocketP
     { ok: true, data: { authenticated: true, actor: subject } },
     false,
     200,
-    { "set-cookie": sessionSetCookie(cookie) },
+    { "set-cookie": sessionSetCookie(cookie, request) },
   );
 }
 
@@ -289,12 +293,12 @@ function invalidCredentials(ip, now) {
   return apiError(401, "unauthorized", "invalid credentials", headers);
 }
 
-function logout() {
+function logout(request) {
   return jsonResponse(
     { ok: true, data: { authenticated: false } },
     false,
     200,
-    { "set-cookie": sessionClearCookie() },
+    { "set-cookie": sessionClearCookies(request) },
   );
 }
 
@@ -353,13 +357,14 @@ export async function setup(request, requestAdmin = adminRequest, socket = admin
     await requestAdmin(socket, {
       type: "set_dashboard_tls",
       mode: body.ssl ? "acme" : "self_signed",
+      ...(body.ssl ? { email: body.email } : {}),
     }, subject);
     const cookie = signSession({ sub: subject });
     return jsonResponse(
       { ok: true, data: { apex_domain: body.apex_domain, dashboard_domain: body.dashboard_domain } },
       false,
       200,
-      { "set-cookie": sessionSetCookie(cookie) },
+      { "set-cookie": sessionSetCookie(cookie, request) },
     );
   } catch (error) {
     const code = error instanceof AdminProtocolError ? error.code : "internal";
@@ -400,7 +405,15 @@ export function signSession(input = {}, now = Date.now()) {
 
 export function verifySessionCookie(cookie, now = Date.now()) {
   if (typeof cookie !== "string") return null;
-  const value = cookie.includes("=") ? parseCookie(cookie, SESSION_COOKIE) : cookie;
+  // Accept either cookie name so sessions survive HTTP↔HTTPS transitions.
+  let value = null;
+  if (cookie.includes("=")) {
+    value =
+      parseCookie(cookie, SESSION_COOKIE) ??
+      parseCookie(cookie, SESSION_COOKIE_INSECURE);
+  } else {
+    value = cookie;
+  }
   if (!value) return null;
   const pieces = value.split(".");
   if (pieces.length !== 3 || pieces[0] !== "v1") return null;
@@ -445,12 +458,61 @@ function credential(valueName, fileName) {
   }
 }
 
-function sessionSetCookie(value) {
-  return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict`;
+/** True when the browser will treat this request as a secure context for cookies. */
+export function requestIsSecure(request) {
+  if (!request) return false;
+  const forwarded = String(request.headers?.get?.("x-forwarded-proto") ?? "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  if (forwarded === "https") return true;
+  if (forwarded === "http") return false;
+  try {
+    const url = new URL(request.url);
+    if (url.protocol === "https:") return true;
+    // Browsers treat loopback HTTP as a secure context for cookies.
+    const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+  } catch {
+    /* ignore */
+  }
+  return false;
 }
 
-function sessionClearCookie() {
-  return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;
+function sessionCookieName(secure) {
+  return secure ? SESSION_COOKIE : SESSION_COOKIE_INSECURE;
+}
+
+function sessionSetCookie(value, request) {
+  const secure = requestIsSecure(request);
+  const name = sessionCookieName(secure);
+  // Secure + __Host- only on HTTPS/loopback. SameSite=Lax so top-level
+  // navigations (GitHub OAuth return) still carry the session.
+  const flags = secure
+    ? `Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; Secure; SameSite=Lax`
+    : `Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax`;
+  return `${name}=${value}; ${flags}`;
+}
+
+function sessionClearCookies(request) {
+  // Always clear both names so a later HTTPS upgrade doesn't leave a stale
+  // insecure cookie, and vice versa.
+  const secure = requestIsSecure(request);
+  const secureFlags = "Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+  const plainFlags = "Path=/; Max-Age=0; HttpOnly; SameSite=Lax";
+  // Bun/jsonResponse only accepts one set-cookie header string here; emit both
+  // names on sequential responses is ideal, but a single combined clear of the
+  // active name plus the alternate is enough for browsers that accept multi
+  // Set-Cookie via array — fall back to the active name first.
+  const primary = secure
+    ? `${SESSION_COOKIE}=; ${secureFlags}`
+    : `${SESSION_COOKIE_INSECURE}=; ${plainFlags}`;
+  const secondary = secure
+    ? `${SESSION_COOKIE_INSECURE}=; ${plainFlags}`
+    : `${SESSION_COOKIE}=; ${secureFlags}`;
+  // Prefer clearing the cookie that matches the current scheme; secondary is
+  // attached via array when the response helper supports it.
+  return [primary, secondary];
 }
 
 function parseCookie(header, name) {
@@ -691,8 +753,12 @@ export function dashboardDomainCommand(body) {
 }
 
 export function dashboardTlsCommand(body) {
-  assertExactKeys(body, ["mode"]);
-  return { type: "set_dashboard_tls", mode: safeTlsMode(body.mode) };
+  assertObjectKeys(body, ["mode"], ["email"]);
+  const command = { type: "set_dashboard_tls", mode: safeTlsMode(body.mode) };
+  if (body.email !== undefined && body.email !== null && String(body.email).trim() !== "") {
+    command.email = safeEmail(body.email);
+  }
+  return command;
 }
 
 export function addAppDomainCommand(app, body) {
@@ -1376,13 +1442,22 @@ function methodNotAllowed(allow) {
   return apiError(405, "method_not_allowed", "method not allowed", { allow });
 }
 function jsonResponse(value, head = false, status = 200, headers = {}) {
+  const responseHeaders = new Headers({
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+  });
+  for (const [key, raw] of Object.entries(headers ?? {})) {
+    if (raw == null) continue;
+    // Multiple Set-Cookie values must be appended, not comma-joined.
+    if (key.toLowerCase() === "set-cookie" && Array.isArray(raw)) {
+      for (const cookie of raw) responseHeaders.append("set-cookie", cookie);
+      continue;
+    }
+    responseHeaders.set(key, String(raw));
+  }
   return new Response(head ? null : JSON.stringify(value), {
     status,
-    headers: {
-      "cache-control": "no-store",
-      ...headers,
-      "content-type": "application/json; charset=utf-8",
-    },
+    headers: responseHeaders,
   });
 }
 function base64UrlEncode(value) {

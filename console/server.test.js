@@ -12,6 +12,8 @@ import {
   MAX_JSON_BODY_BYTES,
   MAX_WEBHOOK_BODY_BYTES,
   MAX_WEBHOOK_CHUNK_BYTES,
+  SESSION_COOKIE,
+  SESSION_COOKIE_INSECURE,
   addAppDomainCommand,
   appDomainTlsCommand,
   buildGithubManifest,
@@ -30,6 +32,7 @@ import {
   healthResponse,
   mapDomainCommand,
   removeAppDomainCommand,
+  requestIsSecure,
   rollbackCommand,
   sessionResponse,
   setup,
@@ -120,6 +123,58 @@ describe("console session primitives", () => {
     expect(verifySessionCookie(recovery.headers.get("set-cookie"))?.sub).toBe(ACTOR_SUBJECT);
   });
 
+  test("uses Secure __Host cookie on HTTPS and plain cookie on remote HTTP", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session-key";
+
+    const httpsUrl = new URL("https://console.example/api/v1/session");
+    const httpsLogin = await handleApi(new Request(httpsUrl, {
+      method: "POST",
+      headers: { origin: httpsUrl.origin, "content-type": "application/json" },
+      body: JSON.stringify({ token: "bootstrap" }),
+    }), httpsUrl);
+    expect(httpsLogin.status).toBe(200);
+    const httpsCookie = httpsLogin.headers.getSetCookie?.() ?? [httpsLogin.headers.get("set-cookie")];
+    expect(httpsCookie.some((c) => c?.startsWith(`${SESSION_COOKIE}=`))).toBe(true);
+    expect(httpsCookie.some((c) => c?.includes("Secure"))).toBe(true);
+    expect(requestIsSecure(new Request(httpsUrl))).toBe(true);
+
+    const httpUrl = new URL("http://207.148.74.199:3000/api/v1/session");
+    const httpLogin = await handleApi(new Request(httpUrl, {
+      method: "POST",
+      headers: { origin: httpUrl.origin, "content-type": "application/json" },
+      body: JSON.stringify({ token: "bootstrap" }),
+    }), httpUrl);
+    expect(httpLogin.status).toBe(200);
+    const httpCookie = httpLogin.headers.getSetCookie?.() ?? [httpLogin.headers.get("set-cookie")];
+    expect(httpCookie.some((c) => c?.startsWith(`${SESSION_COOKIE_INSECURE}=`))).toBe(true);
+    const active = httpCookie.find((c) => c?.startsWith(`${SESSION_COOKIE_INSECURE}=`));
+    expect(active).toBeTruthy();
+    expect(active.includes("Secure")).toBe(false);
+    expect(requestIsSecure(new Request(httpUrl))).toBe(false);
+
+    // Loopback HTTP is treated as secure (browser special-case).
+    const loopback = new URL("http://127.0.0.1:3000/api/v1/session");
+    expect(requestIsSecure(new Request(loopback))).toBe(true);
+
+    // verifySessionCookie accepts either cookie name prefix in the header.
+    const signed = signSession({ sub: "account:9" });
+    expect(verifySessionCookie(`${SESSION_COOKIE_INSECURE}=${signed}`)?.sub).toBe("account:9");
+    expect(verifySessionCookie(`${SESSION_COOKIE}=${signed}`)?.sub).toBe("account:9");
+  });
+
+  test("dashboardTlsCommand forwards ACME contact email", () => {
+    expect(dashboardTlsCommand({ mode: "acme", email: "ops@example.com" })).toEqual({
+      type: "set_dashboard_tls",
+      mode: "acme",
+      email: "ops@example.com",
+    });
+    expect(dashboardTlsCommand({ mode: "self_signed" })).toEqual({
+      type: "set_dashboard_tls",
+      mode: "self_signed",
+    });
+  });
+
   test("sets a signed cookie and bounds repeated failures", async () => {
     process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
     process.env.CYGNUS_CONSOLE_SESSION_KEY = "session-key";
@@ -137,6 +192,7 @@ describe("console session primitives", () => {
     }
     expect((await handleApi(request("wrong"), url)).status).toBe(429);
   });
+
 });
 
 describe("console first-run setup", () => {
@@ -170,7 +226,7 @@ describe("console first-run setup", () => {
       { socket: "/admin.sock", command: { type: "account_status" }, actor: undefined },
       { socket: "/admin.sock", command: { type: "create_initial_account", email: "admin@example.com", password: "correct horse battery staple" }, actor: undefined },
       { socket: "/admin.sock", command: { type: "set_dashboard_domain", domain: "dashboard.cygnus.run", apex: "cygnus.run" }, actor: "account:1" },
-      { socket: "/admin.sock", command: { type: "set_dashboard_tls", mode: "acme" }, actor: "account:1" },
+      { socket: "/admin.sock", command: { type: "set_dashboard_tls", mode: "acme", email: "admin@example.com" }, actor: "account:1" },
     ]);
   });
 

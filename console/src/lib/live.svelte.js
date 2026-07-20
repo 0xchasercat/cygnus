@@ -384,9 +384,11 @@ class Store {
     }
   }
 
-  async setDashboardTls(mode) {
+  async setDashboardTls(mode, email) {
     try {
-      await post('/api/v1/settings/dashboard-tls', { mode });
+      const body = { mode };
+      if (email) body.email = email;
+      await post('/api/v1/settings/dashboard-tls', body);
       this.notice = `Dashboard TLS set to ${mode === 'acme' ? 'automatic' : 'self-signed'}.`;
       await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
       return { ok: true };

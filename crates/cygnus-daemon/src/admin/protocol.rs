@@ -47,6 +47,10 @@ pub enum AdminCommand {
     },
     SetDashboardTls {
         mode: SslMode,
+        /// Let's Encrypt contact email. Required when enabling ACME if none is
+        /// stored yet; ignored when switching to self_signed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
     },
     ListAppDomains {
         app: String,
@@ -461,6 +465,9 @@ pub struct NodeView {
     pub apex_domain: Option<String>,
     #[serde(default)]
     pub ssl_mode: SslMode,
+    /// Let's Encrypt contact email when ACME is configured (no secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_email: Option<String>,
     pub app_count: usize,
     pub version: String,
     pub uptime_seconds: u64,
@@ -674,9 +681,22 @@ mod tests {
         assert_eq!(
             serde_json::to_value(AdminCommand::SetDashboardTls {
                 mode: SslMode::SelfSigned,
+                email: None,
             })
             .unwrap(),
             serde_json::json!({"type":"set_dashboard_tls","mode":"self_signed"})
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetDashboardTls {
+                mode: SslMode::Acme,
+                email: Some("ops@example.com".into()),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type":"set_dashboard_tls",
+                "mode":"acme",
+                "email":"ops@example.com"
+            })
         );
         assert_eq!(
             serde_json::to_value(AdminCommand::SetAppDomainTls {

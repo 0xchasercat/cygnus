@@ -1,5 +1,5 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use crate::deploy::{
     DeployError, DeployRequest, canonical_source_root, new_deployment_id, resolve_deploy_request,
 };
 use crate::domains::{StdDnsResolver, dns_precheck, expected_public_ipv4};
-use crate::edge::SslMode;
+use crate::edge::{CertificateRecord, SslMode};
 use crate::github::{GitHubError, GitHubManager};
 use crate::metrics::MetricsHub;
 use crate::state::{
@@ -51,6 +51,7 @@ pub enum AdminMutation {
     },
     SetDashboardTls {
         mode: SslMode,
+        email: Option<String>,
     },
     AddAppDomain {
         app: String,
@@ -215,11 +216,11 @@ impl StateAdminHandler {
                 AdminMutation::SetDashboardDomain { domain, apex },
                 "set_dashboard_domain",
             ),
-            AdminCommand::SetDashboardTls { mode } => self.mutate(
+            AdminCommand::SetDashboardTls { mode, email } => self.mutate(
                 role,
                 peer,
                 request,
-                AdminMutation::SetDashboardTls { mode },
+                AdminMutation::SetDashboardTls { mode, email },
                 "set_dashboard_tls",
             ),
             AdminCommand::ListAppDomains { app } => {
@@ -717,19 +718,22 @@ impl StateAdminHandler {
             let ok = certificate.not_after_unix > now
                 && certificate.certificate_path.is_file()
                 && certificate.private_key_path.is_file();
+            let is_fallback = certificate_is_self_signed_fallback(&certificate);
             for domain in certificate.domains {
-                let kind = if domain.starts_with("*.") {
-                    "wildcard"
+                let kind = if is_fallback {
+                    "self_signed".into()
+                } else if domain.starts_with("*.") {
+                    "wildcard".into()
                 } else if acme.is_some_and(|config| config.dns_provider.is_some()) {
-                    "acme_dns01"
+                    "acme_dns01".into()
                 } else if acme.is_some() {
-                    "acme_http01"
+                    "acme_http01".into()
                 } else {
-                    "manual"
+                    "manual".into()
                 };
                 certificates.push(CertificateView {
                     domain,
-                    kind: kind.into(),
+                    kind,
                     ok,
                     expires_unix: Some(certificate.not_after_unix),
                 });
@@ -748,6 +752,7 @@ impl StateAdminHandler {
                 dashboard_domain: snapshot.edge.dashboard_domain,
                 apex_domain: snapshot.edge.apex_domain,
                 ssl_mode: snapshot.edge.ssl_mode,
+                acme_email: acme.map(|config| config.email.clone()),
                 app_count: snapshot.apps.len(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 uptime_seconds: self.started_at.elapsed().as_secs(),
@@ -1162,6 +1167,23 @@ fn read_log_chunk(
         .map_err(HandlerFault::internal)?;
     let next_offset = offset + count as u64;
     Ok((bytes, next_offset, next_offset == metadata.len()))
+}
+
+fn certificate_is_self_signed_fallback(certificate: &CertificateRecord) -> bool {
+    let Ok(file) = File::open(&certificate.certificate_path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let Some(Ok(der)) = rustls_pemfile::certs(&mut reader).next() else {
+        return false;
+    };
+    let Ok((_, parsed)) = x509_parser::parse_x509_certificate(der.as_ref()) else {
+        return false;
+    };
+    parsed.subject().iter_common_name().any(|name| {
+        name.as_str()
+            .is_ok_and(|value| value == "Cygnus self-signed fallback")
+    })
 }
 
 fn unix_seconds() -> i64 {

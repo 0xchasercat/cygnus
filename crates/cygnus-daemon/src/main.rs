@@ -621,7 +621,9 @@ impl AdminMutationHandler for LiveAdminMutations {
             AdminMutation::SetDashboardDomain { domain, apex } => {
                 self.set_dashboard_domains(domain.as_deref(), apex.as_deref(), audit)
             }
-            AdminMutation::SetDashboardTls { mode } => self.set_dashboard_tls(mode, audit),
+            AdminMutation::SetDashboardTls { mode, email } => {
+                self.set_dashboard_tls(mode, email.as_deref(), audit)
+            }
             AdminMutation::AddAppDomain { app, host } => self.add_app_domain(&app, &host, audit),
             AdminMutation::RemoveAppDomain { app, host } => {
                 self.remove_app_domain(&app, &host, audit)
@@ -857,20 +859,29 @@ impl LiveAdminMutations {
     fn set_dashboard_tls(
         &self,
         mode: SslMode,
+        email: Option<&str>,
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
         state
-            .update_ssl_mode(mode, audit)
+            .update_ssl_mode(mode, email, audit)
             .map_err(map_admin_state_error)?;
         self.refresh_domains(&mut state)?;
         if mode == SslMode::Acme {
-            let _ = reconcile_acme_domains(
+            // Best-effort: DNS may not be ready yet; fallback stays in place.
+            if let Err(error) = reconcile_acme_domains(
                 &self.state_path,
                 self.http01_challenges.clone(),
                 self.tls.as_ref(),
                 &self.metrics,
-            );
+            ) {
+                record_event(
+                    &self.metrics,
+                    "cert_failed",
+                    None,
+                    format!("ACME reconcile error: {error}"),
+                );
+            }
         }
         Ok(AdminData::DashboardTlsSet { mode })
     }
@@ -1103,6 +1114,18 @@ fn map_deploy_error(error: DeployError) -> AdminMutationError {
 }
 
 fn map_admin_state_error(error: StateError) -> AdminMutationError {
+    let message = match &error {
+        StateError::InvalidConfig(detail) => detail.clone(),
+        StateError::InvalidRecord { detail, .. } => detail.clone(),
+        StateError::AppNotFound(_) | StateError::DomainNotFound(_) => {
+            "requested object does not exist".into()
+        }
+        StateError::DomainConflict { .. }
+        | StateError::NativeDomainImmutable(_)
+        | StateError::ActivationConflict { .. }
+        | StateError::DestructiveApply => "state changed; refresh and try again".into(),
+        _ => "admin mutation failed".into(),
+    };
     let code = match error {
         StateError::AppNotFound(_) | StateError::DomainNotFound(_) => AdminErrorCode::NotFound,
         StateError::DomainConflict { .. }
@@ -1115,12 +1138,6 @@ fn map_admin_state_error(error: StateError) -> AdminMutationError {
         | StateError::ArtifactOwnership { .. }
         | StateError::MetadataMismatch => AdminErrorCode::Validation,
         _ => AdminErrorCode::Internal,
-    };
-    let message = match code {
-        AdminErrorCode::NotFound => "requested object does not exist",
-        AdminErrorCode::Conflict => "state changed; refresh and try again",
-        AdminErrorCode::Validation => "mutation was rejected",
-        _ => "admin mutation failed",
     };
     AdminMutationError::new(code, message)
 }
@@ -1719,7 +1736,7 @@ fn reconcile_acme_domains(
                     "ACME certificate active",
                 );
             }
-            Err(_) => {
+            Err(error) => {
                 had_failure = true;
                 let has_fallback = certificate_for_host(&state.certificates()?, &domain.host)
                     .is_some_and(|certificate| certificate.not_after_unix > now);
@@ -1737,7 +1754,7 @@ fn reconcile_acme_domains(
                     metrics,
                     "cert_failed",
                     Some(&domain.app),
-                    "ACME issuance failed",
+                    format!("ACME issuance failed for {}: {error}", domain.host),
                 );
             }
         }
