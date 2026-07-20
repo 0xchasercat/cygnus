@@ -24,7 +24,12 @@
   let repoConfig = $state({});
   let repoErrors = $state({});
 
-  const appsDomain = $derived(store.node?.apps_domain ?? '');
+  const appsDomain = $derived(store.node?.apps_domain ?? store.node?.apex_domain ?? '');
+  const defaultEngine = $derived(
+    store.node?.engines?.find((en) => en.default)?.version
+    ?? store.node?.engines?.[0]?.version
+    ?? ''
+  );
   const live = $derived(store.mode === 'live');
   const tab = $derived(ui.shipTab ?? 'upload');
 
@@ -53,7 +58,7 @@
       picked = collected;
       appName = sanitize(root) || 'app';
       domain = appsDomain ? `${sanitize(root) || 'app'}.${appsDomain}` : '';
-      engineVersion = store.node?.engines?.find((en) => en.default)?.version ?? 'bun';
+      engineVersion = defaultEngine;
       uploadError = '';
     } catch (cause) {
       picked = null;
@@ -82,7 +87,8 @@
       const r = await store.deployUpload({
         app: appName,
         domain: domain || undefined,
-        engineVersion: engineVersion || undefined,
+        // Empty means "daemon default" — never invent a version name.
+        engineVersion: engineVersion.trim() || undefined,
         entry: entry || undefined,
         tarball: gzBuf,
         totalBytes: gzBuf.length,
@@ -133,11 +139,18 @@
     githubError = '';
     const r = await store.listInstallationRepositories(id);
     githubBusy = false;
-    installationRepos = r.repositories;
-    if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
     for (const repo of installationRepos) {
       if (!repoConfig[repo.repository_id]) {
-        repoConfig[repo.repository_id] = { app: repo.name, domain: appsDomain ? `${repo.name}.${appsDomain}` : '', engine_version: 'bun', entry: 'index.ts' };
+        const eng =
+          store.node?.engines?.find((en) => en.default)?.version
+          ?? store.node?.engines?.[0]?.version
+          ?? '';
+        repoConfig[repo.repository_id] = {
+          app: repo.name,
+          domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
+          engine_version: eng,
+          entry: 'index.ts',
+        };
       }
     }
   }
@@ -153,7 +166,7 @@
       branch: repo.default_branch,
       app: draft.app ?? repo.name,
       domain: draft.domain ?? '',
-      engine_version: draft.engine_version ?? 'bun',
+      engine_version: draft.engine_version || defaultEngine,
       entry: draft.entry ?? 'index.ts',
     });
     if (!r.ok) repoErrors[repo.repository_id] = r.error ?? 'Repository configuration failed';
@@ -172,7 +185,7 @@
       <header>
         <div class="htitle">
           <div>
-            <h2>Ship to {store.node?.apps_domain ?? 'cygnus'}</h2>
+            <h2>Ship to {appsDomain || 'this node'}</h2>
             <p>{live ? 'Choose how the next artifact reaches this node.' : 'Preview dataset · daemon bridge offline.'}</p>
           </div>
         </div>
@@ -239,7 +252,7 @@
               {#if installationRepos.length}
                 <div class="repo-list">
                   {#each installationRepos as repo (repo.repository_id)}
-                    {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: '', engine_version: 'bun', entry: 'index.ts' }}
+                    {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' }}
                     <form class="repo-row" onsubmit={(e) => configureRepo(e, repo)}>
                       <div class="repo-identity"><strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong><small>{repo.private ? 'private' : 'public'} · default {repo.default_branch}</small></div>
                       <label>App<input value={draft.app} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, app: e.currentTarget.value })} maxlength="64" required /></label>

@@ -66,6 +66,12 @@
   const sslAuto = $derived(sslMode === 'acme');
   const acmeEmailKnown = $derived(Boolean(store.node?.acme_email));
 
+  const defaultEngine = $derived(
+    store.node?.engines?.find((en) => en.default)?.version
+    ?? store.node?.engines?.[0]?.version
+    ?? ''
+  );
+
   // Dashboard's own cert status, from the node's certificate list when present.
   const dashboardCert = $derived.by(() => {
     const certs = store.node?.certificates ?? [];
@@ -80,10 +86,10 @@
     if (sslAuto) return { cls: 'build', text: 'issuing' };
     return { cls: 'ghost', text: 'self-signed' };
   });
-
   function openDashEdit() {
     dashDomain = dashboardDomain;
-    dashApex = apexDomain;
+    // UI "Apps domain" is apex; fall back to apps_domain for older nodes.
+    dashApex = apexDomain || store.node?.apps_domain || '';
     dashError = '';
     dashEditOpen = true;
   }
@@ -165,7 +171,7 @@
     if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
     for (const repo of installationRepos) {
       if (!repoConfig[repo.repository_id]) {
-        repoConfig[repo.repository_id] = { app: repo.name, domain: '', engine_version: 'bun', entry: 'index.ts' };
+        repoConfig[repo.repository_id] = { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' };
       }
     }
   }
@@ -181,7 +187,7 @@
       branch: repo.default_branch,
       app: draft.app ?? repo.name,
       domain: draft.domain ?? '',
-      engine_version: draft.engine_version ?? 'bun',
+      engine_version: draft.engine_version || defaultEngine,
       entry: draft.entry ?? 'index.ts',
     });
     if (!r.ok) repoErrors[repo.repository_id] = r.error ?? 'Repository configuration failed';
@@ -299,7 +305,7 @@
             {#if installationRepos.length}
               <div class="repo-list">
                 {#each installationRepos as repo (repo.repository_id)}
-                  {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: '', engine_version: 'bun', entry: 'index.ts' }}
+                  {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' }}
                   <form class="repo-row" onsubmit={(e) => configureRepo(e, repo)}>
                     <div class="repo-identity"><strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong><small>{repo.private ? 'private' : 'public'} · default {repo.default_branch}</small></div>
                     <label>App<input value={draft.app} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, app: e.currentTarget.value })} maxlength="64" required /></label>
@@ -448,7 +454,7 @@
           <div class="row">
             <span class="glyph"><Icon name="node" size={14} /></span>
             <div class="tk">
-              <span class="mname num">{store.node?.apps_domain ?? 'cygnus'}</span>
+              <span class="mname num">{store.node?.apps_domain ?? store.node?.apex_domain ?? 'cygnus'}</span>
               <span class="tmeta num">{store.node?.version ?? '—'} · {store.node?.listen ?? '—'}</span>
             </div>
             <span class="grow"></span>

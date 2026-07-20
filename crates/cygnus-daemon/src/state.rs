@@ -2500,6 +2500,10 @@ impl State {
     }
 
     /// Atomically set dashboard/apex domains and replace all native app domains.
+    ///
+    /// The console "Apps domain" field is the public apex used for native app
+    /// hostnames (`app.<apex>`). Keep `apps_domain` in lockstep so deploy defaults,
+    /// status identity, and native domain reconciliation all see the same value.
     pub fn update_dashboard_domains(
         &mut self,
         dashboard_domain: Option<&str>,
@@ -2510,6 +2514,12 @@ impl State {
         let mut edge = self.load()?.edge;
         edge.dashboard_domain = dashboard_domain.map(str::to_owned);
         edge.apex_domain = apex_domain.map(str::to_owned);
+        // Operator-facing "apps domain" is the apex; mirror it into apps_domain
+        // unless a distinct apps_domain was already configured to something else
+        // that is not the install default / previous apex.
+        if let Some(apex) = apex_domain {
+            edge.apps_domain = Some(apex.to_owned());
+        }
         let listen = self.load()?.listen;
         let edge = canonical_edge_config(listen, &edge)?;
         let transaction = self.connection.transaction()?;
@@ -2552,6 +2562,11 @@ impl State {
                 return Err(StateError::InvalidConfig(
                     "ACME contact email is invalid".into(),
                 ));
+            }
+            // Runtime already defaults to :443 when https_listen is unset; persist
+            // that so config validation and status agree with the live listener.
+            if edge.https_listen.is_none() {
+                edge.https_listen = Some(SocketAddr::from(([0, 0, 0, 0], 443)));
             }
             let dns_provider = edge.acme.as_ref().and_then(|c| c.dns_provider.clone());
             let directory_url = edge
@@ -5666,14 +5681,16 @@ fn canonical_edge_config(listen: SocketAddr, edge: &EdgeConfig) -> Result<EdgeCo
     let dashboard_domain =
         canonical_edge_host(edge.dashboard_domain.as_deref(), "dashboard_domain")?;
     let apex_domain = canonical_edge_host(edge.apex_domain.as_deref(), "apex_domain")?;
+    let mut https_listen = edge.https_listen;
     let acme = edge
         .acme
         .as_ref()
         .map(|acme| {
-            if edge.https_listen.is_none() {
-                return Err(StateError::InvalidConfig(
-                    "ACME requires an HTTPS listener".into(),
-                ));
+            // ACME needs a public HTTPS listener. If the operator never set one,
+            // default to 0.0.0.0:443 — matching the daemon's runtime fallback —
+            // instead of rejecting dashboard/domain saves with a dead-end error.
+            if https_listen.is_none() {
+                https_listen = Some(SocketAddr::from(([0, 0, 0, 0], 443)));
             }
             let email = acme.email.trim();
             if email != acme.email
@@ -5706,18 +5723,18 @@ fn canonical_edge_config(listen: SocketAddr, edge: &EdgeConfig) -> Result<EdgeCo
                     }))
             {
                 return Err(StateError::InvalidConfig(
-                    "DNS provider must be a lowercase identifier".into(),
+                    "ACME dns_provider must be a short lowercase identifier".into(),
                 ));
             }
             Ok(AcmeConfig {
-                email: email.into(),
-                directory_url: directory_url.into(),
+                email: email.to_owned(),
+                directory_url: directory_url.to_owned(),
                 dns_provider: acme.dns_provider.clone(),
             })
         })
         .transpose()?;
     Ok(EdgeConfig {
-        https_listen: edge.https_listen,
+        https_listen,
         apps_domain,
         dashboard_domain,
         apex_domain,
