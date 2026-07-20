@@ -926,10 +926,16 @@ fn build_job(
         job.limits.pids_max = BUILD_INSTALL_PIDS_MAX;
     }
     if linux {
-        let mut rootfs = RootfsSpec::new(vec![
-            workspace.parent().unwrap_or(workspace).to_path_buf(),
-            engine.host_root.clone(),
-        ]);
+        // Same hostlib requirement as runtime cages: without the curated
+        // loader + glibc lowerdir, execve of cygnus-init/bun fails with ENOENT
+        // for ld-linux (errno 2). Engine alone is not enough on a pivoted root.
+        let mut lowerdirs = Vec::with_capacity(3);
+        if let Some(state_root) = engine.host_root.parent().and_then(|p| p.parent()) {
+            lowerdirs.push(state_root.join("hostlib"));
+        }
+        lowerdirs.push(engine.host_root.clone());
+        lowerdirs.push(workspace.parent().unwrap_or(workspace).to_path_buf());
+        let mut rootfs = RootfsSpec::new(lowerdirs);
         rootfs.tmpfs_size = BUILD_ROOTFS_TMPFS_SIZE;
         job.rootfs = Some(rootfs);
         job.build_output = Some(BuildOutputSpec::new(publish));
@@ -2461,7 +2467,9 @@ mod tests {
         fs::create_dir_all(&publish).unwrap();
         let engine = EngineRecord {
             version: "bun".into(),
-            host_root: PathBuf::from("/engine"),
+            // Match install layout: $state/engines/<version> so hostlib resolves
+            // as $state/hostlib (two parents up).
+            host_root: PathBuf::from("/var/lib/cygnus/engines/bun"),
             cage_executable: PathBuf::from("/usr/local/bin/bun"),
             sha256: "0".repeat(64),
             is_default: false,
@@ -2528,6 +2536,18 @@ mod tests {
             assert_eq!(
                 job.rootfs.as_ref().unwrap().tmpfs_size,
                 BUILD_ROOTFS_TMPFS_SIZE
+            );
+            // hostlib must lead the overlay so ld-linux/glibc resolve for
+            // cygnus-init and bun. Without it, Linux builds die at execve ENOENT.
+            let lower = &job.rootfs.as_ref().unwrap().lowerdirs;
+            assert_eq!(
+                lower.first().map(PathBuf::as_path),
+                Some(Path::new("/var/lib/cygnus/hostlib")),
+                "build rootfs must lead with hostlib: {lower:?}"
+            );
+            assert!(
+                lower.iter().any(|p| p == &engine.host_root),
+                "build rootfs missing engine host_root: {lower:?}"
             );
         }
         fs::remove_dir_all(workspace.ancestors().nth(2).unwrap()).unwrap();

@@ -226,11 +226,20 @@
           </div>
         </div>
         <div class="termwrap">
-          {#if lines.length || logMissing}
+          {#if lines.length}
             <Terminal {lines} building={deploy.status === 'building'} follow={true} />
             {#if logMissing}
-              <div class="lognote mono">live logs unavailable on this node · showing what we have</div>
+              <div class="lognote mono">could not refresh logs from the daemon (404) · showing buffered lines</div>
             {/if}
+          {:else if deploy.error}
+            <div class="term-empty mono fail">
+              {deploy.error}
+              {#if logMissing}
+                <div class="lognote">build log files were not readable via the API — the error above is from the deployment record</div>
+              {/if}
+            </div>
+          {:else if logMissing}
+            <div class="term-empty mono">build log not registered for this deployment yet</div>
           {:else}
             <div class="term-empty mono">{deploy.status === 'building' ? 'collecting build output…' : 'no log output captured'}</div>
           {/if}
@@ -482,14 +491,24 @@
     letter-spacing: 0.04em;
   }
   .term-empty {
-    padding: 40px 0;
+    padding: 40px 18px;
     text-align: center;
     font-size: 11px;
     color: var(--ink-4);
-    letter-spacing: 0.06em;
+    letter-spacing: 0.04em;
     background: var(--surface-3);
     border: 1px solid var(--line-2);
     border-radius: var(--r-m);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .term-empty.fail {
+    color: var(--ink-2);
+    border-color: color-mix(in srgb, var(--red) 30%, var(--line-2));
+    background: color-mix(in srgb, var(--red) 8%, var(--surface-3));
+  }
+  .term-empty .lognote {
+    margin-top: 10px;
   }
   .hashbtn {
     font-family: var(--mono);
