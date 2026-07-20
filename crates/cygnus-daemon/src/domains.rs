@@ -35,6 +35,16 @@ pub fn dns_precheck(
     host: &str,
     expected_ip: Option<Ipv4Addr>,
 ) -> DnsPrecheck {
+    // Local-only hosts never need public DNS. Treat loopback and *.localhost as
+    // already pointed at this node so native domains don't stay "pending".
+    if is_local_host(host) {
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        return DnsPrecheck {
+            expected_ip: Some(expected_ip.unwrap_or(loopback)),
+            resolves_to: vec![loopback],
+            ok: true,
+        };
+    }
     let resolves_to = resolver
         .resolve_ipv4(host)
         .unwrap_or_default()
@@ -48,6 +58,16 @@ pub fn dns_precheck(
         resolves_to,
         ok,
     }
+}
+
+/// Hosts that are only meaningful on the local machine (no public A record).
+pub fn is_local_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "127.0.0.1"
+        || host == "0.0.0.0"
+        || host == "::1"
 }
 
 /// Determine this node's expected public IPv4. The explicit override always wins.
@@ -68,6 +88,17 @@ pub fn expected_public_ipv4() -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_hosts_skip_public_dns_and_are_ok() {
+        let expected = Ipv4Addr::new(203, 0, 113, 8);
+        // Even with a resolver that would fail, *.localhost is treated as local.
+        let result = dns_precheck(&FixedResolver(vec![]), "app.apps.localhost", Some(expected));
+        assert!(result.ok);
+        assert_eq!(result.resolves_to, [Ipv4Addr::new(127, 0, 0, 1)]);
+        assert!(is_local_host("apps.localhost"));
+        assert!(is_local_host("Draco.localhost."));
+        assert!(!is_local_host("example.com"));
+    }
     struct FixedResolver(Vec<Ipv4Addr>);
 
     impl DnsResolver for FixedResolver {

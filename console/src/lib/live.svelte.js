@@ -154,10 +154,19 @@ class Store {
     const fetchGithub = this.#tick % GITHUB_EVERY === 0;
 
     const reads = [
-      this.#safeGet('/api/v1/status', (d) => (this.node = d ?? this.node)),
+      this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node)),
       this.#safeGet('/api/v1/apps?limit=50', (d) => (this.apps = Array.isArray(d?.apps) ? d.apps : [])),
       this.#safeGet('/api/v1/deployments?limit=50', (d) => (this.deployments = Array.isArray(d?.deployments) ? d.deployments : [])),
-      this.#safeGet('/api/v1/metrics', (d) => (this.metrics = d ?? null), true),
+      this.#safeGet('/api/v1/metrics', (d) => {
+        if (!d) {
+          this.metrics = null;
+          return;
+        }
+        // AdminData::Metrics is tagged {kind:"metrics", ...snapshot fields}.
+        // Flatten so screens can read totals/series/apps directly.
+        const { kind: _kind, ...snapshot } = d;
+        this.metrics = Object.keys(snapshot).length ? snapshot : d;
+      }, true),
       this.#safeGet('/api/v1/events?limit=100', (d) => (this.events = Array.isArray(d?.events) ? d.events : []), true),
       this.#safeGet('/api/v1/requests?limit=200', (d) => (this.requests = Array.isArray(d?.requests) ? d.requests.slice(0, 200) : []), true),
     ];
@@ -546,6 +555,10 @@ class Store {
       const deploymentId = r?.deployment_id;
       if (!deploymentId) return { ok: false, error: 'deploy/finish returned no deployment id' };
       onProgress?.(1);
+      // Refresh deployments so the build page has the new row immediately.
+      await this.#safeGet('/api/v1/deployments?limit=50', (d) => {
+        this.deployments = Array.isArray(d?.deployments) ? d.deployments : this.deployments;
+      });
       return { ok: true, deploymentId };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'deploy/finish failed' };

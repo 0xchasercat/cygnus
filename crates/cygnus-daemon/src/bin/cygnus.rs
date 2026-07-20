@@ -57,11 +57,20 @@ enum Command {
         command: EngineCommand,
     },
     /// Build and activate a source directory as a deployment.
+    ///
+    /// When run with no flags, deploys the current directory and names the app
+    /// after the folder (e.g. `cygnus deploy` inside `~/apps/draco` → app `draco`).
     Deploy {
-        #[arg(long = "source-dir", alias = "source")]
-        source_dir: PathBuf,
+        /// Source directory (default: current directory).
+        /// Accepts a bare path as the first positional argument.
+        #[arg(long = "source-dir", alias = "source", value_name = "SOURCE_DIR")]
+        source_dir: Option<PathBuf>,
+        /// Optional positional source directory (same as --source-dir).
+        #[arg(value_name = "SOURCE", conflicts_with = "source_dir")]
+        source: Option<PathBuf>,
+        /// App name (default: basename of the source directory).
         #[arg(long)]
-        app: String,
+        app: Option<String>,
         /// Hostname to route (default: <app>.<apps-domain>).
         #[arg(long)]
         domain: Option<String>,
@@ -135,6 +144,20 @@ enum Command {
         offset: u64,
         #[arg(long)]
         follow: bool,
+    },
+    /// Write the daemon process log to stdout.
+    ///
+    /// Looks under ~/.cygnus/log (macOS user install) then /var/log/cygnus.
+    DaemonLogs {
+        /// Read stderr instead of stdout.
+        #[arg(long)]
+        error: bool,
+        /// Follow the file like `tail -f`.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Print only the last N lines (default 200; ignored with --follow).
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
     },
 }
 
@@ -235,6 +258,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Command::Deploy {
             source_dir,
+            source,
             app,
             domain,
             engine_version,
@@ -242,6 +266,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             artifact_root,
             upstream,
         } => {
+            let source_dir = resolve_deploy_source(source_dir.or(source))?;
+            let app = resolve_deploy_app(app, &source_dir)?;
             let request = DeployRequest {
                 source_dir,
                 app,
@@ -363,6 +389,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             offset,
             follow,
         } => stream_log(&client, deployment, stream.into(), offset, follow)?,
+        Command::DaemonLogs {
+            error,
+            follow,
+            lines,
+        } => stream_daemon_log(error, follow, lines)?,
     }
     Ok(())
 }
@@ -389,6 +420,91 @@ fn resolve_admin_socket(flag: Option<PathBuf>) -> PathBuf {
         }
     }
     PathBuf::from(DEFAULT_HOST_ADMIN_SOCKET)
+}
+
+/// Resolve the deploy source directory: explicit path, or the process CWD.
+fn resolve_deploy_source(source: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {
+    let path = match source {
+        Some(path) => path,
+        None => std::env::current_dir()
+            .map_err(|error| format!("cannot determine current directory for deploy: {error}"))?,
+    };
+    // Prefer absolute paths so the daemon and CLI agree on the root, and so a
+    // relative `./` never collapses into a symlink trap under /tmp or volumes.
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot resolve source directory: {error}"))?
+            .join(path)
+    };
+    if !absolute.is_dir() {
+        return Err(format!(
+            "source directory does not exist or is not a directory: {}",
+            absolute.display()
+        )
+        .into());
+    }
+    Ok(absolute)
+}
+
+/// Resolve the app name: explicit --app, else a sanitized folder basename.
+fn resolve_deploy_app(
+    app: Option<String>,
+    source_dir: &std::path::Path,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(app) = app {
+        let trimmed = app.trim();
+        if trimmed.is_empty() {
+            return Err("app name must not be empty".into());
+        }
+        return Ok(trimmed.to_owned());
+    }
+    let name = source_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("cannot infer app name from source directory")?;
+    let sanitized = sanitize_app_name(name);
+    if sanitized.is_empty() {
+        return Err(
+            format!("cannot infer a valid app name from directory {name:?}; pass --app").into(),
+        );
+    }
+    Ok(sanitized)
+}
+
+/// Lowercase DNS-label-ish app names: a-z0-9 and hyphens, no leading/trailing hyphen.
+fn sanitize_app_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_hyphen = false;
+    for ch in raw.chars() {
+        let mapped = match ch {
+            'A'..='Z' => ch.to_ascii_lowercase(),
+            'a'..='z' | '0'..='9' => ch,
+            _ => '-',
+        };
+        if mapped == '-' {
+            if out.is_empty() || last_hyphen {
+                continue;
+            }
+            last_hyphen = true;
+            out.push('-');
+        } else {
+            last_hyphen = false;
+            out.push(mapped);
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    // Keep within the daemon's app-name budget.
+    if out.len() > 63 {
+        out.truncate(63);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
 }
 
 fn call(client: &AdminClient, command: AdminCommand) -> Result<AdminData, Box<dyn Error>> {
@@ -491,6 +607,95 @@ fn stream_log(
 
 const LOG_FOLLOW_QUIET_POLLS: u32 = 3;
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn stream_daemon_log(error: bool, follow: bool, lines: usize) -> Result<(), Box<dyn Error>> {
+    let path = resolve_daemon_log_path(error)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if follow {
+        // Start at EOF so follow only streams new lines, then poll for appends.
+        let mut file = std::fs::File::open(&path)
+            .map_err(|err| format!("cannot open daemon log {}: {err}", path.display()))?;
+        use std::io::Seek;
+        file.seek(io::SeekFrom::End(0))?;
+        let mut buf = [0_u8; 8192];
+        loop {
+            match std::io::Read::read(&mut file, &mut buf) {
+                Ok(0) => thread::sleep(LOG_FOLLOW_POLL_INTERVAL),
+                Ok(n) => {
+                    output.write_all(&buf[..n])?;
+                    output.flush()?;
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+    } else {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|err| format!("cannot read daemon log {}: {err}", path.display()))?;
+        let selected = tail_lines(&contents, lines);
+        output.write_all(selected.as_bytes())?;
+        if !selected.is_empty() && !selected.ends_with('\n') {
+            output.write_all(b"\n")?;
+        }
+        output.flush()?;
+        Ok(())
+    }
+}
+
+fn resolve_daemon_log_path(error: bool) -> Result<PathBuf, Box<dyn Error>> {
+    let names: &[&str] = if error {
+        &["daemon.error.log"]
+    } else {
+        // launchd/user installs often write only to the error stream; prefer
+        // stdout when it has content, otherwise fall back so `cygnus daemon-logs`
+        // is useful without flags.
+        &["daemon.log", "daemon.error.log"]
+    };
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".cygnus/log"));
+    }
+    roots.push(PathBuf::from("/var/log/cygnus"));
+    roots.push(PathBuf::from("/var/log"));
+
+    let mut seen_empty = None;
+    for root in &roots {
+        for name in names {
+            let path = root.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if len > 0 || error {
+                return Ok(path);
+            }
+            if seen_empty.is_none() {
+                seen_empty = Some(path);
+            }
+        }
+    }
+    if let Some(path) = seen_empty {
+        return Ok(path);
+    }
+    Err("daemon log not found (looked under ~/.cygnus/log and /var/log/cygnus; try --error)".into())
+}
+
+fn tail_lines(contents: &str, lines: usize) -> &str {
+    if lines == 0 || contents.is_empty() {
+        return "";
+    }
+    let mut count = 0_usize;
+    for (idx, ch) in contents.char_indices().rev() {
+        if ch == '\n' {
+            count += 1;
+            if count > lines {
+                return &contents[idx + ch.len_utf8()..];
+            }
+        }
+    }
+    contents
+}
 
 fn request_id() -> String {
     let nanos = SystemTime::now()
@@ -1280,6 +1485,80 @@ mod tests {
                 .command,
             Command::Logs { follow: true, .. }
         ));
+    }
+
+    #[test]
+    fn deploy_defaults_source_and_app_from_cwd_basename() {
+        let parsed = Cli::try_parse_from(["cygnus", "deploy"]).unwrap();
+        let Command::Deploy {
+            source_dir,
+            source,
+            app,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected deploy");
+        };
+        assert!(source_dir.is_none());
+        assert!(source.is_none());
+        assert!(app.is_none());
+
+        let dir = std::env::temp_dir().join(format!("cygnus-deploy-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = resolve_deploy_source(Some(dir.clone())).unwrap();
+        assert_eq!(resolved, dir);
+        let inferred = resolve_deploy_app(None, &resolved).unwrap();
+        assert_eq!(
+            inferred,
+            sanitize_app_name(dir.file_name().unwrap().to_str().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_accepts_positional_source() {
+        let parsed = Cli::try_parse_from(["cygnus", "deploy", ".", "--app", "demo"]).unwrap();
+        match parsed.command {
+            Command::Deploy {
+                source: Some(path),
+                app: Some(name),
+                ..
+            } => {
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(name, "demo");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_app_name_is_dns_label_ish() {
+        assert_eq!(sanitize_app_name("Draco UI Design"), "draco-ui-design");
+        assert_eq!(sanitize_app_name("---Hello---"), "hello");
+        assert_eq!(sanitize_app_name("a".repeat(80).as_str()).len(), 63);
+    }
+
+    #[test]
+    fn daemon_logs_command_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["cygnus", "daemon-logs", "--error", "-f", "--lines", "50"])
+                .unwrap()
+                .command,
+            Command::DaemonLogs {
+                error: true,
+                follow: true,
+                lines: 50,
+            }
+        ));
+    }
+
+    #[test]
+    fn tail_lines_keeps_last_n() {
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(tail_lines(text, 2), "c\nd\n");
+        assert_eq!(tail_lines(text, 10), text);
+        assert_eq!(tail_lines(text, 0), "");
     }
 
     #[test]

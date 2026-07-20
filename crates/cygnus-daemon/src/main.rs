@@ -1175,24 +1175,30 @@ fn serve(
     let state = State::open(state_path)?;
     let mut snapshot = state.load()?;
     drop(state);
-    // HTTPS edge: explicit https_listen wins; ACME mode defaults to :443 so
-    // setup-wizard SSL opens a real TLS listener without a separate flag.
-    let https_bind = snapshot.edge.https_listen.or_else(|| {
-        if snapshot.edge.ssl_mode == SslMode::Acme {
-            Some(SocketAddr::from(([0, 0, 0, 0], 443)))
-        } else {
+    // HTTPS edge: explicit https_listen wins. Otherwise try :443 so dashboard
+    // https:// links and apps.localhost work with self-signed certs. A missing
+    // bind permission on the default port must not brick the node — only an
+    // operator-configured https_listen is fatal when it fails.
+    let explicit_https = snapshot.edge.https_listen;
+    let https_bind = explicit_https.or(Some(SocketAddr::from(([0, 0, 0, 0], 443))));
+    let https_listener = match https_bind.map(TcpListener::bind) {
+        Some(Ok(listener)) => Some(listener),
+        Some(Err(error)) if explicit_https.is_some() => {
+            return Err(format!(
+                "failed to bind HTTPS ingress on {https_bind:?}: {error}. \
+                 Cygnus must run with permission to bind that address (e.g. as root)."
+            )
+            .into());
+        }
+        Some(Err(error)) => {
+            eprintln!(
+                "cygnus-daemon: HTTPS default bind on {https_bind:?} failed ({error}); continuing HTTP-only. \
+                 Set edge.https_listen explicitly once privileged, or ignore for plain HTTP local use."
+            );
             None
         }
-    });
-    let https_listener = https_bind
-        .map(TcpListener::bind)
-        .transpose()
-        .map_err(|error| {
-            format!(
-                "failed to bind HTTPS ingress on {https_bind:?}: {error}. \
-                 Cygnus must run with permission to bind port 443 (e.g. as root)."
-            )
-        })?;
+        None => None,
+    };
     // Edge ingress is mandatory on :80. No fallback to the management port —
     // without this bind Cygnus is not an edge router.
     let edge_addr = edge_http_listen();

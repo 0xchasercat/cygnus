@@ -73,13 +73,13 @@
         <span>Search the node</span>
         <kbd>⌘K</kbd>
       </button>
-      <button class="avatar" onclick={toggleMenu} aria-haspopup="menu" aria-expanded={menuOpen} title="operator">
-        <span class="av-t">OP</span>
+      <button class="avatar" onclick={toggleMenu} aria-haspopup="menu" aria-expanded={menuOpen} title="Account">
+        <Icon name="user" size={15} />
       </button>
       {#if menuOpen}
         <div class="popover" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.key === 'Escape' && closeMenu()}>
           <div class="pop-head">
-            <span class="pop-label mono">operator</span>
+            <span class="pop-label mono">account</span>
           </div>
           {#if store.mode === 'live'}
             <button class="pop-item" role="menuitem" onclick={signOut}>

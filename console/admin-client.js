@@ -2,10 +2,11 @@ import { randomBytes } from "node:crypto";
 
 export const ADMIN_PROTOCOL_VERSION = 1;
 export const MAX_ADMIN_FRAME_BYTES = 64 * 1024;
-// Deploy builds and large upload finishes can take longer than a UI poll.
-// Keep the default short enough to surface dead daemons quickly, but well
-// above a busy SQLite busy_timeout (5s) so concurrent admin traffic survives.
-const ADMIN_TIMEOUT_MS = 30_000;
+// Default is short enough to surface a dead daemon quickly, but above SQLite's
+// busy_timeout (5s). Deploy upload/finish can hold the socket longer when the
+// daemon is packing a large source tree into a queued job.
+export const ADMIN_TIMEOUT_MS = 30_000;
+export const ADMIN_DEPLOY_TIMEOUT_MS = 15 * 60_000;
 
 export class AdminProtocolError extends Error {
   constructor(message, code = "transport") {
@@ -15,7 +16,23 @@ export class AdminProtocolError extends Error {
   }
 }
 
-export function adminRequest(socketPath, command, actor) {
+function timeoutForCommand(command) {
+  const type = command && typeof command === "object" ? command.type : null;
+  if (
+    type === "deploy_upload_begin" ||
+    type === "deploy_upload_chunk" ||
+    type === "deploy_upload_finish" ||
+    type === "deploy_start" ||
+    type === "deploy" ||
+    type === "register_engine" ||
+    type === "apply_config"
+  ) {
+    return ADMIN_DEPLOY_TIMEOUT_MS;
+  }
+  return ADMIN_TIMEOUT_MS;
+}
+
+export function adminRequest(socketPath, command, actor, options = {}) {
   if (typeof socketPath !== "string" || !socketPath.startsWith("/")) {
     return Promise.reject(new AdminProtocolError("admin socket path must be absolute"));
   }
@@ -42,9 +59,13 @@ export function adminRequest(socketPath, command, actor) {
     let connection = null;
     let expectedLength = null;
     let received = Buffer.alloc(0);
+    const timeoutMs =
+      typeof options.timeoutMs === "number" && options.timeoutMs > 0
+        ? options.timeoutMs
+        : timeoutForCommand(command);
     const timer = setTimeout(() => {
       finish(null, new AdminProtocolError("daemon admin request timed out", "timeout"));
-    }, ADMIN_TIMEOUT_MS);
+    }, timeoutMs);
 
     const finish = (socket, error, value) => {
       if (settled) return;

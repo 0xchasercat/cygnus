@@ -683,10 +683,12 @@ where
 
         // Re-open the database before seal/activate so admin traffic can resume
         // concurrent access under WAL and we hold a live connection again.
-        state.unpark().map_err(|error| DeployError::ActivationFailed {
-            id: deployment_id.clone(),
-            detail: format!("could not reopen state after build: {error}"),
-        })?;
+        state
+            .unpark()
+            .map_err(|error| DeployError::ActivationFailed {
+                id: deployment_id.clone(),
+                detail: format!("could not reopen state after build: {error}"),
+            })?;
 
         let artifact = ArtifactInput {
             app: request.app.clone(),

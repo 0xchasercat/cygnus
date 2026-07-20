@@ -2320,10 +2320,10 @@ impl State {
                     .map(|state_root| state_root.join("hostlib"))
             });
         let mut lowerdirs = Vec::with_capacity(3);
-        if cfg!(target_os = "linux") {
-            if let Some(hostlib) = hostlib {
-                lowerdirs.push(hostlib);
-            }
+        if cfg!(target_os = "linux")
+            && let Some(hostlib) = hostlib
+        {
+            lowerdirs.push(hostlib);
         }
         lowerdirs.push(engine.host_root);
         lowerdirs.push(artifact.host_path);

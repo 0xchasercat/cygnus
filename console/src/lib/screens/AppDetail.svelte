@@ -36,14 +36,32 @@
 
   const DOMAIN_PILL = {
     active: { cls: 'live', text: 'active' },
-    fallback_active: { cls: 'build', text: 'fallback' },
+    fallback_active: { cls: 'live', text: 'ready' },
     issuing: { cls: 'cobalt', text: 'issuing' },
     pending: { cls: 'ghost', text: 'pending' },
     failed: { cls: 'fail', text: 'failed' },
   };
 
   function domainPill(d) {
+    // Local native domains that already resolve shouldn't look broken.
+    if (d.kind === 'native' && (d.status === 'pending' || d.status === 'fallback_active') && d.dns?.ok) {
+      return { cls: 'live', text: d.status === 'pending' ? 'local' : 'ready' };
+    }
     return DOMAIN_PILL[d.status] ?? { cls: 'ghost', text: d.status ?? '—' };
+  }
+
+  function isLocalHost(host) {
+    if (!host) return false;
+    const h = String(host).toLowerCase().replace(/\.$/, '');
+    return h === 'localhost' || h.endsWith('.localhost') || h === '127.0.0.1';
+  }
+
+  function appUrl(host) {
+    if (!host) return '#';
+    // Prefer https when the node has a TLS listener or the host is local
+    // (we issue a self-signed cert for apps.localhost).
+    const preferHttps = !!store.node?.https_listen || isLocalHost(host) || store.node?.ssl_mode === 'acme';
+    return `${preferHttps ? 'https' : 'http'}://${host}`;
   }
 
   let addDomainOpen = $state(false);
@@ -178,7 +196,7 @@
         </div>
         <div class="domains num">
           {#each app.domains as d}
-            <a href="https://{d}" target="_blank" rel="noopener noreferrer" class="dom"
+            <a href={appUrl(d)} target="_blank" rel="noopener noreferrer" class="dom"
               >{d} <Icon name="ext" size={11} /></a
             >
             <span class="dot">·</span>
@@ -187,7 +205,7 @@
       </div>
       <div class="actions">
         {#if app.domains?.length}
-          <a class="btn primary" href={`https://${app.domains[0]}`} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
+          <a class="btn primary" href={appUrl(app.domains[0])} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
         {/if}
       </div>
     </header>
@@ -304,10 +322,17 @@
                 {@const toggling = pendingTls[d.host]}
                 <div class="dom-row" class:native={d.kind === 'native'}>
                   <div class="dom-host">
-                    <a href={`https://${d.host}`} target="_blank" rel="noopener noreferrer" class="dh-link num">{d.host}</a>
+                    <a href={appUrl(d.host)} target="_blank" rel="noopener noreferrer" class="dh-link num">{d.host}</a>
                     <span class="dom-tag">{d.kind}</span>
                   </div>
-                  <span class="pill {pill.cls}" title={d.status === 'fallback_active' ? 'DNS not pointing here yet — using a self-signed certificate, will upgrade automatically' : ''}>
+                  <span
+                    class="pill {pill.cls}"
+                    title={d.kind === 'native' && isLocalHost(d.host)
+                      ? 'Native local domain · served on this node'
+                      : d.status === 'fallback_active'
+                        ? 'Using a self-signed certificate until DNS resolves for ACME'
+                        : ''}
+                  >
                     {pill.text}
                   </span>
                   <div class="dom-actions">
@@ -327,11 +352,14 @@
                       </button>
                     {/if}
                   </div>
-                  {#if d.kind === 'custom' && d.dns && !d.dns.ok}
+                  {#if d.kind === 'custom' && d.dns && !d.dns.ok && !isLocalHost(d.host)}
                     <div class="dns-hint mono">
                       Point an A record for <b>{d.host}</b> to <b>{d.dns.expected_ip}</b>
-                      {#if d.dns.resolves_to}· currently {d.dns.resolves_to}{/if}
+                      {#if d.dns.resolves_to?.length}· currently {Array.isArray(d.dns.resolves_to) ? d.dns.resolves_to.join(', ') : d.dns.resolves_to}{/if}
                     </div>
+                  {/if}
+                  {#if d.kind === 'native' && isLocalHost(d.host)}
+                    <div class="dns-hint mono">local native domain · no public DNS required</div>
                   {/if}
                   {#if d.status === 'failed'}
                     <div class="dns-hint mono fail">Certificate issuance failed — check DNS, then retry from the TLS toggle.</div>
@@ -366,10 +394,19 @@
             </div>
           {:else}
             <div class="kv">
-              <div class="kvrow"><span>p50</span><b class="num">{am ? millis(am.p50_ms) : '—'}</b></div>
-              <div class="kvrow"><span>p99</span><b class="num">{am ? millis(am.p99_ms) : '—'}</b></div>
-              <div class="kvrow"><span>rps</span><b class="num">{am ? rate(am.rps_1m) : '—'}</b></div>
+              <div class="kvrow"><span>Request p50</span><b class="num">{am && am.requests_1h ? millis(am.p50_ms) : '—'}</b></div>
+              <div class="kvrow"><span>Request p99</span><b class="num">{am && am.requests_1h ? millis(am.p99_ms) : '—'}</b></div>
+              <div class="kvrow"><span>rps</span><b class="num">{am ? rate(am.rps_1m) : '0'}</b></div>
             </div>
+            {#if store.metrics?.totals?.boot_p50_ms}
+              <div class="kv" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line-2)">
+                <div class="kvrow"><span>Revival p50</span><b class="num">{millis(store.metrics.totals.boot_p50_ms)}</b></div>
+                <div class="kvrow"><span>Revival p99</span><b class="num">{millis(store.metrics.totals.boot_p99_ms)}</b></div>
+              </div>
+            {/if}
+            {#if !am || !am.requests_1h}
+              <p class="axiom" style="margin-top:10px">Request latency appears after traffic hits this app.</p>
+            {/if}
           {/if}
         </section>
 

@@ -7,13 +7,24 @@
   import Icon from '../components/Icon.svelte';
 
   let tab = $state('requests');
+  let page = $state(0);
+  let expanded = $state({}); // request_id -> true
+  const PAGE_SIZE = 50;
 
   const series = $derived(
     store.metrics?.series ? store.metrics.series.map((b) => [b.p50_ms, b.p99_ms]) : []
   );
 
-  const reqs = $derived(store.requests.slice(0, 200));
+  const allReqs = $derived(store.requests);
+  const totalPages = $derived(Math.max(1, Math.ceil(allReqs.length / PAGE_SIZE)));
+  const safePage = $derived(Math.min(page, totalPages - 1));
+  const reqs = $derived(allReqs.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE));
   const events = $derived(store.events);
+
+  // Reset page when the stream shrinks under the current offset.
+  $effect(() => {
+    if (page > totalPages - 1) page = Math.max(0, totalPages - 1);
+  });
 
   function reqTime(r) {
     const d = new Date(r.time_ms ?? 0);
@@ -21,6 +32,18 @@
     const mm = String(d.getMinutes()).padStart(2, '0');
     const ss = String(d.getSeconds()).padStart(2, '0');
     return `${hh}:${mm}:${ss}`;
+  }
+
+  function toggleReq(id) {
+    expanded = { ...expanded, [id]: !expanded[id] };
+  }
+
+  function fmtBytes(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v <= 0) return '0 B';
+    if (v < 1024) return `${Math.round(v)} B`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+    return `${(v / (1024 * 1024)).toFixed(1)} MB`;
   }
 </script>
 
@@ -66,19 +89,39 @@
       {#if reqs.length}
         <div class="rows">
           {#each reqs as r (r.request_id)}
-            <div class="req">
-              <span class="time num">{reqTime(r)}</span>
-              <span class="method num">{r.method}</span>
-              <span class="path num">{r.path}</span>
-              <span class="appchip num">{r.app}</span>
-              {#if r.cold}
-                <span class="pill cobalt">revived · {r.duration_ms} ms</span>
+            <div class="req-block">
+              <button type="button" class="req" onclick={() => toggleReq(r.request_id)} aria-expanded={!!expanded[r.request_id]}>
+                <span class="time num">{reqTime(r)}</span>
+                <span class="method num">{r.method}</span>
+                <span class="path num">{r.path}</span>
+                <span class="appchip num">{r.app}</span>
+                {#if r.cold}
+                  <span class="pill cobalt">revived</span>
+                {/if}
+                <span class="status num" class:err={r.status >= 500}>{r.status}</span>
+                <span class="dur num">{millis(r.duration_ms)}</span>
+              </button>
+              {#if expanded[r.request_id]}
+                <div class="req-detail mono">
+                  <div class="rd-row"><span>host</span><b>{r.host || '—'}</b></div>
+                  <div class="rd-row"><span>protocol</span><b>{r.protocol || 'http'}</b></div>
+                  <div class="rd-row"><span>request id</span><b>{r.request_id}</b></div>
+                  <div class="rd-row"><span>bytes in</span><b>{fmtBytes(r.bytes_in)}</b></div>
+                  <div class="rd-row"><span>bytes out</span><b>{fmtBytes(r.bytes_out)}</b></div>
+                  <div class="rd-row"><span>cold start</span><b>{r.cold ? 'yes' : 'no'}</b></div>
+                  <p class="rd-note">Full request/response bodies are not buffered at the edge yet — sizes and timing are captured in-router.</p>
+                </div>
               {/if}
-              <span class="status num" class:err={r.status >= 500}>{r.status}</span>
-              <span class="dur num">{r.duration_ms} ms</span>
             </div>
           {/each}
         </div>
+        {#if allReqs.length > PAGE_SIZE}
+          <div class="pager">
+            <button class="btn sm" disabled={safePage <= 0} onclick={() => (page = Math.max(0, safePage - 1))}>Prev</button>
+            <span class="page-meta num">{safePage + 1} / {totalPages} · {allReqs.length} requests</span>
+            <button class="btn sm" disabled={safePage >= totalPages - 1} onclick={() => (page = Math.min(totalPages - 1, safePage + 1))}>Next</button>
+          </div>
+        {/if}
       {:else}
         <div class="empty mono">collecting…</div>
       {/if}
@@ -170,15 +213,23 @@
   }
 
   .rows { padding: 4px 10px 10px; }
+  .req-block + .req-block { border-top: 1px solid var(--line-2); }
   .req {
     display: flex;
     align-items: center;
     gap: 14px;
+    width: 100%;
     padding: 8.5px 10px;
+    border: 0;
+    background: transparent;
     border-radius: 9px;
+    text-align: left;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
     animation: req-in 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
-  .req + .req { border-top: 1px solid var(--line-2); }
+  .req:hover { background: var(--surface-2); }
   @keyframes req-in {
     from { opacity: 0; transform: translateY(-4px); }
   }
@@ -203,7 +254,49 @@
   }
   .status { font-size: 11.5px; color: var(--ink-3); width: 34px; text-align: right; flex: none; }
   .status.err { color: var(--red); font-weight: 600; }
-  .dur { font-size: 11.5px; color: var(--ink); width: 58px; text-align: right; flex: none; }
+  .dur {
+    font-size: 11.5px;
+    color: var(--ink);
+    width: 72px;
+    min-width: 72px;
+    text-align: right;
+    flex: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
+  .req-detail {
+    margin: 0 10px 10px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--line-2);
+    display: grid;
+    gap: 6px;
+  }
+  .rd-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    font-size: 11.5px;
+  }
+  .rd-row span { color: var(--ink-4); }
+  .rd-row b { color: var(--ink-2); font-weight: 500; word-break: break-all; text-align: right; }
+  .rd-note {
+    margin: 4px 0 0;
+    font-size: 10.5px;
+    color: var(--ink-4);
+    line-height: 1.4;
+  }
+  .pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 8px 14px 14px;
+  }
+  .page-meta { font-size: 11px; color: var(--ink-3); }
 
   .event {
     display: flex;

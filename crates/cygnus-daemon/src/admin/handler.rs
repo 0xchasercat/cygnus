@@ -23,7 +23,7 @@ use crate::metrics::MetricsHub;
 use crate::state::{
     AuditContext, AuditEndpointRole, AuditOutcome, DeployJob, DeployJobSource, DeployJobSpec,
     DeployJobStatus, DeploymentInput, DeploymentRecord, DeploymentSource, DeploymentStatus,
-    DomainRecord, DomainTls, GitHubJobKind, LoadedApp, NodeConfig, State, StateError,
+    DomainRecord, DomainStatus, DomainTls, GitHubJobKind, LoadedApp, NodeConfig, State, StateError,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -227,11 +227,18 @@ impl StateAdminHandler {
                     .open_state()?
                     .app_domains(Some(&app))
                     .map_err(map_state_query_error)?;
-                let expected_ip = expected_public_ipv4();
+                let public_ip = expected_public_ipv4();
                 Ok(AdminData::AppDomains {
                     domains: domains
                         .into_iter()
-                        .map(|domain| app_domain_view(domain, expected_ip))
+                        .map(|domain| {
+                            let expected = if crate::domains::is_local_host(&domain.host) {
+                                Some(std::net::Ipv4Addr::new(127, 0, 0, 1))
+                            } else {
+                                public_ip
+                            };
+                            app_domain_view(domain, expected)
+                        })
                         .collect(),
                 })
             }
@@ -884,11 +891,25 @@ impl StateAdminHandler {
 
 fn app_domain_view(domain: DomainRecord, expected_ip: Option<std::net::Ipv4Addr>) -> AppDomainView {
     let dns = dns_precheck(&StdDnsResolver, &domain.host, expected_ip);
+    // Local / already-resolving hosts should not look "pending" forever when
+    // the cert path is self-signed or a fallback is already serving traffic.
+    // Surface a usable status so operators aren't told to edit public DNS for
+    // apps.localhost.
+    let status = match domain.status {
+        DomainStatus::Pending | DomainStatus::Issuing
+            if dns.ok
+                && (domain.tls == DomainTls::SelfSigned
+                    || crate::domains::is_local_host(&domain.host)) =>
+        {
+            DomainStatus::FallbackActive
+        }
+        other => other,
+    };
     AppDomainView {
         host: domain.host,
         kind: domain.kind,
         tls: domain.tls,
-        status: domain.status,
+        status,
         dns: DomainDnsView {
             expected_ip: dns.expected_ip.map(|ip| ip.to_string()),
             resolves_to: dns

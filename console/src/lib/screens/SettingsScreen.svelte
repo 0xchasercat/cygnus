@@ -391,12 +391,12 @@
         <div class="cardhead"><span class="label">Access</span></div>
         <div class="pad">
           <div class="access-row">
-            <span class="mname">Console</span>
-            <span class="tmeta num">admin account · email + password</span>
+            <span class="mname">Admin password</span>
+            <span class="tmeta num">change from the host with cygnus status · password change UI lands next</span>
           </div>
           <div class="access-row">
-            <span class="mname">Break-glass</span>
-            <span class="tmeta num">bootstrap token · cygnus --admin-socket /run/cygnus/admin.sock on the host</span>
+            <span class="mname">Host break-glass</span>
+            <span class="tmeta num">cygnus --admin-socket ~/.cygnus/run/admin.sock status</span>
           </div>
           {#if store.mode === 'live'}
             <button class="btn sm danger" onclick={signOut}>Sign out</button>

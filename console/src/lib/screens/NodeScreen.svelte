@@ -2,25 +2,28 @@
   import { store } from '../live.svelte.js';
   import { previewEgress } from '../fixtures.js';
   import { uptime, relativeTime } from '../time.js';
-  import { bytes, phaseLabel } from '../fmt.js';
+  import { bytes, millis, phaseLabel } from '../fmt.js';
   import Anatomy from '../components/Anatomy.svelte';
   import Constellation from '../components/Constellation.svelte';
   import Icon from '../components/Icon.svelte';
 
   const node = $derived(store.node);
 
-  const hasMemory = $derived(!!node?.memory);
-  const usedBytes = $derived(node?.memory ? node.memory.total_bytes - node.memory.available_bytes : 0);
-  const usedPct = $derived(node?.memory ? (usedBytes / node.memory.total_bytes) * 100 : 0);
-  const totalGb = $derived(node?.memory ? node.memory.total_bytes / (1024 ** 3) : 0);
+  const hasMemory = $derived(!!node?.memory && Number(node.memory.total_bytes) > 0);
+  const usedBytes = $derived(hasMemory ? node.memory.total_bytes - node.memory.available_bytes : 0);
+  const usedPct = $derived(hasMemory ? (usedBytes / node.memory.total_bytes) * 100 : 0);
+  const totalGb = $derived(hasMemory ? node.memory.total_bytes / (1024 ** 3) : 0);
 
   const bootPhases = $derived(
     store.metrics?.boot_phases?.phases
       ? store.metrics.boot_phases.phases.map((p) => ({ name: phaseLabel(p.name), ms: p.p50_ms, hot: false }))
       : []
   );
+  // On portable (macOS) cages the isolation stages are genuinely zero —
+  // namespaces/cgroup/network/mounts/seccomp don't run. Keep them visible but
+  // mark the real bottleneck so the anatomy isn't a wall of 0.0 ms.
   const hotPhase = $derived(bootPhases.length ? bootPhases.reduce((a, b) => (b.ms > a.ms ? b : a)) : null);
-  const anatomyPhases = $derived(bootPhases.map((p) => ({ ...p, hot: hotPhase && p.name === hotPhase.name })));
+  const anatomyPhases = $derived(bootPhases.map((p) => ({ ...p, hot: hotPhase && p.name === hotPhase.name && p.ms > 0 })));
 
   // Egress has no live source — render the fixture only in preview.
   const egress = $derived(store.mode === 'preview' ? previewEgress : null);
@@ -113,11 +116,16 @@
     <section class="card">
       <div class="cardhead">
         <span class="label">Revival budget</span>
-        {#if store.metrics}<span class="hint num">p50 <b>{store.metrics.totals.boot_p50_ms} ms</b> · p99 <b>{store.metrics.totals.boot_p99_ms} ms</b></span>{/if}
+        {#if store.metrics?.totals}
+          <span class="hint num">p50 <b>{millis(store.metrics.totals.boot_p50_ms)}</b> · p99 <b>{millis(store.metrics.totals.boot_p99_ms)}</b></span>
+        {/if}
       </div>
       <div class="pad">
         {#if anatomyPhases.length}
           <Anatomy phases={anatomyPhases} />
+          {#if hotPhase && (hotPhase.name === 'socket ready' || hotPhase.name.includes('socket'))}
+            <p class="axiom" style="margin-top:12px">Most of revival is runtime init until the readiness socket accepts — isolation stages are free on this host.</p>
+          {/if}
         {:else}
           <div class="empty mono">no boots sampled yet</div>
         {/if}
