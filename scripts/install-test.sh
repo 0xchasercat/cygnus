@@ -175,7 +175,7 @@ assert node["edge"]["acme"]["dns_provider"] == "cloudflare"
 assert len(node["apps"]) == 1
 app = node["apps"][0]
 assert app["name"] == "tenant-0"
-assert app["domains"] == ["cygnus.apps.test"]
+assert app["domains"] == [], app["domains"]
 assert app["tenant_admin"] is True
 assert app["upstream"] == str(root / "run/cygnus/tenant-0/console.sock")
 assert app["command"] == "/usr/local/bin/bun"
@@ -199,7 +199,7 @@ grep -q 'daemon-reload' "$ROOT/systemctl.log" || { echo 'daemon reload missing' 
 grep -q 'restart cygnus.service' "$ROOT/systemctl.log" || { echo 'daemon restart missing' >&2; exit 1; }
 grep -q 'engine register.*--default' "$ROOT/ctl.log" || { echo 'default engine admin call missing' >&2; exit 1; }
 grep -q 'apply ' "$ROOT/ctl.log" || { echo 'apply admin call missing' >&2; exit 1; }
-grep -q '  console   https://cygnus.apps.test:3443' "$ROOT/install-output" || { echo 'console URL missing from output' >&2; exit 1; }
+grep -q '  console   https://127.0.0.1:3443' "$ROOT/install-output" || { echo 'console URL missing from output' >&2; exit 1; }
 grep -Eq '  token     [[:xdigit:]]{64}   \(rotate: install.sh --rotate-secrets\)' "$ROOT/install-output" || { echo 'bootstrap token missing from output' >&2; exit 1; }
 grep -q '  cli       cygnus status' "$ROOT/install-output" || { echo 'CLI hint missing from output' >&2; exit 1; }
 bootstrap_before=$(hash_file "$ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/bootstrap.token")

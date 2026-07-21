@@ -535,6 +535,7 @@ pub struct DeploymentView {
     pub source_hash: String,
     pub engine_version: String,
     pub created_ms: i64,
+    pub updated_ms: i64,
     pub source: DeploymentSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
@@ -1193,6 +1194,7 @@ mod tests {
             source_hash: "a".repeat(64),
             engine_version: "bun".into(),
             created_ms: 1_700_000_000_000,
+            updated_ms: 1_700_000_000_500,
             source: DeploymentSource::github(Some("main".into()), Some("b".repeat(64))),
             artifact_hash: None,
             status: "building".into(),

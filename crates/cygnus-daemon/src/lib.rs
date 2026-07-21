@@ -434,7 +434,7 @@ impl Frontend {
                 return;
             }
         };
-        let buffered = upstream_request_bytes(&head, &buffered);
+        let buffered = upstream_request_bytes(&head, &buffered, "https");
         if (&upstream).write_all(&buffered).is_err() {
             reject(&mut client, &mut span, Status::BadGateway, "upstream_write");
             return;
@@ -545,7 +545,7 @@ impl Frontend {
                 return;
             }
         };
-        let buffered = upstream_request_bytes(&head, &buffered);
+        let buffered = upstream_request_bytes(&head, &buffered, "http");
         if (&upstream).write_all(&buffered).is_err() {
             reject(&mut client, &mut span, Status::BadGateway, "upstream_write");
             return;
@@ -608,12 +608,14 @@ fn forward_or_discard<R: Read, W: Write>(
 }
 
 /// The bytes to hand the upstream: the parsed head with hop-by-hop
-/// connection headers stripped, followed by any payload bytes already
-/// buffered. The exchange is ended by the relay itself once the response is
-/// fully framed (see [`relay_framing`]); the app is never asked to close,
-/// because event loops differ in how faithfully they flush large bodies
-/// while closing.
-fn upstream_request_bytes(head: &RequestHead, buffered: &[u8]) -> Vec<u8> {
+/// connection headers stripped, an `X-Forwarded-Proto` set to the scheme this
+/// daemon terminated (so upstreams like the console can tell HTTPS from HTTP
+/// even though every upstream connection is a plain UNIX socket), followed by
+/// any payload bytes already buffered. The exchange is ended by the relay
+/// itself once the response is fully framed (see [`relay_framing`]); the app
+/// is never asked to close, because event loops differ in how faithfully they
+/// flush large bodies while closing.
+fn upstream_request_bytes(head: &RequestHead, buffered: &[u8], forwarded_proto: &str) -> Vec<u8> {
     let head_bytes = &buffered[..head.head_len];
     let mut rewritten = Vec::with_capacity(buffered.len() + 32);
     let mut lines = head_bytes.split_inclusive(|byte| *byte == b'\n');
@@ -629,11 +631,13 @@ fn upstream_request_bytes(head: &RequestHead, buffered: &[u8]) -> Vec<u8> {
         if name.eq_ignore_ascii_case(b"connection")
             || name.eq_ignore_ascii_case(b"proxy-connection")
             || name.eq_ignore_ascii_case(b"keep-alive")
+            || name.eq_ignore_ascii_case(b"x-forwarded-proto")
         {
             continue;
         }
         rewritten.extend_from_slice(line);
     }
+    rewritten.extend_from_slice(format!("X-Forwarded-Proto: {forwarded_proto}\r\n").as_bytes());
     rewritten.extend_from_slice(b"\r\n");
     rewritten.extend_from_slice(&buffered[head.head_len..]);
     rewritten
@@ -762,11 +766,12 @@ mod tests {
             HeadParse::Complete(head) => (head, raw.to_vec()),
             other => panic!("head should parse: {other:?}"),
         };
-        let rewritten = upstream_request_bytes(&head, &buffered);
+        let rewritten = upstream_request_bytes(&head, &buffered, "https");
         let text = String::from_utf8(rewritten).expect("ascii head");
         assert!(text.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(text.contains("Host: a.example\r\n"));
         assert!(text.contains("X-Custom: yes\r\n"));
+        assert!(text.contains("X-Forwarded-Proto: https\r\n"));
         assert!(text.ends_with("\r\n\r\nBODY"));
         assert!(!text.contains("keep-alive"));
         assert!(!text.to_ascii_lowercase().contains("connection"));

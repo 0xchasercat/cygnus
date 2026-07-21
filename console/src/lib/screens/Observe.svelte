@@ -9,22 +9,53 @@
   let tab = $state('requests');
   let page = $state(0);
   let expanded = $state({}); // request_id -> true
+  let appFilter = $state(''); // '' = all apps
+  let statusFilter = $state(''); // '' | '2xx' | '4xx' | '5xx'
   const PAGE_SIZE = 50;
 
   const series = $derived(
     store.metrics?.series ? store.metrics.series.map((b) => [b.p50_ms, b.p99_ms]) : []
   );
 
-  const allReqs = $derived(store.requests);
+  // App options come from whatever has actually produced requests/events, so
+  // the filter never lists a stale or unrelated app name.
+  const appOptions = $derived(
+    Array.from(
+      new Set([
+        ...store.requests.map((r) => r.app).filter(Boolean),
+        ...store.events.map((e) => e.app).filter(Boolean),
+        ...store.apps.map((a) => a.name),
+      ]),
+    ).sort((a, b) => a.localeCompare(b)),
+  );
+
+  function matchesStatus(status, filter) {
+    if (!filter) return true;
+    const bucket = `${Math.floor(Number(status) / 100)}xx`;
+    return bucket === filter;
+  }
+
+  const allReqs = $derived(
+    store.requests.filter(
+      (r) => (!appFilter || r.app === appFilter) && matchesStatus(r.status, statusFilter),
+    ),
+  );
   const totalPages = $derived(Math.max(1, Math.ceil(allReqs.length / PAGE_SIZE)));
   const safePage = $derived(Math.min(page, totalPages - 1));
   const reqs = $derived(allReqs.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE));
-  const events = $derived(store.events);
+  const events = $derived(store.events.filter((e) => !appFilter || e.app === appFilter));
 
-  // Reset page when the stream shrinks under the current offset.
+  // Reset the page whenever the filtered stream shrinks under the current
+  // offset — also fires right after appFilter/statusFilter change.
   $effect(() => {
     if (page > totalPages - 1) page = Math.max(0, totalPages - 1);
   });
+
+  function clearFilters() {
+    appFilter = '';
+    statusFilter = '';
+    page = 0;
+  }
 
   function reqTime(r) {
     const d = new Date(r.time_ms ?? 0);
@@ -53,7 +84,24 @@
       <h1>Observe</h1>
       <p class="sub">Measured at the router — none of it self-reported by cages.</p>
     </div>
-    <span class="chip">last 60 min · in-memory</span>
+    <div class="filters">
+      <select class="filter-select" bind:value={appFilter} aria-label="Filter by app">
+        <option value="">All apps</option>
+        {#each appOptions as name}
+          <option value={name}>{name}</option>
+        {/each}
+      </select>
+      <select class="filter-select" bind:value={statusFilter} aria-label="Filter by status">
+        <option value="">All statuses</option>
+        <option value="2xx">2xx</option>
+        <option value="4xx">4xx</option>
+        <option value="5xx">5xx</option>
+      </select>
+      {#if appFilter || statusFilter}
+        <button class="btn sm" onclick={clearFilters}>Clear</button>
+      {/if}
+      <span class="chip">last 60 min · in-memory</span>
+    </div>
   </div>
 
   <section class="card">
@@ -168,6 +216,22 @@
     font-size: 13px;
     color: var(--ink-3);
   }
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .filter-select {
+    height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 12px;
+    font-family: var(--mono);
+  }
+  .filter-select:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
 
   .cardhead {
     display: flex;

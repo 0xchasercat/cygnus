@@ -84,10 +84,10 @@
 
   const elapsedMs = $derived.by(() => {
     if (!deploy?.created_ms) return null;
-    const end =
-      deploy.status === 'building'
-        ? nowMs
-        : deploy.activated_ms ?? deploy.finished_ms ?? deploy.updated_ms ?? nowMs;
+    // Backend now emits updated_ms (last status transition). For a
+    // terminal deploy that IS the finish time — never fall back to "now",
+    // which would count time since the page was opened, not build time.
+    const end = deploy.status === 'building' ? nowMs : (deploy.updated_ms ?? deploy.created_ms);
     return Math.max(0, end - deploy.created_ms);
   });
 

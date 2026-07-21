@@ -39,6 +39,7 @@ class Store {
   #domainTimer = null; // polls per-app domain status while non-terminal
 
   #timer = null;
+  #deployTimer = null;
   #tick = 0;
   #booted = false;
   #domainPollApp = null;
@@ -141,22 +142,35 @@ class Store {
     if (this.mode !== 'live' || this.auth !== 'ready') return;
     if (this.#timer) return;
     this.#poll();
-    this.#armPollTimer();
+    this.#pollDeployments();
+    this.#timer = setInterval(() => this.#poll(), POLL_MS);
+    this.#armDeployTimer();
   }
 
-  #armPollTimer() {
-    clearInterval(this.#timer);
+  // Deployments refresh on their own independent, faster-while-building
+  // timer so a build page updates status within ~1s without forcing the
+  // heavier apps/metrics/events/requests poll (and everything that renders
+  // off it — sidebars, counts) to also re-fetch and re-render every tick.
+  // That shared-poll churn was the actual source of the build page's
+  // per-update flicker.
+  #armDeployTimer() {
+    clearInterval(this.#deployTimer);
     if (this.mode !== 'live' || this.auth !== 'ready') {
-      this.#timer = null;
+      this.#deployTimer = null;
       return;
     }
     const building = this.deployments.some((d) => d.status === 'building');
-    this.#timer = setInterval(() => this.#poll(), building ? BUILD_POLL_MS : POLL_MS);
+    this.#deployTimer = setInterval(
+      () => this.#pollDeployments(),
+      building ? BUILD_POLL_MS : POLL_MS,
+    );
   }
 
   stop() {
     clearInterval(this.#timer);
     this.#timer = null;
+    clearInterval(this.#deployTimer);
+    this.#deployTimer = null;
   }
 
   async #poll() {
@@ -167,7 +181,6 @@ class Store {
     const reads = [
       this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node)),
       this.#safeGet('/api/v1/apps?limit=50', (d) => (this.apps = Array.isArray(d?.apps) ? d.apps : [])),
-      this.#safeGet('/api/v1/deployments?limit=50', (d) => (this.deployments = Array.isArray(d?.deployments) ? d.deployments : [])),
       this.#safeGet('/api/v1/metrics', (d) => {
         if (!d) {
           this.metrics = null;
@@ -196,10 +209,35 @@ class Store {
     }
 
     await Promise.all(reads);
-    // Rebuild interval when build activity starts/stops so the deploy page
-    // sees status flips within ~1s instead of the quiet 4s cadence.
-    this.#armPollTimer();
     this.lastSync = Date.now();
+  }
+
+  // Replace this.deployments only when the payload actually differs (by id +
+  // status + updated_ms), so an unchanged poll never hands the UI a fresh
+  // array reference — that reference change was the real source of the
+  // build page's per-tick flicker (every derived view recomputing off a
+  // "new" object with identical fields).
+  async #pollDeployments() {
+    await this.#safeGet('/api/v1/deployments?limit=50', (d) => {
+      const next = Array.isArray(d?.deployments) ? d.deployments : [];
+      const changed =
+        next.length !== this.deployments.length ||
+        next.some((item, i) => {
+          const prev = this.deployments[i];
+          return (
+            !prev ||
+            prev.id !== item.id ||
+            prev.status !== item.status ||
+            prev.updated_ms !== item.updated_ms ||
+            prev.artifact_hash !== item.artifact_hash ||
+            prev.error !== item.error
+          );
+        });
+      if (changed) this.deployments = next;
+    });
+    // Cadence depends on build activity, so re-arm every tick even when the
+    // array reference didn't change.
+    this.#armDeployTimer();
   }
 
   // Fetch one endpoint; 404 (parallel branch not merged yet) is silent.

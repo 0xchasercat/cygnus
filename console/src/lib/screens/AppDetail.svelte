@@ -30,9 +30,33 @@
   );
 
   // ——— domains ———
+  // tenant-0 (the console) has no rows in the domains table by design — its
+  // public hostname is edge.dashboard_domain, set from Settings. Show that
+  // instead of the generic custom-domain list so the card never looks empty
+  // for an app that in fact has automatic HTTPS configured.
+  const isTenantZero = $derived(app?.name === 'tenant-0');
+  const dashboardDomainView = $derived(
+    isTenantZero && store.node?.dashboard_domain
+      ? {
+          host: store.node.dashboard_domain,
+          kind: 'native',
+          tls: store.node.ssl_mode === 'acme' ? 'acme' : 'self_signed',
+          status: store.node.ssl_mode === 'acme' ? 'active' : 'fallback_active',
+          dns: null,
+        }
+      : null,
+  );
   // Live domain list comes from store.appDomains (cached) once the app is open.
   // In preview the fixtures seed a per-app domain map so the card renders.
-  const domains = $derived(app ? (store.appDomains(app.name) ?? previewAppDomains(app.name)) : null);
+  // tenant-0 substitutes its dashboard domain in place of the (always empty)
+  // custom-domain list.
+  const domains = $derived(
+    isTenantZero
+      ? (dashboardDomainView ? [dashboardDomainView] : [])
+      : app
+        ? (store.appDomains(app.name) ?? previewAppDomains(app.name))
+        : null,
+  );
 
   const DOMAIN_PILL = {
     active: { cls: 'live', text: 'active' },
@@ -195,16 +219,28 @@
           <span class="pill {app.name.startsWith('pr-') ? 'preview' : 'ghost'}">{app.name.startsWith('pr-') ? 'preview' : 'production'}</span>
         </div>
         <div class="domains num">
-          {#each app.domains as d}
-            <a href={appUrl(d)} target="_blank" rel="noopener noreferrer" class="dom"
-              >{d} <Icon name="ext" size={11} /></a
-            >
-            <span class="dot">·</span>
-          {/each}
+          {#if isTenantZero}
+            {#if store.node?.dashboard_domain}
+              <a href={appUrl(store.node.dashboard_domain)} target="_blank" rel="noopener noreferrer" class="dom"
+                >{store.node.dashboard_domain} <Icon name="ext" size={11} /></a
+              >
+            {/if}
+          {:else}
+            {#each app.domains as d}
+              <a href={appUrl(d)} target="_blank" rel="noopener noreferrer" class="dom"
+                >{d} <Icon name="ext" size={11} /></a
+              >
+              <span class="dot">·</span>
+            {/each}
+          {/if}
         </div>
       </div>
       <div class="actions">
-        {#if app.domains?.length}
+        {#if isTenantZero}
+          {#if store.node?.dashboard_domain}
+            <a class="btn primary" href={appUrl(store.node.dashboard_domain)} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
+          {/if}
+        {:else if app.domains?.length}
           <a class="btn primary" href={appUrl(app.domains[0])} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
         {/if}
       </div>
@@ -290,12 +326,14 @@
         <section class="card">
           <div class="cardhead">
             <span class="label">Domains</span>
-            <button class="btn sm" onclick={() => (addDomainOpen = !addDomainOpen)}>
-              <Icon name="plus" size={12} />{addDomainOpen ? 'Cancel' : 'Add domain'}
-            </button>
+            {#if !isTenantZero}
+              <button class="btn sm" onclick={() => (addDomainOpen = !addDomainOpen)}>
+                <Icon name="plus" size={12} />{addDomainOpen ? 'Cancel' : 'Add domain'}
+              </button>
+            {/if}
           </div>
 
-          {#if addDomainOpen}
+          {#if addDomainOpen && !isTenantZero}
             <form class="dom-add" onsubmit={submitDomain}>
               <input
                 bind:this={hostEl}
@@ -336,17 +374,29 @@
                     {pill.text}
                   </span>
                   <div class="dom-actions">
-                    <button
-                      type="button"
-                      class="tls-toggle {d.tls === 'acme' ? 'on' : ''}"
-                      onclick={() => toggleTls(d)}
-                      disabled={toggling}
-                      aria-label="Toggle HTTPS mode"
-                      title={d.tls === 'acme' ? 'Automatic HTTPS · click for self-signed' : 'Self-signed · click for automatic HTTPS'}
-                    >
-                      <span class="tls-dot"></span>
-                    </button>
-                    {#if d.kind === 'custom'}
+                    {#if isTenantZero}
+                      <button
+                        type="button"
+                        class="tls-toggle {d.tls === 'acme' ? 'on' : ''}"
+                        onclick={() => go('settings')}
+                        aria-label="Manage in settings"
+                        title="Managed from Settings → Dashboard domain"
+                      >
+                        <span class="tls-dot"></span>
+                      </button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="tls-toggle {d.tls === 'acme' ? 'on' : ''}"
+                        onclick={() => toggleTls(d)}
+                        disabled={toggling}
+                        aria-label="Toggle HTTPS mode"
+                        title={d.tls === 'acme' ? 'Automatic HTTPS · click for self-signed' : 'Self-signed · click for automatic HTTPS'}
+                      >
+                        <span class="tls-dot"></span>
+                      </button>
+                    {/if}
+                    {#if d.kind === 'custom' && !isTenantZero}
                       <button type="button" class="dom-remove" onclick={() => removeHost(d)} disabled={removing} aria-label="Remove domain" title="Remove domain">
                         <Icon name="x" size={13} />
                       </button>
@@ -367,12 +417,21 @@
                 </div>
               {/each}
             </div>
+          {:else if isTenantZero}
+            <div class="empty mono">
+              no dashboard domain set ·
+              <button class="linklike" onclick={() => go('settings')}>set one in Settings</button>
+            </div>
           {:else if domains}
             <div class="empty mono">no custom domains · add one above</div>
           {:else}
             <div class="empty mono">loading domains…</div>
           {/if}
-          <div class="dom-foot num">native domain is always present · custom domains issue a certificate once DNS resolves</div>
+          <div class="dom-foot num">
+            {isTenantZero
+              ? 'the console domain is managed from Settings → Dashboard domain'
+              : 'native domain is always present · custom domains issue a certificate once DNS resolves'}
+          </div>
         </section>
 
         <!-- ————— the cage ————— -->
@@ -686,6 +745,16 @@
   }
   .dom-add input:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
   .dom-add .dom-err { grid-column: 1 / -1; color: var(--red); font-size: 11px; margin: 0; }
+  .linklike {
+    background: none;
+    border: 0;
+    padding: 0;
+    color: var(--cobalt-deep);
+    cursor: pointer;
+    font: inherit;
+    text-decoration: underline;
+  }
+  .linklike:hover { color: var(--cobalt); }
 
   .dom-list { padding: 4px 10px 6px; }
   .dom-row {

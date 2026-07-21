@@ -8,7 +8,12 @@
   let fileInput = $state();
   let picked = $state(null); // { entries, fileCount, totalBytes, rootName }
   let appName = $state('');
+  // Domain tracks appName until the user explicitly edits the domain field
+  // themselves — after that their typed value is authoritative and never
+  // silently overwritten (this also covers the app-name field being edited
+  // after a folder pick, and stray browser form-autofill of a stale value).
   let domain = $state('');
+  let domainTouched = $state(false);
   let engineVersion = $state('');
   // Empty = auto-detect (static site vs server entry). Never invent index.ts —
   // static apps like SvelteKit have no index.ts and would fail the build.
@@ -59,13 +64,27 @@
       const collected = collectEntries(files, root);
       picked = collected;
       appName = sanitize(root) || 'app';
-      domain = appsDomain ? `${sanitize(root) || 'app'}.${appsDomain}` : '';
+      domainTouched = false;
       engineVersion = defaultEngine;
       uploadError = '';
     } catch (cause) {
       picked = null;
       uploadError = cause instanceof Error ? cause.message : 'Could not read that folder.';
     }
+  }
+
+  // Domain follows the app name field live (the folder pick is only ever a
+  // fallback default) until the operator edits the domain box directly —
+  // renaming the app afterward must not leave a stale domain from an earlier
+  // name or a previous upload pointed at a different app.
+  $effect(() => {
+    if (domainTouched) return;
+    domain = appName && appsDomain ? `${appName}.${appsDomain}` : '';
+  });
+
+  function onDomainInput(e) {
+    domainTouched = true;
+    domain = e.currentTarget.value;
   }
 
   function fileSummary() {
@@ -116,6 +135,7 @@
     picked = null;
     appName = '';
     domain = '';
+    domainTouched = false;
     progress = 0;
     uploadError = '';
     if (fileInput) fileInput.value = '';
@@ -216,10 +236,10 @@
 
             {#if picked}
               <form class="uform" onsubmit={startUpload}>
-                <label>App name<input bind:value={appName} maxlength="64" required /></label>
-                <label>Domain<input bind:value={domain} placeholder={appsDomain ? `app.${appsDomain}` : 'app.example.com'} maxlength="253" /></label>
-                <label>Engine<input bind:value={engineVersion} maxlength="128" /></label>
-                <label>Entry <span class="optional">(optional — auto-detect if empty)</span><input bind:value={entry} placeholder="auto-detect" maxlength="4096" /></label>
+                <label>App name<input bind:value={appName} maxlength="64" autocomplete="off" required /></label>
+                <label>Domain<input value={domain} oninput={onDomainInput} placeholder={appsDomain ? `app.${appsDomain}` : 'app.example.com'} maxlength="253" autocomplete="off" /></label>
+                <label>Engine<input bind:value={engineVersion} maxlength="128" autocomplete="off" /></label>
+                <label>Entry <span class="optional">(optional — auto-detect if empty)</span><input bind:value={entry} placeholder="auto-detect" maxlength="4096" autocomplete="off" /></label>
                 <span class="summary num">{fileSummary()}</span>
                 {#if uploading}
                   <div class="progress"><i style="width:{Math.round(progress * 100)}%"></i></div>

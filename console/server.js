@@ -1293,7 +1293,23 @@ export async function webhookIngress(request, requestAdmin = adminRequest, socke
 
 function sameOrigin(request, url) {
   const origin = request.headers.get("origin");
-  return typeof origin === "string" && origin === url.origin && request.headers.get("sec-fetch-site") !== "cross-site";
+  if (typeof origin !== "string" || request.headers.get("sec-fetch-site") === "cross-site") {
+    return false;
+  }
+  // Bun's request.url (and url.origin derived from it) always uses the
+  // scheme of the raw HTTP request Bun itself terminated — http:, even when
+  // this console sits behind the daemon's TLS-terminating reverse proxy on a
+  // plain UNIX socket. Trust X-Forwarded-Proto (set by the daemon relay) for
+  // the scheme the browser actually saw; fall back to the connection's own
+  // protocol when unset (direct/local access, or tests hitting the handler
+  // with a literal https: URL). Deliberately NOT requestIsSecure()'s
+  // loopback-is-secure allowance — that heuristic is for cookie flags, and
+  // would make an `http://localhost` Origin fail to match an inferred https
+  // scheme here.
+  const forwarded = request.headers?.get?.("x-forwarded-proto")?.split(",")[0]?.trim()?.toLowerCase();
+  const scheme = forwarded === "https" ? "https:" : forwarded === "http" ? "http:" : url.protocol;
+  const expected = `${scheme}//${url.host}`;
+  return origin === expected;
 }
 
 function requestIp(request) {

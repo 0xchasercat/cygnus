@@ -207,6 +207,10 @@ pub struct DeploymentRecord {
     pub created_at: String,
     pub created_ms: i64,
     pub updated_at: String,
+    /// Milliseconds since epoch of the last status transition. For a
+    /// terminal deployment (active/failed/sealed) this is effectively the
+    /// finish time; the console uses it instead of "now" to compute duration.
+    pub updated_ms: i64,
     pub log_path: Option<PathBuf>,
 }
 
@@ -1764,7 +1768,7 @@ impl State {
         self.connection
             .query_row(
                 "SELECT id, app, source_hash, engine_version, artifact_hash, status, error,
-                    created_at, unixepoch(created_at) * 1000, updated_at, log_path,
+                    created_at, unixepoch(created_at) * 1000, updated_at, unixepoch(updated_at) * 1000, log_path,
                     source_kind, source_branch, source_commit
              FROM deployments WHERE id = ?1",
                 [id],
@@ -1811,7 +1815,7 @@ impl State {
             None
         };
 
-        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, unixepoch(created_at) * 1000, updated_at, log_path, source_kind, source_branch, source_commit";
+        let columns = "id, app, source_hash, engine_version, artifact_hash, status, error, created_at, unixepoch(created_at) * 1000, updated_at, unixepoch(updated_at) * 1000, log_path, source_kind, source_branch, source_commit";
         let mut deployments = Vec::new();
         match (app, before) {
             (Some(app), Some(before)) => {
@@ -2377,10 +2381,25 @@ impl State {
             Some(_) => {}
             None => {
                 let tls = edge_ssl_mode_tx(&transaction)?;
+                // If this is exactly the host the apex would derive for this
+                // app, it IS the native domain — never create a duplicate
+                // "custom" row for what is really the same hostname.
+                let apex = transaction.query_row(
+                    "SELECT apex_domain FROM edge_config WHERE id = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                let is_native = apex
+                    .as_deref()
+                    .map(|apex| native_domain(app, apex))
+                    .transpose()?
+                    .as_deref()
+                    == Some(canonical.as_str());
+                let kind = if is_native { "native" } else { "custom" };
                 transaction.execute(
                     "INSERT INTO domains (app_id, domain, kind, tls, status)
-                     VALUES (?1, ?2, 'custom', ?3, 'pending')",
-                    params![app_id, canonical, tls],
+                     VALUES (?1, ?2, ?3, ?4, 'pending')",
+                    params![app_id, canonical, kind, tls],
                 )?;
             }
         }
@@ -2435,10 +2454,24 @@ impl State {
             }
         } else {
             let tls = edge_ssl_mode_tx(&transaction)?;
+            // Same de-dup as map_domain: a "custom" add of the app's own
+            // derived native hostname is the native domain, not a second one.
+            let apex = transaction.query_row(
+                "SELECT apex_domain FROM edge_config WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            let is_native = apex
+                .as_deref()
+                .map(|apex| native_domain(app, apex))
+                .transpose()?
+                .as_deref()
+                == Some(host.as_str());
+            let kind = if is_native { "native" } else { "custom" };
             transaction.execute(
                 "INSERT INTO domains (app_id, domain, kind, tls, status)
-                 VALUES (?1, ?2, 'custom', ?3, 'pending')",
-                params![app_id, host, tls],
+                 VALUES (?1, ?2, ?3, ?4, 'pending')",
+                params![app_id, host, kind, tls],
             )?;
         }
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
@@ -3426,17 +3459,31 @@ fn reconcile_native_domains_tx(
             continue;
         }
         let host = native_domain(&app, apex)?;
-        if let Some((owner, _)) = domain_owner_tx(transaction, &host)? {
-            return Err(StateError::DomainConflict {
-                domain: host,
-                owner,
-            });
+        match domain_owner_tx(transaction, &host)? {
+            Some((owner, _)) if owner != app => {
+                return Err(StateError::DomainConflict {
+                    domain: host,
+                    owner,
+                });
+            }
+            // A custom row already covers this exact hostname for this same
+            // app — that IS the native domain, promote it in place instead
+            // of leaving a duplicate/second entry.
+            Some((_, kind)) if kind == "custom" => {
+                transaction.execute(
+                    "UPDATE domains SET kind = 'native' WHERE domain = ?1",
+                    [&host],
+                )?;
+            }
+            Some(_) => {}
+            None => {
+                transaction.execute(
+                    "INSERT INTO domains (app_id, domain, kind, tls, status)
+                     VALUES (?1, ?2, 'native', ?3, 'pending')",
+                    params![app_id, host, ssl_mode_name(mode)],
+                )?;
+            }
         }
-        transaction.execute(
-            "INSERT INTO domains (app_id, domain, kind, tls, status)
-             VALUES (?1, ?2, 'native', ?3, 'pending')",
-            params![app_id, host, ssl_mode_name(mode)],
-        )?;
     }
     Ok(())
 }
@@ -5016,7 +5063,7 @@ fn query_deployment_tx(
     transaction
         .query_row(
             "SELECT id, app, source_hash, engine_version, artifact_hash, status, error,
-                    created_at, unixepoch(created_at) * 1000, updated_at, log_path,
+                    created_at, unixepoch(created_at) * 1000, updated_at, unixepoch(updated_at) * 1000, log_path,
                     source_kind, source_branch, source_commit
              FROM deployments WHERE id = ?1",
             [id],
@@ -5035,10 +5082,10 @@ fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusq
             Box::new(std::io::Error::other(error)),
         )
     })?;
-    let source_kind: String = row.get(11)?;
+    let source_kind: String = row.get(12)?;
     let source_kind = parse_deployment_source_kind(&source_kind).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            11,
+            12,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::other(error)),
         )
@@ -5050,8 +5097,8 @@ fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusq
         engine_version: row.get(3)?,
         source: DeploymentSource {
             kind: source_kind,
-            branch: row.get(12)?,
-            commit: row.get(13)?,
+            branch: row.get(13)?,
+            commit: row.get(14)?,
         },
         artifact_hash: row.get(4)?,
         status,
@@ -5059,7 +5106,8 @@ fn deployment_from_row(row: &rusqlite::Row<'_>) -> Result<DeploymentRecord, rusq
         created_at: row.get(7)?,
         created_ms: row.get(8)?,
         updated_at: row.get(9)?,
-        log_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+        updated_ms: row.get(10)?,
+        log_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
     })
 }
 

@@ -1099,6 +1099,7 @@ fn deployment_view(deployment: DeploymentRecord, role: AdminRole) -> DeploymentV
         source_hash: deployment.source_hash,
         engine_version: deployment.engine_version,
         created_ms: deployment.created_ms,
+        updated_ms: deployment.updated_ms,
         source: deployment.source,
         artifact_hash: deployment.artifact_hash,
         status: deployment_status_name(deployment.status).into(),
