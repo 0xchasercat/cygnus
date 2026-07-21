@@ -471,14 +471,36 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
         AdminCommand::ListAppDomains { app } => validate_app_name(app)?,
         AdminCommand::AddAppDomain { app, host }
         | AdminCommand::RemoveAppDomain { app, host }
-        | AdminCommand::SetAppDomainTls { app, host, .. } => {
+        | AdminCommand::SetAppDomainTls { app, host, .. }
+        | AdminCommand::SetPrimaryDomain { app, host }
+        | AdminCommand::RetryDomainAcme { app, host } => {
             validate_app_name(app)?;
             validate_text(host, MAX_ADMIN_DOMAIN_BYTES, "host")?;
+        }
+        AdminCommand::ListEnvVars { app } => validate_app_name(app)?,
+        AdminCommand::SetEnvVar { app, key, value } => {
+            validate_app_name(app)?;
+            let mut env = std::collections::BTreeMap::new();
+            env.insert(key.clone(), value.clone());
+            validate_env_vars(&env)?;
+        }
+        AdminCommand::RemoveEnvVar { app, key } => {
+            validate_app_name(app)?;
+            validate_text(key, MAX_ADMIN_APP_BYTES, "env var key")?;
         }
         AdminCommand::CreateInitialAccount { email, password }
         | AdminCommand::VerifyCredentials { email, password } => {
             validate_account_email(email)?;
             validate_account_password(password)?;
+        }
+        AdminCommand::ChangePassword {
+            email,
+            current_password,
+            new_password,
+        } => {
+            validate_account_email(email)?;
+            validate_account_password(current_password)?;
+            validate_account_password(new_password)?;
         }
         AdminCommand::ListRequests { limit } | AdminCommand::ListEvents { limit } => {
             if !(1..=MAX_ADMIN_METRICS_LIST_LIMIT).contains(limit) {
@@ -551,12 +573,18 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             if let Some(upstream) = request.upstream.as_deref() {
                 validate_path(upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
             }
+            validate_env_vars(&request.env)?;
+            if let Some(preview) = request.preview.as_deref() {
+                validate_preview_slug(preview)?;
+            }
         }
         AdminCommand::DeployUploadBegin {
             app,
             domain,
             engine_version,
             entry,
+            env,
+            preview,
             total_bytes,
         } => {
             validate_app_name(app)?;
@@ -571,6 +599,10 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             }
             if !(1..=MAX_UPLOAD_BYTES).contains(total_bytes) {
                 return Err("total_bytes must be between 1 byte and 64 MiB".into());
+            }
+            validate_env_vars(env)?;
+            if let Some(preview) = preview.as_deref() {
+                validate_preview_slug(preview)?;
             }
         }
         AdminCommand::DeployUploadChunk {
@@ -813,6 +845,46 @@ fn validate_text(value: &str, max_bytes: usize, field: &str) -> Result<(), Strin
 }
 fn validate_path(path: &Path, max_bytes: usize, field: &str) -> Result<(), String> {
     validate_text(&path.to_string_lossy(), max_bytes, field)
+}
+
+fn validate_env_vars(env: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    const MAX_ENV_VARS_PER_REQUEST: usize = 100;
+    if env.len() > MAX_ENV_VARS_PER_REQUEST {
+        return Err(format!(
+            "env vars exceed {MAX_ENV_VARS_PER_REQUEST} entries per request"
+        ));
+    }
+    for (key, value) in env {
+        validate_text(key, MAX_ADMIN_APP_BYTES, "env var key")?;
+        if value.len() > crate::state::MAX_ENV_VAR_VALUE_BYTES {
+            return Err(format!(
+                "env var {key:?} value exceeds {} bytes",
+                crate::state::MAX_ENV_VAR_VALUE_BYTES
+            ));
+        }
+        if value.bytes().any(|byte| byte == 0) {
+            return Err(format!("env var {key:?} value contains a null byte"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_preview_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty() || slug.len() > MAX_ADMIN_APP_BYTES {
+        return Err(format!(
+            "preview slug must be between 1 and {MAX_ADMIN_APP_BYTES} bytes"
+        ));
+    }
+    if slug == "." || slug == ".." {
+        return Err("preview slug must not be \".\" or \"..\"".into());
+    }
+    if !slug
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("preview slug contains unsupported characters".into());
+    }
+    Ok(())
 }
 
 fn validate_relative_path(path: &Path, max_bytes: usize, field: &str) -> Result<(), String> {
@@ -1153,6 +1225,8 @@ mod tests {
             domain: None,
             engine_version: None,
             entry: Some("src/index.ts".into()),
+            env: Default::default(),
+            preview: None,
             total_bytes: MAX_UPLOAD_BYTES,
         };
         assert!(authorize_actor(AdminRole::Host, &upload).is_ok());
@@ -1185,6 +1259,8 @@ mod tests {
                 entry: None,
                 artifact_root: None,
                 upstream: None,
+                env: Default::default(),
+                preview: None,
                 deployment_id: None,
                 source: crate::state::DeploymentSource::cli(),
             },

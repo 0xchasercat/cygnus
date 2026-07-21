@@ -160,10 +160,15 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   ].includes(path);
   const dashboardDomainRoute = path === "/api/v1/settings/dashboard-domain";
   const dashboardTlsRoute = path === "/api/v1/settings/dashboard-tls";
+  const passwordRoute = path === "/api/v1/settings/password";
   const appDomainsRoute = /^\/api\/v1\/apps\/[^/]+\/domains$/u.test(path);
   const appDomainRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+$/u.test(path);
   const appDomainTlsRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+\/tls$/u.test(path);
-  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || [
+  const appDomainPrimaryRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+\/primary$/u.test(path);
+  const appDomainRetryAcmeRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+\/retry-acme$/u.test(path);
+  const appEnvRoute = /^\/api\/v1\/apps\/[^/]+\/env$/u.test(path);
+  const appEnvKeyRoute = /^\/api\/v1\/apps\/[^/]+\/env\/[^/]+$/u.test(path);
+  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || passwordRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
@@ -176,7 +181,11 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   if (appDomainsRoute && !["GET", "HEAD", "POST"].includes(request.method)) return methodNotAllowed("GET, HEAD, POST");
   if (appDomainRoute && request.method !== "DELETE") return methodNotAllowed("DELETE");
   if (appDomainTlsRoute && request.method !== "POST") return methodNotAllowed("POST");
-  if (readRoute && !appDomainsRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
+  if (appDomainPrimaryRoute && request.method !== "POST") return methodNotAllowed("POST");
+  if (appDomainRetryAcmeRoute && request.method !== "POST") return methodNotAllowed("POST");
+  if (appEnvRoute && !["GET", "HEAD", "POST"].includes(request.method)) return methodNotAllowed("GET, HEAD, POST");
+  if (appEnvKeyRoute && request.method !== "DELETE") return methodNotAllowed("DELETE");
+  if (readRoute && !appDomainsRoute && !appEnvRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");
@@ -543,6 +552,11 @@ export async function commandForRequest(request, url) {
       decodeDomainSegment(parts[5], "host"),
     );
   }
+  if (request.method === "DELETE" && parts.length === 6 && parts[2] === "apps" && parts[4] === "env") {
+    assertQueryKeys(url, []);
+    await assertEmptyBody(request);
+    return removeEnvVarCommand(decodeSegment(parts[3], "app"), decodeSegment(parts[5], "key"));
+  }
   if (request.method !== "POST") return null;
   if (parts.length === 3 && parts[2] === "map-domain") {
     return mapDomainCommand(await readJsonBody(request));
@@ -558,6 +572,10 @@ export async function commandForRequest(request, url) {
     assertQueryKeys(url, []);
     return dashboardTlsCommand(await readJsonBody(request));
   }
+  if (parts.length === 4 && parts[2] === "settings" && parts[3] === "password") {
+    assertQueryKeys(url, []);
+    return changePasswordCommand(await readJsonBody(request));
+  }
   if (parts.length === 5 && parts[2] === "apps" && parts[4] === "domains") {
     assertQueryKeys(url, []);
     return addAppDomainCommand(decodeSegment(parts[3], "app"), await readJsonBody(request));
@@ -569,6 +587,20 @@ export async function commandForRequest(request, url) {
       decodeDomainSegment(parts[5], "host"),
       await readJsonBody(request),
     );
+  }
+  if (parts.length === 7 && parts[2] === "apps" && parts[4] === "domains" && parts[6] === "primary") {
+    assertQueryKeys(url, []);
+    await assertEmptyBody(request);
+    return setPrimaryDomainCommand(decodeSegment(parts[3], "app"), decodeDomainSegment(parts[5], "host"));
+  }
+  if (parts.length === 7 && parts[2] === "apps" && parts[4] === "domains" && parts[6] === "retry-acme") {
+    assertQueryKeys(url, []);
+    await assertEmptyBody(request);
+    return retryDomainAcmeCommand(decodeSegment(parts[3], "app"), decodeDomainSegment(parts[5], "host"));
+  }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "env") {
+    assertQueryKeys(url, []);
+    return setEnvVarCommand(decodeSegment(parts[3], "app"), await readJsonBody(request));
   }
   if (parts.length === 4 && parts[2] === "github" && parts[3] === "repositories") {
     return configureRepositoryCommand(await readJsonBody(request));
@@ -626,7 +658,7 @@ export async function deployUploadIngress(request, url, requestAdmin = adminRequ
 }
 
 export function deployUploadBeginCommand(body) {
-  assertObjectKeys(body, ["app", "total_bytes"], ["domain", "engine_version", "entry"]);
+  assertObjectKeys(body, ["app", "total_bytes"], ["domain", "engine_version", "entry", "env", "preview"]);
   const command = {
     type: "deploy_upload_begin",
     app: safeApp(body.app),
@@ -635,6 +667,8 @@ export function deployUploadBeginCommand(body) {
   if (body.domain !== undefined) command.domain = safeDomain(body.domain);
   if (body.engine_version !== undefined) command.engine_version = safeVersion(body.engine_version);
   if (body.entry !== undefined) command.entry = safeEntry(body.entry);
+  if (body.env !== undefined) command.env = safeEnvMap(body.env);
+  if (body.preview !== undefined) command.preview = safePreviewSlug(body.preview);
   return command;
 }
 
@@ -700,6 +734,10 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
     assertQueryKeys(url, []);
     return { type: "list_app_domains", app: safeApp(decodeSegment(parts[3], "app")) };
   }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "env") {
+    assertQueryKeys(url, []);
+    return listEnvVarsCommand(decodeSegment(parts[3], "app"));
+  }
   if (parts.length === 3 && parts[2] === "deployments") {
     assertQueryKeys(url, ["app", "cursor", "limit"]);
     const app = optionalQuery(url, "app");
@@ -761,6 +799,16 @@ export function dashboardTlsCommand(body) {
   return command;
 }
 
+export function changePasswordCommand(body) {
+  assertExactKeys(body, ["email", "current_password", "new_password"]);
+  return {
+    type: "change_password",
+    email: safeEmail(body.email),
+    current_password: safePassword(body.current_password),
+    new_password: safePassword(body.new_password),
+  };
+}
+
 export function addAppDomainCommand(app, body) {
   assertExactKeys(body, ["host"]);
   return { type: "add_app_domain", app: safeApp(app), host: safeDomain(body.host) };
@@ -780,6 +828,14 @@ export function appDomainTlsCommand(app, host, body) {
   };
 }
 
+export function setPrimaryDomainCommand(app, host) {
+  return { type: "set_primary_domain", app: safeApp(app), host: safeDomain(host) };
+}
+
+export function retryDomainAcmeCommand(app, host) {
+  return { type: "retry_domain_acme", app: safeApp(app), host: safeDomain(host) };
+}
+
 export function mapDomainCommand(body) {
   assertExactKeys(body, ["app", "domain"]);
   return { type: "map_domain", app: safeApp(body.app), domain: safeDomain(body.domain) };
@@ -793,6 +849,24 @@ export function rollbackCommand(body) {
     deployment: safeDeployment(body.deployment),
     expected_active_artifact: safeArtifact(body.expected_active_artifact),
   };
+}
+
+export function listEnvVarsCommand(app) {
+  return { type: "list_env_vars", app: safeApp(app) };
+}
+
+export function setEnvVarCommand(app, body) {
+  assertExactKeys(body, ["key", "value"]);
+  return {
+    type: "set_env_var",
+    app: safeApp(app),
+    key: safeEnvKey(body.key),
+    value: safeEnvValue(body.value),
+  };
+}
+
+export function removeEnvVarCommand(app, key) {
+  return { type: "remove_env_var", app: safeApp(app), key: safeEnvKey(key) };
 }
 
 export function convertManifestCommand(body) {
@@ -951,6 +1025,41 @@ function nullableDomain(value, name) {
 function safeTlsMode(value) {
   if (value !== "acme" && value !== "self_signed") {
     throw new HttpInputError(422, "validation", "mode must be acme or self_signed");
+  }
+  return value;
+}
+function safeEnvKey(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_IDENTIFIER_LENGTH || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) {
+    throw new HttpInputError(422, "validation", "env var key is invalid");
+  }
+  if (["CYGNUS_SOCKET", "PATH", "HOME"].includes(value)) {
+    throw new HttpInputError(422, "validation", `${value} is reserved by the daemon`);
+  }
+  return value;
+}
+function safeEnvValue(value) {
+  if (typeof value !== "string" || Buffer.byteLength(value) > 32 * 1024 || /\u0000/u.test(value)) {
+    throw new HttpInputError(422, "validation", "env var value is invalid");
+  }
+  return value;
+}
+function safeEnvMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpInputError(422, "validation", "env must be an object");
+  }
+  const entries = Object.entries(value);
+  if (entries.length > 100) {
+    throw new HttpInputError(422, "validation", "env vars exceed 100 entries per request");
+  }
+  const env = {};
+  for (const [key, entryValue] of entries) {
+    env[safeEnvKey(key)] = safeEnvValue(entryValue);
+  }
+  return env;
+}
+function safePreviewSlug(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_IDENTIFIER_LENGTH || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)) {
+    throw new HttpInputError(422, "validation", "preview slug is invalid");
   }
   return value;
 }

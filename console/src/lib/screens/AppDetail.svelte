@@ -104,6 +104,57 @@
     }
   });
 
+  // ——— environment variables ———
+  let newEnvKey = $state('');
+  let newEnvValue = $state('');
+  let envVarBusy = $state(false);
+  let envVarError = $state('');
+  let envVarPending = $state({}); // key -> true while removing
+  let envValueVisible = $state({}); // key -> true while revealed
+
+  // Live values come from store.envVars (fetched below). Preview mode has
+  // no values to show (they're sealed secrets in the fixture data) — render
+  // its known keys as an unrevealable placeholder so the card isn't empty.
+  const envVarEntries = $derived(
+    app
+      ? store.mode === 'live'
+        ? Object.entries(store.envVars(app.name) ?? {})
+        : (app.env_keys ?? []).map((key) => [key, '••••••••'])
+      : [],
+  );
+
+  $effect(() => {
+    const name = app?.name;
+    if (name && store.mode === 'live') {
+      store.refreshEnvVars(name);
+    }
+  });
+
+  async function submitEnvVar(e) {
+    e.preventDefault();
+    if (envVarBusy || !app) return;
+    const key = newEnvKey.trim();
+    if (!key) return;
+    envVarBusy = true;
+    envVarError = '';
+    const r = await store.setEnvVar(app.name, key, newEnvValue);
+    envVarBusy = false;
+    if (!r.ok) {
+      envVarError = r.error ?? 'Could not set env var';
+      return;
+    }
+    newEnvKey = '';
+    newEnvValue = '';
+  }
+
+  async function removeEnvVarRow(key) {
+    if (!app) return;
+    envVarPending = { ...envVarPending, [key]: true };
+    const r = await store.removeEnvVar(app.name, key);
+    envVarPending = { ...envVarPending, [key]: false };
+    if (!r.ok) envVarError = r.error ?? 'Could not remove env var';
+  }
+
   async function submitDomain(e) {
     e.preventDefault();
     if (domainBusy || !app) return;
@@ -140,6 +191,22 @@
     const r = await store.setDomainTls(app.name, d.host, next);
     pendingTls = { ...pendingTls, [d.host]: false };
     if (!r.ok) domainError = r.error ?? 'Could not change TLS';
+  }
+
+  async function setPrimary(d) {
+    if (!app || d.is_primary) return;
+    pendingTls = { ...pendingTls, [d.host + ':primary']: true };
+    const r = await store.setPrimaryDomain(app.name, d.host);
+    pendingTls = { ...pendingTls, [d.host + ':primary']: false };
+    if (!r.ok) domainError = r.error ?? 'Could not set primary domain';
+  }
+
+  async function retryAcme(d) {
+    if (!app) return;
+    pendingTls = { ...pendingTls, [d.host + ':retry']: true };
+    const r = await store.retryDomainAcme(app.name, d.host);
+    pendingTls = { ...pendingTls, [d.host + ':retry']: false };
+    if (!r.ok) domainError = r.error ?? 'Could not retry certificate issuance';
   }
 
   // Preview-mode per-app domain fixtures keyed by app name. The live store
@@ -236,6 +303,9 @@
         </div>
       </div>
       <div class="actions">
+        <button class="btn" onclick={() => go('observe', { observeAppFilter: app.name })}>
+          <Icon name="observe" size={13} />Observe
+        </button>
         {#if isTenantZero}
           {#if store.node?.dashboard_domain}
             <a class="btn primary" href={appUrl(store.node.dashboard_domain)} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
@@ -325,7 +395,12 @@
         <!-- ————— domains ————— -->
         <section class="card">
           <div class="cardhead">
-            <span class="label">Domains</span>
+            <span
+              class="label"
+              title={isTenantZero
+                ? 'The console domain is managed from Settings → Dashboard domain.'
+                : 'Native domain is always present · custom domains issue a certificate once DNS resolves.'}
+            >Domains</span>
             {#if !isTenantZero}
               <button class="btn sm" onclick={() => (addDomainOpen = !addDomainOpen)}>
                 <Icon name="plus" size={12} />{addDomainOpen ? 'Cancel' : 'Add domain'}
@@ -358,10 +433,24 @@
                 {@const pill = domainPill(d)}
                 {@const removing = pendingTls[d.host + ':rm']}
                 {@const toggling = pendingTls[d.host]}
+                {@const settingPrimary = pendingTls[d.host + ':primary']}
+                {@const retrying = pendingTls[d.host + ':retry']}
                 <div class="dom-row" class:native={d.kind === 'native'}>
                   <div class="dom-host">
                     <a href={appUrl(d.host)} target="_blank" rel="noopener noreferrer" class="dh-link num">{d.host}</a>
                     <span class="dom-tag">{d.kind}</span>
+                    {#if d.is_primary}
+                      <span class="dom-tag primary" title="Primary domain for this app">primary</span>
+                    {:else if !isTenantZero}
+                      <button
+                        type="button"
+                        class="linklike dom-primary-set"
+                        onclick={() => setPrimary(d)}
+                        disabled={settingPrimary}
+                      >
+                        {settingPrimary ? 'setting…' : 'set primary'}
+                      </button>
+                    {/if}
                   </div>
                   <span
                     class="pill {pill.cls}"
@@ -411,8 +500,14 @@
                   {#if d.kind === 'native' && isLocalHost(d.host)}
                     <div class="dns-hint mono">local native domain · no public DNS required</div>
                   {/if}
-                  {#if d.status === 'failed'}
-                    <div class="dns-hint mono fail">Certificate issuance failed — check DNS, then retry from the TLS toggle.</div>
+                  {#if d.status === 'failed' && d.tls === 'acme'}
+                    <div class="dns-hint mono fail">
+                      {d.error ?? 'Certificate issuance failed.'}
+                      {#if d.next_retry_unix}· next automatic retry {relativeTime(d.next_retry_unix * 1000)}{/if}
+                      <button type="button" class="linklike retry-acme" onclick={() => retryAcme(d)} disabled={retrying}>
+                        {retrying ? 'retrying…' : 'retry now'}
+                      </button>
+                    </div>
                   {/if}
                 </div>
               {/each}
@@ -427,11 +522,6 @@
           {:else}
             <div class="empty mono">loading domains…</div>
           {/if}
-          <div class="dom-foot num">
-            {isTenantZero
-              ? 'the console domain is managed from Settings → Dashboard domain'
-              : 'native domain is always present · custom domains issue a certificate once DNS resolves'}
-          </div>
         </section>
 
         <!-- ————— the cage ————— -->
@@ -463,9 +553,6 @@
                 <div class="kvrow"><span>Revival p99</span><b class="num">{millis(store.metrics.totals.boot_p99_ms)}</b></div>
               </div>
             {/if}
-            {#if !am || !am.requests_1h}
-              <p class="axiom" style="margin-top:10px">Request latency appears after traffic hits this app.</p>
-            {/if}
           {/if}
         </section>
 
@@ -480,22 +567,50 @@
           </div>
         </section>
 
-        <!-- ————— sealed env ————— -->
+        <!-- ————— environment variables ————— -->
         <section class="card">
           <div class="cardhead">
             <span class="label">Environment</span>
-            <span class="envcount num">{app.env_keys?.length ?? 0} keys</span>
+            <span class="envcount num">{envVarEntries.length} vars</span>
           </div>
-          {#if app.env_keys?.length}
+          <form class="env-add" onsubmit={submitEnvVar}>
+            <input bind:value={newEnvKey} placeholder="KEY" maxlength="128" autocomplete="off" spellcheck="false" required />
+            <input bind:value={newEnvValue} placeholder="value" maxlength="4096" autocomplete="off" spellcheck="false" required />
+            <button class="btn cobalt sm" type="submit" disabled={envVarBusy || !newEnvKey.trim() || !newEnvValue}>
+              {envVarBusy ? 'Saving…' : 'Set'}
+            </button>
+          </form>
+          {#if envVarError}<p class="dom-err" role="alert">{envVarError}</p>{/if}
+          {#if envVarEntries.length}
             <div class="kv">
-              {#each app.env_keys as k (k)}
-                <div class="kvrow env"><span class="num">{k}</span><span class="badge">set</span></div>
+              {#each envVarEntries as [key, value] (key)}
+                <div class="kvrow env">
+                  <span class="num">{key}</span>
+                  <span class="env-value num">{envValueVisible[key] ? value : '••••••••'}</span>
+                  <button
+                    type="button"
+                    class="btn icon sm"
+                    onclick={() => (envValueVisible = { ...envValueVisible, [key]: !envValueVisible[key] })}
+                    aria-label={envValueVisible[key] ? `Hide ${key}` : `Reveal ${key}`}
+                  >
+                    <Icon name="eye" size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    class="btn icon sm"
+                    onclick={() => removeEnvVarRow(key)}
+                    disabled={envVarPending[key]}
+                    aria-label="Remove {key}"
+                  >
+                    <Icon name="x" size={12} />
+                  </button>
+                </div>
               {/each}
             </div>
           {:else}
-            <div class="empty mono">no env keys</div>
+            <div class="empty mono">no env vars set</div>
           {/if}
-          <div class="sealed"><Icon name="lock" size={11} /> sealed at rest · values never sent to the console</div>
+          <div class="sealed"><Icon name="lock" size={11} /> encrypted at rest · decrypted here only for this authenticated session</div>
         </section>
       </aside>
     </div>
@@ -668,7 +783,14 @@
   .kvrow + .kvrow { border-top: 1px solid var(--line-2); }
   .kvrow span { color: var(--ink-3); }
   .kvrow b { color: var(--ink); font-weight: 500; font-size: 12px; }
+  .kvrow.env {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto auto;
+    gap: 8px;
+    align-items: center;
+  }
   .kvrow.env span { font-size: 11px; color: var(--ink-2); }
+  .env-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .factpill {
     font-family: var(--mono);
     font-size: 10.5px;
@@ -724,6 +846,24 @@
     color: var(--ink-4);
     border-top: 1px solid var(--line-2);
   }
+  .env-add {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 9px;
+    align-items: center;
+    padding: 12px 16px 14px;
+    border-bottom: 1px solid var(--line-2);
+  }
+  .env-add input {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 9px 11px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .env-add input:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
 
   /* domains card */
   .dom-add {
@@ -790,6 +930,22 @@
     padding: 2px 6px;
     flex: none;
   }
+  .dom-tag.primary {
+    color: var(--cobalt-deep);
+    background: var(--cobalt-ghost);
+    border-color: color-mix(in srgb, var(--cobalt) 25%, var(--line-2));
+  }
+  .dom-primary-set {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+    flex: none;
+  }
+  .retry-acme {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    margin-left: 6px;
+  }
   .dom-actions { display: flex; align-items: center; gap: 6px; }
   .tls-toggle {
     width: 24px;
@@ -839,14 +995,6 @@
   }
   .dns-hint b { color: var(--ink); font-weight: 600; }
   .dns-hint.fail { color: #b02c23; background: var(--red-soft); border-color: color-mix(in srgb, var(--red) 25%, var(--line-2)); }
-
-  .dom-foot {
-    padding: 10px 16px 13px;
-    font-size: 10px;
-    color: var(--ink-4);
-    border-top: 1px solid var(--line-2);
-    line-height: 1.55;
-  }
 
   @media (max-width: 1080px) {
     .grid { grid-template-columns: 1fr; }

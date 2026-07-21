@@ -150,7 +150,11 @@
         {#if recentEvents.length}
           <div class="rows">
             {#each recentEvents as e (e.time_ms + e.type)}
-              <div class="event">
+              <button
+                type="button"
+                class="event event-btn"
+                onclick={() => go('observe', { observeAppFilter: e.app ?? '' })}
+              >
                 <span class="eicon" style={eventStyle(e.type)}>
                   <Icon name={eventIcon(e.type)} size={13} />
                 </span>
@@ -159,7 +163,7 @@
                   <span class="emsg">{e.message}</span>
                 </div>
                 <span class="ewhen num">{relativeTime(e.time_ms)}</span>
-              </div>
+              </button>
             {/each}
           </div>
         {:else}
@@ -170,7 +174,7 @@
       <section class="card nodeCard" role="button" tabindex="0" onclick={() => go('node')} onkeydown={(e) => e.key === 'Enter' && go('node')}>
         <div class="cardhead">
           <span class="label">Node</span>
-          <span class="nodename num">{store.node?.apps_domain ?? 'cygnus'} <span class="led live breathe"></span></span>
+          <span class="nodename num">{store.node?.apps_domain ?? 'cygnus'}</span>
         </div>
         {#if hasMemory}
           <div class="rambar">
@@ -400,6 +404,15 @@
     border-top: none !important;
   }
   .event + .event { border-top: 1px solid var(--line-2) !important; }
+  .event-btn {
+    width: 100%;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 8px;
+  }
+  .event-btn:hover { background: var(--surface-2); }
   .eicon {
     width: 26px;
     height: 26px;

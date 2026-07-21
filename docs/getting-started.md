@@ -13,15 +13,20 @@ Requirements: kernel 5.15+ with cgroups v2, systemd, `nft`, and root.
 curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash
 ```
 
-The installer downloads the latest release, asks a few questions (listeners,
-apps domain, optional ACME email), verifies the host, starts the daemon under
-systemd, and prints:
+The installer downloads the latest release, verifies checksums, starts the
+daemon under systemd, and prints:
 
 - your **console URL** (`https://cygnus.<apps-domain>`)
-- your **bootstrap token** — the credential for the dashboard
+- your **recovery token** — save it now, it's shown only this once. You
+  won't need it for first login (the setup wizard creates the admin
+  account); it's your way back in if you ever lose that password.
 
 Non-interactive installs: pass `--noninteractive` plus flags like
 `--apps-domain apps.example.com --https-listen 0.0.0.0:443 --acme-email you@example.com`.
+
+To remove Cygnus entirely — service, binaries, config, state, and runtime
+sockets — run `install.sh --uninstall`. Re-running the installer afterward
+is a clean reinstall; nothing needs manual deletion first.
 
 ### macOS (development)
 
@@ -46,8 +51,10 @@ resolve `*.localhost` to loopback.
 
 ## 3. Open the console
 
-Visit the console URL and paste the bootstrap token. The token is also stored
-on the host (the installer prints the path) and can be rotated any time with
+Visit the console URL. On first visit the setup wizard walks you through
+creating the admin account (email + password) — that's your login going
+forward. The recovery token from install isn't needed here; keep it for if
+you ever lose the password, and rotate it any time with
 `install.sh --rotate-secrets`.
 
 ## 4. Ship an app
@@ -65,7 +72,9 @@ private GitHub App for your account (one click), you install it on your
 repositories, and map each repository to an app and branch. Pushes deploy
 automatically; pull requests get preview deployments.
 
-**From the CLI:**
+**From the CLI:** run `cygnus deploy` from inside the project directory and
+it infers the app name from the folder, or pass `--app`/`--domain` to
+override:
 
 ```sh
 cygnus deploy --source-dir . --app my-app
@@ -108,8 +117,9 @@ macOS uses `~/.cygnus/{state,run,etc}` for the same roles.
   boot failure with the reason.
 - **App 502/503** — the daemon's log line says why the cage failed to boot;
   `cygnus logs <deployment>` shows the build output.
-- **Lost the bootstrap token** — `install.sh --rotate-secrets` regenerates
-  it and prints the new value.
+- **Locked out of the console** — sign in with the recovery token from
+  install, or regenerate it with `install.sh --rotate-secrets` if you lost
+  it too.
 - **macOS: sockets never become ready after an accidental `sudo` install** —
   a root copy of the service may still be registered with launchd (it
   survives deleting the plist). Remove it and start clean:

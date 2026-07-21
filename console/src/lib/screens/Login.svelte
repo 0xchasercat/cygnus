@@ -153,7 +153,7 @@
     text-align: center;
   }
   .mark {
-    color: var(--cobalt);
+    color: var(--ink);
     display: flex;
     justify-content: center;
     margin-bottom: 16px;

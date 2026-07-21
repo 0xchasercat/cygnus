@@ -48,7 +48,6 @@
     <div>
       <div class="row1">
         <h1>{node?.apps_domain ?? 'cygnus'}</h1>
-        <span class="led live breathe"></span>
       </div>
       <p class="sub num">{node?.version ?? 'cygnus dev'}</p>
       <div class="hostchips">
@@ -101,7 +100,6 @@
             <div class="hairline-v"></div>
             <div class="count"><span class="readout md">{node.app_count ?? store.apps.length}</span><span class="label">apps</span></div>
           </div>
-          <p class="axiom">Density is bounded by concurrent-active apps, not registered apps.</p>
         {:else}
           <div class="counts">
             <div class="count"><span class="readout md">{node?.app_count ?? store.apps.length}</span><span class="label">apps</span></div>
@@ -123,9 +121,6 @@
       <div class="pad">
         {#if anatomyPhases.length}
           <Anatomy phases={anatomyPhases} />
-          {#if hotPhase && (hotPhase.name === 'socket ready' || hotPhase.name.includes('socket'))}
-            <p class="axiom" style="margin-top:12px">Most of revival is runtime init until the readiness socket accepts — isolation stages are free on this host.</p>
-          {/if}
         {:else}
           <div class="empty mono">no boots sampled yet</div>
         {/if}

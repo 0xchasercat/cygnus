@@ -34,6 +34,8 @@ bun_version="$VERSION_DEFAULT"
 noninteractive=0
 reconfigure=0
 rotate_secrets=0
+uninstall=0
+assume_yes=0
 prefix_set=0
 config_set=0
 state_set=0
@@ -71,6 +73,10 @@ Options:
                          for network/domain values (they are dashboard-managed).
   --reconfigure          Permit replacing changed config/service files
   --rotate-secrets       Generate and atomically install new console secrets
+  --uninstall            Remove Cygnus: stop the service, delete binaries,
+                         config, state, and runtime sockets. Prompts for
+                         confirmation unless --yes is also given.
+  --yes                  Skip the --uninstall confirmation prompt
   -h, --help             Show this help
 
 For focused tests only, set CYGNUS_INSTALL_TEST_MODE=1 (and optionally
@@ -101,6 +107,8 @@ while (($#)); do
     --noninteractive|--no-interactive) noninteractive=1; shift ;;
     --reconfigure|--force) reconfigure=1; shift ;;
     --rotate-secrets|--rotate-secret) rotate_secrets=1; shift ;;
+    --uninstall) uninstall=1; shift ;;
+    --yes|-y) assume_yes=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) fail "unknown option: $1 (use --help)" ;;
@@ -153,7 +161,7 @@ then rerun this installer without sudo."
 fi
 
 downloaded_bundle=""
-if [[ -z $bundle_dir ]]; then
+if (( ! uninstall )) && [[ -z $bundle_dir ]]; then
   ARCH=$(uname -m)
   case $OS in
     Linux) OS_LOWER="unknown-linux-gnu" ;;
@@ -226,11 +234,87 @@ is_abs_safe() {
   [[ $p == /* && $p != *$'\n'* && $p != *$'\r'* && $p != *$'\t'* && $p != *' '* ]]
   [[ $p != */../* && $p != */.. && $p != ../* && $p != .. ]]
 }
-for path_name in bundle_dir prefix config_dir state_dir runtime_dir systemd_dir; do
+for path_name in prefix config_dir state_dir runtime_dir systemd_dir; do
   [[ -n ${!path_name} ]] || fail "$path_name is required"
   is_abs_safe "${!path_name}" || fail "$path_name must be an absolute path without whitespace or path traversal: ${!path_name}"
 done
+
+if (( uninstall )); then
+  if (( ! TEST_MODE )) && [[ $OS == Linux ]]; then
+    [[ $(id -u) -eq 0 ]] || fail "root is required to uninstall (or set CYGNUS_INSTALL_TEST_MODE=1 only for tests)"
+  fi
+
+  if [[ $OS == Darwin ]]; then
+    service_file=$HOME/Library/LaunchAgents/com.cygnus.daemon.plist
+    console_root=$HOME/.cygnus/console
+    log_dir=$HOME/.cygnus/log
+  else
+    service_file=$systemd_dir/cygnus.service
+  fi
+
+  echo "This removes Cygnus entirely: stops the service, deletes binaries," >&2
+  echo "config, state (including the SQLite database and all app artifacts)," >&2
+  echo "and runtime sockets. Deployed apps and their data are not recoverable" >&2
+  echo "afterward." >&2
+  echo >&2
+  echo "  binaries   $prefix/cygnus-daemon, cygnus, cygnusctl, bun$([[ $OS == Linux ]] && printf '%s' ', cygnus-init')" >&2
+  echo "  service    $service_file" >&2
+  echo "  config     $config_dir" >&2
+  echo "  state      $state_dir" >&2
+  echo "  runtime    $runtime_dir" >&2
+  [[ $OS == Darwin ]] && echo "  console    $console_root" >&2
+  [[ $OS == Darwin ]] && echo "  logs       $log_dir" >&2
+  echo >&2
+
+  if (( ! assume_yes )) && [[ -t 0 ]] && (( ! TEST_MODE )); then
+    read -r -p "Type 'yes' to remove Cygnus: " confirmation
+    [[ $confirmation == yes ]] || fail "uninstall cancelled"
+  elif (( ! assume_yes )) && (( ! TEST_MODE )); then
+    fail "uninstall requires --yes when not run from an interactive terminal"
+  fi
+
+  echo "Stop Cygnus" >&2
+  if [[ $OS == Darwin ]]; then
+    launchctl_bin=$(command -v launchctl || true)
+    if [[ -n $launchctl_bin ]]; then
+      "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >/dev/null 2>&1 || true
+    fi
+    if (( ! TEST_MODE )); then
+      pkill -U "$(id -u)" -f "$prefix/cygnus-daemon" 2>/dev/null || true
+      pkill -U "$(id -u)" -f "cygnus-console/server.js" 2>/dev/null || true
+    fi
+  else
+    systemctl_bin=$(command -v systemctl || true)
+    if [[ -n $systemctl_bin ]]; then
+      "$systemctl_bin" stop cygnus.service >/dev/null 2>&1 || true
+      "$systemctl_bin" disable cygnus.service >/dev/null 2>&1 || true
+    fi
+  fi
+
+  echo "Remove Cygnus files" >&2
+  # Shared system/user locations (prefix, systemd/launchd dirs) only lose the
+  # specific Cygnus entries; installer-exclusive roots (config/state/runtime,
+  # and on macOS the console/log roots) are removed entirely.
+  rm -f -- "$prefix/cygnus-daemon" "$prefix/cygnus" "$prefix/cygnusctl" "$prefix/cygnus-init" "$prefix/bun" "$service_file"
+  rm -rf -- "$config_dir" "$state_dir" "$runtime_dir"
+  if [[ $OS == Darwin ]]; then
+    rm -rf -- "$console_root" "$log_dir"
+    # The default macOS prefix (~/.cygnus/bin) is installer-exclusive; a
+    # custom --prefix may be a shared system directory and must not be
+    # removed wholesale.
+    if [[ $prefix == "$HOME/.cygnus/bin" ]]; then
+      rmdir -- "$prefix" 2>/dev/null || true
+      rmdir -- "$HOME/.cygnus" 2>/dev/null || true
+    fi
+  fi
+
+  echo >&2
+  echo "Cygnus is uninstalled." >&2
+  exit 0
+fi
+
 [[ -n $bundle_dir ]] || fail "--bundle-dir is required"
+is_abs_safe "$bundle_dir" || fail "bundle_dir must be an absolute path without whitespace or path traversal: $bundle_dir"
 [[ -n $listen ]] || listen=127.0.0.1:3000
 [[ -n $apps_domain ]] || apps_domain=apps.localhost
 [[ -n $dns_provider ]] || dns_provider=none
@@ -1036,10 +1120,17 @@ log "Cygnus is running."
 log ""
 log "  console   ${console_scheme}://${console_host}${console_port_suffix}"
 [[ -n $access_note ]] && log "            ($access_note)"
-log "  token     $bootstrap_hex   (rotate: install.sh --rotate-secrets)"
 log "  cli       cygnus status"
 if [[ $console_scheme == http && $apps_domain != apps.localhost ]]; then
   log ""
   log "  Enable HTTPS + push-to-deploy: re-run with"
   log "    --https-listen 0.0.0.0:443 --acme-email you@example.com"
 fi
+log ""
+log "IMPORTANT: save your recovery token now — it is shown only this once."
+log "It signs you into the console if you ever lose your password, and it is"
+log "the only way in until you create the admin account."
+log ""
+log "  $bootstrap_hex"
+log ""
+log "Lost it later? Rotate with: install.sh --rotate-secrets"

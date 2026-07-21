@@ -32,7 +32,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_ACCOUNT_EMAIL_BYTES: usize = 254;
 pub const MIN_ACCOUNT_PASSWORD_BYTES: usize = 12;
@@ -48,6 +48,7 @@ const RETRY_MAX_SECONDS: i64 = 3600;
 const MAX_GITHUB_TEXT_LEN: usize = 16 * 1024;
 const MAX_GITHUB_JOBS_PER_DELIVERY: usize = 256;
 pub const MAX_GITHUB_WEBHOOK_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_ENV_VAR_VALUE_BYTES: usize = 32 * 1024;
 
 /// Deployment lifecycle persisted by the daemon.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,6 +97,28 @@ pub struct DomainRecord {
     pub status: DomainStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_unix: Option<i64>,
+    /// Last ACME failure message, if any. Cleared on the next successful issuance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Earliest time (unix seconds) the reconciler may retry this domain.
+    /// `None` means eligible immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_unix: Option<i64>,
+    /// Consecutive ACME failures since the last success or manual retry.
+    /// Drives the reconciler's exponential backoff.
+    #[serde(default)]
+    pub retry_count: i64,
+    pub is_primary: bool,
+}
+
+/// One decrypted environment-variable key for an app. Values are encrypted
+/// at rest with the node key (same primitive as GitHub app secrets) and
+/// only ever decrypted server-side to build a cage's runtime environment or
+/// to answer an authenticated admin read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EnvVarRecord {
+    pub key: String,
+    pub value: String,
 }
 
 /// A trusted Bun engine registered by the operator. `host_root` is the host
@@ -979,6 +1002,7 @@ impl State {
                 7 => migrate_v7_to_v8(&transaction)?,
                 8 => migrate_v8_to_v9(&transaction)?,
                 9 => migrate_v9_to_v10(&transaction)?,
+                10 => migrate_v10_to_v11(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -1131,6 +1155,41 @@ impl State {
             ok,
             subject: ok.then(|| account_subject(id)),
         })
+    }
+
+    /// Change the account's password after verifying the current one. The
+    /// caller (admin handler) is responsible for identifying which account
+    /// via `email`; this never trusts a bare subject string for authorization.
+    pub fn update_account_password(
+        &mut self,
+        email: &str,
+        current_password: &str,
+        new_password: &str,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        let verification = self.verify_credentials(email, current_password)?;
+        if !verification.ok {
+            return Err(StateError::InvalidAccountInput(
+                "current password is incorrect".into(),
+            ));
+        }
+        validate_account_password(new_password)?;
+        let email = normalize_and_validate_account_email(email)?;
+        let password_hash = hash_account_password(new_password)?;
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE accounts SET password_hash = ?2 WHERE email = ?1",
+            params![email, password_hash],
+        )?;
+        if changed == 0 {
+            return Err(StateError::InvalidAccountInput(format!(
+                "no account exists for {email:?}"
+            )));
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Daemon-owned artifact root for an app deployment.
@@ -1996,6 +2055,16 @@ impl State {
         let upstream = revision_upstream(&candidate.upstream, &artifact.artifact_hash)?;
         loaded.upstream = upstream.clone();
         loaded.spec.readiness_uds = Some(upstream.clone());
+        for record in match self.app_env_vars(&candidate.name) {
+            Ok(records) => records,
+            Err(StateError::AppNotFound(_)) => Vec::new(),
+            Err(error) => return Err(error),
+        } {
+            loaded
+                .spec
+                .env
+                .insert(OsString::from(record.key), OsString::from(record.value));
+        }
         loaded.spec.env.insert(
             OsString::from("CYGNUS_SOCKET"),
             // Linux cages see the socket through the ingress bind mount at
@@ -2408,6 +2477,84 @@ impl State {
         Ok(canonical)
     }
 
+    /// Return every environment-variable key/value pair set for an app,
+    /// decrypted. Sorted by key for stable rendering.
+    pub fn app_env_vars(&self, app: &str) -> Result<Vec<EnvVarRecord>, StateError> {
+        let app_id: i64 = self
+            .connection
+            .query_row("SELECT id FROM apps WHERE name = ?1", [app], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| StateError::AppNotFound(app.to_owned()))?;
+        let mut statement = self.connection.prepare(
+            "SELECT key, value FROM env_vars WHERE app_id = ?1 ORDER BY key COLLATE BINARY",
+        )?;
+        let rows = statement.query_map([app_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, rusqlite::Error>>()?
+            .into_iter()
+            .map(|(key, blob)| {
+                Ok(EnvVarRecord {
+                    key,
+                    value: decrypt_secret(&self.node_key, &blob)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set (insert or overwrite) one environment variable for an app.
+    pub fn set_env_var(
+        &mut self,
+        app: &str,
+        key: &str,
+        value: &str,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        validate_env_var_key(key)?;
+        if value.len() > MAX_ENV_VAR_VALUE_BYTES {
+            return Err(StateError::InvalidRecord {
+                kind: "env var",
+                detail: format!("value exceeds {MAX_ENV_VAR_VALUE_BYTES} bytes"),
+            });
+        }
+        let encrypted = encrypt_secret(&self.node_key, value)?;
+        let transaction = self.connection.transaction()?;
+        let app_id = app_id_tx(&transaction, app)?;
+        transaction.execute(
+            "INSERT INTO env_vars (app_id, key, value, updated_at)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+             ON CONFLICT(app_id, key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            params![app_id, key, encrypted],
+        )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Remove one environment variable from an app. Idempotent: removing a
+    /// key that does not exist is not an error.
+    pub fn remove_env_var(
+        &mut self,
+        app: &str,
+        key: &str,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        validate_env_var_key(key)?;
+        let transaction = self.connection.transaction()?;
+        let app_id = app_id_tx(&transaction, app)?;
+        transaction.execute(
+            "DELETE FROM env_vars WHERE app_id = ?1 AND key = ?2",
+            params![app_id, key],
+        )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Return all application domains, optionally restricted to one app.
     pub fn app_domains(&self, app: Option<&str>) -> Result<Vec<DomainRecord>, StateError> {
         if let Some(app) = app {
@@ -2421,10 +2568,10 @@ impl State {
             }
         }
         let mut statement = self.connection.prepare(
-            "SELECT d.domain, a.name, d.kind, d.tls, d.status, d.expires_unix
+            "SELECT d.domain, a.name, d.kind, d.tls, d.status, d.expires_unix, d.error, d.next_retry_unix, d.is_primary, d.retry_count
              FROM domains d JOIN apps a ON a.id = d.app_id
              WHERE (?1 IS NULL OR a.name = ?1)
-             ORDER BY a.name COLLATE BINARY, d.domain COLLATE BINARY",
+             ORDER BY a.name COLLATE BINARY, d.is_primary DESC, d.domain COLLATE BINARY",
         )?;
         let rows = statement.query_map([app], domain_record_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -2660,10 +2807,112 @@ impl State {
         self.domain(&host)
     }
 
+    /// Update a domain's ACME reconciliation outcome: status, expiry, the
+    /// last error text (cleared on success), and the earliest next retry
+    /// time. Used by the reconciler and the manual "retry now" mutation so
+    /// operators can see why issuance failed and when it will try again.
+    pub fn update_domain_acme_outcome(
+        &mut self,
+        host: &str,
+        status: DomainStatus,
+        expires_unix: Option<i64>,
+        error: Option<&str>,
+        next_retry_unix: Option<i64>,
+        audit: &AuditContext,
+    ) -> Result<DomainRecord, StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        if expires_unix.is_some_and(|expires| expires <= 0) {
+            return Err(StateError::InvalidRecord {
+                kind: "domain",
+                detail: "expires_unix must be positive when present".into(),
+            });
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE domains SET status = ?2, expires_unix = ?3, error = ?4, next_retry_unix = ?5,
+                 retry_count = CASE WHEN ?4 IS NULL THEN 0 ELSE retry_count + 1 END
+             WHERE domain = ?1",
+            params![
+                host,
+                domain_status_name(status),
+                expires_unix,
+                error,
+                next_retry_unix
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StateError::DomainNotFound(host));
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.domain(&host)
+    }
+
+    /// Clear a domain's backoff so the reconciler retries on its next pass,
+    /// regardless of `next_retry_unix`. Backs the operator-facing "retry now".
+    pub fn clear_domain_retry_backoff(
+        &mut self,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<DomainRecord, StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE domains SET next_retry_unix = NULL, retry_count = 0, status = 'pending'
+             WHERE domain = ?1 AND tls = 'acme'",
+            [&host],
+        )?;
+        if changed == 0 {
+            return Err(StateError::DomainNotFound(host));
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.domain(&host)
+    }
+
+    /// Mark exactly one domain as the app's primary — the hostname shown as
+    /// "the" app URL. Clears any previous primary for the same app inside
+    /// the same transaction so at most one row is ever primary per app.
+    pub fn set_primary_domain(
+        &mut self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<DomainRecord, StateError> {
+        validate_audit_context(audit)?;
+        let host = canonical_exact_domain(host)?;
+        let transaction = self.connection.transaction()?;
+        let app_id = app_id_tx(&transaction, app)?;
+        let owner = domain_owner_tx(&transaction, &host)?;
+        match owner {
+            Some((owner, _)) if owner != app => {
+                return Err(StateError::DomainConflict {
+                    domain: host,
+                    owner,
+                });
+            }
+            Some(_) => {}
+            None => return Err(StateError::DomainNotFound(host)),
+        }
+        transaction.execute(
+            "UPDATE domains SET is_primary = 0 WHERE app_id = ?1",
+            [app_id],
+        )?;
+        transaction.execute(
+            "UPDATE domains SET is_primary = 1 WHERE domain = ?1",
+            [&host],
+        )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        self.domain(&host)
+    }
+
     fn domain(&self, host: &str) -> Result<DomainRecord, StateError> {
         self.connection
             .query_row(
-                "SELECT d.domain, a.name, d.kind, d.tls, d.status, d.expires_unix
+                "SELECT d.domain, a.name, d.kind, d.tls, d.status, d.expires_unix, d.error, d.next_retry_unix, d.is_primary, d.retry_count
                  FROM domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?1",
                 [host],
                 domain_record_from_row,
@@ -3431,6 +3680,10 @@ fn domain_record_from_row(row: &rusqlite::Row<'_>) -> Result<DomainRecord, rusql
         tls,
         status,
         expires_unix: row.get(5)?,
+        error: row.get(6)?,
+        next_retry_unix: row.get(7)?,
+        is_primary: row.get::<_, i64>(8)? != 0,
+        retry_count: row.get(9)?,
     })
 }
 
@@ -3494,7 +3747,7 @@ fn create_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
              id INTEGER PRIMARY KEY CHECK (id = 1),
              listen TEXT NOT NULL
          );
-         CREATE TABLE IF NOT EXISTS apps (
+        CREATE TABLE IF NOT EXISTS apps (
              id INTEGER PRIMARY KEY,
              name TEXT NOT NULL UNIQUE,
              upstream TEXT NOT NULL UNIQUE,
@@ -4355,6 +4608,27 @@ fn migrate_v9_to_v10(connection: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn migrate_v10_to_v11(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "ALTER TABLE domains ADD COLUMN error TEXT;
+         ALTER TABLE domains ADD COLUMN next_retry_unix INTEGER;
+         ALTER TABLE domains ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE domains ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0;
+         CREATE UNIQUE INDEX domains_primary_per_app ON domains(app_id) WHERE is_primary = 1;
+         CREATE TABLE env_vars (
+             id INTEGER PRIMARY KEY,
+             app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+             key TEXT NOT NULL CHECK (key GLOB '[A-Za-z_][A-Za-z0-9_]*'),
+             value BLOB NOT NULL,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             UNIQUE (app_id, key)
+         );
+         CREATE INDEX env_vars_app_id ON env_vars(app_id);",
+    )?;
+    Ok(())
+}
+
 fn normalize_and_validate_account_email(email: &str) -> Result<String, StateError> {
     let normalized = email.trim().to_lowercase();
     if normalized.is_empty() || normalized.len() > MAX_ACCOUNT_EMAIL_BYTES {
@@ -4393,6 +4667,35 @@ fn validate_account_password(password: &str) -> Result<(), StateError> {
         return Err(StateError::InvalidAccountInput(
             "password contains control characters".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Reject env var keys that collide with names the daemon injects itself
+/// (`CYGNUS_SOCKET`) or that would be nonsensical/dangerous to override
+/// (`PATH`, `HOME`). The SQLite CHECK constraint already enforces the
+/// `[A-Za-z_][A-Za-z0-9_]*` shape; this adds the semantic reservations.
+pub(crate) fn validate_env_var_key(key: &str) -> Result<(), StateError> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        || !key
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || char == '_')
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "env var",
+            detail: format!("key {key:?} must match [A-Za-z_][A-Za-z0-9_]*"),
+        });
+    }
+    const RESERVED: &[&str] = &["CYGNUS_SOCKET", "PATH", "HOME"];
+    if RESERVED.contains(&key) {
+        return Err(StateError::InvalidRecord {
+            kind: "env var",
+            detail: format!("{key} is reserved by the daemon"),
+        });
     }
     Ok(())
 }

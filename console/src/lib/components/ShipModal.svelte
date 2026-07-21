@@ -22,6 +22,19 @@
   let uploading = $state(false);
   let progress = $state(0);
 
+  // Environment variables: array of {key, value} rows for stable editing.
+  // Auto-filled from a root .env file on pick unless the operator already
+  // touched the editor (mirrors the domain-follows-appName pattern above).
+  let envRows = $state([]);
+  let envTouched = $state(false);
+  let envPasteOpen = $state(false);
+  let envPasteText = $state('');
+
+  // Preview: deploy to an isolated `<app>-<slug>` app/domain instead of
+  // touching the production app. Off by default.
+  let previewEnabled = $state(false);
+  let previewSlug = $state('');
+
   // git tab
   let githubOwner = $state('');
   let githubError = $state('');
@@ -67,10 +80,80 @@
       domainTouched = false;
       engineVersion = defaultEngine;
       uploadError = '';
+      if (!envTouched) {
+        const envFile = Array.from(files).find((file) => {
+          const path = (file.webkitRelativePath || file.name).split('/').slice(1).join('/');
+          return path === '.env';
+        });
+        if (envFile) {
+          envFile.text().then((text) => {
+            if (envTouched) return;
+            envRows = parseEnvText(text);
+          });
+        } else {
+          envRows = [];
+        }
+      }
     } catch (cause) {
       picked = null;
       uploadError = cause instanceof Error ? cause.message : 'Could not read that folder.';
     }
+  }
+
+  // Parse `KEY=VALUE` lines (dotenv-ish): skips blank lines and `#` comments,
+  // strips one layer of matching quotes, keeps the first `=` as delimiter.
+  function parseEnvText(text) {
+    const rows = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      let value = line.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+        (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+      ) {
+        value = value.slice(1, -1);
+      }
+      if (key) rows.push({ key, value });
+    }
+    return rows;
+  }
+
+  function addEnvRow() {
+    envTouched = true;
+    envRows = [...envRows, { key: '', value: '' }];
+  }
+
+  function updateEnvRow(index, field, value) {
+    envTouched = true;
+    envRows = envRows.map((row, i) => (i === index ? { ...row, [field]: value } : row));
+  }
+
+  function removeEnvRow(index) {
+    envTouched = true;
+    envRows = envRows.filter((_, i) => i !== index);
+  }
+
+  function applyEnvPaste() {
+    envTouched = true;
+    const parsed = parseEnvText(envPasteText);
+    const byKey = new Map(envRows.map((row) => [row.key, row]));
+    for (const row of parsed) byKey.set(row.key, row);
+    envRows = Array.from(byKey.values());
+    envPasteText = '';
+    envPasteOpen = false;
+  }
+
+  function envRowsToMap() {
+    const env = {};
+    for (const row of envRows) {
+      const key = row.key.trim();
+      if (key) env[key] = row.value;
+    }
+    return env;
   }
 
   // Domain follows the app name field live (the folder pick is only ever a
@@ -112,6 +195,8 @@
         engineVersion: engineVersion.trim() || undefined,
         // Only send entry when the operator typed one. Empty → auto-detect.
         entry: entry.trim() || undefined,
+        env: envRowsToMap(),
+        preview: previewEnabled ? (previewSlug.trim() || undefined) : undefined,
         tarball: gzBuf,
         totalBytes: gzBuf.length,
         onProgress: (p) => (progress = p),
@@ -138,6 +223,12 @@
     domainTouched = false;
     progress = 0;
     uploadError = '';
+    envRows = [];
+    envTouched = false;
+    envPasteOpen = false;
+    envPasteText = '';
+    previewEnabled = false;
+    previewSlug = '';
     if (fileInput) fileInput.value = '';
   }
 
@@ -240,6 +331,51 @@
                 <label>Domain<input value={domain} oninput={onDomainInput} placeholder={appsDomain ? `app.${appsDomain}` : 'app.example.com'} maxlength="253" autocomplete="off" /></label>
                 <label>Engine<input bind:value={engineVersion} maxlength="128" autocomplete="off" /></label>
                 <label>Entry <span class="optional">(optional — auto-detect if empty)</span><input bind:value={entry} placeholder="auto-detect" maxlength="4096" autocomplete="off" /></label>
+
+                <label class="preview-toggle">
+                  <input type="checkbox" bind:checked={previewEnabled} />
+                  Deploy as a preview (isolated app + domain)
+                </label>
+                {#if previewEnabled}
+                  <label>Preview slug <span class="optional">(e.g. a branch or PR name)</span>
+                    <input bind:value={previewSlug} placeholder="pr-42" maxlength="64" autocomplete="off" required={previewEnabled} />
+                  </label>
+                {/if}
+
+                <div class="env-editor">
+                  <div class="env-header">
+                    <span>Environment variables</span>
+                    <div class="env-header-actions">
+                      <button class="btn sm" type="button" onclick={() => (envPasteOpen = !envPasteOpen)}>Paste .env</button>
+                      <button class="btn sm" type="button" onclick={addEnvRow}>Add</button>
+                    </div>
+                  </div>
+                  {#if envPasteOpen}
+                    <div class="env-paste">
+                      <textarea bind:value={envPasteText} placeholder={'KEY=value\nANOTHER_KEY=value'} rows="4"></textarea>
+                      <div class="env-paste-actions">
+                        <button class="btn sm" type="button" onclick={() => { envPasteOpen = false; envPasteText = ''; }}>Cancel</button>
+                        <button class="btn cobalt sm" type="button" onclick={applyEnvPaste} disabled={!envPasteText.trim()}>Apply</button>
+                      </div>
+                    </div>
+                  {/if}
+                  {#if envRows.length}
+                    <div class="env-rows">
+                      {#each envRows as row, i (i)}
+                        <div class="env-row">
+                          <input value={row.key} oninput={(e) => updateEnvRow(i, 'key', e.currentTarget.value)} placeholder="KEY" maxlength="128" autocomplete="off" spellcheck="false" />
+                          <input value={row.value} oninput={(e) => updateEnvRow(i, 'value', e.currentTarget.value)} placeholder="value" maxlength="4096" autocomplete="off" spellcheck="false" />
+                          <button class="btn icon sm" type="button" onclick={() => removeEnvRow(i)} aria-label="Remove {row.key || 'env var'}">
+                            <Icon name="x" size={12} />
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
+                  {:else}
+                    <p class="empty mono">no env vars · add one or paste a .env file</p>
+                  {/if}
+                </div>
+
                 <span class="summary num">{fileSummary()}</span>
                 {#if uploading}
                   <div class="progress"><i style="width:{Math.round(progress * 100)}%"></i></div>
@@ -458,6 +594,43 @@
     margin-top: 4px;
   }
   .inline-error { grid-column: 1 / -1; color: var(--red); font-size: 11.5px; margin: 2px 0 0; }
+
+  .preview-toggle {
+    grid-column: 1 / -1;
+    display: flex !important;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+    font-size: 12px !important;
+    color: var(--ink-2) !important;
+    cursor: pointer;
+  }
+  .preview-toggle input[type='checkbox'] { width: 14px; height: 14px; accent-color: var(--cobalt); }
+
+  .env-editor { grid-column: 1 / -1; display: grid; gap: 8px; }
+  .env-header {
+    display: flex; align-items: center; justify-content: space-between;
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .env-header-actions { display: flex; gap: 6px; }
+  .env-rows { display: grid; gap: 6px; }
+  .env-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; align-items: center; }
+  .env-row input {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px; background: var(--surface); color: var(--ink);
+    padding: 8px 9px; font-family: var(--mono); font-size: 12px;
+  }
+  .env-paste { display: grid; gap: 6px; }
+  .env-paste textarea {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px; background: var(--surface); color: var(--ink);
+    padding: 9px 10px; font-family: var(--mono); font-size: 12px; resize: vertical;
+  }
+  .env-paste-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .env-editor .empty { margin: 0; font-size: 11.5px; color: var(--ink-4); }
 
   /* git */
   .git-copy { margin: 0 0 14px; font-size: 13px; color: var(--ink-2); line-height: 1.5; }

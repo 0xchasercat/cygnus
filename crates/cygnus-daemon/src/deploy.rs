@@ -106,6 +106,17 @@ pub struct DeployRequest {
     pub artifact_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<PathBuf>,
+    /// Environment variables to persist for the app before activation. Only
+    /// the keys present here are written; existing keys not listed are left
+    /// untouched (dedicated env var admin commands manage full lifecycle).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Optional preview slug (e.g. a branch or PR name). When present the
+    /// deploy targets an isolated `{app}-{slug}` app and `{app}-{slug}.<apex>`
+    /// domain instead of the production app/domain, so preview builds never
+    /// touch the production deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     #[serde(skip)]
     pub deployment_id: Option<String>,
     #[serde(skip)]
@@ -130,6 +141,8 @@ impl DeployRequest {
             entry: Some(entry.into()),
             artifact_root: Some(artifact_root.into()),
             upstream: Some(upstream.into()),
+            env: BTreeMap::new(),
+            preview: None,
             deployment_id: None,
             source: DeploymentSource::cli(),
         }
@@ -157,6 +170,7 @@ pub struct ResolvedDeployRequest {
     pub entry_explicit: bool,
     pub artifact_root: PathBuf,
     pub upstream: PathBuf,
+    pub env: BTreeMap<String, String>,
     pub deployment_id: Option<String>,
     pub source: DeploymentSource,
 }
@@ -371,6 +385,24 @@ pub fn resolve_deploy_request(
             "app must be a nonempty safe path component".into(),
         ));
     }
+    let app = match request.preview.as_deref() {
+        None => request.app.clone(),
+        Some(slug) => {
+            let slug = slug.trim();
+            if slug.is_empty() || !safe_app_component(slug) {
+                return Err(DeployError::InvalidInput(
+                    "preview slug must be a nonempty safe path component".into(),
+                ));
+            }
+            let preview_app = format!("{}-{slug}", request.app);
+            if !safe_app_component(&preview_app) || preview_app.len() > 128 {
+                return Err(DeployError::InvalidInput(
+                    "app plus preview slug exceeds the safe app name length".into(),
+                ));
+            }
+            preview_app
+        }
+    };
     if request.deployment_id.as_deref().is_some_and(|id| {
         id.is_empty()
             || matches!(id, "." | "..")
@@ -403,17 +435,17 @@ pub fn resolve_deploy_request(
                         .into(),
                 )
             })?;
-            format!("{}.{}", request.app, apex)
+            format!("{app}.{apex}")
         }
     };
     let entry_explicit = request.entry.is_some();
     let entry = request.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
     let artifact_root = request
         .artifact_root
-        .unwrap_or_else(|| state.deployment_artifact_root(&request.app));
+        .unwrap_or_else(|| state.deployment_artifact_root(&app));
     let upstream = request
         .upstream
-        .unwrap_or_else(|| state.deployment_upstream(&request.app));
+        .unwrap_or_else(|| state.deployment_upstream(&app));
     validate_entry(&entry)?;
     validate_upstream(&upstream)?;
     if state.engine(&engine_version)?.is_none() {
@@ -423,13 +455,14 @@ pub fn resolve_deploy_request(
     }
     Ok(ResolvedDeployRequest {
         source_dir: request.source_dir,
-        app: request.app,
+        app,
         domain,
         engine_version,
         entry,
         entry_explicit,
         artifact_root,
         upstream,
+        env: request.env,
         deployment_id: request.deployment_id,
         source: request.source,
     })
@@ -707,6 +740,14 @@ where
                 &deployment_id,
                 format!("artifact could not be sealed: {error}"),
             ));
+        }
+        for (key, value) in &request.env {
+            state
+                .set_env_var(&request.app, key, value, audit)
+                .map_err(|error| DeployError::ActivationFailed {
+                    id: deployment_id.clone(),
+                    detail: format!("could not persist env var {key:?}: {error}"),
+                })?;
         }
         let plan = state
             .plan_activation(

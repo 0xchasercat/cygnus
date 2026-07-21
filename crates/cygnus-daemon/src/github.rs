@@ -1357,6 +1357,8 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
                 entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
                 artifact_root: Some(config.artifact_root.clone()),
                 upstream: Some(config.upstream.clone()),
+                env: std::collections::BTreeMap::new(),
+                preview: None,
                 deployment_id: None,
                 source: DeploymentSource::github(
                     Some(config.branch.clone()),

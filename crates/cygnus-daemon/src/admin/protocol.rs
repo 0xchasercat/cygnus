@@ -40,6 +40,11 @@ pub enum AdminCommand {
         email: String,
         password: String,
     },
+    ChangePassword {
+        email: String,
+        current_password: String,
+        new_password: String,
+    },
     Status,
     SetDashboardDomain {
         domain: Option<String>,
@@ -67,6 +72,26 @@ pub enum AdminCommand {
         app: String,
         host: String,
         mode: DomainTls,
+    },
+    SetPrimaryDomain {
+        app: String,
+        host: String,
+    },
+    RetryDomainAcme {
+        app: String,
+        host: String,
+    },
+    ListEnvVars {
+        app: String,
+    },
+    SetEnvVar {
+        app: String,
+        key: String,
+        value: String,
+    },
+    RemoveEnvVar {
+        app: String,
+        key: String,
     },
     GetMetrics,
     ListRequests {
@@ -124,6 +149,10 @@ pub enum AdminCommand {
         engine_version: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entry: Option<std::path::PathBuf>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
         total_bytes: u64,
     },
     DeployUploadChunk {
@@ -342,6 +371,22 @@ pub enum AdminData {
     AppDomainTlsSet {
         domain: AppDomainView,
     },
+    AppDomainPrimarySet {
+        domain: AppDomainView,
+    },
+    AppDomainAcmeRetried {
+        domain: AppDomainView,
+    },
+    PasswordChanged,
+    EnvVars {
+        vars: std::collections::BTreeMap<String, String>,
+    },
+    EnvVarSet {
+        key: String,
+    },
+    EnvVarRemoved {
+        key: String,
+    },
     ConfigApplied {
         listen: String,
         app_count: usize,
@@ -449,6 +494,14 @@ pub struct AppDomainView {
     pub dns: DomainDnsView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_unix: Option<i64>,
+    /// Last ACME failure message, if any. `None` once issuance succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Earliest time (unix seconds) the reconciler will retry a failed
+    /// domain. `None` means eligible immediately (or never failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_unix: Option<i64>,
+    pub is_primary: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -725,6 +778,9 @@ mod tests {
                     ok: true,
                 },
                 expires_unix: None,
+                error: None,
+                next_retry_unix: None,
+                is_primary: false,
             }],
         };
         assert_eq!(
@@ -740,7 +796,8 @@ mod tests {
                         "expected_ip":"203.0.113.8",
                         "resolves_to":["203.0.113.8"],
                         "ok":true
-                    }
+                    },
+                    "is_primary":false
                 }]
             })
         );
@@ -865,6 +922,8 @@ mod tests {
             domain: Some("hello.example".into()),
             engine_version: None,
             entry: Some("src/index.ts".into()),
+            env: Default::default(),
+            preview: None,
             total_bytes: 123,
         };
         assert_eq!(
@@ -910,6 +969,8 @@ mod tests {
                 entry: None,
                 artifact_root: None,
                 upstream: None,
+                env: Default::default(),
+                preview: None,
                 deployment_id: None,
                 source: DeploymentSource::cli(),
             },

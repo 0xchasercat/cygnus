@@ -36,6 +36,7 @@ class Store {
   notice = $state(''); // transient GitHub callback / mutation notice
   buildLogByDeploy = $state({}); // deploymentId -> string[] (preview fallback)
   domainsByApp = $state({}); // appName -> {domains:[...], at:number} (live cache)
+  envVarsByApp = $state({}); // appName -> {key: value} (live cache)
   #domainTimer = null; // polls per-app domain status while non-terminal
 
   #timer = null;
@@ -351,6 +352,7 @@ class Store {
     this.requests = [];
     this.github = { configured: false, app: null, repositories: [], jobs: [] };
     this.domainsByApp = {};
+    this.envVarsByApp = {};
     return { ok: true };
   }
 
@@ -410,6 +412,57 @@ class Store {
     }
   }
 
+  // ——— per-app environment variables ———
+  envVars(appName) {
+    return this.envVarsByApp[appName] ?? null;
+  }
+
+  async refreshEnvVars(appName) {
+    if (!appName) return null;
+    try {
+      const data = await api(`/api/v1/apps/${encodeURIComponent(appName)}/env`);
+      const vars = data?.vars && typeof data.vars === 'object' ? data.vars : {};
+      this.envVarsByApp = { ...this.envVarsByApp, [appName]: vars };
+      return vars;
+    } catch (cause) {
+      if (cause instanceof ApiError && (cause.status === 404 || cause.status === 405)) {
+        if (!this.envVarsByApp[appName]) {
+          this.envVarsByApp = { ...this.envVarsByApp, [appName]: {} };
+        }
+        return this.envVarsByApp[appName];
+      }
+      if (cause instanceof ApiError && cause.status === 401) {
+        this.auth = 'signin';
+        this.stop();
+      }
+      return this.envVarsByApp[appName] ?? null;
+    }
+  }
+
+  async setEnvVar(appName, key, value) {
+    try {
+      await post(`/api/v1/apps/${encodeURIComponent(appName)}/env`, { key, value });
+      this.notice = `${key} set for ${appName}.`;
+      await this.refreshEnvVars(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not set env var' };
+    }
+  }
+
+  async removeEnvVar(appName, key) {
+    try {
+      await api(`/api/v1/apps/${encodeURIComponent(appName)}/env/${encodeURIComponent(key)}`, {
+        method: 'DELETE',
+      });
+      this.notice = `${key} removed from ${appName}.`;
+      await this.refreshEnvVars(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not remove env var' };
+    }
+  }
+
   async setDomainTls(appName, host, mode) {
     try {
       await post(
@@ -421,6 +474,28 @@ class Store {
       return { ok: true };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'Could not change TLS' };
+    }
+  }
+
+  async setPrimaryDomain(appName, host) {
+    try {
+      await post(`/api/v1/apps/${encodeURIComponent(appName)}/domains/${encodeURIComponent(host)}/primary`);
+      this.notice = `${host} is now the primary domain for ${appName}.`;
+      await this.refreshAppDomains(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not set primary domain' };
+    }
+  }
+
+  async retryDomainAcme(appName, host) {
+    try {
+      await post(`/api/v1/apps/${encodeURIComponent(appName)}/domains/${encodeURIComponent(host)}/retry-acme`);
+      this.notice = `Retrying certificate issuance for ${host}.`;
+      await this.refreshAppDomains(appName);
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not retry certificate issuance' };
     }
   }
 
@@ -446,6 +521,23 @@ class Store {
       return { ok: true };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'Could not change dashboard TLS' };
+    }
+  }
+
+  async changePassword({ email, currentPassword, newPassword }) {
+    try {
+      await post('/api/v1/settings/password', {
+        email,
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+      this.notice = 'Password changed.';
+      return { ok: true };
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        return { ok: false, error: 'Current password is incorrect' };
+      }
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not change password' };
     }
   }
 
@@ -573,13 +665,15 @@ class Store {
   // Packs an already-built tarball (Uint8Array) through begin/chunk/finish,
   // reporting progress via the onProgress callback (0..1). Returns the
   // deployment_id on success.
-  async deployUpload({ app, domain, engineVersion, entry, tarball, totalBytes, onProgress }) {
+  async deployUpload({ app, domain, engineVersion, entry, env, preview, tarball, totalBytes, onProgress }) {
     const begin = {
       app,
       total_bytes: totalBytes,
       ...(domain ? { domain } : {}),
       ...(engineVersion ? { engine_version: engineVersion } : {}),
       ...(entry ? { entry } : {}),
+      ...(env && Object.keys(env).length ? { env } : {}),
+      ...(preview ? { preview } : {}),
     };
     let uploadId;
     try {

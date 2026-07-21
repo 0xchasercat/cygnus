@@ -38,7 +38,6 @@
   <div class="head">
     <div>
       <h1>Deploys</h1>
-      <p class="sub">Every artifact this node has built. Blue-green swaps, prior sealed deployments retained for instant rollback.</p>
     </div>
     <div class="seg">
       <button class:on={filter === 'all'} onclick={() => (filter = 'all')}>All</button>
@@ -91,12 +90,6 @@
     font-size: 23px;
     font-weight: 650;
     letter-spacing: -0.02em;
-  }
-  .sub {
-    margin-top: 5px;
-    font-size: 13px;
-    color: var(--ink-3);
-    max-width: 560px;
   }
 
   .rows { padding: 6px; }

@@ -7,12 +7,20 @@ export const ui = $state({
   paletteOpen: false,
   shipOpen: false,
   shipTab: 'upload', // 'upload' | 'git'
+  // Set by go('observe', { observeAppFilter }) so a deep link (e.g. an
+  // app-scoped event on Overview) opens Observe pre-filtered to that app.
+  // Observe.svelte consumes and clears it on mount so it never sticks
+  // across an unrelated later visit.
+  observeAppFilter: null,
 });
 
 export function go(screen, opts = {}) {
   ui.screen = screen;
   ui.appId = opts.appId ?? ui.appId;
   ui.deployId = opts.deployId ?? null;
+  if (screen === 'observe' && opts.observeAppFilter !== undefined) {
+    ui.observeAppFilter = opts.observeAppFilter;
+  }
   ui.paletteOpen = false;
   ui.shipOpen = false;
   window.scrollTo({ top: 0 });

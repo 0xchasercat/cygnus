@@ -333,6 +333,8 @@ impl GitHubDeployExecutor for ProductionGitHubDeployExecutor {
                 entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
                 artifact_root: Some(config.artifact_root.clone()),
                 upstream: Some(config.upstream.clone()),
+                env: std::collections::BTreeMap::new(),
+                preview: None,
                 deployment_id: None,
                 source: DeploymentSource::github(
                     Some(config.branch.clone()),
@@ -471,6 +473,8 @@ fn generic_deploy_request(job: &DeployJob, source_dir: PathBuf) -> Result<Deploy
         entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
         artifact_root: Some(job.artifact_root.clone()),
         upstream: Some(job.upstream.clone()),
+        env: std::collections::BTreeMap::new(),
+        preview: None,
         deployment_id: Some(deployment_id),
         source,
     })
@@ -632,6 +636,16 @@ impl AdminMutationHandler for LiveAdminMutations {
                 self.set_app_domain_tls(&app, &host, mode, audit)
             }
             AdminMutation::MapDomain { app, domain } => self.map_domain(&app, &domain, audit),
+            AdminMutation::SetPrimaryDomain { app, host } => {
+                self.set_primary_domain(&app, &host, audit)
+            }
+            AdminMutation::RetryDomainAcme { app, host } => {
+                self.retry_domain_acme(&app, &host, audit)
+            }
+            AdminMutation::SetEnvVar { app, key, value } => {
+                self.set_env_var(&app, &key, &value, audit)
+            }
+            AdminMutation::RemoveEnvVar { app, key } => self.remove_env_var(&app, &key, audit),
             AdminMutation::Rollback {
                 app,
                 deployment,
@@ -1005,6 +1019,104 @@ impl LiveAdminMutations {
         Ok(AdminData::DomainMapped {
             app: app.to_owned(),
             domain: canonical,
+        })
+    }
+
+    fn set_primary_domain(
+        &self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let domain = state
+            .set_primary_domain(app, host, audit)
+            .map_err(map_admin_state_error)?;
+        Ok(AdminData::AppDomainPrimarySet {
+            domain: live_domain_view(domain),
+        })
+    }
+
+    fn retry_domain_acme(
+        &self,
+        app: &str,
+        host: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let domain = state
+            .app_domains(Some(app))
+            .map_err(map_admin_state_error)?
+            .into_iter()
+            .find(|candidate| candidate.host == host)
+            .ok_or_else(|| {
+                AdminMutationError::new(
+                    AdminErrorCode::NotFound,
+                    format!("domain {host:?} not found"),
+                )
+            })?;
+        if domain.tls != DomainTls::Acme {
+            return Err(AdminMutationError::new(
+                AdminErrorCode::Conflict,
+                format!("domain {host:?} is not using ACME"),
+            ));
+        }
+        state
+            .clear_domain_retry_backoff(host, audit)
+            .map_err(map_admin_state_error)?;
+        let _ = reconcile_acme_domains(
+            &self.state_path,
+            self.http01_challenges.clone(),
+            self.tls.as_ref(),
+            &self.metrics,
+        );
+        let domain = State::open(&self.state_path)
+            .and_then(|state| state.app_domains(Some(app)))
+            .map_err(map_admin_state_error)?
+            .into_iter()
+            .find(|candidate| candidate.host == host)
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::Internal, "domain disappeared")
+            })?;
+        record_event(
+            &self.metrics,
+            "domain_acme_retry",
+            Some(app),
+            format!("manual ACME retry requested for {host}"),
+        );
+        Ok(AdminData::AppDomainAcmeRetried {
+            domain: live_domain_view(domain),
+        })
+    }
+
+    fn set_env_var(
+        &self,
+        app: &str,
+        key: &str,
+        value: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        state
+            .set_env_var(app, key, value, audit)
+            .map_err(map_admin_state_error)?;
+        Ok(AdminData::EnvVarSet {
+            key: key.to_owned(),
+        })
+    }
+
+    fn remove_env_var(
+        &self,
+        app: &str,
+        key: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        state
+            .remove_env_var(app, key, audit)
+            .map_err(map_admin_state_error)?;
+        Ok(AdminData::EnvVarRemoved {
+            key: key.to_owned(),
         })
     }
 
@@ -1561,6 +1673,9 @@ fn live_domain_view(domain: DomainRecord) -> AppDomainView {
             ok: precheck.ok,
         },
         expires_unix: domain.expires_unix,
+        error: domain.error,
+        next_retry_unix: domain.next_retry_unix,
+        is_primary: domain.is_primary,
     }
 }
 
@@ -1714,6 +1829,9 @@ fn reconcile_acme_domains(
                 && domain
                     .expires_unix
                     .is_some_and(|expires| expires > renew_before))
+            || domain
+                .next_retry_unix
+                .is_some_and(|retry_at| retry_at > now)
         {
             continue;
         }
@@ -1740,10 +1858,12 @@ fn reconcile_acme_domains(
                 if let Some(tls) = tls {
                     tls.reload(&certificates)?;
                 }
-                state.update_domain_status(
+                state.update_domain_acme_outcome(
                     &domain.host,
                     DomainStatus::Active,
                     Some(expires),
+                    None,
+                    None,
                     &system_domain_audit(&domain.host, "domain_acme_active"),
                 )?;
                 record_event(
@@ -1757,7 +1877,10 @@ fn reconcile_acme_domains(
                 had_failure = true;
                 let has_fallback = certificate_for_host(&state.certificates()?, &domain.host)
                     .is_some_and(|certificate| certificate.not_after_unix > now);
-                state.update_domain_status(
+                let rate_limited = error.is_rate_limited();
+                let next_retry_unix = now + acme_retry_delay_secs(domain.retry_count, rate_limited);
+                let error_text = error.to_string();
+                state.update_domain_acme_outcome(
                     &domain.host,
                     if has_fallback {
                         DomainStatus::FallbackActive
@@ -1765,13 +1888,15 @@ fn reconcile_acme_domains(
                         DomainStatus::Failed
                     },
                     domain.expires_unix,
+                    Some(&error_text),
+                    Some(next_retry_unix),
                     &system_domain_audit(&domain.host, "domain_acme_failed"),
                 )?;
                 record_event(
                     metrics,
                     "cert_failed",
                     Some(&domain.app),
-                    format!("ACME issuance failed for {}: {error}", domain.host),
+                    format!("ACME issuance failed for {}: {error_text}", domain.host),
                 );
             }
         }
@@ -1806,6 +1931,26 @@ fn reconcile_acme_domains(
         }
     }
     Ok(had_failure)
+}
+
+/// Exponential backoff for ACME retries: `base * 2^retry_count`, capped, with
+/// a much higher floor and cap for CA rate-limit responses so a rate-limited
+/// app cannot hammer the CA (and risk a longer suspension) every reconcile pass.
+fn acme_retry_delay_secs(retry_count: i64, rate_limited: bool) -> i64 {
+    let attempts = retry_count.clamp(0, 10) as u32;
+    if rate_limited {
+        const RATE_LIMIT_BASE_SECS: i64 = 60 * 60;
+        const RATE_LIMIT_MAX_SECS: i64 = 24 * 60 * 60;
+        RATE_LIMIT_BASE_SECS
+            .saturating_mul(1_i64.checked_shl(attempts).unwrap_or(i64::MAX))
+            .min(RATE_LIMIT_MAX_SECS)
+    } else {
+        const BASE_SECS: i64 = 60;
+        const MAX_SECS: i64 = 60 * 60;
+        BASE_SECS
+            .saturating_mul(1_i64.checked_shl(attempts).unwrap_or(i64::MAX))
+            .min(MAX_SECS)
+    }
 }
 
 fn spawn_domain_reconciler(

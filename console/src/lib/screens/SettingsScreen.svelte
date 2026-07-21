@@ -201,13 +201,62 @@
     await store.signOut();
   }
 
+  // ——— password change ———
+  let pwOpen = $state(false);
+  let pwEmail = $state('');
+  let pwCurrent = $state('');
+  let pwNew = $state('');
+  let pwConfirm = $state('');
+  let pwError = $state('');
+  let pwBusy = $state(false);
+  let pwDone = $state(false);
+
+  function openPasswordForm() {
+    pwOpen = true;
+    pwEmail = '';
+    pwCurrent = '';
+    pwNew = '';
+    pwConfirm = '';
+    pwError = '';
+    pwDone = false;
+  }
+
+  async function submitPasswordChange(e) {
+    e.preventDefault();
+    if (pwBusy) return;
+    if (pwNew.length < 12) {
+      pwError = 'New password must be at least 12 characters.';
+      return;
+    }
+    if (pwNew !== pwConfirm) {
+      pwError = 'New password and confirmation do not match.';
+      return;
+    }
+    pwBusy = true;
+    pwError = '';
+    const r = await store.changePassword({
+      email: pwEmail.trim(),
+      currentPassword: pwCurrent,
+      newPassword: pwNew,
+    });
+    pwBusy = false;
+    if (!r.ok) {
+      pwError = r.error ?? 'Could not change password';
+      return;
+    }
+    pwOpen = false;
+    pwDone = true;
+    pwCurrent = '';
+    pwNew = '';
+    pwConfirm = '';
+  }
+
   const recentJobs = $derived(store.github.jobs.slice(0, 5));
 </script>
 
 <div class="page screen-enter">
   <div class="head">
     <h1>Settings</h1>
-    <p class="sub">One node, one binary. Everything else is a row in SQLite.</p>
   </div>
 
   {#if store.notice}
@@ -435,8 +484,26 @@
         <div class="pad">
           <div class="access-row">
             <span class="mname">Admin password</span>
-            <span class="tmeta num">change from the host with cygnus status · password change UI lands next</span>
+            {#if !pwOpen}
+              <button class="btn sm" onclick={openPasswordForm}>Change password</button>
+            {/if}
           </div>
+          {#if pwDone}
+            <p class="pwdone" role="status"><Icon name="check" size={12} /> Password changed.</p>
+          {/if}
+          {#if pwOpen}
+            <form class="pwform" onsubmit={submitPasswordChange}>
+              <label>Email<input type="email" bind:value={pwEmail} autocomplete="email" required /></label>
+              <label>Current password<input type="password" bind:value={pwCurrent} autocomplete="current-password" required /></label>
+              <label>New password<input type="password" bind:value={pwNew} autocomplete="new-password" minlength="12" required /></label>
+              <label>Confirm new password<input type="password" bind:value={pwConfirm} autocomplete="new-password" minlength="12" required /></label>
+              {#if pwError}<p class="pwerr" role="alert">{pwError}</p>{/if}
+              <div class="pwactions">
+                <button class="btn sm" type="button" onclick={() => (pwOpen = false)} disabled={pwBusy}>Cancel</button>
+                <button class="btn cobalt sm" type="submit" disabled={pwBusy}>{pwBusy ? 'Changing…' : 'Change password'}</button>
+              </div>
+            </form>
+          {/if}
           <div class="access-row">
             <span class="mname">Host break-glass</span>
             <span class="tmeta num">cygnus --admin-socket ~/.cygnus/run/admin.sock status</span>
@@ -458,7 +525,6 @@
               <span class="tmeta num">{store.node?.version ?? '—'} · {store.node?.listen ?? '—'}</span>
             </div>
             <span class="grow"></span>
-            <span class="led {store.connected ? 'live' : 'build'} breathe"></span>
           </div>
           {#if store.node?.engines?.length}
             {#each store.node.engines as e (e.version)}
@@ -489,7 +555,6 @@
     font-weight: 650;
     letter-spacing: -0.02em;
   }
-  .sub { margin-top: 5px; font-size: 13px; color: var(--ink-3); }
 
   .grid {
     display: grid;
@@ -645,6 +710,40 @@
   }
   .access-row + .access-row { border-top: 1px solid var(--line-2); }
   .access-row .tmeta { flex: 1; text-align: right; overflow-wrap: anywhere; }
+  .pwform {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    padding: 12px 0 4px;
+  }
+  .pwform label {
+    display: grid;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .pwform input {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 9px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .pwerr { grid-column: 1 / -1; color: var(--red); font-size: 11.5px; margin: 0; }
+  .pwactions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+  .pwdone {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0 0;
+    font-size: 11.5px;
+    color: var(--live);
+  }
 
   /* dashboard domain + SSL card */
   .dash-row {

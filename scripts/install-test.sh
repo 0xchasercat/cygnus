@@ -200,7 +200,8 @@ grep -q 'restart cygnus.service' "$ROOT/systemctl.log" || { echo 'daemon restart
 grep -q 'engine register.*--default' "$ROOT/ctl.log" || { echo 'default engine admin call missing' >&2; exit 1; }
 grep -q 'apply ' "$ROOT/ctl.log" || { echo 'apply admin call missing' >&2; exit 1; }
 grep -q '  console   https://127.0.0.1:3443' "$ROOT/install-output" || { echo 'console URL missing from output' >&2; exit 1; }
-grep -Eq '  token     [[:xdigit:]]{64}   \(rotate: install.sh --rotate-secrets\)' "$ROOT/install-output" || { echo 'bootstrap token missing from output' >&2; exit 1; }
+grep -Eq '^  [[:xdigit:]]{64}$' "$ROOT/install-output" || { echo 'bootstrap token missing from output' >&2; exit 1; }
+grep -q 'save your recovery token now' "$ROOT/install-output" || { echo 'token save instruction missing from output' >&2; exit 1; }
 grep -q '  cli       cygnus status' "$ROOT/install-output" || { echo 'CLI hint missing from output' >&2; exit 1; }
 bootstrap_before=$(hash_file "$ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/bootstrap.token")
 session_before=$(hash_file "$ROOT/var/lib/cygnus/artifacts/tenant-0-secrets/cygnus/secrets/session.key")
@@ -365,7 +366,7 @@ grep -q 'apply ' "$CYGNUS_TEST_CTL_LOG" || { echo 'darwin config apply missing' 
 [[ $(grep -c '^macOS runs cages as plain processes: no namespaces, no cgroups, no seccomp\.$' "$DARWIN_ROOT/install-output") == 1 ]] || { echo 'canonical macOS platform line missing or repeated' >&2; exit 1; }
 grep -q '  console   http://localhost:3000' "$DARWIN_ROOT/install-output" || { echo 'darwin console URL missing' >&2; exit 1; }
 grep -q 'loopback only' "$DARWIN_ROOT/install-output" || { echo 'darwin loopback access note missing' >&2; exit 1; }
-grep -Eq '  token     [[:xdigit:]]{64}   \(rotate: install.sh --rotate-secrets\)' "$DARWIN_ROOT/install-output" || { echo 'darwin token output missing' >&2; exit 1; }
+grep -Eq '^  [[:xdigit:]]{64}$' "$DARWIN_ROOT/install-output" || { echo 'darwin token output missing' >&2; exit 1; }
 grep -Fq 'Add Cygnus to PATH: export PATH="$HOME/.cygnus/bin:$PATH"' "$DARWIN_ROOT/install-output" || { echo 'darwin PATH hint missing' >&2; exit 1; }
 
 darwin_bootstrap_before=$(hash_file "$DARWIN_SECRETS/bootstrap.token")

@@ -510,6 +510,19 @@ pub enum AcmeError {
     Json(#[from] serde_json::Error),
 }
 
+impl AcmeError {
+    /// True when the ACME server rejected the request with the RFC 8555
+    /// `rateLimited` problem type. Callers use this to apply a much longer
+    /// backoff than a transient/network failure would warrant.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            AcmeError::Protocol(instant_acme::Error::Api(problem))
+                if problem.r#type.as_deref() == Some("urn:ietf:params:acme:error:rateLimited")
+        )
+    }
+}
+
 struct AccountStore {
     directory: PathBuf,
     path: PathBuf,

@@ -17,6 +17,7 @@ import {
   addAppDomainCommand,
   appDomainTlsCommand,
   buildGithubManifest,
+  changePasswordCommand,
   clearManifestStates,
   commandForRequest,
   configureRepositoryCommand,
@@ -30,11 +31,16 @@ import {
   deployUploadIngress,
   handleApi,
   healthResponse,
+  listEnvVarsCommand,
   mapDomainCommand,
   removeAppDomainCommand,
+  removeEnvVarCommand,
   requestIsSecure,
+  retryDomainAcmeCommand,
   rollbackCommand,
   sessionResponse,
+  setEnvVarCommand,
+  setPrimaryDomainCommand,
   setup,
   signSession,
   statusForDaemonCode,
@@ -400,6 +406,91 @@ describe("console request validation", () => {
     await expect(commandForRequest(new Request(encodedSlash, { method: "DELETE" }), encodedSlash)).rejects.toThrow("host is invalid");
   });
 
+  test("maps primary-domain, retry-acme, and env var routes to exact admin commands", async () => {
+    const command = async (path, method = "GET", body) => {
+      const url = new URL(`https://console.example${path}`);
+      const request = new Request(url, {
+        method,
+        ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+      });
+      return commandForRequest(request, url);
+    };
+
+    expect(await command("/api/v1/apps/demo/domains/www.example.com/primary", "POST")).toEqual({
+      type: "set_primary_domain",
+      app: "demo",
+      host: "www.example.com",
+    });
+    expect(await command("/api/v1/apps/demo/domains/www.example.com/retry-acme", "POST")).toEqual({
+      type: "retry_domain_acme",
+      app: "demo",
+      host: "www.example.com",
+    });
+    expect(await command("/api/v1/apps/demo/env")).toEqual({ type: "list_env_vars", app: "demo" });
+    expect(await command("/api/v1/apps/demo/env", "POST", { key: "API_KEY", value: "secret" })).toEqual({
+      type: "set_env_var",
+      app: "demo",
+      key: "API_KEY",
+      value: "secret",
+    });
+    expect(await command("/api/v1/apps/demo/env/API_KEY", "DELETE")).toEqual({
+      type: "remove_env_var",
+      app: "demo",
+      key: "API_KEY",
+    });
+  });
+
+  test("rejects invalid primary-domain, retry-acme, and env var inputs", async () => {
+    expect(() => setPrimaryDomainCommand("../demo", "www.example.com")).toThrow("app is invalid");
+    expect(() => retryDomainAcmeCommand("demo", "https://example.com")).toThrow("domain is invalid");
+    expect(() => setEnvVarCommand("demo", { key: "not valid", value: "x" })).toThrow("env var key is invalid");
+    expect(() => setEnvVarCommand("demo", { key: "PATH", value: "x" })).toThrow("reserved by the daemon");
+    expect(() => setEnvVarCommand("demo", { key: "OK", value: "x", extra: true })).toThrow("unsupported fields");
+    expect(() => removeEnvVarCommand("demo", "1bad")).toThrow("env var key is invalid");
+    expect(() => listEnvVarsCommand("../demo")).toThrow("app is invalid");
+  });
+
+  test("validates and shapes the password change command", async () => {
+    expect(changePasswordCommand({
+      email: "admin@example.com",
+      current_password: "correct horse battery staple",
+      new_password: "another strong password here",
+    })).toEqual({
+      type: "change_password",
+      email: "admin@example.com",
+      current_password: "correct horse battery staple",
+      new_password: "another strong password here",
+    });
+    expect(() => changePasswordCommand({
+      email: "admin@example.com",
+      current_password: "correct horse battery staple",
+      new_password: "short",
+    })).toThrow("password is invalid");
+    expect(() => changePasswordCommand({
+      email: "admin@example.com",
+      current_password: "correct horse battery staple",
+      new_password: "another strong password here",
+      extra: true,
+    })).toThrow("unsupported fields");
+
+    const url = new URL("https://console.example/api/v1/settings/password");
+    const request = new Request(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "admin@example.com",
+        current_password: "correct horse battery staple",
+        new_password: "another strong password here",
+      }),
+    });
+    expect(await commandForRequest(request, url)).toEqual({
+      type: "change_password",
+      email: "admin@example.com",
+      current_password: "correct horse battery staple",
+      new_password: "another strong password here",
+    });
+  });
+
   test("enforces methods and same origin for authenticated domain mutations", async () => {
     process.env.CYGNUS_CONSOLE_SESSION_KEY = "session-key";
     const getSettings = new URL("https://console.example/api/v1/settings/dashboard-domain");
@@ -585,6 +676,20 @@ describe("console deploy upload bridge", () => {
       upload_id: "upl_1",
     });
     expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: 1, extra: true })).toThrow("unsupported fields");
+    expect(deployUploadBeginCommand({
+      app: "demo",
+      total_bytes: 1,
+      env: { API_KEY: "secret", DEBUG: "true" },
+      preview: "pr-42",
+    })).toEqual({
+      type: "deploy_upload_begin",
+      app: "demo",
+      total_bytes: 1,
+      env: { API_KEY: "secret", DEBUG: "true" },
+      preview: "pr-42",
+    });
+    expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: 1, env: { PATH: "x" } })).toThrow("reserved by the daemon");
+    expect(() => deployUploadBeginCommand({ app: "demo", total_bytes: 1, preview: "../escape" })).toThrow("preview slug is invalid");
     expect(() => deployUploadFinishCommand({ upload_id: "upl_1", app: "demo" })).toThrow("unsupported fields");
   });
 

@@ -70,6 +70,23 @@ pub enum AdminMutation {
         app: String,
         domain: String,
     },
+    SetPrimaryDomain {
+        app: String,
+        host: String,
+    },
+    RetryDomainAcme {
+        app: String,
+        host: String,
+    },
+    SetEnvVar {
+        app: String,
+        key: String,
+        value: String,
+    },
+    RemoveEnvVar {
+        app: String,
+        key: String,
+    },
     Rollback {
         app: String,
         deployment: String,
@@ -198,6 +215,33 @@ impl StateAdminHandler {
                     }
                 }
             }
+            AdminCommand::ChangePassword {
+                email,
+                current_password,
+                new_password,
+            } => {
+                let audit = self.request_audit(role, peer, request, "change_password")?;
+                let mut state = self.open_state()?;
+                match state.update_account_password(
+                    &email,
+                    &current_password,
+                    &new_password,
+                    &audit,
+                ) {
+                    Ok(()) => Ok(AdminData::PasswordChanged),
+                    Err(error) => {
+                        let fault = map_account_state_error(error);
+                        state
+                            .append_audit(
+                                &audit,
+                                AuditOutcome::Failure,
+                                Some(admin_error_name(fault.code)),
+                            )
+                            .map_err(HandlerFault::internal)?;
+                        Err(fault)
+                    }
+                }
+            }
             AdminCommand::VerifyCredentials { email, password } => {
                 let credentials = self
                     .open_state()?
@@ -263,6 +307,44 @@ impl StateAdminHandler {
                 request,
                 AdminMutation::SetAppDomainTls { app, host, mode },
                 "set_app_domain_tls",
+            ),
+            AdminCommand::SetPrimaryDomain { app, host } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetPrimaryDomain { app, host },
+                "set_primary_domain",
+            ),
+            AdminCommand::RetryDomainAcme { app, host } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::RetryDomainAcme { app, host },
+                "retry_domain_acme",
+            ),
+            AdminCommand::ListEnvVars { app } => {
+                let vars = self
+                    .open_state()?
+                    .app_env_vars(&app)
+                    .map_err(map_state_query_error)?
+                    .into_iter()
+                    .map(|record| (record.key, record.value))
+                    .collect();
+                Ok(AdminData::EnvVars { vars })
+            }
+            AdminCommand::SetEnvVar { app, key, value } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetEnvVar { app, key, value },
+                "set_env_var",
+            ),
+            AdminCommand::RemoveEnvVar { app, key } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::RemoveEnvVar { app, key },
+                "remove_env_var",
             ),
             AdminCommand::GetMetrics => Ok(AdminData::Metrics {
                 metrics: self.metrics.metrics(),
@@ -390,6 +472,8 @@ impl StateAdminHandler {
                 domain,
                 engine_version,
                 entry,
+                env,
+                preview,
                 total_bytes,
             } => {
                 let upload_id = self
@@ -400,6 +484,8 @@ impl StateAdminHandler {
                             domain,
                             engine_version,
                             entry,
+                            env,
+                            preview,
                         },
                         total_bytes,
                     )
@@ -594,6 +680,8 @@ impl StateAdminHandler {
             entry: upload.metadata.entry,
             artifact_root: None,
             upstream: None,
+            env: upload.metadata.env,
+            preview: upload.metadata.preview.clone(),
             deployment_id: None,
             source: DeploymentSource::upload(),
         };
@@ -925,6 +1013,9 @@ fn app_domain_view(domain: DomainRecord, expected_ip: Option<std::net::Ipv4Addr>
             ok: dns.ok,
         },
         expires_unix: domain.expires_unix,
+        error: domain.error,
+        next_retry_unix: domain.next_retry_unix,
+        is_primary: domain.is_primary,
     }
 }
 
@@ -1498,6 +1589,8 @@ mod tests {
                 domain: Some("hello.example".into()),
                 engine_version: None,
                 entry: None,
+                env: Default::default(),
+                preview: None,
                 total_bytes: 4,
             }),
         );
@@ -1601,6 +1694,8 @@ mod tests {
                     entry: None,
                     artifact_root: None,
                     upstream: None,
+                    env: Default::default(),
+                    preview: None,
                     deployment_id: None,
                     source: DeploymentSource::upload(),
                 },

@@ -3,13 +3,18 @@
   import { store } from '../live.svelte.js';
   import { relativeTime } from '../time.js';
   import { eventIcon, eventStyle } from '../events.js';
+  import { ui } from '../stores.svelte.js';
   import Chart from '../components/Chart.svelte';
   import Icon from '../components/Icon.svelte';
 
   let tab = $state('requests');
   let page = $state(0);
   let expanded = $state({}); // request_id -> true
-  let appFilter = $state(''); // '' = all apps
+  // Deep-linked from Overview's event list (go('observe', {observeAppFilter}));
+  // consumed once here and cleared so a later plain visit to Observe starts
+  // unfiltered again.
+  let appFilter = $state(ui.observeAppFilter ?? '');
+  ui.observeAppFilter = null;
   let statusFilter = $state(''); // '' | '2xx' | '4xx' | '5xx'
   const PAGE_SIZE = 50;
 
@@ -82,7 +87,6 @@
   <div class="head">
     <div>
       <h1>Observe</h1>
-      <p class="sub">Measured at the router — none of it self-reported by cages.</p>
     </div>
     <div class="filters">
       <select class="filter-select" bind:value={appFilter} aria-label="Filter by app">
@@ -210,11 +214,6 @@
     font-size: 23px;
     font-weight: 650;
     letter-spacing: -0.02em;
-  }
-  .sub {
-    margin-top: 5px;
-    font-size: 13px;
-    color: var(--ink-3);
   }
   .filters {
     display: flex;

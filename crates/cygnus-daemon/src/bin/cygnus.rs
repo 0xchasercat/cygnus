@@ -86,6 +86,13 @@ enum Command {
         /// Upstream socket path (default: daemon-owned).
         #[arg(long)]
         upstream: Option<PathBuf>,
+        /// Environment variable to set, as KEY=VALUE. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Deploy as an isolated preview under `<app>-<slug>` instead of
+        /// touching the production app/domain.
+        #[arg(long)]
+        preview: Option<String>,
     },
     /// Check protocol and daemon availability.
     Health,
@@ -265,9 +272,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             entry,
             artifact_root,
             upstream,
+            env,
+            preview,
         } => {
             let source_dir = resolve_deploy_source(source_dir.or(source))?;
             let app = resolve_deploy_app(app, &source_dir)?;
+            let env = parse_env_flags(&env)?;
             let request = DeployRequest {
                 source_dir,
                 app,
@@ -276,6 +286,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 entry,
                 artifact_root,
                 upstream,
+                env,
+                preview,
                 deployment_id: None,
                 source: DeploymentSource::cli(),
             };
@@ -471,6 +483,23 @@ fn resolve_deploy_app(
         );
     }
     Ok(sanitized)
+}
+
+/// Parse repeated `--env KEY=VALUE` flags into a map. Later duplicates win.
+fn parse_env_flags(
+    flags: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn Error>> {
+    let mut env = std::collections::BTreeMap::new();
+    for flag in flags {
+        let (key, value) = flag
+            .split_once('=')
+            .ok_or_else(|| format!("--env {flag:?} must be in KEY=VALUE form"))?;
+        if key.is_empty() {
+            return Err(format!("--env {flag:?} has an empty key").into());
+        }
+        env.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(env)
 }
 
 /// Lowercase DNS-label-ish app names: a-z0-9 and hyphens, no leading/trailing hyphen.

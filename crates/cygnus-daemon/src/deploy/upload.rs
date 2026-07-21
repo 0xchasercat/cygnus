@@ -47,6 +47,10 @@ pub struct UploadMetadata {
     pub engine_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 /// A complete archive retained in the spool for an asynchronous worker.
@@ -652,6 +656,8 @@ mod tests {
             domain: Some("hello.example".into()),
             engine_version: Some("1.0.0".into()),
             entry: Some("src/index.ts".into()),
+            env: Default::default(),
+            preview: None,
         }
     }
 
