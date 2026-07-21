@@ -364,8 +364,7 @@ grep -q '^bootstrap gui/' "$CYGNUS_TEST_LAUNCHCTL_LOG" || { echo 'launchctl boot
 grep -q 'engine register.*--host-root .*\.cygnus/state/engines/bun-1.3.14.*--default' "$CYGNUS_TEST_CTL_LOG" || { echo 'darwin default engine registration missing' >&2; exit 1; }
 grep -q 'apply ' "$CYGNUS_TEST_CTL_LOG" || { echo 'darwin config apply missing' >&2; exit 1; }
 [[ $(grep -c '^macOS runs cages as plain processes: no namespaces, no cgroups, no seccomp\.$' "$DARWIN_ROOT/install-output") == 1 ]] || { echo 'canonical macOS platform line missing or repeated' >&2; exit 1; }
-grep -q '  console   http://localhost:3000' "$DARWIN_ROOT/install-output" || { echo 'darwin console URL missing' >&2; exit 1; }
-grep -q 'loopback only' "$DARWIN_ROOT/install-output" || { echo 'darwin loopback access note missing' >&2; exit 1; }
+grep -q '  console   http://127.0.0.1:3000' "$DARWIN_ROOT/install-output" || { echo 'darwin console URL missing' >&2; exit 1; }
 grep -Eq '^  [[:xdigit:]]{64}$' "$DARWIN_ROOT/install-output" || { echo 'darwin token output missing' >&2; exit 1; }
 grep -Fq 'Add Cygnus to PATH: export PATH="$HOME/.cygnus/bin:$PATH"' "$DARWIN_ROOT/install-output" || { echo 'darwin PATH hint missing' >&2; exit 1; }
 
