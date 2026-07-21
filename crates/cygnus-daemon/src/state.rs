@@ -2150,10 +2150,16 @@ impl State {
             [],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
         )?;
-        let native = apex
-            .as_deref()
-            .map(|apex| native_domain(&plan.logical_app, apex))
-            .transpose()?;
+        // Product apps get app.<apex>. The console (tenant-0) is reached only
+        // via edge.dashboard_domain / the management listener — never a
+        // synthetic tenant-0.<apex> hostname.
+        let native = if plan.logical_app == "tenant-0" {
+            None
+        } else {
+            apex.as_deref()
+                .map(|apex| native_domain(&plan.logical_app, apex))
+                .transpose()?
+        };
         for domain in &plan.candidate.domains {
             match domain_owner_tx(&transaction, domain)? {
                 Some((owner, _)) if owner != plan.logical_app => {
@@ -3413,6 +3419,12 @@ fn reconcile_native_domains_tx(
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     for (app_id, app) in apps {
+        // tenant-0 is the console process, not a product app. Its public
+        // hostname is edge.dashboard_domain only — never invent
+        // tenant-0.<apex> alongside the operator's dashboard URL.
+        if app == "tenant-0" {
+            continue;
+        }
         let host = native_domain(&app, apex)?;
         if let Some((owner, _)) = domain_owner_tx(transaction, &host)? {
             return Err(StateError::DomainConflict {
@@ -5543,6 +5555,10 @@ fn snapshot_from_config(config: &NodeConfig) -> Result<Snapshot, StateError> {
     let edge = canonical_edge_config(config.listen, &config.edge)?;
     if let Some(apex) = edge.apex_domain.as_deref() {
         for app in &mut apps {
+            // Console process is not a product app — no tenant-0.<apex>.
+            if app.name == "tenant-0" || app.tenant_admin {
+                continue;
+            }
             let native = native_domain(&app.name, apex)?;
             app.domains.retain(|domain| domain != &native);
             app.domains.push(native);

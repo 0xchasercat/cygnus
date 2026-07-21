@@ -17,6 +17,7 @@ import {
 } from './fixtures.js';
 
 const POLL_MS = 4000;
+const BUILD_POLL_MS = 1000; // faster while any deploy is building
 const GITHUB_EVERY = 3; // every 3rd tick
 const DOMAIN_POLL_MS = 5000; // per-app domain status while non-terminal
 
@@ -140,11 +141,21 @@ class Store {
     if (this.mode !== 'live' || this.auth !== 'ready') return;
     if (this.#timer) return;
     this.#poll();
-    this.#timer = setInterval(() => this.#poll(), POLL_MS);
+    this.#armPollTimer();
+  }
+
+  #armPollTimer() {
+    clearInterval(this.#timer);
+    if (this.mode !== 'live' || this.auth !== 'ready') {
+      this.#timer = null;
+      return;
+    }
+    const building = this.deployments.some((d) => d.status === 'building');
+    this.#timer = setInterval(() => this.#poll(), building ? BUILD_POLL_MS : POLL_MS);
   }
 
   stop() {
-    if (this.#timer) clearInterval(this.#timer);
+    clearInterval(this.#timer);
     this.#timer = null;
   }
 
@@ -185,6 +196,9 @@ class Store {
     }
 
     await Promise.all(reads);
+    // Rebuild interval when build activity starts/stops so the deploy page
+    // sees status flips within ~1s instead of the quiet 4s cadence.
+    this.#armPollTimer();
     this.lastSync = Date.now();
   }
 

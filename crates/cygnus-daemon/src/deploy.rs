@@ -875,6 +875,20 @@ fn build_job(
         .insert("BUN_INSTALL_CACHE_DIR".into(), cache_path.into_os_string());
     job.env
         .insert("NPM_CONFIG_REGISTRY".into(), BUILD_REGISTRY.into());
+    // Rooted Linux cages only stage the CA bundle under this fixed path.
+    // macOS host builds use the process environment's system trust store.
+    if linux {
+        job.env.insert(
+            "SSL_CERT_FILE".into(),
+            OsString::from("/etc/ssl/certs/ca-certificates.crt"),
+        );
+        job.env
+            .insert("SSL_CERT_DIR".into(), OsString::from("/etc/ssl/certs"));
+        job.env.insert(
+            "NODE_EXTRA_CA_CERTS".into(),
+            OsString::from("/etc/ssl/certs/ca-certificates.crt"),
+        );
+    }
     job.env
         .insert("CYGNUS_BUILD_CONFIG".into(), config_path.into_os_string());
     job.env.insert(

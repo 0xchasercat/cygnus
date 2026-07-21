@@ -504,8 +504,12 @@ struct OverlayPlan {
     upper: CString,
     upper_dev: CString,
     upper_etc: CString,
+    upper_ssl: CString,
+    upper_ssl_certs: CString,
     upper_resolv_conf: CString,
+    upper_ca_bundle: CString,
     resolv_conf: Vec<u8>,
+    ca_bundle: Vec<u8>,
     work: CString,
     merged: CString,
     merged_dev: CString,
@@ -516,6 +520,35 @@ struct OverlayPlan {
     merged_proc: CString,
     put_old: CString,
     old_root: CString,
+}
+
+/// Host CA bundle paths tried in order. Staging a copy into the cage upper
+/// layer (not a bind mount) keeps the cage independent of host layout while
+/// still trusting the node's system CAs for HTTPS (npm, ACME, app egress).
+const HOST_CA_BUNDLE_CANDIDATES: [&str; 3] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+];
+
+fn load_host_ca_bundle() -> Result<Vec<u8>, CageError> {
+    for path in HOST_CA_BUNDLE_CANDIDATES {
+        match fs::read(path) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= 4 * 1024 * 1024 => return Ok(bytes),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CageError::Io {
+                    operation: "read host CA bundle",
+                    path: PathBuf::from(path),
+                    source: error,
+                });
+            }
+        }
+    }
+    Err(CageError::InvalidSpec(
+        "no host CA certificate bundle found under /etc/ssl or /etc/pki".into(),
+    ))
 }
 
 impl OverlayPlan {
@@ -533,8 +566,12 @@ impl OverlayPlan {
             upper: path_cstring(&upper)?,
             upper_dev: path_cstring(&upper_dev)?,
             upper_etc: path_cstring(&upper.join("etc"))?,
+            upper_ssl: path_cstring(&upper.join("etc/ssl"))?,
+            upper_ssl_certs: path_cstring(&upper.join("etc/ssl/certs"))?,
             upper_resolv_conf: path_cstring(&upper.join("etc/resolv.conf"))?,
+            upper_ca_bundle: path_cstring(&upper.join("etc/ssl/certs/ca-certificates.crt"))?,
             resolv_conf: format!("nameserver {}\noptions edns0\n", net::GATEWAY).into_bytes(),
+            ca_bundle: load_host_ca_bundle()?,
             work: path_cstring(&staged.staging.join("work"))?,
             merged: path_cstring(&merged)?,
             merged_dev: path_cstring(&merged_dev)?,
@@ -585,7 +622,10 @@ impl OverlayPlan {
             mkdir(&self.upper, 0o700)?;
             mkdir(&self.upper_dev, 0o755)?;
             mkdir(&self.upper_etc, 0o755)?;
+            mkdir(&self.upper_ssl, 0o755)?;
+            mkdir(&self.upper_ssl_certs, 0o755)?;
             write_new_file(&self.upper_resolv_conf, &self.resolv_conf, 0o644)?;
+            write_new_file(&self.upper_ca_bundle, &self.ca_bundle, 0o644)?;
             mkdir(&self.work, 0o700)?;
             mkdir(&self.merged, 0o700)?;
             for device in &self.devices {
@@ -908,6 +948,14 @@ mod tests {
             overlay.upper_resolv_conf.to_bytes(),
             staging.join("upper/etc/resolv.conf").as_os_str().as_bytes()
         );
+        assert_eq!(
+            overlay.upper_ca_bundle.to_bytes(),
+            staging
+                .join("upper/etc/ssl/certs/ca-certificates.crt")
+                .as_os_str()
+                .as_bytes()
+        );
+        assert!(!overlay.ca_bundle.is_empty());
         assert_eq!(
             overlay.resolv_conf,
             format!("nameserver {}\noptions edns0\n", net::GATEWAY).as_bytes()

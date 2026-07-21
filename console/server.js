@@ -823,20 +823,28 @@ export function listRepositoriesCommand(limit = 50) {
 }
 
 export function configureRepositoryCommand(body) {
-  assertExactKeys(body, ["installation_id", "repository_id", "owner", "name", "branch", "app", "domain", "engine_version", "entry"]);
+  assertObjectKeys(
+    body,
+    ["installation_id", "repository_id", "owner", "name", "branch", "app", "domain", "engine_version"],
+    ["entry"],
+  );
+  const repository = {
+    installation_id: safePositiveId(body.installation_id),
+    repository_id: safePositiveId(body.repository_id),
+    owner: safeGithubOwner(body.owner),
+    name: safeGithubName(body.name),
+    branch: safeGithubBranch(body.branch),
+    app: safeApp(body.app),
+    domain: safeDomain(body.domain),
+    engine_version: safeVersion(body.engine_version),
+  };
+  // Empty/omitted entry → daemon auto-detects static vs server.
+  if (body.entry !== undefined && body.entry !== null && String(body.entry).trim() !== "") {
+    repository.entry = safeEntry(body.entry);
+  }
   return {
     type: "configure_repository",
-    repository: {
-      installation_id: safePositiveId(body.installation_id),
-      repository_id: safePositiveId(body.repository_id),
-      owner: safeGithubOwner(body.owner),
-      name: safeGithubName(body.name),
-      branch: safeGithubBranch(body.branch),
-      app: safeApp(body.app),
-      domain: safeDomain(body.domain),
-      engine_version: safeVersion(body.engine_version),
-      entry: safeEntry(body.entry),
-    },
+    repository,
   };
 }
 

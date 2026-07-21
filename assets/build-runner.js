@@ -56,6 +56,15 @@ const CONTROL_ENV = Object.freeze({
   PATH,
   BUN_INSTALL_CACHE_DIR: CACHE,
   NPM_CONFIG_REGISTRY: REGISTRY,
+  // Forward cage-staged CA paths when the daemon sets them (Linux). On
+  // macOS host builds leave these unset so Bun uses the system trust store.
+  ...(process.env.SSL_CERT_FILE
+    ? { SSL_CERT_FILE: process.env.SSL_CERT_FILE }
+    : {}),
+  ...(process.env.SSL_CERT_DIR ? { SSL_CERT_DIR: process.env.SSL_CERT_DIR } : {}),
+  ...(process.env.NODE_EXTRA_CA_CERTS
+    ? { NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS }
+    : {}),
 });
 
 function fail(message) {

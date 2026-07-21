@@ -10,7 +10,9 @@
   let appName = $state('');
   let domain = $state('');
   let engineVersion = $state('');
-  let entry = $state('index.ts');
+  // Empty = auto-detect (static site vs server entry). Never invent index.ts —
+  // static apps like SvelteKit have no index.ts and would fail the build.
+  let entry = $state('');
   let uploadError = $state('');
   let uploading = $state(false);
   let progress = $state(0);
@@ -89,7 +91,8 @@
         domain: domain || undefined,
         // Empty means "daemon default" — never invent a version name.
         engineVersion: engineVersion.trim() || undefined,
-        entry: entry || undefined,
+        // Only send entry when the operator typed one. Empty → auto-detect.
+        entry: entry.trim() || undefined,
         tarball: gzBuf,
         totalBytes: gzBuf.length,
         onProgress: (p) => (progress = p),
@@ -149,7 +152,8 @@
           app: repo.name,
           domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
           engine_version: eng,
-          entry: 'index.ts',
+          // Empty = auto-detect on the daemon (static vs server).
+          entry: '',
         };
       }
     }
@@ -167,7 +171,8 @@
       app: draft.app ?? repo.name,
       domain: draft.domain ?? '',
       engine_version: draft.engine_version || defaultEngine,
-      entry: draft.entry ?? 'index.ts',
+      // Omit empty entry so the daemon auto-detects app type.
+      entry: (draft.entry ?? '').trim() || undefined,
     });
     if (!r.ok) repoErrors[repo.repository_id] = r.error ?? 'Repository configuration failed';
   }
@@ -214,16 +219,25 @@
                 <label>App name<input bind:value={appName} maxlength="64" required /></label>
                 <label>Domain<input bind:value={domain} placeholder={appsDomain ? `app.${appsDomain}` : 'app.example.com'} maxlength="253" /></label>
                 <label>Engine<input bind:value={engineVersion} maxlength="128" /></label>
-                <label>Entry<input bind:value={entry} maxlength="4096" /></label>
+                <label>Entry <span class="optional">(optional — auto-detect if empty)</span><input bind:value={entry} placeholder="auto-detect" maxlength="4096" /></label>
                 <span class="summary num">{fileSummary()}</span>
                 {#if uploading}
                   <div class="progress"><i style="width:{Math.round(progress * 100)}%"></i></div>
+                  <span class="summary num">
+                    {progress < 1
+                      ? `Uploading source · ${Math.round(progress * 100)}%`
+                      : 'Queued — opening build…'}
+                  </span>
                 {/if}
                 {#if uploadError}<p class="inline-error" role="alert">{uploadError}</p>{/if}
                 <div class="uactions">
                   <button class="btn" type="button" onclick={resetUpload} disabled={uploading}>Clear</button>
                   <button class="btn cobalt" type="submit" disabled={uploading || !appName}>
-                    {uploading ? 'Uploading…' : 'Build & deploy'}
+                    {uploading
+                      ? progress < 1
+                        ? 'Uploading…'
+                        : 'Starting build…'
+                      : 'Build & deploy'}
                   </button>
                 </div>
               </form>
@@ -395,6 +409,12 @@
     display: grid; gap: 5px;
     font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--ink-3);
+  }
+  .uform .optional {
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--ink-4);
+    font-weight: 400;
   }
   .uform input {
     border: 1px solid var(--line-strong);

@@ -470,7 +470,6 @@ json_listen=$(json_safe_string "$listen")
 json_https='null'
 [[ -z $https_listen ]] || json_https="\"$(json_safe_string "$https_listen")\""
 json_domain=$(json_safe_string "$apps_domain")
-json_console_domain=$(json_safe_string "cygnus.$apps_domain")
 json_engine_root=$(json_safe_string "$engine_root")
 json_console_root=$(json_safe_string "$console_root")
 json_secret_root=$(json_safe_string "$secret_root")
@@ -493,11 +492,13 @@ log "Configure Cygnus"
 if [[ $OS == Darwin ]]; then
   json_command=$(json_safe_string "$prefix/bun")
   json_console_script=$(json_safe_string "$console_root/opt/cygnus-console/server.js")
-  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"%s","args":["%s"],"env":{"CYGNUS_SOCKET":"%s","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"lifecycle":{"min_instances":1}}]}\n' \
-    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_command" "$json_console_script" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" >"$stage/node.json"
+  # tenant-0 has no product hostname. Operators set dashboard_domain in the
+  # console; the management listener + Host default route reach it until then.
+  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":[],"tenant_admin":true,"upstream":"%s","command":"%s","args":["%s"],"env":{"CYGNUS_SOCKET":"%s","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"lifecycle":{"min_instances":1}}]}\n' \
+    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_upstream" "$json_command" "$json_console_script" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" >"$stage/node.json"
 else
-  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":["%s"],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
-    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_domain" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" "$json_hostlib_root" "$json_engine_root" "$json_console_root" "$json_secret_root" >"$stage/node.json"
+  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":[],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
+    "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" "$json_hostlib_root" "$json_engine_root" "$json_console_root" "$json_secret_root" >"$stage/node.json"
 fi
 printf '%s\n' \
   '# Cygnus console credentials; keep this file mode 0600.' \
@@ -790,6 +791,10 @@ if (( engine_needs_install )); then
   chmod 0755 "$engine_tmp" "$engine_tmp/usr" "$engine_tmp/usr/local" "$engine_tmp/usr/local/bin"
   cp -- "$stage/engine/usr/local/bin/bun" "$engine_tmp/usr/local/bin/bun"
   chmod 0755 "$engine_tmp/usr/local/bin/bun"
+  # Framework tools (vite, etc.) often use `#!/usr/bin/env node`. Bun is a
+  # drop-in for that surface; hardlink so cages don't need a separate Node.
+  ln -- "$engine_tmp/usr/local/bin/bun" "$engine_tmp/usr/local/bin/node"
+  chmod 0755 "$engine_tmp/usr/local/bin/node"
   if [[ $OS == Linux ]]; then
     cp -- "$stage/engine/usr/local/bin/cygnus-init" "$engine_tmp/usr/local/bin/cygnus-init"
     chmod 0755 "$engine_tmp/usr/local/bin/cygnus-init"
@@ -822,10 +827,6 @@ stage_hostlib() {
   chmod 0755 "$stage" "$stage/lib64" "$stage/$hostlib_lib_dir"
   cp -L -- "$hostlib_loader" "$stage/lib64/$(basename -- "$hostlib_loader")"
   chmod 0755 "$stage/lib64/$(basename -- "$hostlib_loader")"
-  # Shared glibc ABI for both `bun` and `cygnus-init` (same loader path).
-  # Verified against a glibc Bun build on Ubuntu 24.04; a Rust glibc init only
-  # needs a subset (libc/pthread/dl/m/gcc_s). Missing libs surface as ENOENT
-  # at execve time inside the cage.
   local libs=(
     libc.so.6
     libpthread.so.0
@@ -833,6 +834,9 @@ stage_hostlib() {
     libm.so.6
     libgcc_s.so.1
     libstdc++.so.6
+    # Framework native addons (rollup, etc.) load these at runtime.
+    librt.so.1
+    libresolv.so.2
   )
   local lib src
   for lib in "${libs[@]}"; do
@@ -843,6 +847,25 @@ stage_hostlib() {
     cp -L -- "$src" "$stage/$hostlib_lib_dir/$lib"
     chmod 0755 "$stage/$hostlib_lib_dir/$lib"
   done
+  # Framework build scripts (`bun run build`, vite) need a POSIX shell.
+  # Stage the host's real /bin/sh (dash on Debian/Ubuntu) as a regular file
+  # at /bin/sh so cages do not depend on a /bin symlink farm.
+  local host_sh
+  host_sh=$(readlink -f /bin/sh 2>/dev/null || true)
+  [[ -n $host_sh && -x $host_sh ]] || host_sh=/usr/bin/dash
+  [[ -x $host_sh ]] || host_sh=/bin/bash
+  [[ -x $host_sh ]] || fail "no usable host shell found for cage hostlib (/bin/sh)"
+  mkdir -p "$stage/bin"
+  chmod 0755 "$stage/bin"
+  cp -L -- "$host_sh" "$stage/bin/sh"
+  chmod 0755 "$stage/bin/sh"
+  # Also expose as /usr/bin/env for scripts that use `#!/usr/bin/env`.
+  if [[ -x /usr/bin/env ]]; then
+    mkdir -p "$stage/usr/bin"
+    chmod 0755 "$stage/usr" "$stage/usr/bin"
+    cp -L -- /usr/bin/env "$stage/usr/bin/env"
+    chmod 0755 "$stage/usr/bin/env"
+  fi
 }
 if [[ $OS == Linux ]]; then
   hostlib_stage=$stage/hostlib
@@ -974,35 +997,35 @@ if [[ $console_listener =~ :([0-9]+)$ ]]; then
   [[ $console_port == 80 || $console_port == 443 ]] || console_port_suffix=":$console_port"
 fi
 
-# Pick a host the operator can actually reach. A configured apps domain is the
-# real answer; otherwise (the apps.localhost default) point at the machine's
-# own address, since the daemon routes any unmatched host to the console.
+# Console URL for the operator. Prefer the management listener address —
+# dashboard_domain is operator-owned and may not exist yet. Never invent
+# cygnus.<apex> as a second competing hostname.
 listen_host=${console_listener%:*}
-console_host="cygnus.${apps_domain}"
+console_host=""
 access_note=""
-if [[ $apps_domain == apps.localhost ]]; then
+if [[ $listen_host == 0.0.0.0 || $listen_host == "::" || $listen_host == "[::]" ]]; then
   primary_ip=""
-  if [[ $listen_host == 0.0.0.0 || $listen_host == "::" || $listen_host == "[::]" ]]; then
-    if [[ $OS == Linux ]]; then
-      # Guard every stage: under `set -o pipefail` an empty grep would abort
-      # the installer right before the success banner.
-      local_ips=$(hostname -I 2>/dev/null || true)
-      for candidate in $local_ips; do
-        [[ $candidate == *:* ]] && continue
-        primary_ip=$candidate
-        break
-      done
-    else
-      primary_ip=$(ipconfig getifaddr en0 2>/dev/null || true)
-    fi
+  if [[ $OS == Linux ]]; then
+    local_ips=$(hostname -I 2>/dev/null || true)
+    for candidate in $local_ips; do
+      [[ $candidate == *:* ]] && continue
+      primary_ip=$candidate
+      break
+    done
+  else
+    primary_ip=$(ipconfig getifaddr en0 2>/dev/null || true)
   fi
   if [[ -n $primary_ip ]]; then
     console_host=$primary_ip
-    access_note="reachable at any hostname pointed here; set --apps-domain for clean app URLs"
+    access_note="set dashboard domain in the console for a stable HTTPS URL"
   else
     console_host=localhost
-    access_note="loopback only; re-run with --listen 0.0.0.0:PORT and --apps-domain to expose it"
+    access_note="loopback only; re-run with --listen 0.0.0.0:PORT to expose it"
   fi
+else
+  # Strip brackets from IPv6 literals for display.
+  console_host=${listen_host#[}
+  console_host=${console_host%]}
 fi
 
 if [[ $OS == Darwin && :$PATH: != *:$HOME/.cygnus/bin:* ]]; then

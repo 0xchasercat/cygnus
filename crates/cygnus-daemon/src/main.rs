@@ -1617,12 +1617,25 @@ fn ensure_domain_fallbacks(
             .is_some_and(|domain| domain.tls == DomainTls::SelfSigned)
             || (snapshot.edge.dashboard_domain.as_deref() == Some(host.as_str())
                 && snapshot.edge.ssl_mode == SslMode::SelfSigned);
-        let usable = certificate_for_host(&certificates, &host).is_some_and(|certificate| {
-            certificate.not_after_unix > now
-                && (!force_fallback || certificate_is_fallback(certificate))
+        let existing = certificate_for_host(&certificates, &host);
+        // A non-fallback (ACME) cert that is still valid is always usable —
+        // never clobber it with a self-signed. Self-signed mode may force a
+        // fallback cert even when something else is installed.
+        let has_live_acme = existing.is_some_and(|certificate| {
+            certificate.not_after_unix > now && !certificate_is_fallback(certificate)
         });
-        let fallback_installed = !usable;
-        if fallback_installed {
+        let has_live_fallback = existing.is_some_and(|certificate| {
+            certificate.not_after_unix > now && certificate_is_fallback(certificate)
+        });
+        let needs_install = if force_fallback {
+            !has_live_fallback
+        } else {
+            // Prefer keeping a live ACME cert; only install self-signed when
+            // there is no usable certificate at all.
+            !has_live_acme && !has_live_fallback
+        };
+        let fallback_installed = needs_install;
+        if needs_install {
             let fallback = self_signed_fallback(&host)?;
             let audit = system_domain_audit(&host, "fallback_certificate_install");
             state.install_certificate(&fallback, &audit)?;
@@ -1635,19 +1648,23 @@ fn ensure_domain_fallbacks(
                 format!("self-signed fallback installed for {host}"),
             );
         }
-        if let Some(domain) = app_domains.iter_mut().find(|domain| domain.host == host)
-            && (fallback_installed
-                || domain.status != DomainStatus::Active
-                || domain.tls == DomainTls::SelfSigned)
-        {
-            let audit = system_domain_audit(&host, "domain_fallback_active");
-            *domain = state.update_domain_status(
-                &host,
-                DomainStatus::FallbackActive,
-                certificate_for_host(&certificates, &host)
-                    .map(|certificate| certificate.not_after_unix),
-                &audit,
-            )?;
+        // Only mark fallback_active when we actually installed a fallback or
+        // the domain is still self-signed / never became ACME-active. Do not
+        // demote an ACME-active domain just because reconcile ran.
+        if let Some(domain) = app_domains.iter_mut().find(|domain| domain.host == host) {
+            let should_mark_fallback = fallback_installed
+                || domain.tls == DomainTls::SelfSigned
+                || (domain.status != DomainStatus::Active && !has_live_acme);
+            if should_mark_fallback {
+                let audit = system_domain_audit(&host, "domain_fallback_active");
+                *domain = state.update_domain_status(
+                    &host,
+                    DomainStatus::FallbackActive,
+                    certificate_for_host(&certificates, &host)
+                        .map(|certificate| certificate.not_after_unix),
+                    &audit,
+                )?;
+            }
         }
     }
     if changed && let Some(tls) = tls {
@@ -1799,16 +1816,21 @@ fn spawn_domain_reconciler(
     metrics: MetricsHub,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut next_check = Instant::now();
+        // First pass almost immediately so new app hosts don't sit on
+        // self-signed for minutes after deploy. Subsequent cadence is short
+        // while any domain still needs a cert, longer when everything is fine.
+        let mut next_check = Instant::now() + Duration::from_secs(5);
         while !shutdown.load(Ordering::Acquire) {
             if Instant::now() >= next_check {
                 match reconcile_acme_domains(&state_path, challenges.clone(), Some(&tls), &metrics)
                 {
-                    Ok(true) => next_check = Instant::now() + Duration::from_secs(60 * 60),
-                    Ok(false) => next_check = Instant::now() + Duration::from_secs(10 * 60),
+                    // Any failure: retry in 2 minutes (rate-limit friendly but not hour-scale).
+                    Ok(true) => next_check = Instant::now() + Duration::from_secs(2 * 60),
+                    // Clean: re-check every 2 minutes for newly deployed hosts / renewals.
+                    Ok(false) => next_check = Instant::now() + Duration::from_secs(2 * 60),
                     Err(error) => {
                         eprintln!("cygnus-daemon: domain reconciliation failed: {error}");
-                        next_check = Instant::now() + Duration::from_secs(60 * 60);
+                        next_check = Instant::now() + Duration::from_secs(5 * 60);
                     }
                 }
             }

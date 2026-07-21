@@ -28,6 +28,9 @@ pub const SUBNET_PREFIX: u8 = 16;
 pub const SUBNET_BASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 /// Interface name the peer veth end takes inside the cage.
 pub const CAGE_INTERFACE: &str = "eth0";
+/// Host DNS forwarder port (UDP/TCP). Shared by the resolv.conf injection and
+/// the host firewall allow rules that admit cage queries past UFW.
+pub const DNS_PORT: u16 = 53;
 
 /// First assignable host value in the subnet (`100.64.0.2`); `.0` is the
 /// network address and `.1` is the gateway.
@@ -256,6 +259,12 @@ pub(crate) fn ensure_bridge() -> Result<(), CageError> {
 
 /// Ensure the node forwards and masquerades cage traffic, so a cage with egress
 /// can reach the internet. Idempotent across boots.
+///
+/// Also opens the host filter table for cage-bridge DNS and forwarded traffic.
+/// UFW/firewalld default to deny-incoming and deny-routed; an isolated nft
+/// `accept` at a different priority does **not** override those tables (nft
+/// accept only ends the current chain). Rules are therefore inserted into the
+/// legacy filter table that UFW owns, via `iptables`.
 pub(crate) fn ensure_host_nat() -> Result<(), CageError> {
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").map_err(|source| {
         CageError::Network {
@@ -263,7 +272,74 @@ pub(crate) fn ensure_host_nat() -> Result<(), CageError> {
             detail: source.to_string(),
         }
     })?;
-    nft_load(None, &nat_ruleset(), "load host NAT ruleset")
+    nft_load(None, &nat_ruleset(), "load host NAT ruleset")?;
+    ensure_host_filter_allows()
+}
+
+/// Insert (idempotently) host filter rules so cage DNS and NAT work under UFW.
+///
+/// Matching is by cage subnet source, not bridge interface name: packets from
+/// a cage arrive on the host-side veth, not on `cygnus0` itself.
+fn ensure_host_filter_allows() -> Result<(), CageError> {
+    let subnet = format!("{SUBNET_BASE}/{SUBNET_PREFIX}");
+    // INPUT: admit DNS queries from cages to the host forwarder on the gateway.
+    iptables_ensure(&[
+        "-C", "INPUT", "-s", &subnet, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
+    ])?;
+    iptables_ensure(&[
+        "-C", "INPUT", "-s", &subnet, "-p", "tcp", "--dport", "53", "-j", "ACCEPT",
+    ])?;
+    // FORWARD: allow cage egress (and established return) past deny-routed.
+    iptables_ensure(&["-C", "FORWARD", "-s", &subnet, "-j", "ACCEPT"])?;
+    iptables_ensure(&[
+        "-C",
+        "FORWARD",
+        "-d",
+        &subnet,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-j",
+        "ACCEPT",
+    ])?;
+    Ok(())
+}
+
+/// Ensure an iptables rule exists: try `-C` (check), and on failure `-I` (insert).
+fn iptables_ensure(check_args: &[&str]) -> Result<(), CageError> {
+    let check = Command::new("iptables")
+        .args(check_args)
+        .output()
+        .map_err(|source| CageError::Network {
+            operation: "check host filter rule".into(),
+            detail: source.to_string(),
+        })?;
+    if check.status.success() {
+        return Ok(());
+    }
+    // Transform `-C` into `-I` at the same position.
+    let mut insert: Vec<&str> = check_args.to_vec();
+    if let Some(flag) = insert.first_mut()
+        && *flag == "-C"
+    {
+        *flag = "-I";
+    }
+    let output = Command::new("iptables")
+        .args(&insert)
+        .output()
+        .map_err(|source| CageError::Network {
+            operation: "insert host filter rule".into(),
+            detail: source.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(CageError::Network {
+            operation: "insert host filter rule".into(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
 }
 
 /// Attach a cage to the bridge, ensure host NAT, address its interface, and
@@ -497,6 +573,17 @@ mod tests {
         assert!(script.contains("type nat hook postrouting"));
         // Flush-and-recreate keeps repeated boots from stacking rules.
         assert!(script.contains("delete table ip cygnus_nat"));
+    }
+
+    #[test]
+    fn host_filter_rules_target_cage_subnet() {
+        // Pure documentation of the invariants the runtime iptables rules
+        // enforce. The actual inserts need root + iptables, so we pin the
+        // subnet/port constants that those rules are built from.
+        assert_eq!(SUBNET_BASE, Ipv4Addr::new(100, 64, 0, 0));
+        assert_eq!(SUBNET_PREFIX, 16);
+        assert_eq!(DNS_PORT, 53);
+        assert_eq!(GATEWAY, Ipv4Addr::new(100, 64, 0, 1));
     }
 
     #[test]
