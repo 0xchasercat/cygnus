@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::deploy::DeployRequest;
 use crate::edge::SslMode;
 pub use crate::github::{
-    GitHubInstallationRepositoryView, GitHubManifestMetadata, GitHubRepositoryInput,
-    GitHubRepositoryView,
+    GitHubInstallationRepositoryView, GitHubInstallationView, GitHubManifestMetadata,
+    GitHubRepositoryInput, GitHubRepositoryView,
 };
 use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
 use crate::state::{
@@ -224,6 +224,10 @@ pub enum AdminCommand {
     ListInstallationRepositories {
         installation_id: i64,
     },
+    /// Walk every installation of the configured GitHub App and return the
+    /// union of accessible repositories. Preferred by the console so operators
+    /// never have to paste an installation ID.
+    ListDiscoverableRepositories,
 }
 
 const fn default_list_limit() -> u16 {
@@ -473,6 +477,10 @@ pub enum AdminData {
     },
     InstallationRepositories {
         repositories: Vec<GitHubInstallationRepositoryView>,
+    },
+    DiscoverableRepositories {
+        repositories: Vec<GitHubInstallationRepositoryView>,
+        installations: Vec<GitHubInstallationView>,
     },
 }
 

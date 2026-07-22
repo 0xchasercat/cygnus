@@ -172,6 +172,16 @@ pub struct GitHubInstallationRepositoryView {
     pub private: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubInstallationView {
+    pub installation_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubHttpResponse {
     pub status: u16,
@@ -407,6 +417,93 @@ impl GitHubManager {
 
     pub fn app_status(&self) -> Result<Option<GitHubManifestMetadata>, GitHubError> {
         Ok(State::open(&self.state_path)?.github_app()?.map(Into::into))
+    }
+
+    /// List every installation of this GitHub App via JWT auth.
+    /// Used so the console never asks operators to paste installation IDs.
+    pub fn list_installations(&self) -> Result<Vec<GitHubInstallationView>, GitHubError> {
+        let jwt = self.app_jwt()?;
+        let auth = format!("Bearer {jwt}");
+        let mut page = 1_u32;
+        let mut installations = Vec::new();
+        loop {
+            let path = format!("/app/installations?per_page=100&page={page}");
+            let response = self.transport.request_limited(
+                "GET",
+                &path,
+                Some(&auth),
+                None,
+                MAX_NORMAL_BODY_BYTES,
+            )?;
+            if response.status != 200 {
+                return Err(http_status(
+                    "installation listing",
+                    response.status,
+                    &response.body,
+                ));
+            }
+            let value: Value = serde_json::from_slice(&response.body)?;
+            let items = value
+                .as_array()
+                .ok_or_else(|| GitHubError::InvalidInput(
+                    "installation listing response is not an array".into(),
+                ))?;
+            for item in items {
+                let id = item.get("id").and_then(Value::as_i64).ok_or_else(|| {
+                    GitHubError::InvalidInput("installation omitted id".into())
+                })?;
+                if id <= 0 {
+                    return Err(GitHubError::InvalidInput(
+                        "installation id must be positive".into(),
+                    ));
+                }
+                installations.push(GitHubInstallationView {
+                    installation_id: id,
+                    account_login: item
+                        .pointer("/account/login")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    account_type: item
+                        .pointer("/account/type")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                });
+            }
+            let has_next = response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("link"))
+                .is_some_and(|(_, value)| value.contains("rel=\"next\""));
+            if !has_next || items.is_empty() {
+                break;
+            }
+            page = page.checked_add(1).ok_or_else(|| {
+                GitHubError::InvalidInput("installation pagination overflow".into())
+            })?;
+            if page > 100 {
+                return Err(GitHubError::InvalidInput(
+                    "installation pagination exceeded bound".into(),
+                ));
+            }
+        }
+        Ok(installations)
+    }
+
+    /// Discover every repository the app can currently access by walking
+    /// installations → installation tokens → /installation/repositories.
+    pub fn discoverable_repositories(
+        &self,
+    ) -> Result<Vec<GitHubInstallationRepositoryView>, GitHubError> {
+        let mut repositories = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for installation in self.list_installations()? {
+            for repo in self.installation_repositories(installation.installation_id)? {
+                if seen.insert(repo.repository_id) {
+                    repositories.push(repo);
+                }
+            }
+        }
+        Ok(repositories)
     }
 
     pub fn configure_repository(

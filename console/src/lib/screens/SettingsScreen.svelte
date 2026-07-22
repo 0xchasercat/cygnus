@@ -1,6 +1,5 @@
 <script>
   import { store } from '../live.svelte.js';
-  import { ui } from '../stores.svelte.js';
   import { relativeTime } from '../time.js';
   import { shortHash } from '../fmt.js';
   import Icon from '../components/Icon.svelte';
@@ -46,10 +45,13 @@
   let githubOwner = $state('');
   let githubError = $state('');
   let githubBusy = $state(false);
-  let installationId = $state('');
-  let installationRepos = $state([]);
   let repoConfig = $state({});
   let repoErrors = $state({});
+  let mappingBusy = $state({});
+
+  const discoverableRepos = $derived(store.github.discoverable ?? []);
+  const installationCount = $derived((store.github.installations ?? []).length);
+  const appsDomain = $derived(store.node?.apps_domain ?? store.node?.apex_domain ?? '');
 
   // ——— dashboard domain + SSL ———
   let dashEditOpen = $state(false);
@@ -157,29 +159,33 @@
     if (!r.ok) githubError = r.error ?? 'GitHub setup could not start';
   }
 
-  async function discoverRepos(e) {
-    e.preventDefault();
-    const id = installationId.trim();
-    if (!/^\d+$/u.test(id) || Number(id) <= 0) {
-      githubError = 'Enter the positive installation ID from GitHub.';
-      return;
-    }
-    githubBusy = true;
-    githubError = '';
-    const r = await store.listInstallationRepositories(id);
-    githubBusy = false;
-    installationRepos = r.repositories;
-    if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
-    for (const repo of installationRepos) {
+  function seedRepoDrafts(repos) {
+    for (const repo of repos) {
       if (!repoConfig[repo.repository_id]) {
-        repoConfig[repo.repository_id] = { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' };
+        repoConfig[repo.repository_id] = {
+          app: repo.name,
+          domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
+          engine_version: defaultEngine,
+          entry: '',
+        };
       }
     }
+  }
+
+  async function refreshDiscoverable() {
+    if (githubBusy) return;
+    githubBusy = true;
+    githubError = '';
+    const r = await store.discoverRepositories();
+    githubBusy = false;
+    if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
+    seedRepoDrafts(r.repositories ?? discoverableRepos);
   }
 
   async function configureRepo(e, repo) {
     e.preventDefault();
     const draft = repoConfig[repo.repository_id] ?? {};
+    mappingBusy = { ...mappingBusy, [repo.repository_id]: true };
     const r = await store.configureRepository({
       installation_id: repo.installation_id,
       repository_id: repo.repository_id,
@@ -189,9 +195,15 @@
       app: draft.app ?? repo.name,
       domain: draft.domain ?? '',
       engine_version: draft.engine_version || defaultEngine,
-      entry: draft.entry ?? 'index.ts',
+      entry: (draft.entry ?? '').trim() || undefined,
     });
-    if (!r.ok) repoErrors[repo.repository_id] = r.error ?? 'Repository configuration failed';
+    mappingBusy = { ...mappingBusy, [repo.repository_id]: false };
+    if (!r.ok) {
+      repoErrors = { ...repoErrors, [repo.repository_id]: r.error ?? 'Repository configuration failed' };
+      return;
+    }
+    repoErrors = { ...repoErrors, [repo.repository_id]: '' };
+    await store.refreshGithub();
   }
 
   async function retryJob(job) {
@@ -254,28 +266,16 @@
 
   const recentJobs = $derived(store.github.jobs.slice(0, 5));
 
-  // Auto-discover repos when the GitHub install redirect seeded a
-  // pendingInstallationId (set by live.svelte.js #handleGithubCallback).
+  // Auto-load discoverable repos — never ask for an installation ID.
   onMount(() => {
-    const pending = ui.pendingInstallationId;
-    if (pending && /^\d+$/u.test(pending) && Number(pending) > 0) {
-      ui.pendingInstallationId = null; // consume once
-      installationId = pending;
-      // Fire discovery immediately
-      (async () => {
-        githubBusy = true;
-        githubError = '';
-        const r = await store.listInstallationRepositories(pending);
-        githubBusy = false;
-        installationRepos = r.repositories;
-        if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
-        for (const repo of installationRepos) {
-          if (!repoConfig[repo.repository_id]) {
-            repoConfig[repo.repository_id] = { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' };
-          }
-        }
-      })();
+    if (store.github.configured) {
+      seedRepoDrafts(discoverableRepos);
+      if (!discoverableRepos.length) refreshDiscoverable();
     }
+  });
+
+  $effect(() => {
+    seedRepoDrafts(discoverableRepos);
   });
 </script>
 
@@ -353,7 +353,7 @@
               <span class="glyph"><Icon name="branch" size={14} /></span>
               <div class="tk">
                 <span class="mname">{store.github.app?.name ?? 'Cygnus GitHub App'}</span>
-                <span class="tmeta num">{store.github.app?.owner ?? '—'} · {store.github.repositories.length} repo{store.github.repositories.length === 1 ? '' : 's'}</span>
+                <span class="tmeta num">{store.github.app?.owner ?? '—'} · {store.github.repositories.length} mapped · {installationCount} install{installationCount === 1 ? '' : 's'}</span>
               </div>
               <span class="grow"></span>
               <span class="led live"></span>
@@ -369,34 +369,53 @@
             {/each}
           </div>
           <div class="install-block">
-            {#if store.github.app?.html_url}
-              <div class="install-cta">
+            <div class="install-cta">
+              {#if store.github.app?.html_url}
                 <a class="btn cobalt sm" href="{store.github.app.html_url}/installations/new">
-                  Install App on GitHub <Icon name="arrowR" size={12} />
+                  {installationCount ? 'Manage GitHub access' : 'Install App on GitHub'} <Icon name="arrowR" size={12} />
                 </a>
-                <p class="install-desc">Click to select which GitHub account and repositories this app is allowed to access. After installation, repositories appear below automatically.</p>
-              </div>
-            {/if}
-            <form class="install-form" onsubmit={discoverRepos}>
-              <label>Installation ID <span class="optional">(optional manual entry)</span>
-                <input bind:value={installationId} inputmode="numeric" pattern="[0-9]+" placeholder="12345678" />
-              </label>
-              <button class="btn sm" type="submit" disabled={githubBusy}>{githubBusy ? 'Discovering…' : 'Discover repositories'}</button>
-            </form>
-            {#if installationRepos.length}
+              {/if}
+              <button class="btn sm" type="button" onclick={refreshDiscoverable} disabled={githubBusy}>
+                {githubBusy ? 'Refreshing…' : 'Refresh repositories'}
+              </button>
+              <p class="install-desc">
+                {#if installationCount}
+                  Repositories from your GitHub installation appear below automatically. Map a repo to deploy on push.
+                {:else}
+                  Install the app on a GitHub account or organization, then repositories appear here automatically.
+                {/if}
+              </p>
+              {#if githubError}<p class="inline-error" role="alert">{githubError}</p>{/if}
+            </div>
+            {#if discoverableRepos.length}
               <div class="repo-list">
-                {#each installationRepos as repo (repo.repository_id)}
-                  {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' }}
-                  <form class="repo-row" onsubmit={(e) => configureRepo(e, repo)}>
-                    <div class="repo-identity"><strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong><small>{repo.private ? 'private' : 'public'} · default {repo.default_branch}</small></div>
-                    <label>App<input value={draft.app} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, app: e.currentTarget.value })} maxlength="64" required /></label>
-                    <label>Domain<input value={draft.domain} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, domain: e.currentTarget.value })} maxlength="253" placeholder="app.example.com" required /></label>
-                    <label>Engine<input value={draft.engine_version} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, engine_version: e.currentTarget.value })} maxlength="128" required /></label>
-                    <button class="btn cobalt sm" type="submit">Map</button>
+                {#each discoverableRepos as repo (repo.repository_id)}
+                  {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: appsDomain ? `${repo.name}.${appsDomain}` : '', engine_version: defaultEngine, entry: '' }}
+                  {@const alreadyMapped = store.github.repositories.some((r) => r.repository_id === repo.repository_id)}
+                  <form class="repo-card" onsubmit={(e) => configureRepo(e, repo)}>
+                    <div class="repo-card-head">
+                      <div class="repo-identity">
+                        <strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong>
+                        <small>{repo.private ? 'private' : 'public'} · default {repo.default_branch}{#if alreadyMapped} · mapped{/if}</small>
+                      </div>
+                      <button class="btn cobalt sm" type="submit" disabled={mappingBusy[repo.repository_id] || alreadyMapped}>
+                        {alreadyMapped ? 'Mapped' : mappingBusy[repo.repository_id] ? 'Mapping…' : 'Map'}
+                      </button>
+                    </div>
+                    <div class="repo-fields">
+                      <label>App<input value={draft.app} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, app: e.currentTarget.value })} maxlength="64" required disabled={alreadyMapped} /></label>
+                      <label>Domain<input value={draft.domain} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, domain: e.currentTarget.value })} maxlength="253" placeholder="app.example.com" required disabled={alreadyMapped} /></label>
+                      <label>Engine<input value={draft.engine_version} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, engine_version: e.currentTarget.value })} maxlength="128" required disabled={alreadyMapped} /></label>
+                      <label>Entry <span class="optional">(optional)</span><input value={draft.entry} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, entry: e.currentTarget.value })} maxlength="128" placeholder="auto" disabled={alreadyMapped} /></label>
+                    </div>
                     {#if repoErrors[repo.repository_id]}<p class="inline-error" role="alert">{repoErrors[repo.repository_id]}</p>{/if}
                   </form>
                 {/each}
               </div>
+            {:else if githubBusy}
+              <div class="empty mono">discovering repositories…</div>
+            {:else}
+              <div class="empty mono">no repositories yet — install the app, then refresh</div>
             {/if}
           </div>
         {/if}
@@ -693,46 +712,58 @@
 
   .certstate { font-size: 10.5px; color: var(--ink-3); width: 56px; text-align: right; }
 
-  .install-cta { margin-bottom: 14px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-  .install-desc { margin: 0; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+  .install-cta { margin-bottom: 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .install-desc { margin: 0; flex: 1 1 100%; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
   .optional { font-size: 9px; opacity: 0.65; text-transform: lowercase; font-weight: normal; letter-spacing: 0; }
 
-  .install-block { border-top: 1px solid var(--line-2); padding: 14px 18px; }
-  .install-form { display: grid; grid-template-columns: minmax(180px, 280px) auto; gap: 10px; align-items: end; }
-  .install-form label {
-    display: grid; gap: 5px;
-    font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
-    text-transform: uppercase; color: var(--ink-3);
-  }
-  .install-form input {
-    border: 1px solid var(--line-strong);
-    border-radius: 8px; background: var(--surface); color: var(--ink);
-    padding: 9px 10px; font-family: var(--mono); font-size: 12px;
-  }
+  .install-block { border-top: 1px solid var(--line-2); padding: 14px 18px; min-width: 0; }
 
-  .repo-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
-  .repo-row {
-    display: grid;
-    grid-template-columns: minmax(140px, 1.2fr) repeat(3, minmax(100px, 1fr)) auto;
+  .repo-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .repo-card {
+    display: flex;
+    flex-direction: column;
     gap: 10px;
-    align-items: end;
     padding: 12px;
     border: 1px solid var(--line-2);
     border-radius: 10px;
+    min-width: 0;
   }
-  .repo-identity { min-width: 0; align-self: center; }
-  .repo-identity strong { display: block; font-size: 12.5px; }
+  .repo-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+  }
+  .repo-identity { min-width: 0; flex: 1; }
+  .repo-identity strong {
+    display: block;
+    font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .repo-identity small { display: block; margin-top: 4px; color: var(--ink-4); font-size: 10px; }
-  .repo-row label {
-    display: grid; gap: 4px;
+  .repo-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    min-width: 0;
+  }
+  .repo-fields label {
+    display: grid; gap: 4px; min-width: 0;
     font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.06em;
     text-transform: uppercase; color: var(--ink-3);
   }
-  .repo-row input {
+  .repo-fields input {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     border: 1px solid var(--line-strong);
     border-radius: 7px; background: var(--surface); color: var(--ink);
     padding: 7px 9px; font-family: var(--mono); font-size: 11.5px;
   }
+  .repo-fields input:disabled { opacity: 0.55; }
 
   .jobs { border-top: 1px solid var(--line-2); }
   .jobs-head { padding: 12px 18px 4px; }
@@ -879,7 +910,7 @@
 
   @media (max-width: 1080px) {
     .grid { grid-template-columns: 1fr; }
-    .addform, .install-form, .dash-form { grid-template-columns: 1fr; }
-    .repo-row { grid-template-columns: 1fr; }
+    .addform, .dash-form { grid-template-columns: 1fr; }
+    .repo-fields { grid-template-columns: 1fr; }
   }
 </style>

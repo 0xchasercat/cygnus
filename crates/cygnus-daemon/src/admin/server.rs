@@ -656,6 +656,7 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
                 return Err("installation id must be positive".into());
             }
         }
+        AdminCommand::ListDiscoverableRepositories => {}
         AdminCommand::WebhookBegin {
             delivery_id,
             event,

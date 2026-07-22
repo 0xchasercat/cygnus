@@ -172,7 +172,7 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
     "/api/v1/rollback",
     "/api/v1/github/manifest",
   ].includes(path) || /^\/api\/v1\/github\/jobs\/[^/]+\/retry$/u.test(path);
-  const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|jobs))(?:\/[^/]+)?$/u.test(path)
+  const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|discoverable-repositories|jobs))(?:\/[^/]+)?$/u.test(path)
     || /^\/api\/v1\/(?:metrics|requests|events)$/u.test(path)
     || /^\/api\/v1\/(?:apps|deployments)\/[^/]+\/logs$/u.test(path);
   if (mutationRoute && request.method !== "POST") return methodNotAllowed("POST");
@@ -772,6 +772,10 @@ function commandForRead(url, parts = url.pathname.split("/").filter(Boolean)) {
   if (parts.length === 6 && parts[2] === "github" && parts[3] === "installations" && parts[5] === "repositories") {
     assertQueryKeys(url, []);
     return listInstallationRepositoriesCommand(safePositiveId(decodeSegment(parts[4], "installation id")));
+  }
+  if (parts.length === 4 && parts[2] === "github" && parts[3] === "discoverable-repositories") {
+    assertQueryKeys(url, []);
+    return { type: "list_discoverable_repositories" };
   }
   if (parts.length === 4 && parts[2] === "github" && parts[3] === "jobs") {
     assertQueryKeys(url, ["cursor", "limit"]);
@@ -1468,9 +1472,21 @@ function publicDaemonCode(code) {
 function sanitizeGithubData(data) {
   if (!data || typeof data !== "object") return { kind: "unknown" };
   const kind = data.kind;
-  if (kind === "repositories" || kind === "installation_repositories") {
-    const repositories = Array.isArray(data.repositories) ? data.repositories.map((repo) => kind === "repositories" ? sanitizeConfiguredRepository(repo) : sanitizeInstallationRepository(repo)) : [];
-    return { kind, repositories, ...(data.next_cursor ? { next_cursor: data.next_cursor } : {}) };
+  if (kind === "repositories" || kind === "installation_repositories" || kind === "discoverable_repositories") {
+    const repositories = Array.isArray(data.repositories)
+      ? data.repositories.map((repo) => kind === "repositories" ? sanitizeConfiguredRepository(repo) : sanitizeInstallationRepository(repo))
+      : [];
+    const out = { kind, repositories, ...(data.next_cursor ? { next_cursor: data.next_cursor } : {}) };
+    if (kind === "discoverable_repositories") {
+      out.installations = Array.isArray(data.installations)
+        ? data.installations.map((item) => ({
+            installation_id: item?.installation_id,
+            account_login: item?.account_login,
+            account_type: item?.account_type,
+          }))
+        : [];
+    }
+    return out;
   }
   if (kind === "repository_configured") return { kind, repository: sanitizeConfiguredRepository(data.repository) };
   if (kind === "github_status" || kind === "git_hub_status" || kind === "manifest_converted") {

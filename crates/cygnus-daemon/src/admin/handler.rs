@@ -594,6 +594,27 @@ impl StateAdminHandler {
                 repositories.truncate(usize::from(MAX_ADMIN_LIST_LIMIT));
                 Ok(AdminData::InstallationRepositories { repositories })
             }
+            AdminCommand::ListDiscoverableRepositories => {
+                let github = self.github_manager()?;
+                let installations = github.list_installations().map_err(github_fault)?;
+                let mut repositories = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for installation in &installations {
+                    for repo in github
+                        .installation_repositories(installation.installation_id)
+                        .map_err(github_fault)?
+                    {
+                        if seen.insert(repo.repository_id) {
+                            repositories.push(repo);
+                        }
+                    }
+                }
+                repositories.truncate(usize::from(MAX_ADMIN_LIST_LIMIT));
+                Ok(AdminData::DiscoverableRepositories {
+                    repositories,
+                    installations,
+                })
+            }
             AdminCommand::ConfigureRepository { repository } => {
                 let github = self.github_manager()?;
                 let audit = self.request_audit(role, peer, request, "configure_repository")?;

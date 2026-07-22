@@ -30,8 +30,7 @@ class Store {
   deployments = $state([]);
   metrics = $state(null);
   events = $state([]);
-  requests = $state([]);
-  github = $state({ configured: false, app: null, repositories: [], jobs: [] });
+  github = $state({ configured: false, app: null, repositories: [], jobs: [], discoverable: [], installations: [] });
   connected = $state(true);
   lastSync = $state(0);
   notice = $state(''); // transient GitHub callback / mutation notice
@@ -139,19 +138,11 @@ class Store {
     }
     if (!g) return;
     window.history.replaceState({}, '', window.location.pathname);
-    // Await so store.github.configured is populated before the UI renders
-    // the Settings screen — without this the "Connect GitHub" form flashes.
+    // Await so store.github.configured is populated before Settings renders.
     await this.refreshGithub();
-    if (hasInstallation) {
-      // Navigate to Settings and seed the installation ID so SettingsScreen
-      // can auto-discover repos without manual copy-paste.
-      ui.pendingInstallationId = installationId;
-      go('settings');
-    } else if (g === 'configured') {
-      // After app creation, send to Settings so the user sees the install
-      // button right away instead of landing on the Overview.
-      go('settings');
-    }
+    // Always auto-discover after any GitHub callback — no installation ID UI.
+    await this.discoverRepositories();
+    if (g === 'configured' || hasInstallation) go('settings');
   }
 
   // ——— polling ———
@@ -203,6 +194,8 @@ class Store {
         this.github = { ...this.github, jobs: Array.isArray(d?.jobs) ? d.jobs : [] };
       }),
     ]);
+    // Discovery is explicit (callback / Settings / ShipModal) so we don't
+    // burn GitHub rate limits on every status poll.
   }
 
   async #poll(forceGithub = false) {
@@ -380,7 +373,7 @@ class Store {
     this.metrics = null;
     this.events = [];
     this.requests = [];
-    this.github = { configured: false, app: null, repositories: [], jobs: [] };
+    this.github = { configured: false, app: null, repositories: [], jobs: [], discoverable: [], installations: [] };
     this.domainsByApp = {};
     this.envVarsByApp = {};
     return { ok: true };
@@ -685,6 +678,28 @@ class Store {
       return { ok: true, repositories: Array.isArray(result?.repositories) ? result.repositories : [] };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'Repository discovery failed', repositories: [] };
+    }
+  }
+
+  // Preferred discovery path: list every installation + accessible repo via
+  // the GitHub App JWT. No operator-supplied installation ID required.
+  async discoverRepositories() {
+    if (this.mode !== 'live' || this.auth !== 'ready') {
+      return { ok: false, error: 'Not ready', repositories: [], installations: [] };
+    }
+    try {
+      const result = await api('/api/v1/github/discoverable-repositories');
+      const repositories = Array.isArray(result?.repositories) ? result.repositories : [];
+      const installations = Array.isArray(result?.installations) ? result.installations : [];
+      this.github = { ...this.github, discoverable: repositories, installations };
+      return { ok: true, repositories, installations };
+    } catch (cause) {
+      return {
+        ok: false,
+        error: cause instanceof Error ? cause.message : 'Repository discovery failed',
+        repositories: [],
+        installations: [],
+      };
     }
   }
 
