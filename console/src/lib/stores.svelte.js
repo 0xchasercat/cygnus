@@ -12,6 +12,9 @@ export const ui = $state({
   // Observe.svelte consumes and clears it on mount so it never sticks
   // across an unrelated later visit.
   observeAppFilter: null,
+  // Set by the GitHub install redirect callback so SettingsScreen can
+  // auto-discover repos for this installation on mount.
+  pendingInstallationId: null,
 });
 
 export function go(screen, opts = {}) {

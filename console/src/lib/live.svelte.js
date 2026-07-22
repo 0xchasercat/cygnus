@@ -5,6 +5,7 @@
 // metrics/events/requests branch never poisons status/apps/deployments.
 
 import { api, post, ApiError } from './api.js';
+import { go, ui } from './stores.svelte.js';
 import {
   previewNode,
   previewApps,
@@ -70,7 +71,7 @@ class Store {
         return;
       }
       await this.#resolveAuth();
-      this.#handleGithubCallback();
+      await this.#handleGithubCallback();
     } catch {
       // health unreachable — degrade to preview rather than hang.
       this.seedPreview();
@@ -126,20 +127,30 @@ class Store {
     }
   }
 
-  #handleGithubCallback() {
+  async #handleGithubCallback() {
     const params = new URLSearchParams(window.location.search);
     const g = params.get('github');
     const installationId = params.get('installation_id');
+    const hasInstallation = g === 'setup' && /^\d+$/.test(installationId ?? '') && Number(installationId) > 0;
     if (g === 'configured') {
-      this.notice = 'GitHub App created. Install it, then return to choose repositories.';
-    } else if (g === 'setup' && /^\d+$/.test(installationId ?? '') && Number(installationId) > 0) {
-      this.notice = 'GitHub App installed. Reading the selected repositories…';
+      this.notice = 'GitHub App created. Install it on your account to continue.';
+    } else if (hasInstallation) {
+      this.notice = 'GitHub App installed. Discovering repositories…';
     }
     if (!g) return;
     window.history.replaceState({}, '', window.location.pathname);
-    this.refreshGithub();
-    if (g === 'setup' && /^\d+$/.test(installationId ?? '') && Number(installationId) > 0) {
-      this.listInstallationRepositories(installationId);
+    // Await so store.github.configured is populated before the UI renders
+    // the Settings screen — without this the "Connect GitHub" form flashes.
+    await this.refreshGithub();
+    if (hasInstallation) {
+      // Navigate to Settings and seed the installation ID so SettingsScreen
+      // can auto-discover repos without manual copy-paste.
+      ui.pendingInstallationId = installationId;
+      go('settings');
+    } else if (g === 'configured') {
+      // After app creation, send to Settings so the user sees the install
+      // button right away instead of landing on the Overview.
+      go('settings');
     }
   }
 

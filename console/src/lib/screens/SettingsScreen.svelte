@@ -5,6 +5,7 @@
   import { shortHash } from '../fmt.js';
   import Icon from '../components/Icon.svelte';
   import Identicon from '../components/Identicon.svelte';
+  import { onMount } from 'svelte';
 
   // ——— domains ———
   let addOpen = $state(false);
@@ -252,6 +253,30 @@
   }
 
   const recentJobs = $derived(store.github.jobs.slice(0, 5));
+
+  // Auto-discover repos when the GitHub install redirect seeded a
+  // pendingInstallationId (set by live.svelte.js #handleGithubCallback).
+  onMount(() => {
+    const pending = ui.pendingInstallationId;
+    if (pending && /^\d+$/u.test(pending) && Number(pending) > 0) {
+      ui.pendingInstallationId = null; // consume once
+      installationId = pending;
+      // Fire discovery immediately
+      (async () => {
+        githubBusy = true;
+        githubError = '';
+        const r = await store.listInstallationRepositories(pending);
+        githubBusy = false;
+        installationRepos = r.repositories;
+        if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
+        for (const repo of installationRepos) {
+          if (!repoConfig[repo.repository_id]) {
+            repoConfig[repo.repository_id] = { app: repo.name, domain: '', engine_version: defaultEngine, entry: 'index.ts' };
+          }
+        }
+      })();
+    }
+  });
 </script>
 
 <div class="page screen-enter">
@@ -346,7 +371,7 @@
           <div class="install-block">
             {#if store.github.app?.html_url}
               <div class="install-cta">
-                <a class="btn cobalt sm" href="{store.github.app.html_url}" target="_blank" rel="noreferrer">
+                <a class="btn cobalt sm" href="{store.github.app.html_url}/installations/new">
                   Install App on GitHub <Icon name="arrowR" size={12} />
                 </a>
                 <p class="install-desc">Click to select which GitHub account and repositories this app is allowed to access. After installation, repositories appear below automatically.</p>
