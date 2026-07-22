@@ -779,8 +779,12 @@ class Store {
         repository_id: repositoryId,
       });
       this.notice = 'Build queued.';
-      await this.#poll();
-      return { ok: true, job: data };
+      await Promise.all([this.#poll(), this.#pollDeployments()]);
+      return {
+        ok: true,
+        job: data,
+        deploymentId: data?.deployment_id ?? data?.id ?? null,
+      };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'Failed to trigger build' };
     }

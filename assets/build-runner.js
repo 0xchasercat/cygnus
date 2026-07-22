@@ -2,10 +2,13 @@ import {
   copyFile,
   lstat,
   mkdir,
+  readFile,
   readdir,
+  realpath,
   rm,
+  writeFile,
 } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 // Daemon-owned dependency build controller.
 //
 // This file is staged outside the tenant workspace and is launched with the
@@ -46,6 +49,10 @@ const STATIC_OUTPUT_DIRECTORIES = Object.freeze([
 ]);
 const ROOT_COPY_EXCLUSIONS = Object.freeze(new Set([
   "node_modules",
+  ".git",
+  ".cygnus-cache",
+]));
+const RUNTIME_COPY_EXCLUSIONS = Object.freeze(new Set([
   ".git",
   ".cygnus-cache",
 ]));
@@ -219,14 +226,140 @@ async function firstStaticOutputDirectory() {
       if (metadata.isSymbolicLink()) {
         fail(`static output ${relativePath} must not be a symlink`);
       }
-      if (metadata.isDirectory()) return { path: candidate, relativePath };
+      if (metadata.isDirectory()) {
+        const index = join(candidate, "index.html");
+        try {
+          const indexMetadata = await lstat(index);
+          if (indexMetadata.isFile()) return { path: candidate, relativePath };
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
   }
-  fail(
-    `static build completed but no output directory exists (${STATIC_OUTPUT_DIRECTORIES.join(", ")})`,
+  const error = new Error(
+    `static build completed but no output directory with index.html exists (${STATIC_OUTPUT_DIRECTORIES.join(", ")})`,
   );
+  error.code = "CYGNUS_NO_STATIC_OUTPUT";
+  throw error;
+}
+
+async function packageHasStartScript() {
+  try {
+    const packageJson = JSON.parse(await readFile(join(WORKSPACE, "package.json"), "utf8"));
+    return typeof packageJson?.scripts?.start === "string" && packageJson.scripts.start.trim().length > 0;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+let canonicalWorkspace;
+async function isInsideWorkspace(path) {
+  canonicalWorkspace ??= await realpath(WORKSPACE);
+  const rel = relative(canonicalWorkspace, path);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+// Runtime applications need their installed dependency tree, not just one
+// guessed framework entry. Dereference only workspace-contained symlinks so
+// Bun's node_modules layouts remain portable without publishing links that can
+// escape the immutable artifact.
+async function copyRuntimeTree(source, destination, ancestry = new Set()) {
+  let resolved = source;
+  let metadata = await lstat(source);
+  if (metadata.isSymbolicLink()) {
+    resolved = await realpath(source);
+    if (!(await isInsideWorkspace(resolved))) {
+      fail(`runtime tree symlink escapes workspace: ${source}`);
+    }
+    metadata = await lstat(resolved);
+  }
+  if (metadata.isFile()) {
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(resolved, destination);
+    return;
+  }
+  if (!metadata.isDirectory()) fail(`runtime tree contains a special file: ${source}`);
+
+  const canonical = await realpath(resolved);
+  if (ancestry.has(canonical)) fail(`runtime tree contains a symlink cycle: ${source}`);
+  const nextAncestry = new Set(ancestry).add(canonical);
+  await mkdir(destination, { recursive: true });
+  const entries = await readdir(resolved, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    if (
+      RUNTIME_COPY_EXCLUSIONS.has(entry.name) ||
+      entry.name === ".env" ||
+      entry.name.startsWith(".env.")
+    ) continue;
+    await copyRuntimeTree(
+      join(resolved, entry.name),
+      join(destination, entry.name),
+      nextAncestry,
+    );
+  }
+}
+
+async function buildStartLauncher() {
+  phaseLog("detect", "package start script found → Bun runtime mode");
+  const runtimeWorkspace = join(OUTPUT, "workspace");
+  await rm(runtimeWorkspace, { recursive: true, force: true });
+  await copyRuntimeTree(WORKSPACE, runtimeWorkspace);
+
+  const launcher = join(OUTPUT, "cygnus-static-server.ts");
+  await writeFile(
+    launcher,
+    `import { join } from "node:path";
+(async () => {
+const shim = join(import.meta.dir, "cygnus", "shim.js");
+const workspace = join(import.meta.dir, "workspace");
+const child = Bun.spawn([
+  process.execPath,
+  "run",
+  "--bun",
+  "--no-env-file",
+  "--preload",
+  shim,
+  "start",
+], {
+  cwd: workspace,
+  env: {
+    ...process.env,
+    NODE_ENV: process.env.NODE_ENV ?? "production",
+    BUN_OPTIONS: [process.env.BUN_OPTIONS, "--no-env-file", "--preload=" + shim]
+      .filter(Boolean)
+      .join(" "),
+  },
+  stdin: "inherit",
+  stdout: "inherit",
+  stderr: "inherit",
+});
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => child.kill(signal));
+}
+process.exit(await child.exited);
+})();
+`,
+    { mode: 0o600 },
+  );
+  const result = await Bun.build({
+    entrypoints: [launcher],
+    root: OUTPUT,
+    outdir: OUTPUT,
+    ...DETERMINISTIC_BUILD_OPTIONS,
+  });
+  await rm(launcher, { force: true });
+  if (!result.success) {
+    for (const log of result.logs) console.error("[build]", log);
+    phaseLog("build", "runtime launcher bundle failed");
+    return 1;
+  }
+  phaseLog("build", "runtime application packaged successfully");
+  return 0;
 }
 
 async function copyStaticTree(source, destination, excludeControls) {
@@ -304,11 +437,21 @@ async function buildStatic() {
 
 async function buildAuto() {
   // Run the build script first, then decide based on output.
-  phaseLog("detect", "running build script, then inspecting output");
-  const status = await runStaticBuildScript();
-  if (status !== 0) return status;
+  if (STATIC_BUILD_SCRIPT) {
+    phaseLog("detect", "running build script, then inspecting output");
+    const status = await runStaticBuildScript();
+    if (status !== 0) return status;
+  } else {
+    phaseLog("detect", "no build script configured; inspecting runtime package");
+  }
 
-  // 1. Check if static output was produced (Vite, Gatsby, plain HTML, etc.)
+  // A start script is the repository's own Bun runtime contract. Preserve the
+  // built workspace and execute that contract with the Cygnus socket shim.
+  if (await packageHasStartScript()) return buildStartLauncher();
+
+  // Check if static output was produced (Vite, Gatsby, plain HTML, etc.). An
+  // output directory only counts as static when it actually has index.html;
+  // SSR frameworks commonly emit asset-only public/dist directories too.
   try {
     const output = await firstStaticOutputDirectory();
     phaseLog("detect", `static output found: ${output.relativePath} → static mode`);
@@ -317,11 +460,13 @@ async function buildAuto() {
     await copyStaticTree(output.path, publicOutput, true);
     phaseLog("build", "static output copy completed");
     return buildStaticServer();
-  } catch {
+  } catch (error) {
+    if (error?.code !== "CYGNUS_NO_STATIC_OUTPUT") throw error;
     // No standard static output dir — continue to server checks.
   }
 
-  // 2. Check for known framework standalone entrypoints.
+  // Check for known framework standalone entrypoints when no start contract
+  // exists. Bundling keeps this fallback self-contained.
   const STANDALONE_ENTRIES = [
     ".next/standalone/server.js",          // Next.js standalone
     ".output/server/index.mjs",            // Nuxt / Nitro
@@ -343,14 +488,12 @@ async function buildAuto() {
           outdir: OUTPUT,
           ...DETERMINISTIC_BUILD_OPTIONS,
         });
-        if (result.success) {
-          phaseLog("build", "standalone entry bundled successfully");
-          return 0;
+        if (!result.success) {
+          for (const log of result.logs) console.error("[build]", log);
+          phaseLog("build", "standalone entry bundle failed");
+          return 1;
         }
-        phaseLog("build", "standalone bundle failed, copying as-is");
-        // Fallback: copy the entry file directly.
-        const dest = join(OUTPUT, "entry.js");
-        await copyFile(fullPath, dest);
+        phaseLog("build", "standalone entry bundled successfully");
         return 0;
       }
     } catch {

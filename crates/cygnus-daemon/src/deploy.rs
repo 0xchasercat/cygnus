@@ -67,8 +67,11 @@ const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_BUN_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BUILD_OUTPUT: usize = 4 * 1024 * 1024;
 const LOG_REL: &str = "logs";
-const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ARTIFACT_INODES: u64 = 8_192;
+// Runtime-mode artifacts preserve installed dependencies so `bun run start`
+// behaves the same as the built workspace. Keep hard bounds, but size them for
+// real framework dependency trees rather than static bundles only.
+const MAX_ARTIFACT_BYTES: u64 = 768 * 1024 * 1024;
+const MAX_ARTIFACT_INODES: u64 = 100_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BuildMode {
@@ -78,9 +81,9 @@ enum BuildMode {
     Static {
         build_script: Option<String>,
     },
-    /// Run the build script, then inspect output to decide static vs server.
+    /// Optionally run the build script, then inspect output/package runtime.
     Auto {
-        build_script: String,
+        build_script: Option<String>,
     },
 }
 
@@ -970,7 +973,7 @@ fn build_job(
             );
             job.env.insert(
                 "CYGNUS_STATIC_BUILD_SCRIPT".into(),
-                OsString::from(build_script),
+                OsString::from(build_script.as_deref().unwrap_or("")),
             );
         }
         BuildMode::Server { .. } => {}
@@ -1131,28 +1134,34 @@ fn preflight_workspace(
     reject_workspace_path(workspace, "bun.lockb", false)?;
 
     let package_path = workspace.join("package.json");
-    let (has_dependencies, build_script) = match fs::symlink_metadata(&package_path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                return Err(DeployError::InvalidInput(
-                    "package.json must be a regular file".into(),
-                ));
+    let (has_dependencies, build_script, has_start_script) =
+        match fs::symlink_metadata(&package_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(DeployError::InvalidInput(
+                        "package.json must be a regular file".into(),
+                    ));
+                }
+                let bytes =
+                    read_control_file(&package_path, MAX_PACKAGE_JSON_BYTES, "package.json")?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    DeployError::InvalidInput(format!("package.json is malformed: {error}"))
+                })?;
+                let package = value.as_object().ok_or_else(|| {
+                    DeployError::InvalidInput("package.json must contain a JSON object".into())
+                })?;
+                let has_dependencies = dependency_section_nonempty(package, "dependencies")?
+                    || dependency_section_nonempty(package, "devDependencies")?
+                    || dependency_section_nonempty(package, "optionalDependencies")?;
+                (
+                    has_dependencies,
+                    package_script(package, "build")?,
+                    package_script(package, "start")?.is_some(),
+                )
             }
-            let bytes = read_control_file(&package_path, MAX_PACKAGE_JSON_BYTES, "package.json")?;
-            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-                DeployError::InvalidInput(format!("package.json is malformed: {error}"))
-            })?;
-            let package = value.as_object().ok_or_else(|| {
-                DeployError::InvalidInput("package.json must contain a JSON object".into())
-            })?;
-            let has_dependencies = dependency_section_nonempty(package, "dependencies")?
-                || dependency_section_nonempty(package, "devDependencies")?
-                || dependency_section_nonempty(package, "optionalDependencies")?;
-            (has_dependencies, package_build_script(package)?)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None),
-        Err(error) => return Err(error.into()),
-    };
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None, false),
+            Err(error) => return Err(error.into()),
+        };
 
     let frozen = validate_workspace_lock(workspace)?;
     let (mode, detection) = if let Some(entry) = explicit_entry {
@@ -1171,19 +1180,21 @@ fn preflight_workspace(
                 BuildMode::Static { build_script: None },
                 "static site (index.html)".into(),
             )
+        } else if build_script.is_some() || has_start_script {
+            // Build when requested, then honor a package start script or
+            // inspect generated output. This keeps Bun applications drop-in,
+            // including start-only servers without a conventional entry file.
+            (
+                BuildMode::Auto { build_script },
+                if has_start_script {
+                    "auto-detect (package runtime)".into()
+                } else {
+                    "auto-detect (build script)".into()
+                },
+            )
         } else if let Some(entry) = first_server_entry(workspace)? {
             let detection = format!("server app ({})", slash_path(&entry));
             (BuildMode::Server { entry }, detection)
-        } else if let Some(script) = build_script {
-            // Has a build script — run it first, then decide based on output.
-            // This handles Vite (static), Next.js (static or SSR), SvelteKit, etc.
-            // without hardcoding framework names.
-            (
-                BuildMode::Auto {
-                    build_script: script,
-                },
-                "auto-detect (build script)".into(),
-            )
         } else {
             return Err(DeployError::InvalidInput(
                 "could not detect app type: looked for index.html, server entry (index.ts, index.js, src/index.ts, server.ts), or a build script; pass --entry for a server app"
@@ -1200,8 +1211,9 @@ fn preflight_workspace(
     })
 }
 
-fn package_build_script(
+fn package_script(
     package: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
 ) -> Result<Option<String>, DeployError> {
     let Some(scripts) = package.get("scripts") else {
         return Ok(None);
@@ -1209,18 +1221,18 @@ fn package_build_script(
     let scripts = scripts.as_object().ok_or_else(|| {
         DeployError::InvalidInput("package.json scripts must be a JSON object".into())
     })?;
-    let Some(build) = scripts.get("build") else {
+    let Some(script) = scripts.get(name) else {
         return Ok(None);
     };
-    let build = build.as_str().ok_or_else(|| {
-        DeployError::InvalidInput("package.json scripts.build must be a string".into())
+    let script = script.as_str().ok_or_else(|| {
+        DeployError::InvalidInput(format!("package.json scripts.{name} must be a string"))
     })?;
-    if build.trim().is_empty() {
-        return Err(DeployError::InvalidInput(
-            "package.json scripts.build must not be empty".into(),
-        ));
+    if script.trim().is_empty() {
+        return Err(DeployError::InvalidInput(format!(
+            "package.json scripts.{name} must not be empty"
+        )));
     }
-    Ok(Some("build".into()))
+    Ok(Some(name.into()))
 }
 
 fn validate_workspace_lock(workspace: &Path) -> Result<bool, DeployError> {
@@ -1846,6 +1858,13 @@ fn fail_build(
         }
     }
     let _ = OpenOptions::new()
+        .append(true)
+        .open(logs.join("build.stderr.log"))
+        .and_then(|mut file| {
+            writeln!(file, "[pipeline] {detail}")?;
+            file.flush()
+        });
+    let _ = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -2394,7 +2413,7 @@ mod tests {
                 install: true,
                 frozen: true,
                 mode: BuildMode::Auto {
-                    build_script: "build".into()
+                    build_script: Some("build".into())
                 },
                 detection: "auto-detect (build script)".into(),
             }
@@ -2416,6 +2435,22 @@ mod tests {
             }
         );
         assert_eq!(plan.detection, "server app (src/index.ts)");
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn start_only_package_uses_auto_runtime_mode() {
+        let workspace = temp_dir("detect-start-only");
+        fs::write(
+            workspace.join("package.json"),
+            br#"{"scripts":{"start":"bun app.ts"}}"#,
+        )
+        .unwrap();
+        fs::write(workspace.join("app.ts"), b"Bun.serve({ fetch() {} });\n").unwrap();
+
+        let plan = preflight_workspace(&workspace, None).unwrap();
+        assert_eq!(plan.mode, BuildMode::Auto { build_script: None });
+        assert_eq!(plan.detection, "auto-detect (package runtime)");
         fs::remove_dir_all(workspace).unwrap();
     }
 

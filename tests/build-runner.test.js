@@ -132,6 +132,11 @@ test("runner parses bundle and static argument forms", () => {
     frozen: false,
     static: true,
   });
+  expect(parseRunnerArgs(["--auto"])).toEqual({
+    install: false,
+    frozen: false,
+    auto: true,
+  });
 });
 
 test("runner rejects unknown arguments before any phase", async () => {
@@ -221,6 +226,7 @@ test("static build selects the first conventional output directory", async () =>
       `import { mkdir, writeFile } from "node:fs/promises";
 for (const directory of ["build", "public", "dist", "out", ".output/public"]) {
   await mkdir(directory, { recursive: true });
+  await writeFile(directory + "/index.html", "<h1>fixture</h1>");
   await writeFile(directory + "/selected.txt", directory);
 }
 console.error("fixture build output");
@@ -260,7 +266,66 @@ test("static build fails when no conventional output directory exists", async ()
     const result = await run(["--static"], fixture.env);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("[build] static build script completed");
-    expect(result.stderr).toContain("no output directory exists");
+    expect(result.stderr).toContain("no output directory with index.html exists");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("auto mode packages and runs a start-only Bun application", async () => {
+  const fixture = await staticFixture();
+  try {
+    await writeFile(
+      join(fixture.workspace, "package.json"),
+      JSON.stringify({ scripts: { start: "bun server.ts" } }),
+    );
+    await writeFile(
+      join(fixture.workspace, "server.ts"),
+      `Bun.serve({ port: 3000, fetch() { return new Response("runtime ok"); } });\n`,
+    );
+    await mkdir(join(fixture.workspace, "node_modules", "fixture-dependency"), { recursive: true });
+    await writeFile(
+      join(fixture.workspace, "node_modules", "fixture-dependency", "index.js"),
+      "export default true;\n",
+    );
+    await mkdir(join(fixture.workspace, "node_modules", ".bin"), { recursive: true });
+    await symlink(
+      "../fixture-dependency/index.js",
+      join(fixture.workspace, "node_modules", ".bin", "fixture-dependency"),
+    );
+
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("package start script found");
+    expect(result.stderr).toContain("runtime application packaged successfully");
+    expect(
+      await exists(join(fixture.output, "workspace", "node_modules", "fixture-dependency", "index.js")),
+    ).toBe(true);
+    expect(
+      await readFile(join(fixture.output, "workspace", "node_modules", ".bin", "fixture-dependency"), "utf8"),
+    ).toContain("export default true");
+
+    const runtimeShim = join(fixture.output, "cygnus", "shim.js");
+    await mkdir(join(fixture.output, "cygnus"), { recursive: true });
+    await copyFile(SHIM, runtimeShim);
+    const generatedServer = join(fixture.output, "cygnus-static-server.js");
+    expect(await exists(generatedServer)).toBe(true);
+    expect(await exists(join(fixture.output, "cygnus-static-server.js.jsc"))).toBe(true);
+
+    const socket = join(fixture.root, "runtime.sock");
+    const server = Bun.spawn([BUN, "--no-env-file", "--preload", runtimeShim, generatedServer], {
+      env: { ...process.env, CYGNUS_SOCKET: socket },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const response = await unixRequestEventually(socket, "/");
+      expect(response.status).toBe(200);
+      expect(response.body).toBe("runtime ok");
+    } finally {
+      server.kill();
+      await server.exited;
+    }
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

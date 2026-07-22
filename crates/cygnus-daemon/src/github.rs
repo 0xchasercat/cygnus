@@ -26,9 +26,9 @@ use thiserror::Error;
 
 use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare};
 use crate::state::{
-    AuditContext, DeployJob, DeployJobSource, DeployJobSpec, DeploymentSource, GitHubAppRecord,
-    GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind,
-    GitHubRepositoryConfig, State, StateError,
+    AuditContext, DeployJob, DeployJobSource, DeployJobSpec, DeploymentInput, DeploymentSource,
+    GitHubAppRecord, GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus,
+    GitHubJobKind, GitHubRepositoryConfig, State, StateError,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -639,7 +639,16 @@ impl GitHubManager {
         };
 
         let mut state = State::open(&self.state_path)?;
-        state.enqueue_deploy_job(&job)?;
+        state.enqueue_preassigned_deployment(
+            &DeploymentInput {
+                id: job.id.clone(),
+                app: job.app.clone(),
+                source_hash: job.source_ref.clone(),
+                engine_version: job.engine_version.clone(),
+                source: DeploymentSource::github(job.branch.clone(), job.commit.clone()),
+            },
+            &job,
+        )?;
         state
             .deploy_job(&job.id)?
             .ok_or_else(|| GitHubError::InvalidInput("enqueued job not found".into()))
@@ -1534,6 +1543,7 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
         source: &Path,
         audit: &AuditContext,
     ) -> Result<DeployResult, DeployError> {
+        let preassigned = state.deployment(&job.id)?.map(|_| job.id.clone());
         deploy_with_audit_and_prepare(
             state,
             DeployRequest {
@@ -1546,7 +1556,7 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
                 upstream: Some(config.upstream.clone()),
                 env: std::collections::BTreeMap::new(),
                 preview: None,
-                deployment_id: None,
+                deployment_id: preassigned,
                 source: DeploymentSource::github(
                     Some(config.branch.clone()),
                     Some(job.sha.clone()),
@@ -1637,6 +1647,11 @@ impl GitHubWorker {
                 if transient {
                     state.retry_github_job_with_error(&job.id, &error.to_string())?;
                 } else {
+                    // Archive/config/report failures can happen before the
+                    // deploy pipeline has a chance to create build logs. Keep
+                    // the pre-created deployment visible with the durable
+                    // error so the console never loses the failure in Events.
+                    let _ = state.mark_deployment_failed(&job.id, &error.to_string());
                     state.finish_github_job(
                         &job.id,
                         GitHubDeployJobStatus::Failed,

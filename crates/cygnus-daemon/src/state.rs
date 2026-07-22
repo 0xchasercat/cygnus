@@ -3149,7 +3149,30 @@ impl State {
             return Ok(false);
         }
         for job in jobs {
+            // A deployment row exists from the moment GitHub work is queued,
+            // not only after archive download succeeds. This gives early
+            // failures a durable UI destination and local deployment id.
+            transaction.execute(
+                "INSERT OR IGNORE INTO deployments
+                 (id, app, source_hash, engine_version, source_kind, source_branch, source_commit, status, error)
+                 SELECT ?1, ?2, ?3, ?4, 'github', ?5, ?6, 'building', NULL
+                 WHERE EXISTS (SELECT 1 FROM engines WHERE version = ?4)",
+                params![
+                    job.id,
+                    job.app,
+                    job.source_ref,
+                    job.engine_version,
+                    job.branch,
+                    job.commit,
+                ],
+            )?;
             enqueue_deploy_job_tx(&transaction, job)?;
+            transaction.execute(
+                "UPDATE deploy_jobs SET deployment_id = ?2, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND deployment_id IS NULL
+                   AND EXISTS (SELECT 1 FROM deployments WHERE id = ?2)",
+                params![job.id, job.id],
+            )?;
         }
         transaction.commit()?;
         Ok(true)

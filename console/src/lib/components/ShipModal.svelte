@@ -323,10 +323,13 @@
     ui.shipOpen = false;
     clearSelectedRepo();
     await store.refreshGithub();
-    // Navigate to the app detail page so the user can watch the build.
+    // Open the same live build/log view used by folder uploads. The daemon
+    // pre-creates this row before GitHub archive intake, so even early failures
+    // have a durable page instead of falling back to the tenant/app screen.
     const appName = mapDraft.app || repo.name;
-    const { go } = await import('../stores.svelte.js');
-    go('app', { appId: appName });
+    const { openDeploy, go } = await import('../stores.svelte.js');
+    if (trigger.deploymentId) openDeploy(appName, trigger.deploymentId);
+    else go('deploys');
   }
 
   // Ensure discovery is running when the git tab is open.
