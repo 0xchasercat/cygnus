@@ -135,7 +135,14 @@ class Store {
     } else if (g === 'setup' && /^\d+$/.test(installationId ?? '') && Number(installationId) > 0) {
       this.notice = 'GitHub App installed. Reading the selected repositories…';
     }
-    if (g) window.history.replaceState({}, '', window.location.pathname);
+    if (!g) return;
+    window.history.replaceState({}, '', window.location.pathname);
+    // The conversion just happened on the server (or a fresh install
+    // completed) — force a poll so the connected state shows up
+    // immediately instead of waiting for the next periodic tick. Without
+    // this, the operator sees a stale "Connect GitHub" form after
+    // returning from a successful install.
+    if (this.mode === 'live' && this.auth === 'ready') this.#poll();
   }
 
   // ——— polling ———

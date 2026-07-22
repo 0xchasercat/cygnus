@@ -1,0 +1,22 @@
+fix: poll on GitHub callback redirect so the connected state shows immediately
+
+After the user creates a GitHub App from the manifest, the server
+exchanges the conversion code at /github/app/manifest/callback (per
+GitHub's manifest spec) and 303-redirects to /?github=configured. The
+console's live store was setting a notice on that URL but never
+re-polling, so the operator saw a stale "Connect GitHub" form even
+though the daemon had already stored the new app. Force a poll on
+the configured/setup query params so the connected state shows up
+without waiting for the next periodic tick.
+
+Also corrects the test to match the actual GitHub flow: the conversion
+code is sent to the redirect_url (/github/app/manifest/callback),
+not the setup_url — the latter is hit after install with whatever
+params GitHub decides on. (Earlier confusion: the docs example is
+literally https://example.com/redirect?code=...&state=...) The
+setup_url handler stays lenient about its params and just bounces the
+user back to the console, optionally forwarding installation_id when
+GitHub bundles it.
+
+Verified: cargo fmt clean, clippy -D warnings clean, 179 lib + 15
+binary + 20 integration = 214 daemon tests pass, 39 console tests pass.

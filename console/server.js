@@ -149,9 +149,8 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
     return logout(request);
   }
 
-  if (path === GITHUB_SETUP_PATH) return githubSetupCallback(request, url, requestAdmin, socket);
-  if (path === GITHUB_MANIFEST_CALLBACK_PATH || path === GITHUB_INSTALL_CALLBACK_PATH) return githubInstallCallback(request, url);
-
+  if (path === GITHUB_MANIFEST_CALLBACK_PATH) return manifestCallback(request, url, requestAdmin, socket);
+  if (path === GITHUB_SETUP_PATH || path === GITHUB_INSTALL_CALLBACK_PATH) return githubSetupCallback(request, url);
   const deployUploadRoute = [
     "/api/v1/deploy/begin",
     "/api/v1/deploy/chunk",
@@ -1285,37 +1284,33 @@ export function consumeManifestState(state, sessionCookie, now = Date.now()) {
   manifestStates.delete(hash);
   return { ...entry };
 }
-
-// GitHub's manifest flow has two distinct callbacks:
-//   * setup_url (`/github/app/setup`)  — hit immediately after the user clicks
-//     "Create" in the manifest form. GitHub sends a temporary `code` here, which
-//     we exchange with the App Manifests API for the app's id / client_id /
-//     client_secret / pem / webhook_secret. This is the only step that
-//     actually stores the GitHub App in the daemon's state; without it the
-//     console never reports `configured: true` and the user sees a
-//     "connected" form even though the app already exists on GitHub.
-//   * redirect_url (`/github/app/manifest/callback`) — hit *after* the user
-//     installs the app from GitHub. It carries `installation_id` +
-//     `setup_action`; we don't need to do anything here except bounce the
-//     user back to the console so the live store picks up the install.
-async function githubSetupCallback(request, url, requestAdmin = adminRequest, socket = adminSocketPath) {
+// GitHub's manifest flow sends the temporary conversion `code` to the
+// `redirect_url` declared in the manifest (NOT `setup_url` — that's the
+// post-install setup URL, only used if the app needs extra configuration).
+// The docs example is literally: `https://example.com/redirect?code=…&state=…`
+// This handler does the conversion (POST /app-manifests/{code}/conversions)
+// and bounces the user back to the console. The conversion must complete
+// within one hour, and requires a session cookie so the state token we
+// minted in manifestStart can be validated.
+async function manifestCallback(request, url, requestAdmin = adminRequest, socket = adminSocketPath) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
   if ([...url.searchParams.keys()].some((key) => key !== "code" && key !== "state")) {
-    return apiError(400, "github_callback", "GitHub setup callback contains unsupported fields");
+    return apiError(400, "github_callback", "GitHub callback contains unsupported fields");
   }
-  if (!code || !state) return apiError(400, "github_callback", "GitHub setup callback is missing code or state");
+  if (!code || !state) return apiError(400, "github_callback", "GitHub callback is missing code or state");
   try {
     convertManifestCommand({ code });
   } catch (error) {
-    return apiError(error.status ?? 400, error.code ?? "github_callback", "GitHub setup callback code is invalid");
+    return apiError(error.status ?? 400, error.code ?? "github_callback", "GitHub callback code is invalid");
   }
   const auth = authStatus();
   if (!auth.configured) return apiError(503, "misconfigured", "console authentication is misconfigured");
   const cookie = request.headers.get("cookie");
   if (!verifySessionCookie(cookie)) return apiError(401, "unauthorized", "authentication required");
   const stateEntry = consumeManifestState(state, cookie);
-  if (!stateEntry) return apiError(400, "github_state", "GitHub setup callback state is invalid or expired");
+  if (!stateEntry) return apiError(400, "github_state", "GitHub callback state is invalid or expired");
   if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
   try {
     await requestAdmin(
@@ -1333,21 +1328,22 @@ async function githubSetupCallback(request, url, requestAdmin = adminRequest, so
   }
 }
 
-function githubInstallCallback(request, url) {
+// `setup_url` is hit after the user installs the app (if `setup_on_update`
+// is set, or the app asked for additional setup). GitHub decides which
+// params to include — we just bounce the user back to the console. The
+// conversion already happened at `redirect_url`.
+function githubSetupCallback(request, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const installationId = url.searchParams.get("installation_id");
-  if ([...url.searchParams.keys()].some((key) => key !== "installation_id" && key !== "setup_action")) {
-    return apiError(400, "github_install", "GitHub install callback contains unsupported fields");
-  }
-  if (!installationId || !/^\d+$/u.test(installationId) || Number(installationId) <= 0) {
-    return apiError(400, "github_install", "GitHub install callback is missing installation_id");
-  }
+  const hasInstallationId = installationId !== null
+    && /^\d+$/u.test(installationId)
+    && Number(installationId) > 0;
+  const location = hasInstallationId
+    ? `/?github=setup&installation_id=${encodeURIComponent(installationId)}`
+    : "/?github=configured";
   return new Response(null, {
     status: 303,
-    headers: {
-      location: `/?github=setup&installation_id=${encodeURIComponent(installationId)}`,
-      "cache-control": "no-store",
-    },
+    headers: { location, "cache-control": "no-store" },
   });
 }
 

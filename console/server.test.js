@@ -524,7 +524,7 @@ describe("console request validation", () => {
     expect(consumeManifestState(state, cookie)).toBeNull();
   });
 
-  test("setup callback exchanges the manifest code and redirects to the configured console", async () => {
+  test("manifest callback exchanges the conversion code and setup/install callbacks bounce to the console", async () => {
     process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "manifest-bootstrap";
     process.env.CYGNUS_CONSOLE_SESSION_KEY = "manifest-session";
     clearManifestStates();
@@ -545,19 +545,27 @@ describe("console request validation", () => {
       if (command.type === "convert_manifest") return { data: { kind: "manifest_converted", app: { app_id: "1" } } };
       return { data: { ok: true } };
     };
-    const setupUrl = new URL(`http://localhost/github/app/setup?code=temp-code&state=${encodeURIComponent(state)}`);
-    const response = await handleApi(new Request(setupUrl, { method: "GET", headers: { cookie } }), setupUrl, requestAdmin, "/admin.sock");
-    expect(response.status).toBe(303);
-    expect(response.headers.get("location")).toBe("/?github=configured");
+    // Per GitHub's manifest spec, the conversion `code` is sent to the
+    // `redirect_url` (here /github/app/manifest/callback), not the
+    // `setup_url`. The docs example is literally:
+    //   https://example.com/redirect?code=…&state=…
+    const convertUrl = new URL(`http://localhost/github/app/manifest/callback?code=temp-code&state=${encodeURIComponent(state)}`);
+    const converted = await handleApi(new Request(convertUrl, { method: "GET", headers: { cookie } }), convertUrl, requestAdmin, "/admin.sock");
+    expect(converted.status).toBe(303);
+    expect(converted.headers.get("location")).toBe("/?github=configured");
     expect(commands.some((c) => c.command.type === "convert_manifest" && c.command.code === "temp-code" && c.command.owner === "acme")).toBe(true);
-    // The install callback is the separate flow that only carries installation_id.
-    const installUrl = new URL("http://localhost/github/app/manifest/callback?installation_id=42&setup_action=install");
-    const install = await handleApi(new Request(installUrl, { method: "GET", headers: { cookie } }), installUrl, requestAdmin, "/admin.sock");
-    expect(install.status).toBe(303);
-    expect(install.headers.get("location")).toBe("/?github=setup&installation_id=42");
-    // No convert call should fire from the install callback.
+    // `setup_url` is hit after install (if `setup_on_update` is set). It
+    // carries whatever params GitHub decides on; we just bounce the user
+    // back to the console. With `installation_id` we forward it so the
+    // console can auto-discover repositories.
+    const setupUrl = new URL("http://localhost/github/app/setup?installation_id=42&setup_action=install");
+    const setup = await handleApi(new Request(setupUrl, { method: "GET", headers: { cookie } }), setupUrl, requestAdmin, "/admin.sock");
+    expect(setup.status).toBe(303);
+    expect(setup.headers.get("location")).toBe("/?github=setup&installation_id=42");
+    // Only the manifest callback should have fired the conversion.
     expect(commands.filter((c) => c.command.type === "convert_manifest")).toHaveLength(1);
   });
+
 
   test("streams an exact 25 MiB webhook through frame-safe chunks", async () => {
     const body = Buffer.alloc(MAX_WEBHOOK_BODY_BYTES, 0x5a);
@@ -584,24 +592,24 @@ describe("console request validation", () => {
       return { data: { delivery_id: "delivery-1", duplicate: false, jobs: 1 } };
     };
     const request = new Request("https://cygnus.apps.test/github/webhook", {
-      method: "POST",
-      headers: {
-        "content-length": String(body.length),
-        "x-github-delivery": "delivery-1",
-        "x-github-event": "push",
-        "x-hub-signature-256": `sha256=${"a".repeat(64)}`,
-      },
-      body,
-    });
-
-    const response = await webhookIngress(request, requestAdmin, "/cygnus/admin/admin.sock");
-    expect(response.status).toBe(202);
-    expect(bytes).toBe(body.length);
-    expect(observed.digest("hex")).toBe(expected);
-    expect(chunks).toBe(Math.ceil(body.length / MAX_WEBHOOK_CHUNK_BYTES));
-    expect(commands[0]).toBe("webhook_begin");
-    expect(commands.at(-1)).toBe("webhook_finish");
+    method: "POST",
+    headers: {
+      "content-length": String(body.length),
+      "x-github-delivery": "delivery-1",
+      "x-github-event": "push",
+      "x-hub-signature-256": `sha256=${"a".repeat(64)}`,
+    },
+    body,
   });
+
+  const response = await webhookIngress(request, requestAdmin, "/cygnus/admin/admin.sock");
+  expect(response.status).toBe(202);
+  expect(bytes).toBe(body.length);
+  expect(observed.digest("hex")).toBe(expected);
+  expect(chunks).toBe(Math.ceil(body.length / MAX_WEBHOOK_CHUNK_BYTES));
+  expect(commands[0]).toBe("webhook_begin");
+  expect(commands.at(-1)).toBe("webhook_finish");
+});
 
   test("rejects malformed webhooks before admin work and short-circuits duplicates", async () => {
     let calls = 0;
