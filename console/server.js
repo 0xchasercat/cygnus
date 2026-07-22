@@ -166,11 +166,11 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   const appDomainRetryAcmeRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+\/retry-acme$/u.test(path);
   const appEnvRoute = /^\/api\/v1\/apps\/[^/]+\/env$/u.test(path);
   const appEnvKeyRoute = /^\/api\/v1\/apps\/[^/]+\/env\/[^/]+$/u.test(path);
+  const githubReposRoute = path === "/api/v1/github/repositories";
   const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || passwordRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
-    "/api/v1/github/repositories",
   ].includes(path) || /^\/api\/v1\/github\/jobs\/[^/]+\/retry$/u.test(path);
   const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|jobs))(?:\/[^/]+)?$/u.test(path)
     || /^\/api\/v1\/(?:metrics|requests|events)$/u.test(path)
@@ -183,7 +183,8 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   if (appDomainRetryAcmeRoute && request.method !== "POST") return methodNotAllowed("POST");
   if (appEnvRoute && !["GET", "HEAD", "POST"].includes(request.method)) return methodNotAllowed("GET, HEAD, POST");
   if (appEnvKeyRoute && request.method !== "DELETE") return methodNotAllowed("DELETE");
-  if (readRoute && !appDomainsRoute && !appEnvRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
+  if (githubReposRoute && !["GET", "HEAD", "POST"].includes(request.method)) return methodNotAllowed("GET, HEAD, POST");
+  if (readRoute && !appDomainsRoute && !appEnvRoute && !githubReposRoute && request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     if (!sameOrigin(request, url)) return apiError(403, "csrf", "request origin is not allowed");

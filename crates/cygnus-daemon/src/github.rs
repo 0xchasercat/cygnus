@@ -494,8 +494,8 @@ impl GitHubManager {
                 "installation id must be positive".into(),
             ));
         }
-        let jwt = self.app_jwt()?;
-        let auth = format!("Bearer {jwt}");
+        let token = self.installation_token(installation_id, None)?;
+        let auth = format!("Bearer {token}");
         let mut page = 1_u32;
         let mut repositories = Vec::new();
         loop {
