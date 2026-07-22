@@ -149,9 +149,8 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
     return logout(request);
   }
 
-  if (path === GITHUB_WEBHOOK_PATH) return webhookIngress(request);
-  if (path === GITHUB_MANIFEST_CALLBACK_PATH) return manifestCallback(request, url);
-  if (path === GITHUB_SETUP_PATH || path === GITHUB_INSTALL_CALLBACK_PATH) return githubSetupRedirect(request, url);
+  if (path === GITHUB_SETUP_PATH) return githubSetupCallback(request, url, requestAdmin, socket);
+  if (path === GITHUB_MANIFEST_CALLBACK_PATH || path === GITHUB_INSTALL_CALLBACK_PATH) return githubInstallCallback(request, url);
 
   const deployUploadRoute = [
     "/api/v1/deploy/begin",
@@ -1287,27 +1286,40 @@ export function consumeManifestState(state, sessionCookie, now = Date.now()) {
   return { ...entry };
 }
 
-async function manifestCallback(request, url) {
-  if (request.method !== "GET") return methodNotAllowed("GET");
+// GitHub's manifest flow has two distinct callbacks:
+//   * setup_url (`/github/app/setup`)  — hit immediately after the user clicks
+//     "Create" in the manifest form. GitHub sends a temporary `code` here, which
+//     we exchange with the App Manifests API for the app's id / client_id /
+//     client_secret / pem / webhook_secret. This is the only step that
+//     actually stores the GitHub App in the daemon's state; without it the
+//     console never reports `configured: true` and the user sees a
+//     "connected" form even though the app already exists on GitHub.
+//   * redirect_url (`/github/app/manifest/callback`) — hit *after* the user
+//     installs the app from GitHub. It carries `installation_id` +
+//     `setup_action`; we don't need to do anything here except bounce the
+//     user back to the console so the live store picks up the install.
+async function githubSetupCallback(request, url, requestAdmin = adminRequest, socket = adminSocketPath) {
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
-  if ([...url.searchParams.keys()].some((key) => key !== "code" && key !== "state")) return apiError(400, "github_callback", "GitHub callback contains unsupported fields");
-  if (!code || !state) return apiError(400, "github_callback", "GitHub callback is missing code or state");
+  if ([...url.searchParams.keys()].some((key) => key !== "code" && key !== "state")) {
+    return apiError(400, "github_callback", "GitHub setup callback contains unsupported fields");
+  }
+  if (!code || !state) return apiError(400, "github_callback", "GitHub setup callback is missing code or state");
   try {
     convertManifestCommand({ code });
   } catch (error) {
-    return apiError(error.status ?? 400, error.code ?? "github_callback", "GitHub callback code is invalid");
+    return apiError(error.status ?? 400, error.code ?? "github_callback", "GitHub setup callback code is invalid");
   }
   const auth = authStatus();
   if (!auth.configured) return apiError(503, "misconfigured", "console authentication is misconfigured");
   const cookie = request.headers.get("cookie");
   if (!verifySessionCookie(cookie)) return apiError(401, "unauthorized", "authentication required");
   const stateEntry = consumeManifestState(state, cookie);
-  if (!stateEntry) return apiError(400, "github_state", "GitHub callback state is invalid or expired");
-  if (!adminSocketPath) return apiError(503, "unavailable", "daemon admin bridge unavailable");
+  if (!stateEntry) return apiError(400, "github_state", "GitHub setup callback state is invalid or expired");
+  if (!socket) return apiError(503, "unavailable", "daemon admin bridge unavailable");
   try {
-    await adminRequest(
-      adminSocketPath,
+    await requestAdmin(
+      socket,
       convertManifestCommand({ code, ...(stateEntry.owner === undefined ? {} : { owner: stateEntry.owner }) }),
       ACTOR_SUBJECT,
     );
@@ -1321,14 +1333,14 @@ async function manifestCallback(request, url) {
   }
 }
 
-function githubSetupRedirect(request, url) {
+function githubInstallCallback(request, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const installationId = url.searchParams.get("installation_id");
   if ([...url.searchParams.keys()].some((key) => key !== "installation_id" && key !== "setup_action")) {
-    return apiError(400, "github_setup", "GitHub setup callback contains unsupported fields");
+    return apiError(400, "github_install", "GitHub install callback contains unsupported fields");
   }
   if (!installationId || !/^\d+$/u.test(installationId) || Number(installationId) <= 0) {
-    return apiError(400, "github_setup", "GitHub setup callback is missing installation_id");
+    return apiError(400, "github_install", "GitHub install callback is missing installation_id");
   }
   return new Response(null, {
     status: 303,

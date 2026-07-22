@@ -524,6 +524,41 @@ describe("console request validation", () => {
     expect(consumeManifestState(state, cookie)).toBeNull();
   });
 
+  test("setup callback exchanges the manifest code and redirects to the configured console", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "manifest-bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "manifest-session";
+    clearManifestStates();
+    const cookie = signSession();
+    // Drive manifestStart so the manifestStates table has a live session-bound entry.
+    const startUrl = new URL("http://localhost/api/v1/github/manifest");
+    const start = await handleApi(new Request(startUrl, {
+      method: "POST",
+      headers: { origin: startUrl.origin, cookie, "content-type": "application/json" },
+      body: JSON.stringify({ owner: "acme" }),
+    }), startUrl);
+    const state = new URL((await start.json()).data.action).searchParams.get("state");
+    expect(state).toBeTruthy();
+
+    const commands = [];
+    const requestAdmin = async (_socket, command, actor) => {
+      commands.push({ command, actor });
+      if (command.type === "convert_manifest") return { data: { kind: "manifest_converted", app: { app_id: "1" } } };
+      return { data: { ok: true } };
+    };
+    const setupUrl = new URL(`http://localhost/github/app/setup?code=temp-code&state=${encodeURIComponent(state)}`);
+    const response = await handleApi(new Request(setupUrl, { method: "GET", headers: { cookie } }), setupUrl, requestAdmin, "/admin.sock");
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/?github=configured");
+    expect(commands.some((c) => c.command.type === "convert_manifest" && c.command.code === "temp-code" && c.command.owner === "acme")).toBe(true);
+    // The install callback is the separate flow that only carries installation_id.
+    const installUrl = new URL("http://localhost/github/app/manifest/callback?installation_id=42&setup_action=install");
+    const install = await handleApi(new Request(installUrl, { method: "GET", headers: { cookie } }), installUrl, requestAdmin, "/admin.sock");
+    expect(install.status).toBe(303);
+    expect(install.headers.get("location")).toBe("/?github=setup&installation_id=42");
+    // No convert call should fire from the install callback.
+    expect(commands.filter((c) => c.command.type === "convert_manifest")).toHaveLength(1);
+  });
+
   test("streams an exact 25 MiB webhook through frame-safe chunks", async () => {
     const body = Buffer.alloc(MAX_WEBHOOK_BODY_BYTES, 0x5a);
     const expected = createHash("sha256").update(body).digest("hex");
