@@ -211,13 +211,6 @@
     display: grid;
     place-items: center;
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25), var(--shadow-card);
-    margin-left: 2px;
-  }
-  .av-t {
-    font-size: 9.5px;
-    font-weight: 700;
-    font-family: var(--mono);
-    letter-spacing: 0.06em;
   }
   .popover {
     position: absolute;
