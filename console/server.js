@@ -1296,9 +1296,6 @@ async function manifestCallback(request, url, requestAdmin = adminRequest, socke
   if (request.method !== "GET") return methodNotAllowed("GET");
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
-  if ([...url.searchParams.keys()].some((key) => key !== "code" && key !== "state")) {
-    return apiError(400, "github_callback", "GitHub callback contains unsupported fields");
-  }
   if (!code || !state) return apiError(400, "github_callback", "GitHub callback is missing code or state");
   try {
     convertManifestCommand({ code });

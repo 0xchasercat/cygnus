@@ -1,27 +1,9 @@
-fix: stop hiding the GitHub manifest form with display:none
+fix: allow extra query params on manifest callback URL
 
-The console's "Connect GitHub" flow builds a synthetic form, appends
-it to document.body, and calls form.submit() to POST the manifest
-JSON to github.com. The form was being hidden with form.hidden = true
-so it would apply the HTML `hidden` attribute, which the browser styles
-with display: none. Multiple browsers (Chrome, Safari, Firefox) will
-not auto-submit a form whose computed display is none, so the
-.github.com POST never happened. The backend manifestStart succeeded
-(server returned 200 with action+manifest), but the browser never
-left the console, so the operator saw a silent "nothing happened".
-
-The HAR trace shows the manifest POST returning 200 with a 644-byte
-body, then 40+ seconds of nothing before the next poll — no POST to
-github.com, no callback to /github/app/manifest/callback. That 40
-seconds of silence is the user staring at a form that was never going
-to submit.
-
-Fix: position the form off-screen with inline styles instead of the
-hidden attribute, and wrap form.submit() in a try/catch so a blocked
-submission surfaces a clear error instead of a silent failure.
-</mm:think>
-
-
-
-
-</mm:think>
+GitHub can append extra query parameters (such as `installation_id`,
+`setup_action`, or tracking params) to the `redirect_url` when bouncing
+the browser back after app registration. The `manifestCallback` handler
+was strictly enforcing that ONLY `code` and `state` were in the query string
+and returned HTTP 400 "unsupported fields" if any other parameter was present.
+Removing the rigid whitelist allows `manifestCallback` to extract `code` and
+`state` and exchange the credentials successfully regardless of extra query params.
