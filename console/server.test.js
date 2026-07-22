@@ -618,6 +618,30 @@ describe("console request validation", () => {
     }), deployUrl);
     expect(deploy.status).toBe(404);
   });
+
+  test("accepts and honors X-Forwarded-Proto https behind the daemon's TLS-terminating proxy", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session";
+    clearManifestStates();
+    const cookie = signSession();
+    // Bun's own request.url is always http: even when the daemon terminated
+    // TLS on a UDS upstream — this is exactly that shape.
+    const manifestUrl = new URL("http://console.cygnus.run/api/v1/github/manifest");
+    const response = await handleApi(new Request(manifestUrl, {
+      method: "POST",
+      headers: {
+        origin: "https://console.cygnus.run",
+        cookie,
+        "content-type": "application/json",
+        "x-forwarded-proto": "https",
+      },
+      body: "{}",
+    }), manifestUrl);
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result.data.manifest.url).toBe("https://console.cygnus.run");
+    expect(result.data.manifest.hook_attributes.url).toBe("https://console.cygnus.run/github/webhook");
+  });
   test("maps daemon error codes to safe HTTP statuses", () => {
     expect(statusForDaemonCode("unauthorized")).toBe(401);
     expect(statusForDaemonCode("forbidden")).toBe(403);

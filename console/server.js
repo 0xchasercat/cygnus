@@ -1235,8 +1235,8 @@ export function clearManifestStates() {
 }
 
 async function manifestStart(request, url, sessionCookie) {
-  if (request.method !== "POST") return methodNotAllowed("POST");
-  if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+  const scheme = forwardedScheme(request, url);
+  if (scheme !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
     return apiError(422, "github_origin", "GitHub App setup requires an HTTPS console origin");
   }
   let body;
@@ -1264,7 +1264,7 @@ async function manifestStart(request, url, sessionCookie) {
     sessionHash: createHash("sha256").update(String(sessionCookie), "utf8").digest("hex"),
     expiresAt: now + MANIFEST_STATE_TTL_MS,
   });
-  const manifest = buildGithubManifest(url.origin);
+  const manifest = buildGithubManifest(`${scheme}//${url.host}`);
   const action = owner
     ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/new?state=${encodeURIComponent(state)}`
     : `https://github.com/settings/apps/new?state=${encodeURIComponent(state)}`;
@@ -1400,23 +1400,27 @@ export async function webhookIngress(request, requestAdmin = adminRequest, socke
   }
 }
 
+// Bun's request.url (and url.origin/url.protocol derived from it) always uses
+// the scheme of the raw HTTP request Bun itself terminated — http:, even when
+// this console sits behind the daemon's TLS-terminating reverse proxy on a
+// plain UNIX socket. Trust X-Forwarded-Proto (set by the daemon relay) for
+// the scheme the browser actually saw; fall back to the connection's own
+// protocol when unset (direct/local access, or tests hitting the handler
+// with a literal https: URL). Deliberately NOT requestIsSecure()'s
+// loopback-is-secure allowance — that heuristic is for cookie flags, and
+// would make an `http://localhost` Origin/manifest fail to match an inferred
+// https scheme here.
+function forwardedScheme(request, url) {
+  const forwarded = request.headers?.get?.("x-forwarded-proto")?.split(",")[0]?.trim()?.toLowerCase();
+  return forwarded === "https" ? "https:" : forwarded === "http" ? "http:" : url.protocol;
+}
+
 function sameOrigin(request, url) {
   const origin = request.headers.get("origin");
   if (typeof origin !== "string" || request.headers.get("sec-fetch-site") === "cross-site") {
     return false;
   }
-  // Bun's request.url (and url.origin derived from it) always uses the
-  // scheme of the raw HTTP request Bun itself terminated — http:, even when
-  // this console sits behind the daemon's TLS-terminating reverse proxy on a
-  // plain UNIX socket. Trust X-Forwarded-Proto (set by the daemon relay) for
-  // the scheme the browser actually saw; fall back to the connection's own
-  // protocol when unset (direct/local access, or tests hitting the handler
-  // with a literal https: URL). Deliberately NOT requestIsSecure()'s
-  // loopback-is-secure allowance — that heuristic is for cookie flags, and
-  // would make an `http://localhost` Origin fail to match an inferred https
-  // scheme here.
-  const forwarded = request.headers?.get?.("x-forwarded-proto")?.split(",")[0]?.trim()?.toLowerCase();
-  const scheme = forwarded === "https" ? "https:" : forwarded === "http" ? "http:" : url.protocol;
+  const scheme = forwardedScheme(request, url);
   const expected = `${scheme}//${url.host}`;
   return origin === expected;
 }

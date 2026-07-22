@@ -114,7 +114,7 @@
               </div>
               <span class="led {ledFor(a)}" class:breathe={a.lifecycle_state === 'ready'}></span>
             </div>
-            <span class="domain num">{a.domains?.[0] ?? 'unrouted'}</span>
+            <span class="domain num">{a.domains?.[0] ?? (a.name === 'tenant-0' ? store.node?.dashboard_domain : null) ?? 'unrouted'}</span>
             <div class="foot">
               <span class="meta num">
                 {#if a.lifecycle_state === 'building'}
