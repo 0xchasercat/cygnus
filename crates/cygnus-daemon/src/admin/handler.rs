@@ -1806,7 +1806,9 @@ mod tests {
         let missing = handler.handle(
             AdminRole::Host,
             AdminPeerCredentials::default(),
-            request(AdminCommand::GetDeployment { deployment: "ffffffff".into() }),
+            request(AdminCommand::GetDeployment {
+                deployment: "ffffffff".into(),
+            }),
         );
         assert!(matches!(
             missing,
@@ -1815,7 +1817,6 @@ mod tests {
         drop(handler);
         fs::remove_dir_all(root).unwrap();
     }
-
 
     #[test]
     fn status_includes_runtime_and_host_basics() {

@@ -755,7 +755,11 @@ fn which_journalctl() -> Option<std::path::PathBuf> {
         }
     }
     // Common fallback when /usr/sbin (root-only) isn't on this user's PATH.
-    for absolute in &["/usr/bin/journalctl", "/bin/journalctl", "/usr/sbin/journalctl"] {
+    for absolute in &[
+        "/usr/bin/journalctl",
+        "/bin/journalctl",
+        "/usr/sbin/journalctl",
+    ] {
         let path = std::path::PathBuf::from(absolute);
         if path.is_file() {
             return Some(path);
@@ -1613,9 +1617,7 @@ mod tests {
         let parsed = Cli::try_parse_from(["cygnus", "logs"]).unwrap();
         match parsed.command {
             Command::Logs {
-                deployment,
-                follow,
-                ..
+                deployment, follow, ..
             } => {
                 assert!(deployment.is_none());
                 assert!(!follow);
