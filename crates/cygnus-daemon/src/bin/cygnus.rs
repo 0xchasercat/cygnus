@@ -1055,7 +1055,7 @@ impl Theme {
             .iter()
             .map(|deployment| {
                 [
-                    short_hash(&deployment.id),
+                    deployment.id.clone(),
                     deployment.app.clone(),
                     state_cell(self, &deployment.status),
                     deployment.engine_version.clone(),

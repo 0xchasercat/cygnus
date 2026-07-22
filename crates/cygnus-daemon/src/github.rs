@@ -1408,15 +1408,6 @@ pub fn safe_extract_archive_reader<R: Read>(
 
 fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError> {
     let mut archive = Archive::new(reader);
-    // Detect the GitHub-style "every entry is under one top-level directory"
-    // wrapper lazily. The first dir entry we see proposes itself as the
-    // wrapper; if any later entry (file OR dir) is NOT under it, we clear
-    // the wrapper for the rest of the stream so paths are taken verbatim.
-    // This avoids colliding top-level files with same-named files inside a
-    // nested directory (e.g. a project with a top-level README.md and a
-    // src/README.md under a picked Downloads/ parent).
-    let mut wrapper: Option<PathBuf> = None;
-    let mut wrapper_decided = false;
     let mut extracted = 0_u64;
     for item in archive
         .entries()
@@ -1452,31 +1443,12 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError
                 path.display()
             )));
         }
-        if !wrapper_decided {
-            if entry_type.is_dir() {
-                if wrapper.is_none() {
-                    wrapper = path
-                        .components()
-                        .next()
-                        .map(|component| PathBuf::from(component.as_os_str()));
-                }
-            } else {
-                wrapper_decided = true;
-            }
-        }
-        if let Some(candidate) = wrapper.as_ref()
-            && !path.starts_with(candidate)
-        {
-            wrapper = None;
-        }
-        let relative = wrapper
-            .as_deref()
-            .and_then(|prefix| path.strip_prefix(prefix).ok())
-            .unwrap_or(path.as_path());
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let output = destination.join(relative);
+        // Extract paths verbatim first. GitHub tarballs normally wrap every
+        // file in one repository directory, but that directory is not
+        // guaranteed to have its own tar entry. Deciding while streaming made
+        // archives beginning with `repo-sha/package.json` remain one level too
+        // deep, so framework detection could not see package.json.
+        let output = destination.join(&path);
         if !output.starts_with(destination) {
             return Err(GitHubError::UnsafeArchive(
                 "archive path escaped destination".into(),
@@ -1516,6 +1488,21 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError
         }
         file.sync_data()?;
     }
+    flatten_single_archive_wrapper(destination)?;
+    Ok(())
+}
+
+fn flatten_single_archive_wrapper(destination: &Path) -> Result<(), GitHubError> {
+    let mut entries = fs::read_dir(destination)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != 1 || !entries[0].file_type()?.is_dir() {
+        return Ok(());
+    }
+    let wrapper = entries.pop().expect("one archive root entry").path();
+    let children = fs::read_dir(&wrapper)?.collect::<Result<Vec<_>, _>>()?;
+    for child in children {
+        fs::rename(child.path(), destination.join(child.file_name()))?;
+    }
+    fs::remove_dir(wrapper)?;
     Ok(())
 }
 
@@ -2077,6 +2064,30 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join("src/index.js")).unwrap(), b"x");
         assert!(!dir.join("repo-sha").exists());
+    }
+
+    #[test]
+    fn archive_strips_github_wrapper_without_directory_entry() {
+        let dir = tmp();
+        let bytes = build_tar(&[
+            (
+                "owner-repo-9f0c6a7e1ea393fab43108a9ea8480a5800508d3/package.json",
+                br#"{"scripts":{"build":"next build","start":"next start"}}"#,
+                false,
+            ),
+            (
+                "owner-repo-9f0c6a7e1ea393fab43108a9ea8480a5800508d3/app/page.tsx",
+                b"export default function Page() {}",
+                false,
+            ),
+        ]);
+        safe_extract_archive(&bytes, &dir).unwrap();
+        assert!(dir.join("package.json").is_file());
+        assert!(dir.join("app/page.tsx").is_file());
+        assert!(
+            !dir.join("owner-repo-9f0c6a7e1ea393fab43108a9ea8480a5800508d3")
+                .exists()
+        );
     }
 
     #[test]

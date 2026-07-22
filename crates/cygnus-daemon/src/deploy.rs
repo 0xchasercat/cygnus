@@ -534,22 +534,6 @@ where
             return Err(error);
         }
     };
-    let build_plan = match preflight_workspace(
-        &workspace,
-        request.entry_explicit.then_some(requested_entry.as_path()),
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let _ = remove_work(&artifact_root, &deployment_id);
-            return Err(error);
-        }
-    };
-    let rootfs = workspace.parent().unwrap_or(&workspace);
-    if let Err(error) = stage_build_controls(rootfs) {
-        let _ = remove_work(&artifact_root, &deployment_id);
-        return Err(error);
-    };
-
     let input = DeploymentInput {
         id: deployment_id.clone(),
         app: request.app.clone(),
@@ -584,6 +568,34 @@ where
         }
     };
     if let Err(error) = state.set_deployment_log_path(&deployment_id, &log_path) {
+        return Err(fail_build(
+            state,
+            &artifact_root,
+            &building,
+            &log_path,
+            &deployment_id,
+            error.to_string(),
+        ));
+    }
+
+    let build_plan = match preflight_workspace(
+        &workspace,
+        request.entry_explicit.then_some(requested_entry.as_path()),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(fail_build(
+                state,
+                &artifact_root,
+                &building,
+                &log_path,
+                &deployment_id,
+                error.to_string(),
+            ));
+        }
+    };
+    let rootfs = workspace.parent().unwrap_or(&workspace);
+    if let Err(error) = stage_build_controls(rootfs) {
         return Err(fail_build(
             state,
             &artifact_root,
@@ -2422,6 +2434,43 @@ mod tests {
     }
 
     #[test]
+    fn next_app_detects_build_and_package_runtime() {
+        let workspace = temp_dir("detect-next");
+        fs::write(
+            workspace.join("package.json"),
+            br#"{
+                "scripts":{"dev":"next dev","build":"next build","start":"next start"},
+                "dependencies":{"next":"^14.2.3","react":"18.2.0","react-dom":"18.2.0"}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("package-lock.json"),
+            br#"{"name":"next-fixture","lockfileVersion":3,"packages":{}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join("app")).unwrap();
+        fs::write(
+            workspace.join("app/page.tsx"),
+            b"export default function Page() { return null; }\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            preflight_workspace(&workspace, None).unwrap(),
+            BuildPlan {
+                install: true,
+                frozen: false,
+                mode: BuildMode::Auto {
+                    build_script: Some("build".into())
+                },
+                detection: "auto-detect (package runtime)".into(),
+            }
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
     fn plain_server_detects_conventional_entry() {
         let workspace = temp_dir("detect-server");
         fs::create_dir_all(workspace.join("src")).unwrap();
@@ -2831,6 +2880,43 @@ mod tests {
         );
         assert_eq!(state.deployment_logs_dir(&id).unwrap(), Some(logs));
         assert!(artifacts.join("failed").join(id).is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_preflight_records_visible_logs_and_failed_state() {
+        let root = temp_dir("failed-preflight");
+        let source = root.join("source");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("package.json"),
+            br#"{"scripts":{"test":"bun test"}}"#,
+        )
+        .unwrap();
+        let mut state = State::open(root.join("state.db")).unwrap();
+        let shell = fs::canonicalize("/bin/sh").unwrap();
+        register_engine(&mut state, "shell", "/", shell).unwrap();
+        let mut request = DeployRequest::new(
+            &source,
+            "failed-preflight-app",
+            "failed-preflight.localhost",
+            "shell",
+            "index.ts",
+            &artifacts,
+            root.join("run/app.sock"),
+        );
+        request.entry = None;
+
+        let error = deploy(&mut state, request).expect_err("unknown app must fail preflight");
+        let DeployError::BuildFailed { id, logs, .. } = error else {
+            panic!("expected registered build failure, got {error:?}");
+        };
+        let stderr = fs::read_to_string(logs.join("build.stderr.log")).unwrap();
+        assert!(stderr.contains("could not detect app type"));
+        let deployment = state.deployment(&id).unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Failed);
+        assert_eq!(deployment.log_path, Some(logs));
         fs::remove_dir_all(root).unwrap();
     }
 
