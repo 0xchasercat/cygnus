@@ -344,13 +344,20 @@
             {/each}
           </div>
           <div class="install-block">
+            {#if store.github.app?.html_url}
+              <div class="install-cta">
+                <a class="btn cobalt sm" href="{store.github.app.html_url}" target="_blank" rel="noreferrer">
+                  Install App on GitHub <Icon name="arrowR" size={12} />
+                </a>
+                <p class="install-desc">Click to select which GitHub account and repositories this app is allowed to access. After installation, repositories appear below automatically.</p>
+              </div>
+            {/if}
             <form class="install-form" onsubmit={discoverRepos}>
-              <label>Installation ID
+              <label>Installation ID <span class="optional">(optional manual entry)</span>
                 <input bind:value={installationId} inputmode="numeric" pattern="[0-9]+" placeholder="12345678" />
               </label>
               <button class="btn sm" type="submit" disabled={githubBusy}>{githubBusy ? 'Discovering…' : 'Discover repositories'}</button>
             </form>
-            {#if githubError}<p class="inline-error" role="alert">{githubError}</p>{/if}
             {#if installationRepos.length}
               <div class="repo-list">
                 {#each installationRepos as repo (repo.repository_id)}
@@ -660,6 +667,10 @@
   }
 
   .certstate { font-size: 10.5px; color: var(--ink-3); width: 56px; text-align: right; }
+
+  .install-cta { margin-bottom: 14px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+  .install-desc { margin: 0; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+  .optional { font-size: 9px; opacity: 0.65; text-transform: lowercase; font-weight: normal; letter-spacing: 0; }
 
   .install-block { border-top: 1px solid var(--line-2); padding: 14px 18px; }
   .install-form { display: grid; grid-template-columns: minmax(180px, 280px) auto; gap: 10px; align-items: end; }

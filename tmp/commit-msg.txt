@@ -1,14 +1,12 @@
-fix: match daemon's serde snake_case kind "git_hub_status" in sanitizeGithubData
+ux: add direct "Install App on GitHub" button to eliminate manual Installation ID entry
 
-The Rust daemon serializes `AdminData::GitHubStatus` using serde's `rename_all = "snake_case"`,
-which turns `GitHubStatus` into `"git_hub_status"` (with an underscore between `git` and `hub`).
+Creating a GitHub App from a manifest registers the App in GitHub and Cygnus,
+but does not automatically install it on a user/org account until the operator
+completes the GitHub installation step.
 
-`console/server.js`'s `sanitizeGithubData` function previously only checked `kind === "github_status"`.
-Because `data.kind` was `"git_hub_status"`, the check failed, and `sanitizeGithubData` stripped the
-`configured` and `app` fields from the API response payload, returning `{ kind: "git_hub_status" }`.
-
-Consequently, `live.svelte.js` evaluated `d?.configured === true` as `false` (`undefined === true`),
-leaving `this.github.configured = false` in the UI even after the GitHub App was stored in SQLite.
-
-Updated `sanitizeGithubData` to accept `"git_hub_status"` as well as `"github_status"`, normalizing
-the response to `"github_status"` with `configured` and `app` preserved. Added unit test.
+Previously, the UI fell back to a manual numeric input for "Installation ID".
+Added a direct `[Install App on GitHub ->]` primary action linking to
+`store.github.app.html_url`. Clicking the button opens GitHub's installation
+picker directly; upon clicking "Install", GitHub redirects back to Cygnus at
+`/?github=setup&installation_id=...`, which automatically auto-discovers and
+populates the repositories list without requiring any manual copy-pasting.
