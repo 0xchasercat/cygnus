@@ -45,13 +45,29 @@
   let githubOwner = $state('');
   let githubError = $state('');
   let githubBusy = $state(false);
-  let repoConfig = $state({});
-  let repoErrors = $state({});
-  let mappingBusy = $state({});
+  let repoQuery = $state('');
+  let selectedRepoId = $state(null);
+  let mapBusy = $state(false);
+  let mapError = $state('');
+  let mapDraft = $state({ app: '', domain: '', engine_version: '', entry: '' });
 
   const discoverableRepos = $derived(store.github.discoverable ?? []);
   const installationCount = $derived((store.github.installations ?? []).length);
   const appsDomain = $derived(store.node?.apps_domain ?? store.node?.apex_domain ?? '');
+  const filteredRepos = $derived.by(() => {
+    const q = repoQuery.trim().toLowerCase();
+    const items = discoverableRepos;
+    if (!q) return items;
+    return items.filter((repo) => {
+      const full = (repo.full_name ?? `${repo.owner}/${repo.name}`).toLowerCase();
+      return full.includes(q) || String(repo.owner ?? '').toLowerCase().includes(q) || String(repo.name ?? '').toLowerCase().includes(q);
+    });
+  });
+  const selectedRepo = $derived(
+    selectedRepoId == null
+      ? null
+      : discoverableRepos.find((r) => r.repository_id === selectedRepoId) ?? null
+  );
 
   // ——— dashboard domain + SSL ———
   let dashEditOpen = $state(false);
@@ -159,17 +175,24 @@
     if (!r.ok) githubError = r.error ?? 'GitHub setup could not start';
   }
 
-  function seedRepoDrafts(repos) {
-    for (const repo of repos) {
-      if (!repoConfig[repo.repository_id]) {
-        repoConfig[repo.repository_id] = {
-          app: repo.name,
-          domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
-          engine_version: defaultEngine,
-          entry: '',
-        };
-      }
-    }
+  function defaultDraftFor(repo) {
+    return {
+      app: repo.name,
+      domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
+      engine_version: defaultEngine,
+      entry: '',
+    };
+  }
+
+  function selectRepo(repo) {
+    selectedRepoId = repo.repository_id;
+    mapError = '';
+    mapDraft = defaultDraftFor(repo);
+  }
+
+  function clearSelectedRepo() {
+    selectedRepoId = null;
+    mapError = '';
   }
 
   async function refreshDiscoverable() {
@@ -179,30 +202,35 @@
     const r = await store.discoverRepositories();
     githubBusy = false;
     if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
-    seedRepoDrafts(r.repositories ?? discoverableRepos);
+    // Keep selection only if the repo is still present.
+    if (selectedRepoId != null && !(r.repositories ?? []).some((repo) => repo.repository_id === selectedRepoId)) {
+      clearSelectedRepo();
+    }
   }
 
-  async function configureRepo(e, repo) {
+  async function configureSelected(e) {
     e.preventDefault();
-    const draft = repoConfig[repo.repository_id] ?? {};
-    mappingBusy = { ...mappingBusy, [repo.repository_id]: true };
+    const repo = selectedRepo;
+    if (!repo || mapBusy) return;
+    mapBusy = true;
+    mapError = '';
     const r = await store.configureRepository({
       installation_id: repo.installation_id,
       repository_id: repo.repository_id,
       owner: repo.owner,
       name: repo.name,
       branch: repo.default_branch,
-      app: draft.app ?? repo.name,
-      domain: draft.domain ?? '',
-      engine_version: draft.engine_version || defaultEngine,
-      entry: (draft.entry ?? '').trim() || undefined,
+      app: mapDraft.app || repo.name,
+      domain: mapDraft.domain || '',
+      engine_version: mapDraft.engine_version || defaultEngine,
+      entry: (mapDraft.entry ?? '').trim() || undefined,
     });
-    mappingBusy = { ...mappingBusy, [repo.repository_id]: false };
+    mapBusy = false;
     if (!r.ok) {
-      repoErrors = { ...repoErrors, [repo.repository_id]: r.error ?? 'Repository configuration failed' };
+      mapError = r.error ?? 'Repository configuration failed';
       return;
     }
-    repoErrors = { ...repoErrors, [repo.repository_id]: '' };
+    clearSelectedRepo();
     await store.refreshGithub();
   }
 
@@ -268,14 +296,7 @@
 
   // Auto-load discoverable repos — never ask for an installation ID.
   onMount(() => {
-    if (store.github.configured) {
-      seedRepoDrafts(discoverableRepos);
-      if (!discoverableRepos.length) refreshDiscoverable();
-    }
-  });
-
-  $effect(() => {
-    seedRepoDrafts(discoverableRepos);
+    if (store.github.configured && !discoverableRepos.length) refreshDiscoverable();
   });
 </script>
 
@@ -376,40 +397,63 @@
                 </a>
               {/if}
               <button class="btn sm" type="button" onclick={refreshDiscoverable} disabled={githubBusy}>
-                {githubBusy ? 'Refreshing…' : 'Refresh repositories'}
+                {githubBusy ? 'Refreshing…' : 'Refresh'}
               </button>
               <p class="install-desc">
-                {#if installationCount}
-                  Repositories from your GitHub installation appear below automatically. Map a repo to deploy on push.
-                {:else}
-                  Install the app on a GitHub account or organization, then repositories appear here automatically.
-                {/if}
+                Search your accessible repositories, pick one, then configure the mapping.
               </p>
               {#if githubError}<p class="inline-error" role="alert">{githubError}</p>{/if}
             </div>
-            {#if discoverableRepos.length}
-              <div class="repo-list">
-                {#each discoverableRepos as repo (repo.repository_id)}
-                  {@const draft = repoConfig[repo.repository_id] ?? { app: repo.name, domain: appsDomain ? `${repo.name}.${appsDomain}` : '', engine_version: defaultEngine, entry: '' }}
+
+            {#if selectedRepo}
+              <form class="map-panel" onsubmit={configureSelected}>
+                <div class="map-head">
+                  <div class="repo-identity">
+                    <strong>{selectedRepo.full_name ?? `${selectedRepo.owner}/${selectedRepo.name}`}</strong>
+                    <small>{selectedRepo.private ? 'private' : 'public'} · default {selectedRepo.default_branch}</small>
+                  </div>
+                  <button class="btn sm" type="button" onclick={clearSelectedRepo}>Back</button>
+                </div>
+                <div class="repo-fields">
+                  <label>App<input bind:value={mapDraft.app} maxlength="64" required /></label>
+                  <label>Domain<input bind:value={mapDraft.domain} maxlength="253" placeholder="app.example.com" required /></label>
+                  <label>Engine<input bind:value={mapDraft.engine_version} maxlength="128" required /></label>
+                  <label>Entry <span class="optional">(optional)</span><input bind:value={mapDraft.entry} maxlength="128" placeholder="auto" /></label>
+                </div>
+                {#if mapError}<p class="inline-error" role="alert">{mapError}</p>{/if}
+                <div class="map-actions">
+                  <button class="btn cobalt sm" type="submit" disabled={mapBusy}>
+                    {mapBusy ? 'Mapping…' : 'Map repository'}
+                  </button>
+                </div>
+              </form>
+            {:else if discoverableRepos.length}
+              <div class="repo-search">
+                <input
+                  type="search"
+                  bind:value={repoQuery}
+                  placeholder="Search repositories…"
+                  aria-label="Search repositories"
+                />
+                <span class="repo-search-count num">{filteredRepos.length} of {discoverableRepos.length}</span>
+              </div>
+              <div class="repo-pick-list">
+                {#each filteredRepos as repo (repo.repository_id)}
                   {@const alreadyMapped = store.github.repositories.some((r) => r.repository_id === repo.repository_id)}
-                  <form class="repo-card" onsubmit={(e) => configureRepo(e, repo)}>
-                    <div class="repo-card-head">
-                      <div class="repo-identity">
-                        <strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong>
-                        <small>{repo.private ? 'private' : 'public'} · default {repo.default_branch}{#if alreadyMapped} · mapped{/if}</small>
-                      </div>
-                      <button class="btn cobalt sm" type="submit" disabled={mappingBusy[repo.repository_id] || alreadyMapped}>
-                        {alreadyMapped ? 'Mapped' : mappingBusy[repo.repository_id] ? 'Mapping…' : 'Map'}
-                      </button>
+                  <button
+                    type="button"
+                    class="repo-pick"
+                    class:mapped={alreadyMapped}
+                    onclick={() => selectRepo(repo)}
+                  >
+                    <div class="repo-identity">
+                      <strong>{repo.full_name ?? `${repo.owner}/${repo.name}`}</strong>
+                      <small>{repo.private ? 'private' : 'public'} · {repo.default_branch}{#if alreadyMapped} · already mapped{/if}</small>
                     </div>
-                    <div class="repo-fields">
-                      <label>App<input value={draft.app} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, app: e.currentTarget.value })} maxlength="64" required disabled={alreadyMapped} /></label>
-                      <label>Domain<input value={draft.domain} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, domain: e.currentTarget.value })} maxlength="253" placeholder="app.example.com" required disabled={alreadyMapped} /></label>
-                      <label>Engine<input value={draft.engine_version} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, engine_version: e.currentTarget.value })} maxlength="128" required disabled={alreadyMapped} /></label>
-                      <label>Entry <span class="optional">(optional)</span><input value={draft.entry} oninput={(e) => (repoConfig[repo.repository_id] = { ...draft, entry: e.currentTarget.value })} maxlength="128" placeholder="auto" disabled={alreadyMapped} /></label>
-                    </div>
-                    {#if repoErrors[repo.repository_id]}<p class="inline-error" role="alert">{repoErrors[repo.repository_id]}</p>{/if}
-                  </form>
+                    <Icon name="arrowR" size={12} />
+                  </button>
+                {:else}
+                  <div class="empty mono">no repositories match “{repoQuery}”</div>
                 {/each}
               </div>
             {:else if githubBusy}
@@ -718,23 +762,52 @@
 
   .install-block { border-top: 1px solid var(--line-2); padding: 14px 18px; min-width: 0; }
 
-  .repo-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-  .repo-card {
+  .repo-search {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .repo-search input {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 9px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .repo-search-count { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+
+  .repo-pick-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    padding: 12px;
-    border: 1px solid var(--line-2);
-    border-radius: 10px;
+    gap: 6px;
+    max-height: 360px;
+    overflow-y: auto;
     min-width: 0;
   }
-  .repo-card-head {
+  .repo-pick {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+    width: 100%;
+    text-align: left;
+    padding: 11px 12px;
+    border: 1px solid var(--line-2);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
     min-width: 0;
   }
+  .repo-pick:hover { border-color: var(--cobalt); background: var(--cobalt-ghost); }
+  .repo-pick.mapped { opacity: 0.72; }
   .repo-identity { min-width: 0; flex: 1; }
   .repo-identity strong {
     display: block;
@@ -744,6 +817,23 @@
     white-space: nowrap;
   }
   .repo-identity small { display: block; margin-top: 4px; color: var(--ink-4); font-size: 10px; }
+
+  .map-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
+    border: 1px solid var(--line-2);
+    border-radius: 10px;
+    min-width: 0;
+  }
+  .map-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+  }
   .repo-fields {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -763,7 +853,7 @@
     border-radius: 7px; background: var(--surface); color: var(--ink);
     padding: 7px 9px; font-family: var(--mono); font-size: 11.5px;
   }
-  .repo-fields input:disabled { opacity: 0.55; }
+  .map-actions { display: flex; justify-content: flex-end; }
 
   .jobs { border-top: 1px solid var(--line-2); }
   .jobs-head { padding: 12px 18px 4px; }
@@ -910,7 +1000,7 @@
 
   @media (max-width: 1080px) {
     .grid { grid-template-columns: 1fr; }
-    .addform, .dash-form { grid-template-columns: 1fr; }
+    .addform, .dash-form, .repo-search { grid-template-columns: 1fr; }
     .repo-fields { grid-template-columns: 1fr; }
   }
 </style>
