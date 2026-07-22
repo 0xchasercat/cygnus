@@ -1287,10 +1287,10 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError
                 wrapper_decided = true;
             }
         }
-        if let Some(candidate) = wrapper.as_ref() {
-            if !path.starts_with(candidate) {
-                wrapper = None;
-            }
+        if let Some(candidate) = wrapper.as_ref()
+            && !path.starts_with(candidate)
+        {
+            wrapper = None;
         }
         let relative = wrapper
             .as_deref()
@@ -1866,7 +1866,11 @@ mod tests {
     fn write_entry(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str, body: &[u8], dir: bool) {
         let mut header = tar::Header::new_gnu();
         header.set_path(path).unwrap();
-        header.set_entry_type(if dir { tar::EntryType::Directory } else { tar::EntryType::Regular });
+        header.set_entry_type(if dir {
+            tar::EntryType::Directory
+        } else {
+            tar::EntryType::Regular
+        });
         header.set_size(if dir { 0 } else { body.len() as u64 });
         header.set_mode(0o644);
         header.set_cksum();
@@ -1888,9 +1892,16 @@ mod tests {
     #[test]
     fn archive_strips_github_style_wrapper() {
         let dir = tmp();
-        let bytes = build_tar(&[("repo-sha", b"", true), ("repo-sha/README.md", b"hello", false), ("repo-sha/src/index.js", b"x", false)]);
+        let bytes = build_tar(&[
+            ("repo-sha", b"", true),
+            ("repo-sha/README.md", b"hello", false),
+            ("repo-sha/src/index.js", b"x", false),
+        ]);
         safe_extract_archive(&bytes, &dir).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "hello"
+        );
         assert_eq!(std::fs::read(dir.join("src/index.js")).unwrap(), b"x");
         assert!(!dir.join("repo-sha").exists());
     }
@@ -1900,18 +1911,39 @@ mod tests {
         let dir = tmp();
         let bytes = build_tar(&[("README.md", b"top", false), ("package.json", b"{}", false)]);
         safe_extract_archive(&bytes, &dir).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "top");
-        assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "{}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("package.json")).unwrap(),
+            "{}"
+        );
     }
 
     #[test]
     fn archive_preserves_paths_when_wrapper_does_not_cover_every_entry() {
         let dir = tmp();
-        let bytes = build_tar(&[("src", b"", true), ("README.md", b"top", false), ("package.json", b"{}", false), ("src/index.js", b"x", false), ("src/README.md", b"inner", false)]);
+        let bytes = build_tar(&[
+            ("src", b"", true),
+            ("README.md", b"top", false),
+            ("package.json", b"{}", false),
+            ("src/index.js", b"x", false),
+            ("src/README.md", b"inner", false),
+        ]);
         safe_extract_archive(&bytes, &dir).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "top");
-        assert_eq!(std::fs::read_to_string(dir.join("src/README.md")).unwrap(), "inner");
-        assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "{}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/README.md")).unwrap(),
+            "inner"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("package.json")).unwrap(),
+            "{}"
+        );
     }
 
     #[test]
@@ -1929,7 +1961,9 @@ mod tests {
             builder.append(&header, io::empty()).unwrap();
             builder.finish().unwrap();
         }
-        assert!(matches!(safe_extract_archive(&bytes, &path), Err(GitHubError::UnsafeArchive(_))));
+        assert!(matches!(
+            safe_extract_archive(&bytes, &path),
+            Err(GitHubError::UnsafeArchive(_))
+        ));
     }
-
 }
