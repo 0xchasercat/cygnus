@@ -83,13 +83,6 @@
 
     <footer class="colophon num">
       <span>{footer}</span>
-      {#if store.mode === 'live'}
-        {#if store.connected}
-          <span class="conn"><span class="led live breathe"></span>connected</span>
-        {:else}
-          <span class="conn amber"><span class="led build breathe"></span>reconnecting…</span>
-        {/if}
-      {/if}
     </footer>
   </div>
 
@@ -117,13 +110,6 @@
     gap: 12px;
     align-items: center;
   }
-  .conn {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-  }
-  .conn .led { width: 6px; height: 6px; }
-  .conn.amber { color: var(--amber); }
 
   .loading {
     min-height: 100vh;
