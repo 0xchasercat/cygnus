@@ -651,6 +651,14 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
                 return Err("installation and repository ids must be positive".into());
             }
         }
+        AdminCommand::TriggerDeploy {
+            installation_id,
+            repository_id,
+        } => {
+            if *installation_id <= 0 || *repository_id <= 0 {
+                return Err("installation and repository ids must be positive".into());
+            }
+        }
         AdminCommand::ListInstallationRepositories { installation_id } => {
             if *installation_id <= 0 {
                 return Err("installation id must be positive".into());

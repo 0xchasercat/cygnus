@@ -193,6 +193,10 @@ pub enum AdminCommand {
     ConfigureRepository {
         repository: GitHubRepositoryInput,
     },
+    TriggerDeploy {
+        installation_id: i64,
+        repository_id: i64,
+    },
     WebhookBegin {
         delivery_id: String,
         event: String,
@@ -455,6 +459,9 @@ pub enum AdminData {
     },
     RepositoryConfigured {
         repository: GitHubRepositoryView,
+    },
+    DeployTriggered {
+        job: Box<GitHubJobView>,
     },
     WebhookBegun {
         delivery_id: String,

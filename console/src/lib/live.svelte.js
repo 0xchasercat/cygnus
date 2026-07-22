@@ -772,6 +772,20 @@ class Store {
     }
   }
 
+  async triggerDeploy(installationId, repositoryId) {
+    try {
+      const data = await post('/api/v1/github/trigger-deploy', {
+        installation_id: installationId,
+        repository_id: repositoryId,
+      });
+      this.notice = 'Build queued.';
+      await this.#poll();
+      return { ok: true, job: data };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Failed to trigger build' };
+    }
+  }
+
   async retryJob(id) {
     try {
       await post(`/api/v1/github/jobs/${encodeURIComponent(id)}/retry`);

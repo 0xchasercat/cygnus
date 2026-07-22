@@ -623,6 +623,19 @@ impl StateAdminHandler {
                     .map_err(github_fault)?;
                 Ok(AdminData::RepositoryConfigured { repository })
             }
+            AdminCommand::TriggerDeploy {
+                installation_id,
+                repository_id,
+            } => {
+                let github = self.github_manager()?;
+                let audit = self.request_audit(role, peer, request, "trigger_deploy")?;
+                let job = github
+                    .trigger_initial_deploy(installation_id, repository_id, &audit)
+                    .map_err(github_fault)?;
+                Ok(AdminData::DeployTriggered {
+                    job: Box::new(job_view(job)),
+                })
+            }
             AdminCommand::WebhookBegin {
                 delivery_id,
                 event,

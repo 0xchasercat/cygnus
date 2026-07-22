@@ -336,9 +336,21 @@ async function buildAuto() {
       const meta = await lstat(fullPath);
       if (meta.isFile()) {
         phaseLog("detect", `server entry found: ${candidate} → server mode`);
-        // Write the entry path so the daemon can launch it.
-        const entryMarker = join(OUTPUT, "entry.txt");
-        await Bun.write(entryMarker, candidate);
+        // Bundle the standalone entry so the daemon can run it with the shim.
+        const result = await Bun.build({
+          entrypoints: [fullPath],
+          root: WORKSPACE,
+          outdir: OUTPUT,
+          ...DETERMINISTIC_BUILD_OPTIONS,
+        });
+        if (result.success) {
+          phaseLog("build", "standalone entry bundled successfully");
+          return 0;
+        }
+        phaseLog("build", "standalone bundle failed, copying as-is");
+        // Fallback: copy the entry file directly.
+        const dest = join(OUTPUT, "entry.js");
+        await copyFile(fullPath, dest);
         return 0;
       }
     } catch {
@@ -346,23 +358,7 @@ async function buildAuto() {
     }
   }
 
-  // 3. No standalone entry — fall back to scripts.start from package.json.
-  //    This handles `next start`, `nuxt start`, etc. where the framework
-  //    CLI manages the server process.
-  try {
-    const pkg = JSON.parse(await Bun.file(join(WORKSPACE, "package.json")).text());
-    const startCmd = pkg?.scripts?.start;
-    if (typeof startCmd === "string" && startCmd.trim().length > 0) {
-      phaseLog("detect", `scripts.start found: "${startCmd}" → server mode (start script)`);
-      const entryMarker = join(OUTPUT, "entry.txt");
-      await Bun.write(entryMarker, `__start__:${startCmd}`);
-      return 0;
-    }
-  } catch {
-    // No package.json or unparseable.
-  }
-
-  // 4. Nothing worked — fail with guidance.
+  // 3. Nothing worked — fail with guidance.
   phaseLog(
     "detect",
     "build completed but no static output or server entry found; pass --entry <path>",

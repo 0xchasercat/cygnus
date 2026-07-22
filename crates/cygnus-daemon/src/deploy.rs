@@ -1701,25 +1701,6 @@ fn validate_static_public_root(app: &Path) -> Result<(), DeployError> {
 }
 
 fn expected_generated_entry(app: &Path, mode: &BuildMode) -> Result<PathBuf, DeployError> {
-    // For Auto mode, read the entry marker written by buildAuto.
-    if let BuildMode::Auto { .. } = mode {
-        let entry_marker = app.join("entry.txt");
-        if let Ok(content) = fs::read_to_string(&entry_marker) {
-            let content = content.trim().to_string();
-            if content.starts_with("__start__:") {
-                // Start script mode — the daemon will run `bun run start`.
-                // Return a synthetic path; the runtime config handles this.
-                return Ok(app.join("__start__.js"));
-            }
-            // Explicit entry path from framework standalone detection.
-            let entry_path = app.join(&content);
-            if entry_path.exists() {
-                return Ok(entry_path);
-            }
-        }
-        // Fall through to standard entry detection.
-    }
-
     let expected = app.join(mode.generated_entry().with_extension("js"));
     match fs::symlink_metadata(&expected) {
         Ok(metadata) if metadata.file_type().is_file() => return Ok(expected),

@@ -167,11 +167,12 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   const appEnvRoute = /^\/api\/v1\/apps\/[^/]+\/env$/u.test(path);
   const appEnvKeyRoute = /^\/api\/v1\/apps\/[^/]+\/env\/[^/]+$/u.test(path);
   const githubReposRoute = path === "/api/v1/github/repositories";
+  const githubTriggerRoute = /^\/api\/v1\/github\/trigger-deploy$/u.test(path);
   const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || passwordRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
-  ].includes(path) || /^\/api\/v1\/github\/jobs\/[^/]+\/retry$/u.test(path);
+  ].includes(path) || githubTriggerRoute || /^\/api\/v1\/github\/jobs\/[^/]+\/retry$/u.test(path);
   const readRoute = /^(?:\/api\/v1\/(?:status|apps|deployments)|\/api\/v1\/github\/(?:status|repositories|installations\/[^/]+\/repositories|discoverable-repositories|jobs))(?:\/[^/]+)?$/u.test(path)
     || /^\/api\/v1\/(?:metrics|requests|events)$/u.test(path)
     || /^\/api\/v1\/(?:apps|deployments)\/[^/]+\/logs$/u.test(path);
@@ -604,6 +605,9 @@ export async function commandForRequest(request, url) {
   if (parts.length === 4 && parts[2] === "github" && parts[3] === "repositories") {
     return configureRepositoryCommand(await readJsonBody(request));
   }
+  if (parts.length === 4 && parts[2] === "github" && parts[3] === "trigger-deploy") {
+    return triggerDeployCommand(await readJsonBody(request));
+  }
   if (parts.length === 6 && parts[2] === "github" && parts[3] === "jobs" && parts[5] === "retry") {
     await assertEmptyBody(request);
     return retryDeployJobCommand(decodeSegment(parts[4], "job id"));
@@ -922,6 +926,15 @@ export function configureRepositoryCommand(body) {
   return {
     type: "configure_repository",
     repository,
+  };
+}
+
+export function triggerDeployCommand(body) {
+  assertExactKeys(body, ["installation_id", "repository_id"]);
+  return {
+    type: "trigger_deploy",
+    installation_id: safePositiveId(body.installation_id),
+    repository_id: safePositiveId(body.repository_id),
   };
 }
 

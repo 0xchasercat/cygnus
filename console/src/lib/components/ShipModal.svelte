@@ -308,11 +308,19 @@
       engine_version: mapDraft.engine_version || defaultEngine,
       entry: (mapDraft.entry ?? '').trim() || undefined,
     });
-    mapBusy = false;
     if (!r.ok) {
+      mapBusy = false;
       mapError = r.error ?? 'Repository configuration failed';
       return;
     }
+    // Trigger initial build.
+    const trigger = await store.triggerDeploy(repo.installation_id, repo.repository_id);
+    mapBusy = false;
+    if (!trigger.ok) {
+      mapError = trigger.error ?? 'Build could not be triggered';
+      return;
+    }
+    ui.shipOpen = false;
     clearSelectedRepo();
     await store.refreshGithub();
   }
@@ -437,7 +445,7 @@
         {:else}
           <div class="git">
             {#if !store.github.configured}
-              <p class="git-copy">Create the private Cygnus GitHub App, install it, then map one branch to deploy on push.</p>
+              <p class="git-copy">Create the private Cygnus GitHub App, install it, then connect a repo to deploy.</p>
               <form class="github-start" onsubmit={connectGithub}>
                 <label>Organization (optional)<input bind:value={githubOwner} maxlength="39" placeholder="acme" autocomplete="organization" /></label>
                 <button class="btn cobalt" type="submit" disabled={githubBusy}>{githubBusy ? 'Opening GitHub…' : 'Connect GitHub'}</button>
@@ -477,7 +485,7 @@
                   {#if mapError}<p class="inline-error" role="alert">{mapError}</p>{/if}
                   <div class="map-actions">
                     <button class="btn cobalt sm" type="submit" disabled={mapBusy}>
-                      {mapBusy ? 'Mapping…' : 'Map repository'}
+                      {mapBusy ? 'Deploying…' : 'Deploy'}
                     </button>
                   </div>
                 </form>

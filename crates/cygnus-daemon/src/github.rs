@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare};
 use crate::state::{
-    AuditContext, DeployJobSource, DeployJobSpec, DeploymentSource, GitHubAppRecord,
+    AuditContext, DeployJob, DeployJobSource, DeployJobSpec, DeploymentSource, GitHubAppRecord,
     GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus, GitHubJobKind,
     GitHubRepositoryConfig, State, StateError,
 };
@@ -571,6 +571,78 @@ impl GitHubManager {
         };
         state.configure_github_repository_with_audit(&config, audit)?;
         Ok(config.into())
+    }
+
+    /// Trigger an initial build for a newly configured repository.
+    /// Fetches the latest commit SHA from GitHub and enqueues a deploy job.
+    pub fn trigger_initial_deploy(
+        &self,
+        installation_id: i64,
+        repository_id: i64,
+        _audit: &AuditContext,
+    ) -> Result<DeployJob, GitHubError> {
+        let state = State::open(&self.state_path)?;
+        let config = state
+            .github_repository(installation_id, repository_id)?
+            .ok_or_else(|| GitHubError::InvalidInput("repository not configured".into()))?;
+
+        // Fetch the latest commit SHA from GitHub.
+        let token = self.installation_token(installation_id, None)?;
+        let auth = format!("Bearer {token}");
+        let path = format!(
+            "/repos/{}/{}/commits/{}?per_page=1",
+            config.owner, config.name, config.branch
+        );
+        let response = self.transport.request_limited(
+            "GET",
+            &path,
+            Some(&auth),
+            None,
+            MAX_NORMAL_BODY_BYTES,
+        )?;
+        if response.status != 200 {
+            return Err(http_status(
+                "fetch latest commit",
+                response.status,
+                &response.body,
+            ));
+        }
+        let value: Value = serde_json::from_slice(&response.body)?;
+        let sha = value
+            .get("sha")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GitHubError::InvalidInput("commit response omitted sha".into()))?
+            .to_owned();
+
+        // Create and enqueue the deploy job.
+        let job = DeployJobSpec {
+            id: job_id("initial", installation_id, repository_id, None, &sha),
+            key: format!("{installation_id}:{repository_id}:initial"),
+            source: DeployJobSource::GitHub,
+            source_path: PathBuf::from(format!("{}/{}", config.owner, config.name)),
+            source_ref: sha.clone(),
+            app: config.app,
+            domain: config.domain,
+            engine_version: config.engine_version,
+            entry: config.entry,
+            artifact_root: config.artifact_root,
+            upstream: config.upstream,
+            branch: Some(config.branch),
+            commit: Some(sha),
+            installation_id: Some(installation_id),
+            repository_id: Some(repository_id),
+            owner: Some(config.owner),
+            name: Some(config.name),
+            environment: Some("production".into()),
+            kind: Some(GitHubJobKind::Production),
+            pull_request: None,
+        };
+
+        let mut state = State::open(&self.state_path)?;
+        state.enqueue_deploy_job(&job)?;
+        state
+            .deploy_job(&job.id)?
+            .ok_or_else(|| GitHubError::InvalidInput("enqueued job not found".into()))
     }
 
     pub fn repositories(&self) -> Result<Vec<GitHubRepositoryView>, GitHubError> {
