@@ -1,12 +1,14 @@
-fix: force immediate GitHub status fetch on callback redirect
+fix: match daemon's serde snake_case kind "git_hub_status" in sanitizeGithubData
 
-When returning from GitHub App setup or installation, `#handleGithubCallback`
-invoked `#poll()`, but `#poll()` only fetched `/api/v1/github/status` on every
-3rd tick (`this.#tick % GITHUB_EVERY === 0`). Because `#tick` was usually not
-divisible by 3 on the single forced poll, the status fetch was skipped, leaving
-`this.github.configured = false` and causing the UI to render the unconfigured
-"Connect GitHub" form.
+The Rust daemon serializes `AdminData::GitHubStatus` using serde's `rename_all = "snake_case"`,
+which turns `GitHubStatus` into `"git_hub_status"` (with an underscore between `git` and `hub`).
 
-Added `refreshGithub()` which immediately fetches status, repositories, and jobs
-in parallel, and call it directly from `#handleGithubCallback()`. Also supported
-`#poll(forceGithub = true)` to bypass the cadence check when needed.
+`console/server.js`'s `sanitizeGithubData` function previously only checked `kind === "github_status"`.
+Because `data.kind` was `"git_hub_status"`, the check failed, and `sanitizeGithubData` stripped the
+`configured` and `app` fields from the API response payload, returning `{ kind: "git_hub_status" }`.
+
+Consequently, `live.svelte.js` evaluated `d?.configured === true` as `false` (`undefined === true`),
+leaving `this.github.configured = false` in the UI even after the GitHub App was stored in SQLite.
+
+Updated `sanitizeGithubData` to accept `"git_hub_status"` as well as `"github_status"`, normalizing
+the response to `"github_status"` with `configured` and `app` preserved. Added unit test.

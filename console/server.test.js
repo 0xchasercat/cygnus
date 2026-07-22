@@ -685,6 +685,23 @@ describe("console request validation", () => {
     expect(result.data.manifest.url).toBe("https://console.cygnus.run");
     expect(result.data.manifest.hook_attributes.url).toBe("https://console.cygnus.run/github/webhook");
   });
+
+  test("sanitizes git_hub_status from daemon serde snake_case to github_status", async () => {
+    process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN = "bootstrap";
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "session";
+    const cookie = signSession();
+    const url = new URL("http://localhost/api/v1/github/status");
+    const response = await handleApi(
+      new Request(url, { headers: { cookie } }),
+      url,
+      async () => ({ data: { kind: "git_hub_status", configured: true, app: { app_id: "123", name: "test-app" } } }),
+      "/admin.sock",
+    );
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result.data.configured).toBe(true);
+    expect(result.data.app.name).toBe("test-app");
+  });
   test("maps daemon error codes to safe HTTP statuses", () => {
     expect(statusForDaemonCode("unauthorized")).toBe(401);
     expect(statusForDaemonCode("forbidden")).toBe(403);

@@ -1472,8 +1472,8 @@ function sanitizeGithubData(data) {
     return { kind, repositories, ...(data.next_cursor ? { next_cursor: data.next_cursor } : {}) };
   }
   if (kind === "repository_configured") return { kind, repository: sanitizeConfiguredRepository(data.repository) };
-  if (kind === "github_status" || kind === "manifest_converted") {
-    return { kind, ...(typeof data.configured === "boolean" ? { configured: data.configured } : {}), ...(data.app ? { app: sanitizeGithubApp(data.app) } : {}) };
+  if (kind === "github_status" || kind === "git_hub_status" || kind === "manifest_converted") {
+    return { kind: "github_status", ...(typeof data.configured === "boolean" ? { configured: data.configured } : {}), ...(data.app ? { app: sanitizeGithubApp(data.app) } : {}) };
   }
   if (kind === "deploy_jobs") {
     const jobs = Array.isArray(data.jobs) ? data.jobs.map(sanitizeGithubJob) : [];
