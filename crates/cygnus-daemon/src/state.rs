@@ -26,6 +26,7 @@ use cygnus_supervisor::{
 use getrandom::fill as random_fill;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use thiserror::Error;
@@ -3160,7 +3161,7 @@ impl State {
                 params![
                     job.id,
                     job.app,
-                    job.source_ref,
+                    provisional_source_hash(&job.source_ref),
                     job.engine_version,
                     job.branch,
                     job.commit,
@@ -5004,6 +5005,13 @@ fn validate_hash(hash: &str, kind: &str) -> Result<(), StateError> {
         });
     }
     Ok(())
+}
+
+/// A valid temporary source identity for queued work whose canonical workspace
+/// digest is not available until source intake. `resume_building_deployment`
+/// replaces it with the real content hash before the build begins.
+pub(crate) fn provisional_source_hash(source_ref: &str) -> String {
+    hex::encode(Sha256::digest(source_ref.as_bytes()))
 }
 
 fn metadata_value<'a>(
@@ -7026,6 +7034,19 @@ mod tests {
         assert_eq!(state.deployments(None, None, 1).unwrap(), [resumed]);
         drop(state);
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn git_commit_refs_get_valid_provisional_source_hashes() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let hash = provisional_source_hash(commit);
+        assert_eq!(hash.len(), SHA256_HEX_LEN);
+        assert!(validate_hash(&hash, "source hash").is_ok());
+        assert_eq!(hash, provisional_source_hash(commit));
+        assert_ne!(
+            hash,
+            provisional_source_hash("1123456789abcdef0123456789abcdef01234567")
+        );
     }
 
     #[test]

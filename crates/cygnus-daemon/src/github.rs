@@ -28,7 +28,7 @@ use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_
 use crate::state::{
     AuditContext, DeployJob, DeployJobSource, DeployJobSpec, DeploymentInput, DeploymentSource,
     GitHubAppRecord, GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus,
-    GitHubJobKind, GitHubRepositoryConfig, State, StateError,
+    GitHubJobKind, GitHubRepositoryConfig, State, StateError, provisional_source_hash,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -643,7 +643,7 @@ impl GitHubManager {
             &DeploymentInput {
                 id: job.id.clone(),
                 app: job.app.clone(),
-                source_hash: job.source_ref.clone(),
+                source_hash: provisional_source_hash(&job.source_ref),
                 engine_version: job.engine_version.clone(),
                 source: DeploymentSource::github(job.branch.clone(), job.commit.clone()),
             },
