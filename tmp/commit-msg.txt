@@ -1,22 +1,27 @@
-fix: poll on GitHub callback redirect so the connected state shows immediately
+fix: stop hiding the GitHub manifest form with display:none
 
-After the user creates a GitHub App from the manifest, the server
-exchanges the conversion code at /github/app/manifest/callback (per
-GitHub's manifest spec) and 303-redirects to /?github=configured. The
-console's live store was setting a notice on that URL but never
-re-polling, so the operator saw a stale "Connect GitHub" form even
-though the daemon had already stored the new app. Force a poll on
-the configured/setup query params so the connected state shows up
-without waiting for the next periodic tick.
+The console's "Connect GitHub" flow builds a synthetic form, appends
+it to document.body, and calls form.submit() to POST the manifest
+JSON to github.com. The form was being hidden with form.hidden = true
+so it would apply the HTML `hidden` attribute, which the browser styles
+with display: none. Multiple browsers (Chrome, Safari, Firefox) will
+not auto-submit a form whose computed display is none, so the
+.github.com POST never happened. The backend manifestStart succeeded
+(server returned 200 with action+manifest), but the browser never
+left the console, so the operator saw a silent "nothing happened".
 
-Also corrects the test to match the actual GitHub flow: the conversion
-code is sent to the redirect_url (/github/app/manifest/callback),
-not the setup_url — the latter is hit after install with whatever
-params GitHub decides on. (Earlier confusion: the docs example is
-literally https://example.com/redirect?code=...&state=...) The
-setup_url handler stays lenient about its params and just bounces the
-user back to the console, optionally forwarding installation_id when
-GitHub bundles it.
+The HAR trace shows the manifest POST returning 200 with a 644-byte
+body, then 40+ seconds of nothing before the next poll — no POST to
+github.com, no callback to /github/app/manifest/callback. That 40
+seconds of silence is the user staring at a form that was never going
+to submit.
 
-Verified: cargo fmt clean, clippy -D warnings clean, 179 lib + 15
-binary + 20 integration = 214 daemon tests pass, 39 console tests pass.
+Fix: position the form off-screen with inline styles instead of the
+hidden attribute, and wrap form.submit() in a try/catch so a blocked
+submission surfaces a clear error instead of a silent failure.
+</mm:think>
+
+
+
+
+</mm:think>

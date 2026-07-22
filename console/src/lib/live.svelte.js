@@ -620,17 +620,36 @@ class Store {
       if (!result?.action || !result?.manifest) {
         return { ok: false, error: 'GitHub setup link was incomplete' };
       }
+      // Build a form off-screen rather than `form.hidden = true` —
+      // `display: none` (which the `hidden` attribute applies) can prevent
+      // `form.submit()` from navigating in some browsers, and the form
+      // submission is what carries the manifest JSON to github.com.
       const form = document.createElement('form');
       form.method = 'POST';
       form.action = result.action;
-      form.hidden = true;
+      form.style.position = 'absolute';
+      form.style.left = '-9999px';
+      form.style.top = '0';
+      form.setAttribute('aria-hidden', 'true');
       const input = document.createElement('input');
       input.type = 'hidden';
       input.name = 'manifest';
       input.value = JSON.stringify(result.manifest);
       form.append(input);
       document.body.append(form);
-      form.submit();
+      // Submit synchronously. If the call throws (popup blocker, CSP),
+      // fall back to opening the manifest creation page in a new tab and
+      // surface a clear error so the operator knows the form auto-submit
+      // failed instead of seeing a silent "nothing happened".
+      try {
+        form.submit();
+      } catch (submitError) {
+        try { document.body.removeChild(form); } catch { /* ignore */ }
+        return {
+          ok: false,
+          error: 'Browser blocked the form auto-submit to GitHub; open the page manually and paste the manifest if this persists.',
+        };
+      }
       return { ok: true };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'GitHub setup could not start' };
