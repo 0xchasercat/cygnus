@@ -85,7 +85,7 @@ function isSafeEntry(entry) {
 export function parseRunnerArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.length > 2) {
     fail(
-      "runner accepts [entry], [--install, entry], [--install-latest, entry], [--static], [--install, --static], or [--install-latest, --static]",
+      "runner accepts [entry], [--install, entry], [--install-latest, entry], [--static], [--auto], [--install, --static], [--install-latest, --static], [--install, --auto], or [--install-latest, --auto]",
     );
   }
   const install = argv.length === 2;
@@ -96,6 +96,9 @@ export function parseRunnerArgs(argv) {
   const entry = argv[install ? 1 : 0];
   if (entry === "--static") {
     return { install, frozen, static: true };
+  }
+  if (entry === "--auto") {
+    return { install, frozen, auto: true };
   }
   if (typeof entry === "string" && entry.startsWith("--")) {
     fail(`unknown runner argument ${JSON.stringify(entry)}`);
@@ -299,14 +302,83 @@ async function buildStatic() {
   return buildStaticServer();
 }
 
+async function buildAuto() {
+  // Run the build script first, then decide based on output.
+  phaseLog("detect", "running build script, then inspecting output");
+  const status = await runStaticBuildScript();
+  if (status !== 0) return status;
+
+  // 1. Check if static output was produced (Vite, Gatsby, plain HTML, etc.)
+  try {
+    const output = await firstStaticOutputDirectory();
+    phaseLog("detect", `static output found: ${output.relativePath} → static mode`);
+    const publicOutput = join(OUTPUT, "public");
+    await rm(publicOutput, { recursive: true, force: true });
+    await copyStaticTree(output.path, publicOutput, true);
+    phaseLog("build", "static output copy completed");
+    return buildStaticServer();
+  } catch {
+    // No standard static output dir — continue to server checks.
+  }
+
+  // 2. Check for known framework standalone entrypoints.
+  const STANDALONE_ENTRIES = [
+    ".next/standalone/server.js",          // Next.js standalone
+    ".output/server/index.mjs",            // Nuxt / Nitro
+    ".output/server/index.js",             // Nuxt / Nitro (CJS fallback)
+    "dist/server/index.mjs",               // SolidStart
+    "build/server/index.mjs",              // SvelteKit
+    "build/index.js",                      // Remix
+  ];
+  for (const candidate of STANDALONE_ENTRIES) {
+    const fullPath = join(WORKSPACE, candidate);
+    try {
+      const meta = await lstat(fullPath);
+      if (meta.isFile()) {
+        phaseLog("detect", `server entry found: ${candidate} → server mode`);
+        // Write the entry path so the daemon can launch it.
+        const entryMarker = join(OUTPUT, "entry.txt");
+        await Bun.write(entryMarker, candidate);
+        return 0;
+      }
+    } catch {
+      // Not found, try next.
+    }
+  }
+
+  // 3. No standalone entry — fall back to scripts.start from package.json.
+  //    This handles `next start`, `nuxt start`, etc. where the framework
+  //    CLI manages the server process.
+  try {
+    const pkg = JSON.parse(await Bun.file(join(WORKSPACE, "package.json")).text());
+    const startCmd = pkg?.scripts?.start;
+    if (typeof startCmd === "string" && startCmd.trim().length > 0) {
+      phaseLog("detect", `scripts.start found: "${startCmd}" → server mode (start script)`);
+      const entryMarker = join(OUTPUT, "entry.txt");
+      await Bun.write(entryMarker, `__start__:${startCmd}`);
+      return 0;
+    }
+  } catch {
+    // No package.json or unparseable.
+  }
+
+  // 4. Nothing worked — fail with guidance.
+  phaseLog(
+    "detect",
+    "build completed but no static output or server entry found; pass --entry <path>",
+  );
+  return 1;
+}
+
 export async function runRunner(argv) {
-  const { install, frozen, static: staticMode, entry } = parseRunnerArgs(argv);
+  const { install, frozen, static: staticMode, auto: autoMode, entry } = parseRunnerArgs(argv);
   if (BUILD_DETECTION) phaseLog("detect", BUILD_DETECTION);
   await ensureDirectories();
   if (install) {
     const status = await installDependencies(frozen);
     if (status !== 0) return status;
   }
+  if (autoMode) return buildAuto();
   return staticMode ? buildStatic() : buildBundle(entry);
 }
 

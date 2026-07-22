@@ -58,6 +58,7 @@ const BUILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const INIT_CAGE_PATH: &str = "/usr/local/bin/cygnus-init";
 const BUILD_REGISTRY: &str = "https://registry.npmjs.org";
 const BUILD_REGISTRY_DOMAIN: &str = "registry.npmjs.org";
+const BUILD_FONT_DOMAINS: &[&str] = &["fonts.googleapis.com", "fonts.gstatic.com"];
 const BUILD_ROOTFS_TMPFS_SIZE: u64 = 1536 * 1024 * 1024;
 const BUILD_INSTALL_MEMORY_MAX: u64 = 1536 * 1024 * 1024;
 const BUILD_INSTALL_MEMORY_HIGH: u64 = 1280 * 1024 * 1024;
@@ -71,15 +72,23 @@ const MAX_ARTIFACT_INODES: u64 = 8_192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BuildMode {
-    Server { entry: PathBuf },
-    Static { build_script: Option<String> },
+    Server {
+        entry: PathBuf,
+    },
+    Static {
+        build_script: Option<String>,
+    },
+    /// Run the build script, then inspect output to decide static vs server.
+    Auto {
+        build_script: String,
+    },
 }
 
 impl BuildMode {
     fn generated_entry(&self) -> &Path {
         match self {
             Self::Server { entry } => entry,
-            Self::Static { .. } => Path::new("cygnus-static-server.ts"),
+            Self::Static { .. } | Self::Auto { .. } => Path::new("cygnus-static-server.ts"),
         }
     }
 }
@@ -907,6 +916,7 @@ fn build_job(
     match &plan.mode {
         BuildMode::Server { entry } => job.args.push(entry.as_os_str().to_owned()),
         BuildMode::Static { .. } => job.args.push(OsString::from("--static")),
+        BuildMode::Auto { .. } => job.args.push(OsString::from("--auto")),
     }
     job.env.insert("HOME".into(), home_path.into_os_string());
     job.env
@@ -942,23 +952,41 @@ fn build_job(
         "CYGNUS_BUILD_DETECTION".into(),
         OsString::from(&plan.detection),
     );
-    if let BuildMode::Static { build_script } = &plan.mode {
-        job.env.insert(
-            "CYGNUS_STATIC_SERVER_SOURCE".into(),
-            static_server_path.into_os_string(),
-        );
-        job.env.insert(
-            "CYGNUS_STATIC_BUILD_SCRIPT".into(),
-            OsString::from(build_script.as_deref().unwrap_or("")),
-        );
+    match &plan.mode {
+        BuildMode::Static { build_script } => {
+            job.env.insert(
+                "CYGNUS_STATIC_SERVER_SOURCE".into(),
+                static_server_path.into_os_string(),
+            );
+            job.env.insert(
+                "CYGNUS_STATIC_BUILD_SCRIPT".into(),
+                OsString::from(build_script.as_deref().unwrap_or("")),
+            );
+        }
+        BuildMode::Auto { build_script } => {
+            job.env.insert(
+                "CYGNUS_STATIC_SERVER_SOURCE".into(),
+                static_server_path.into_os_string(),
+            );
+            job.env.insert(
+                "CYGNUS_STATIC_BUILD_SCRIPT".into(),
+                OsString::from(build_script),
+            );
+        }
+        BuildMode::Server { .. } => {}
     }
     job.egress = if plan.install {
-        EgressMode::BuildDomains {
-            allow: vec![DomainEgressRule {
-                domain: BUILD_REGISTRY_DOMAIN.into(),
+        let mut allow = vec![DomainEgressRule {
+            domain: BUILD_REGISTRY_DOMAIN.into(),
+            ports: vec![443],
+        }];
+        for domain in BUILD_FONT_DOMAINS {
+            allow.push(DomainEgressRule {
+                domain: (*domain).into(),
                 ports: vec![443],
-            }],
+            });
         }
+        EgressMode::BuildDomains { allow }
     } else {
         EgressMode::None
     };
@@ -1103,7 +1131,7 @@ fn preflight_workspace(
     reject_workspace_path(workspace, "bun.lockb", false)?;
 
     let package_path = workspace.join("package.json");
-    let (has_dependencies, build_script, framework) = match fs::symlink_metadata(&package_path) {
+    let (has_dependencies, build_script) = match fs::symlink_metadata(&package_path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(DeployError::InvalidInput(
@@ -1120,13 +1148,9 @@ fn preflight_workspace(
             let has_dependencies = dependency_section_nonempty(package, "dependencies")?
                 || dependency_section_nonempty(package, "devDependencies")?
                 || dependency_section_nonempty(package, "optionalDependencies")?;
-            (
-                has_dependencies,
-                package_build_script(package)?,
-                frontend_framework(package)?,
-            )
+            (has_dependencies, package_build_script(package)?)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None, None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None),
         Err(error) => return Err(error.into()),
     };
 
@@ -1141,18 +1165,28 @@ fn preflight_workspace(
         )
     } else {
         let has_index_html = workspace_file_exists(workspace, Path::new("index.html"))?;
-        if has_index_html || (build_script.is_some() && framework.is_some()) {
-            let reason = framework.as_deref().unwrap_or("index.html");
+        if has_index_html && build_script.is_none() {
+            // Pure static folder, no build step needed.
             (
-                BuildMode::Static { build_script },
-                format!("static site ({reason})"),
+                BuildMode::Static { build_script: None },
+                "static site (index.html)".into(),
             )
         } else if let Some(entry) = first_server_entry(workspace)? {
             let detection = format!("server app ({})", slash_path(&entry));
             (BuildMode::Server { entry }, detection)
+        } else if let Some(script) = build_script {
+            // Has a build script — run it first, then decide based on output.
+            // This handles Vite (static), Next.js (static or SSR), SvelteKit, etc.
+            // without hardcoding framework names.
+            (
+                BuildMode::Auto {
+                    build_script: script,
+                },
+                "auto-detect (build script)".into(),
+            )
         } else {
             return Err(DeployError::InvalidInput(
-                "could not detect app type: looked for a package.json build script with a known frontend framework dependency, root index.html, or server entry index.ts, index.js, src/index.ts, or server.ts; pass --entry for a server app"
+                "could not detect app type: looked for index.html, server entry (index.ts, index.js, src/index.ts, server.ts), or a build script; pass --entry for a server app"
                     .into(),
             ));
         }
@@ -1187,53 +1221,6 @@ fn package_build_script(
         ));
     }
     Ok(Some("build".into()))
-}
-
-fn frontend_framework(
-    package: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<String>, DeployError> {
-    let mut dependencies = Vec::new();
-    for section in ["dependencies", "devDependencies"] {
-        let Some(value) = package.get(section) else {
-            continue;
-        };
-        let values = value.as_object().ok_or_else(|| {
-            DeployError::InvalidInput(format!("package.json {section} must be a JSON object"))
-        })?;
-        dependencies.extend(values.keys().map(String::as_str));
-    }
-
-    let known = [
-        ("vite", "vite"),
-        ("react-scripts", "react-scripts"),
-        ("next", "next"),
-        ("@sveltejs/kit", "sveltekit"),
-        ("svelte", "svelte"),
-        ("astro", "astro"),
-        ("nuxt", "nuxt"),
-        ("vue", "vue"),
-        ("@angular/core", "angular"),
-        ("parcel", "parcel"),
-        ("gatsby", "gatsby"),
-    ];
-    for (dependency, label) in known {
-        if dependencies.contains(&dependency) {
-            return Ok(Some(label.into()));
-        }
-    }
-    if dependencies
-        .iter()
-        .any(|dependency| dependency.starts_with("@vitejs/plugin-"))
-    {
-        return Ok(Some("vite".into()));
-    }
-    if dependencies
-        .iter()
-        .any(|dependency| dependency.starts_with("@remix-run/"))
-    {
-        return Ok(Some("remix".into()));
-    }
-    Ok(None)
 }
 
 fn validate_workspace_lock(workspace: &Path) -> Result<bool, DeployError> {
@@ -1714,6 +1701,25 @@ fn validate_static_public_root(app: &Path) -> Result<(), DeployError> {
 }
 
 fn expected_generated_entry(app: &Path, mode: &BuildMode) -> Result<PathBuf, DeployError> {
+    // For Auto mode, read the entry marker written by buildAuto.
+    if let BuildMode::Auto { .. } = mode {
+        let entry_marker = app.join("entry.txt");
+        if let Ok(content) = fs::read_to_string(&entry_marker) {
+            let content = content.trim().to_string();
+            if content.starts_with("__start__:") {
+                // Start script mode — the daemon will run `bun run start`.
+                // Return a synthetic path; the runtime config handles this.
+                return Ok(app.join("__start__.js"));
+            }
+            // Explicit entry path from framework standalone detection.
+            let entry_path = app.join(&content);
+            if entry_path.exists() {
+                return Ok(entry_path);
+            }
+        }
+        // Fall through to standard entry detection.
+    }
+
     let expected = app.join(mode.generated_entry().with_extension("js"));
     match fs::symlink_metadata(&expected) {
         Ok(metadata) if metadata.file_type().is_file() => return Ok(expected),
@@ -2406,10 +2412,10 @@ mod tests {
             BuildPlan {
                 install: true,
                 frozen: true,
-                mode: BuildMode::Static {
-                    build_script: Some("build".into())
+                mode: BuildMode::Auto {
+                    build_script: "build".into()
                 },
-                detection: "static site (vite)".into(),
+                detection: "auto-detect (build script)".into(),
             }
         );
         fs::remove_dir_all(workspace).unwrap();
@@ -2477,8 +2483,8 @@ mod tests {
 
         let error = preflight_workspace(&workspace, None).unwrap_err();
         let detail = error.to_string();
-        assert!(detail.contains("root index.html"));
-        assert!(detail.contains("server entry index.ts"));
+        assert!(detail.contains("index.html"));
+        assert!(detail.contains("server entry"));
         assert!(detail.contains("pass --entry"));
         fs::remove_dir_all(workspace).unwrap();
     }
