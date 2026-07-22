@@ -30,7 +30,16 @@ class Store {
   deployments = $state([]);
   metrics = $state(null);
   events = $state([]);
-  github = $state({ configured: false, app: null, repositories: [], jobs: [], discoverable: [], installations: [] });
+  github = $state({
+    configured: false,
+    app: null,
+    repositories: [],
+    jobs: [],
+    discoverable: [],
+    installations: [],
+    discovering: false,
+    discovered: false,
+  });
   connected = $state(true);
   lastSync = $state(0);
   notice = $state(''); // transient GitHub callback / mutation notice
@@ -44,6 +53,7 @@ class Store {
   #tick = 0;
   #booted = false;
   #domainPollApp = null;
+  #discoveryInflight = null;
 
   async boot() {
     if (this.#booted) return;
@@ -194,14 +204,19 @@ class Store {
         this.github = { ...this.github, jobs: Array.isArray(d?.jobs) ? d.jobs : [] };
       }),
     ]);
-    // Discovery is explicit (callback / Settings / ShipModal) so we don't
-    // burn GitHub rate limits on every status poll.
+    // Once the app is known to be configured, kick discovery immediately so
+    // Settings/Ship don't flash a fake "install" empty state.
+    if (this.github.configured) {
+      void this.ensureDiscoverable();
+    }
   }
 
   async #poll(forceGithub = false) {
     if (this.mode !== 'live' || this.auth !== 'ready') return;
     this.#tick += 1;
-    const fetchGithub = forceGithub || (this.#tick % GITHUB_EVERY === 0);
+    // Always fetch GitHub on the first tick so discovery can start immediately
+    // after login instead of waiting for GITHUB_EVERY.
+    const fetchGithub = forceGithub || this.#tick === 1 || (this.#tick % GITHUB_EVERY === 0);
     const reads = [
       this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node)),
       this.#safeGet('/api/v1/apps?limit=50', (d) => (this.apps = Array.isArray(d?.apps) ? d.apps : [])),
@@ -234,6 +249,9 @@ class Store {
 
     await Promise.all(reads);
     this.lastSync = Date.now();
+    if (fetchGithub && this.github.configured) {
+      void this.ensureDiscoverable();
+    }
   }
 
   // Replace this.deployments only when the payload actually differs (by id +
@@ -373,7 +391,16 @@ class Store {
     this.metrics = null;
     this.events = [];
     this.requests = [];
-    this.github = { configured: false, app: null, repositories: [], jobs: [], discoverable: [], installations: [] };
+    this.github = {
+      configured: false,
+      app: null,
+      repositories: [],
+      jobs: [],
+      discoverable: [],
+      installations: [],
+      discovering: false,
+      discovered: false,
+    };
     this.domainsByApp = {};
     this.envVarsByApp = {};
     return { ok: true };
@@ -683,24 +710,55 @@ class Store {
 
   // Preferred discovery path: list every installation + accessible repo via
   // the GitHub App JWT. No operator-supplied installation ID required.
-  async discoverRepositories() {
+  async discoverRepositories({ force = false } = {}) {
     if (this.mode !== 'live' || this.auth !== 'ready') {
       return { ok: false, error: 'Not ready', repositories: [], installations: [] };
     }
-    try {
-      const result = await api('/api/v1/github/discoverable-repositories');
-      const repositories = Array.isArray(result?.repositories) ? result.repositories : [];
-      const installations = Array.isArray(result?.installations) ? result.installations : [];
-      this.github = { ...this.github, discoverable: repositories, installations };
-      return { ok: true, repositories, installations };
-    } catch (cause) {
-      return {
-        ok: false,
-        error: cause instanceof Error ? cause.message : 'Repository discovery failed',
-        repositories: [],
-        installations: [],
-      };
+    if (this.#discoveryInflight && !force) return this.#discoveryInflight;
+
+    this.github = { ...this.github, discovering: true };
+    const run = (async () => {
+      try {
+        const result = await api('/api/v1/github/discoverable-repositories');
+        const repositories = Array.isArray(result?.repositories) ? result.repositories : [];
+        const installations = Array.isArray(result?.installations) ? result.installations : [];
+        this.github = {
+          ...this.github,
+          discoverable: repositories,
+          installations,
+          discovering: false,
+          discovered: true,
+        };
+        return { ok: true, repositories, installations };
+      } catch (cause) {
+        this.github = { ...this.github, discovering: false, discovered: true };
+        return {
+          ok: false,
+          error: cause instanceof Error ? cause.message : 'Repository discovery failed',
+          repositories: [],
+          installations: [],
+        };
+      } finally {
+        this.#discoveryInflight = null;
+      }
+    })();
+    this.#discoveryInflight = run;
+    return run;
+  }
+
+  // Fire-and-forget discovery once the GitHub App is known to exist.
+  // Avoids the Settings empty-state race where configured flips true before
+  // any discoverable list has been fetched.
+  ensureDiscoverable() {
+    if (!this.github.configured) return Promise.resolve({ ok: false, error: 'not configured' });
+    if (this.github.discovered || this.github.discovering || this.#discoveryInflight) {
+      return this.#discoveryInflight ?? Promise.resolve({
+        ok: true,
+        repositories: this.github.discoverable,
+        installations: this.github.installations,
+      });
     }
+    return this.discoverRepositories();
   }
 
   async configureRepository(cfg) {

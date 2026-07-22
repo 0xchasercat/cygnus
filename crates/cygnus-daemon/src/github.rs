@@ -443,15 +443,14 @@ impl GitHubManager {
                 ));
             }
             let value: Value = serde_json::from_slice(&response.body)?;
-            let items = value
-                .as_array()
-                .ok_or_else(|| GitHubError::InvalidInput(
-                    "installation listing response is not an array".into(),
-                ))?;
+            let items = value.as_array().ok_or_else(|| {
+                GitHubError::InvalidInput("installation listing response is not an array".into())
+            })?;
             for item in items {
-                let id = item.get("id").and_then(Value::as_i64).ok_or_else(|| {
-                    GitHubError::InvalidInput("installation omitted id".into())
-                })?;
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| GitHubError::InvalidInput("installation omitted id".into()))?;
                 if id <= 0 {
                     return Err(GitHubError::InvalidInput(
                         "installation id must be positive".into(),

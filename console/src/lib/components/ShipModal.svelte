@@ -280,10 +280,10 @@
   }
 
   async function refreshDiscoverable() {
-    if (githubBusy) return;
+    if (githubBusy || store.github.discovering) return;
     githubBusy = true;
     githubError = '';
-    const r = await store.discoverRepositories();
+    const r = await store.discoverRepositories({ force: true });
     githubBusy = false;
     if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
     if (selectedRepoId != null && !(r.repositories ?? []).some((repo) => repo.repository_id === selectedRepoId)) {
@@ -317,10 +317,10 @@
     await store.refreshGithub();
   }
 
-  // When the git tab opens, auto-load discoverable repos.
+  // Ensure discovery is running when the git tab is open.
   $effect(() => {
     if (!ui.shipOpen || tab !== 'git' || !store.github.configured) return;
-    if (!discoverableRepos.length && !githubBusy) refreshDiscoverable();
+    void store.ensureDiscoverable();
   });
 </script>
 
@@ -450,11 +450,11 @@
                   <strong>{store.github.app?.name ?? 'Cygnus GitHub App'}</strong>
                   <small>{store.github.app?.owner ?? '—'} · {store.github.repositories.length} mapped · {installationCount} install{installationCount === 1 ? '' : 's'}</small>
                 </div>
-                <button class="btn sm" type="button" onclick={refreshDiscoverable} disabled={githubBusy}>
-                  {githubBusy ? 'Refreshing…' : 'Refresh'}
+                <button class="btn sm" type="button" onclick={refreshDiscoverable} disabled={githubBusy || store.github.discovering}>
+                  {githubBusy || store.github.discovering ? 'Refreshing…' : 'Refresh'}
                 </button>
               </div>
-              {#if store.github.app?.html_url && !installationCount}
+              {#if store.github.app?.html_url && !installationCount && store.github.discovered && !store.github.discovering}
                 <a class="btn cobalt sm install-link" href="{store.github.app.html_url}/installations/new">
                   Install App on GitHub <Icon name="arrowR" size={12} />
                 </a>
@@ -500,10 +500,12 @@
                     <p class="empty mono">no repositories match “{repoQuery}”</p>
                   {/each}
                 </div>
-              {:else if githubBusy}
+              {:else if store.github.discovering || githubBusy || !store.github.discovered}
                 <p class="empty mono">discovering repositories…</p>
+              {:else if installationCount === 0}
+                <p class="empty mono">install the GitHub App on an account to see repositories</p>
               {:else}
-                <p class="empty mono">no repositories yet — install the app, then refresh</p>
+                <p class="empty mono">no repositories accessible to this installation</p>
               {/if}
             {/if}
           </div>

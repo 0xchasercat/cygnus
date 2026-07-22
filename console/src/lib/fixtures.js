@@ -395,6 +395,31 @@ export const previewRequests = (() => {
 export const previewGithub = {
   configured: true,
   app: { name: 'Cygnus Tenant Zero', owner: 'chasercat', html_url: 'https://github.com/apps/cygnus-tenant-zero' },
+  discovering: false,
+  discovered: true,
+  installations: [
+    { installation_id: 12345678, account_login: 'chasercat', account_type: 'User' },
+  ],
+  discoverable: [
+    {
+      installation_id: 12345678,
+      repository_id: 9012,
+      owner: 'chasercat',
+      name: 'atelier',
+      full_name: 'chasercat/atelier',
+      default_branch: 'main',
+      private: false,
+    },
+    {
+      installation_id: 12345678,
+      repository_id: 9013,
+      owner: 'chasercat',
+      name: 'helios-api',
+      full_name: 'chasercat/helios-api',
+      default_branch: 'main',
+      private: true,
+    },
+  ],
   repositories: [
     {
       installation_id: 12345678,

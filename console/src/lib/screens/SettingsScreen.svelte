@@ -196,10 +196,10 @@
   }
 
   async function refreshDiscoverable() {
-    if (githubBusy) return;
+    if (githubBusy || store.github.discovering) return;
     githubBusy = true;
     githubError = '';
-    const r = await store.discoverRepositories();
+    const r = await store.discoverRepositories({ force: true });
     githubBusy = false;
     if (!r.ok) githubError = r.error ?? 'Repository discovery failed';
     // Keep selection only if the repo is still present.
@@ -294,9 +294,9 @@
 
   const recentJobs = $derived(store.github.jobs.slice(0, 5));
 
-  // Auto-load discoverable repos — never ask for an installation ID.
+  // Kick discovery if the store hasn't started it yet (e.g. deep-link into Settings).
   onMount(() => {
-    if (store.github.configured && !discoverableRepos.length) refreshDiscoverable();
+    if (store.github.configured) void store.ensureDiscoverable();
   });
 </script>
 
@@ -391,13 +391,17 @@
           </div>
           <div class="install-block">
             <div class="install-cta">
-              {#if store.github.app?.html_url}
+              {#if store.github.app?.html_url && !installationCount && store.github.discovered && !store.github.discovering}
                 <a class="btn cobalt sm" href="{store.github.app.html_url}/installations/new">
-                  {installationCount ? 'Manage GitHub access' : 'Install App on GitHub'} <Icon name="arrowR" size={12} />
+                  Install App on GitHub <Icon name="arrowR" size={12} />
+                </a>
+              {:else if store.github.app?.html_url && installationCount}
+                <a class="btn sm" href="{store.github.app.html_url}/installations/new">
+                  Manage GitHub access <Icon name="arrowR" size={12} />
                 </a>
               {/if}
-              <button class="btn sm" type="button" onclick={refreshDiscoverable} disabled={githubBusy}>
-                {githubBusy ? 'Refreshing…' : 'Refresh'}
+              <button class="btn sm" type="button" onclick={refreshDiscoverable} disabled={githubBusy || store.github.discovering}>
+                {githubBusy || store.github.discovering ? 'Refreshing…' : 'Refresh'}
               </button>
               <p class="install-desc">
                 Search your accessible repositories, pick one, then configure the mapping.
@@ -456,10 +460,12 @@
                   <div class="empty mono">no repositories match “{repoQuery}”</div>
                 {/each}
               </div>
-            {:else if githubBusy}
+            {:else if store.github.discovering || githubBusy || !store.github.discovered}
               <div class="empty mono">discovering repositories…</div>
+            {:else if installationCount === 0}
+              <div class="empty mono">install the GitHub App on an account to see repositories</div>
             {:else}
-              <div class="empty mono">no repositories yet — install the app, then refresh</div>
+              <div class="empty mono">no repositories accessible to this installation</div>
             {/if}
           </div>
         {/if}
