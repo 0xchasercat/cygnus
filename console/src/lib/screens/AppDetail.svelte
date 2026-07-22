@@ -862,6 +862,11 @@
     padding: 9px 11px;
     font-family: var(--mono);
     font-size: 12px;
+    /* Grid items default to min-width: auto, which lets the input's
+       intrinsic size (20-char size attribute) blow out the 1fr column
+       and overlap the KEY input beside it. Force the shrink so each
+       column stays inside its grid track. */
+    min-width: 0;
   }
   .env-add input:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
 
