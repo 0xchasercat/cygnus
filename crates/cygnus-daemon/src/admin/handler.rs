@@ -9,8 +9,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use super::{
     ActiveDeploymentView, AdminCommand, AdminData, AdminErrorCode, AdminHandler,
     AdminPeerCredentials, AdminRequest, AdminResponse, AdminRole, AppDomainView, AppView,
-    CertificateView, DeploymentView, DomainDnsView, EngineView, GitHubJobView,
-    MAX_ADMIN_LIST_LIMIT, MAX_LOG_CHUNK_BYTES, MemoryView, NodeView,
+    CertificateView, DeploymentView, DomainDnsView, EngineView, GitHubJobView, MAX_LOG_CHUNK_BYTES,
+    MemoryView, NodeView,
 };
 use crate::deploy::upload::{UploadError, UploadManager, UploadMetadata};
 use crate::deploy::{
@@ -588,10 +588,11 @@ impl StateAdminHandler {
             }
             AdminCommand::ListInstallationRepositories { installation_id } => {
                 let github = self.github_manager()?;
-                let mut repositories = github
+                // Discovery lists can be large; do not clip to the general
+                // admin page size used by cursor-paginated endpoints.
+                let repositories = github
                     .installation_repositories(installation_id)
                     .map_err(github_fault)?;
-                repositories.truncate(usize::from(MAX_ADMIN_LIST_LIMIT));
                 Ok(AdminData::InstallationRepositories { repositories })
             }
             AdminCommand::ListDiscoverableRepositories => {
@@ -609,7 +610,6 @@ impl StateAdminHandler {
                         }
                     }
                 }
-                repositories.truncate(usize::from(MAX_ADMIN_LIST_LIMIT));
                 Ok(AdminData::DiscoverableRepositories {
                     repositories,
                     installations,

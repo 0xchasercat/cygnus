@@ -14,7 +14,9 @@ use crate::state::{
 };
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
-pub const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
+// Discovery of large GitHub installations can serialize hundreds of repo
+// records; 1 MiB keeps that under one frame without unbounded growth.
+pub const MAX_ADMIN_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_LOG_CHUNK_BYTES: u32 = 48 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

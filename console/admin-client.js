@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 
 export const ADMIN_PROTOCOL_VERSION = 1;
-export const MAX_ADMIN_FRAME_BYTES = 64 * 1024;
+export const MAX_ADMIN_FRAME_BYTES = 1024 * 1024;
 // Default is short enough to surface a dead daemon quickly, but above SQLite's
 // busy_timeout (5s). Deploy upload/finish can hold the socket longer when the
 // daemon is packing a large source tree into a queued job.
@@ -25,7 +25,9 @@ function timeoutForCommand(command) {
     type === "deploy_start" ||
     type === "deploy" ||
     type === "register_engine" ||
-    type === "apply_config"
+    type === "apply_config" ||
+    type === "list_discoverable_repositories" ||
+    type === "list_installation_repositories"
   ) {
     return ADMIN_DEPLOY_TIMEOUT_MS;
   }
