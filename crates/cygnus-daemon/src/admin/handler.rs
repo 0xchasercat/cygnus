@@ -422,13 +422,42 @@ impl StateAdminHandler {
             }
             AdminCommand::GetDeployment { deployment } => {
                 let state = self.open_state()?;
-                let deployment = state
+                if let Some(deployment) = state
                     .deployment(&deployment)
                     .map_err(HandlerFault::internal)?
-                    .ok_or_else(|| HandlerFault::not_found("deployment does not exist"))?;
-                Ok(AdminData::Deployment {
-                    deployment: deployment_view(deployment, role),
-                })
+                {
+                    return Ok(AdminData::Deployment {
+                        deployment: deployment_view(deployment, role),
+                    });
+                }
+                // Fall back to a prefix match against recent deployments. The
+                // `cygnus deployments` table only renders the first 12 chars of
+                // the id, so the obvious copy/paste comes back here as a
+                // short prefix rather than the full hex string. Exact match
+                // above handles the 23-char case unambiguously.
+                let candidates = state
+                    .deployments(None, None, 50)
+                    .map_err(HandlerFault::internal)?
+                    .into_iter()
+                    .filter(|record| record.id.starts_with(&deployment))
+                    .map(|record| record.id)
+                    .collect::<Vec<_>>();
+                match candidates.len() {
+                    0 => Err(HandlerFault::not_found("deployment does not exist")),
+                    1 => {
+                        let only = candidates.into_iter().next().unwrap();
+                        let record = state
+                            .deployment(&only)
+                            .map_err(HandlerFault::internal)?
+                            .ok_or_else(|| HandlerFault::not_found("deployment does not exist"))?;
+                        Ok(AdminData::Deployment {
+                            deployment: deployment_view(record, role),
+                        })
+                    }
+                    n => Err(HandlerFault::validation(format!(
+                        "deployment {deployment:?} is ambiguous ({n} matches); pass a longer prefix or the full id"
+                    ))),
+                }
             }
             AdminCommand::ApplyConfig(config) => self.mutate(
                 role,
@@ -1725,6 +1754,68 @@ mod tests {
         drop(handler);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn get_deployment_resolves_a_unique_prefix() {
+        let (root, path) = state_with_engine("get-deploy-prefix");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("index.ts"), b"export default 1").unwrap();
+        let handler = StateAdminHandler::new(&path, |_| None, unused_mutations());
+        let started = handler.handle(
+            AdminRole::Host,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::DeployStart {
+                request: DeployRequest {
+                    source_dir: source,
+                    app: "hello".into(),
+                    domain: Some("hello.example".into()),
+                    engine_version: None,
+                    entry: None,
+                    artifact_root: None,
+                    upstream: None,
+                    env: Default::default(),
+                    preview: None,
+                    deployment_id: None,
+                    source: DeploymentSource::cli(),
+                },
+            }),
+        );
+        let started_data = match started {
+            AdminResponse::Ok { data, .. } => *data,
+            other => panic!("unexpected start: {other:?}"),
+        };
+        let deployment_id = match started_data {
+            AdminData::DeployStarted { deployment_id, .. } => deployment_id,
+            other => panic!("unexpected start data: {other:?}"),
+        };
+        let short = deployment_id[..12].to_owned();
+        let resolved = handler.handle(
+            AdminRole::Host,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::GetDeployment { deployment: short }),
+        );
+        let resolved_data = match resolved {
+            AdminResponse::Ok { data, .. } => *data,
+            other => panic!("unexpected get: {other:?}"),
+        };
+        let deployment = match resolved_data {
+            AdminData::Deployment { deployment } => deployment,
+            other => panic!("unexpected get data: {other:?}"),
+        };
+        assert_eq!(deployment.id, deployment_id);
+        let missing = handler.handle(
+            AdminRole::Host,
+            AdminPeerCredentials::default(),
+            request(AdminCommand::GetDeployment { deployment: "ffffffff".into() }),
+        );
+        assert!(matches!(
+            missing,
+            AdminResponse::Error { error, .. } if error.code == AdminErrorCode::NotFound
+        ));
+        drop(handler);
+        fs::remove_dir_all(root).unwrap();
+    }
+
 
     #[test]
     fn status_includes_runtime_and_host_basics() {

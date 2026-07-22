@@ -142,9 +142,10 @@ enum Command {
         #[arg(long)]
         expected_active_artifact: String,
     },
-    /// Write a deployment build log to stdout.
+    /// Write a deployment build log to stdout. With no <DEPLOYMENT>, shows the
+    /// most recent deployment's log (run `cygnus deployments` for ids).
     Logs {
-        deployment: String,
+        deployment: Option<String>,
         #[arg(long, value_enum, default_value_t = StreamArg::Stdout)]
         stream: StreamArg,
         #[arg(long, default_value_t = 0)]
@@ -576,14 +577,39 @@ fn print_json(data: AdminData) -> Result<(), Box<dyn Error>> {
     output.write_all(b"\n")?;
     Ok(())
 }
+/// Pick the most recent deployment so `cygnus logs` (no id) does the obvious
+/// thing instead of erroring. If nothing has shipped yet, print a hint.
+fn latest_deployment_id(client: &AdminClient) -> Result<String, Box<dyn Error>> {
+    let data = call(
+        client,
+        AdminCommand::ListDeployments {
+            app: None,
+            cursor: None,
+            limit: 1,
+        },
+    )?;
+    let AdminData::Deployments { deployments, .. } = data else {
+        return Err("daemon returned an unexpected response to ListDeployments".into());
+    };
+    match deployments.into_iter().next() {
+        Some(d) => Ok(d.id),
+        None => Err(
+            "no deployments yet — run `cygnus deploy` or pass an explicit <DEPLOYMENT> id".into(),
+        ),
+    }
+}
 
 fn stream_log(
     client: &AdminClient,
-    deployment: String,
+    deployment: Option<String>,
     stream: LogStream,
     mut offset: u64,
     follow: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let deployment = match deployment {
+        Some(id) => id,
+        None => latest_deployment_id(client)?,
+    };
     let stdout = io::stdout();
     let mut output = stdout.lock();
     let mut quiet_polls: u32 = 0;
@@ -638,7 +664,14 @@ const LOG_FOLLOW_QUIET_POLLS: u32 = 3;
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn stream_daemon_log(error: bool, follow: bool, lines: usize) -> Result<(), Box<dyn Error>> {
-    let path = resolve_daemon_log_path(error)?;
+    // The CLI looks for a file log first (macOS user install, dev runs). On
+    // a systemd-managed install the daemon writes to journald and there is
+    // no file; fall back to `journalctl -u cygnus.service` so the same
+    // command works in both worlds.
+    let path = match resolve_daemon_log_path(error) {
+        Ok(path) => path,
+        Err(file_error) => return stream_daemon_journal(error, follow, lines, file_error),
+    };
     let stdout = io::stdout();
     let mut output = stdout.lock();
     if follow {
@@ -670,6 +703,65 @@ fn stream_daemon_log(error: bool, follow: bool, lines: usize) -> Result<(), Box<
         output.flush()?;
         Ok(())
     }
+}
+
+/// Fall back to `journalctl -u cygnus.service` for systemd installs. The
+/// caller passes along the file-log error so the user gets a single
+/// actionable message if journalctl is also unavailable.
+fn stream_daemon_journal(
+    error: bool,
+    follow: bool,
+    lines: usize,
+    file_error: Box<dyn Error>,
+) -> Result<(), Box<dyn Error>> {
+    let unit = match std::env::var_os("CYGNUS_JOURNAL_UNIT") {
+        Some(value) => value.to_string_lossy().into_owned(),
+        None => "cygnus.service".to_owned(),
+    };
+    let journalctl = which_journalctl().ok_or_else(|| {
+        format!(
+            "{file_error}; journalctl is also unavailable — install systemd-journald or write a log file at ~/.cygnus/log/daemon.log"
+        )
+    })?;
+    let mut command = std::process::Command::new(&journalctl);
+    command.arg("-u").arg(&unit);
+    if error {
+        command.arg("-p").arg("err");
+    }
+    if !follow {
+        command.arg("--no-pager");
+        command.arg("-n").arg(format!("{lines}"));
+    } else {
+        command.arg("-f");
+    }
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to spawn journalctl: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "journalctl -u {unit} exited with {status}; (file fallback: {file_error})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn which_journalctl() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for root in std::env::split_paths(&path) {
+        let candidate = root.join("journalctl");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // Common fallback when /usr/sbin (root-only) isn't on this user's PATH.
+    for absolute in &["/usr/bin/journalctl", "/bin/journalctl", "/usr/sbin/journalctl"] {
+        let path = std::path::PathBuf::from(absolute);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn resolve_daemon_log_path(error: bool) -> Result<PathBuf, Box<dyn Error>> {
@@ -1514,6 +1606,22 @@ mod tests {
                 .command,
             Command::Logs { follow: true, .. }
         ));
+    }
+
+    #[test]
+    fn logs_without_deployment_arg_parses() {
+        let parsed = Cli::try_parse_from(["cygnus", "logs"]).unwrap();
+        match parsed.command {
+            Command::Logs {
+                deployment,
+                follow,
+                ..
+            } => {
+                assert!(deployment.is_none());
+                assert!(!follow);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

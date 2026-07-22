@@ -1231,7 +1231,15 @@ pub fn safe_extract_archive_reader<R: Read>(
 
 fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError> {
     let mut archive = Archive::new(reader);
+    // Detect the GitHub-style "every entry is under one top-level directory"
+    // wrapper lazily. The first dir entry we see proposes itself as the
+    // wrapper; if any later entry (file OR dir) is NOT under it, we clear
+    // the wrapper for the rest of the stream so paths are taken verbatim.
+    // This avoids colliding top-level files with same-named files inside a
+    // nested directory (e.g. a project with a top-level README.md and a
+    // src/README.md under a picked Downloads/ parent).
     let mut wrapper: Option<PathBuf> = None;
+    let mut wrapper_decided = false;
     let mut extracted = 0_u64;
     for item in archive
         .entries()
@@ -1267,11 +1275,22 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError
                 path.display()
             )));
         }
-        if wrapper.is_none() && entry_type.is_dir() {
-            wrapper = path
-                .components()
-                .next()
-                .map(|component| PathBuf::from(component.as_os_str()));
+        if !wrapper_decided {
+            if entry_type.is_dir() {
+                if wrapper.is_none() {
+                    wrapper = path
+                        .components()
+                        .next()
+                        .map(|component| PathBuf::from(component.as_os_str()));
+                }
+            } else {
+                wrapper_decided = true;
+            }
+        }
+        if let Some(candidate) = wrapper.as_ref() {
+            if !path.starts_with(candidate) {
+                wrapper = None;
+            }
         }
         let relative = wrapper
             .as_deref()
@@ -1844,6 +1863,56 @@ mod tests {
             Err(GitHubError::Json(_))
         ));
     }
+    fn write_entry(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str, body: &[u8], dir: bool) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(if dir { tar::EntryType::Directory } else { tar::EntryType::Regular });
+        header.set_size(if dir { 0 } else { body.len() as u64 });
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, body).unwrap();
+    }
+
+    fn build_tar(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            for (path, body, dir) in entries {
+                write_entry(&mut builder, path, body, *dir);
+            }
+            builder.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn archive_strips_github_style_wrapper() {
+        let dir = tmp();
+        let bytes = build_tar(&[("repo-sha", b"", true), ("repo-sha/README.md", b"hello", false), ("repo-sha/src/index.js", b"x", false)]);
+        safe_extract_archive(&bytes, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "hello");
+        assert_eq!(std::fs::read(dir.join("src/index.js")).unwrap(), b"x");
+        assert!(!dir.join("repo-sha").exists());
+    }
+
+    #[test]
+    fn archive_preserves_paths_when_no_wrapper() {
+        let dir = tmp();
+        let bytes = build_tar(&[("README.md", b"top", false), ("package.json", b"{}", false)]);
+        safe_extract_archive(&bytes, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "top");
+        assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "{}");
+    }
+
+    #[test]
+    fn archive_preserves_paths_when_wrapper_does_not_cover_every_entry() {
+        let dir = tmp();
+        let bytes = build_tar(&[("src", b"", true), ("README.md", b"top", false), ("package.json", b"{}", false), ("src/index.js", b"x", false), ("src/README.md", b"inner", false)]);
+        safe_extract_archive(&bytes, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "top");
+        assert_eq!(std::fs::read_to_string(dir.join("src/README.md")).unwrap(), "inner");
+        assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "{}");
+    }
 
     #[test]
     fn archive_rejects_traversal_and_symlinks() {
@@ -1860,9 +1929,7 @@ mod tests {
             builder.append(&header, io::empty()).unwrap();
             builder.finish().unwrap();
         }
-        assert!(matches!(
-            safe_extract_archive(&bytes, &path),
-            Err(GitHubError::UnsafeArchive(_))
-        ));
+        assert!(matches!(safe_extract_archive(&bytes, &path), Err(GitHubError::UnsafeArchive(_))));
     }
+
 }
