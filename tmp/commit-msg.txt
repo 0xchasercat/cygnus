@@ -1,9 +1,12 @@
-fix: allow extra query params on manifest callback URL
+fix: force immediate GitHub status fetch on callback redirect
 
-GitHub can append extra query parameters (such as `installation_id`,
-`setup_action`, or tracking params) to the `redirect_url` when bouncing
-the browser back after app registration. The `manifestCallback` handler
-was strictly enforcing that ONLY `code` and `state` were in the query string
-and returned HTTP 400 "unsupported fields" if any other parameter was present.
-Removing the rigid whitelist allows `manifestCallback` to extract `code` and
-`state` and exchange the credentials successfully regardless of extra query params.
+When returning from GitHub App setup or installation, `#handleGithubCallback`
+invoked `#poll()`, but `#poll()` only fetched `/api/v1/github/status` on every
+3rd tick (`this.#tick % GITHUB_EVERY === 0`). Because `#tick` was usually not
+divisible by 3 on the single forced poll, the status fetch was skipped, leaving
+`this.github.configured = false` and causing the UI to render the unconfigured
+"Connect GitHub" form.
+
+Added `refreshGithub()` which immediately fetches status, repositories, and jobs
+in parallel, and call it directly from `#handleGithubCallback()`. Also supported
+`#poll(forceGithub = true)` to bypass the cadence check when needed.

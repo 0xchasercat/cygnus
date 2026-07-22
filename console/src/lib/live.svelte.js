@@ -137,12 +137,10 @@ class Store {
     }
     if (!g) return;
     window.history.replaceState({}, '', window.location.pathname);
-    // The conversion just happened on the server (or a fresh install
-    // completed) — force a poll so the connected state shows up
-    // immediately instead of waiting for the next periodic tick. Without
-    // this, the operator sees a stale "Connect GitHub" form after
-    // returning from a successful install.
-    if (this.mode === 'live' && this.auth === 'ready') this.#poll();
+    this.refreshGithub();
+    if (g === 'setup' && /^\d+$/.test(installationId ?? '') && Number(installationId) > 0) {
+      this.listInstallationRepositories(installationId);
+    }
   }
 
   // ——— polling ———
@@ -181,11 +179,25 @@ class Store {
     this.#deployTimer = null;
   }
 
-  async #poll() {
+  async refreshGithub() {
+    if (this.mode !== 'live' || this.auth !== 'ready') return;
+    await Promise.allSettled([
+      this.#safeGet('/api/v1/github/status', (d) => {
+        this.github = { ...this.github, configured: d?.configured === true, app: d?.app ?? null };
+      }),
+      this.#safeGet('/api/v1/github/repositories?limit=50', (d) => {
+        this.github = { ...this.github, repositories: Array.isArray(d?.repositories) ? d.repositories : [] };
+      }),
+      this.#safeGet('/api/v1/github/jobs?limit=50', (d) => {
+        this.github = { ...this.github, jobs: Array.isArray(d?.jobs) ? d.jobs : [] };
+      }),
+    ]);
+  }
+
+  async #poll(forceGithub = false) {
     if (this.mode !== 'live' || this.auth !== 'ready') return;
     this.#tick += 1;
-    const fetchGithub = this.#tick % GITHUB_EVERY === 0;
-
+    const fetchGithub = forceGithub || (this.#tick % GITHUB_EVERY === 0);
     const reads = [
       this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node)),
       this.#safeGet('/api/v1/apps?limit=50', (d) => (this.apps = Array.isArray(d?.apps) ? d.apps : [])),
