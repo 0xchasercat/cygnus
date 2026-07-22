@@ -1602,20 +1602,10 @@ impl GitHubWorker {
             });
         }
         if let Err(error) = self.start_reports(&mut state, &mut job) {
-            let transient = matches!(error, GitHubError::Transient(_));
-            if transient {
-                state.retry_github_job_with_error(&job.id, &error.to_string())?;
-            } else {
-                state.finish_github_job(
-                    &job.id,
-                    GitHubDeployJobStatus::Failed,
-                    Some(&error.to_string()),
-                )?;
-            }
-            return Ok(GitHubWorkerResult::Failed {
-                job_id: job.id,
-                transient,
-            });
+            // Check-run/deployment reporting is best-effort — don't block the
+            // actual deploy if GitHub reporting fails (e.g. missing permissions,
+            // 404 on a repo the app can read but not write checks to).
+            let _ = error;
         }
         let result = self.run_claimed(&mut state, &job);
         match result {

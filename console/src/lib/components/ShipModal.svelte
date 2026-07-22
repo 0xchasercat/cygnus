@@ -323,6 +323,10 @@
     ui.shipOpen = false;
     clearSelectedRepo();
     await store.refreshGithub();
+    // Navigate to the app detail page so the user can watch the build.
+    const appName = mapDraft.app || repo.name;
+    const { go } = await import('../stores.svelte.js');
+    go('app', { appId: appName });
   }
 
   // Ensure discovery is running when the git tab is open.
