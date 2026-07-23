@@ -335,7 +335,11 @@ impl GitHubDeployExecutor for ProductionGitHubDeployExecutor {
                 upstream: Some(config.upstream.clone()),
                 env: std::collections::BTreeMap::new(),
                 preview: None,
-                deployment_id: None,
+                // GitHub jobs pre-create the user-visible deployment row so
+                // build progress and failures share one durable identity.
+                // Dropping this id created a second timestamp deployment and
+                // left the original `gh-*` row to be marked failed.
+                deployment_id: Some(job.id.clone()),
                 source: DeploymentSource::github(
                     Some(config.branch.clone()),
                     Some(job.sha.clone()),
@@ -663,17 +667,6 @@ impl LiveAdminMutations {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
         let current = state.load().map_err(map_admin_state_error)?;
         let desired = state.preview(config).map_err(map_admin_state_error)?;
-        if current.listen != desired.listen
-            || current.edge.https_listen != desired.edge.https_listen
-            || current.edge.apps_domain != desired.edge.apps_domain
-            || current.edge.acme != desired.edge.acme
-        {
-            return Err(AdminMutationError::new(
-                AdminErrorCode::Conflict,
-                "listener, legacy apps-domain, and ACME account changes require daemon restart",
-            ));
-        }
-
         let current_apps = current
             .apps
             .iter()

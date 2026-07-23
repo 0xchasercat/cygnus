@@ -24,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use cygnus_cage::{
-    BuildOutputSpec, CageError, DomainEgressRule, EgressMode, FilterMode, JobCompletion, JobConfig,
-    JobExitOutcome, RootfsSpec, run_job_streaming,
+    BuildOutputSpec, CageError, EgressMode, FilterMode, JobCompletion, JobConfig, JobExitOutcome,
+    RootfsSpec, run_job_streaming,
 };
 #[cfg(target_os = "linux")]
 use cygnus_cage::{DnsForwarder, run_job_streaming_with_dns};
@@ -57,8 +57,6 @@ const BUILD_TMPDIR_CAGE_PATH: &str = "/cygnus/tmp";
 const BUILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const INIT_CAGE_PATH: &str = "/usr/local/bin/cygnus-init";
 const BUILD_REGISTRY: &str = "https://registry.npmjs.org";
-const BUILD_REGISTRY_DOMAIN: &str = "registry.npmjs.org";
-const BUILD_FONT_DOMAINS: &[&str] = &["fonts.googleapis.com", "fonts.gstatic.com"];
 const BUILD_ROOTFS_TMPFS_SIZE: u64 = 1536 * 1024 * 1024;
 const BUILD_INSTALL_MEMORY_MAX: u64 = 1536 * 1024 * 1024;
 const BUILD_INSTALL_MEMORY_HIGH: u64 = 1280 * 1024 * 1024;
@@ -994,21 +992,12 @@ fn build_job(
         }
         BuildMode::Server { .. } => {}
     }
-    job.egress = if plan.install {
-        let mut allow = vec![DomainEgressRule {
-            domain: BUILD_REGISTRY_DOMAIN.into(),
-            ports: vec![443],
-        }];
-        for domain in BUILD_FONT_DOMAINS {
-            allow.push(DomainEgressRule {
-                domain: (*domain).into(),
-                ports: vec![443],
-            });
-        }
-        EgressMode::BuildDomains { allow }
-    } else {
-        EgressMode::None
-    };
+    // Build scripts routinely fetch fonts, schemas, CMS/API data, binaries,
+    // browser bundles, and framework assets from arbitrary public hosts. A
+    // registry-only allowlist makes otherwise valid local Bun builds fail.
+    // Public mode still blocks RFC1918, link-local/cloud metadata, the host,
+    // and sibling cages; runtime egress remains an independent app policy.
+    job.egress = EgressMode::Public;
     job.seccomp = Some(FilterMode::Enforce);
     if linux {
         job.init = Some(PathBuf::from(INIT_CAGE_PATH));
@@ -2736,7 +2725,7 @@ mod tests {
     }
 
     #[test]
-    fn install_job_has_closed_runner_argv_and_transient_domain_egress() {
+    fn install_job_has_closed_runner_argv_and_public_build_egress() {
         let workspace = temp_dir("job").join("rootfs/workspace");
         fs::create_dir_all(&workspace).unwrap();
         let publish = workspace.parent().unwrap().join("publish");
@@ -2803,7 +2792,7 @@ mod tests {
             job.env.get(OsStr::new("NPM_CONFIG_REGISTRY")),
             Some(&OsString::from(BUILD_REGISTRY)),
         );
-        assert!(matches!(job.egress, EgressMode::BuildDomains { .. }));
+        assert!(matches!(job.egress, EgressMode::Public));
         assert_eq!(
             job.init,
             cfg!(target_os = "linux").then(|| PathBuf::from(INIT_CAGE_PATH))
@@ -2875,7 +2864,7 @@ mod tests {
             job.env.get(OsStr::new("CYGNUS_STATIC_SERVER_SOURCE")),
             Some(&expected_server.into_os_string())
         );
-        assert!(matches!(job.egress, EgressMode::None));
+        assert!(matches!(job.egress, EgressMode::Public));
         fs::remove_dir_all(root).unwrap();
     }
 

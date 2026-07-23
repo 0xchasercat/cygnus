@@ -574,6 +574,19 @@ class Store {
     }
   }
 
+  async retryDashboardAcme() {
+    try {
+      // Re-applying automatic TLS is intentionally idempotent and asks the
+      // daemon to reconcile the dashboard certificate immediately.
+      await post('/api/v1/settings/dashboard-tls', { mode: 'acme' });
+      this.notice = 'Retrying dashboard certificate issuance.';
+      await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not retry dashboard certificate issuance' };
+    }
+  }
+
   async changePassword({ email, currentPassword, newPassword }) {
     try {
       await post('/api/v1/settings/password', {

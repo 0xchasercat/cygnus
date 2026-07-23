@@ -500,9 +500,9 @@
                   {#if d.kind === 'native' && isLocalHost(d.host)}
                     <div class="dns-hint mono">local native domain · no public DNS required</div>
                   {/if}
-                  {#if d.status === 'failed' && d.tls === 'acme'}
+                  {#if (d.status === 'failed' || d.status === 'fallback_active') && d.tls === 'acme'}
                     <div class="dns-hint mono fail">
-                      {d.error ?? 'Certificate issuance failed.'}
+                      {d.error ?? 'Using the self-signed fallback while certificate issuance is pending.'}
                       {#if d.next_retry_unix}· next automatic retry {relativeTime(d.next_retry_unix * 1000)}{/if}
                       <button type="button" class="linklike retry-acme" onclick={() => retryAcme(d)} disabled={retrying}>
                         {retrying ? 'retrying…' : 'retry now'}

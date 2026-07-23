@@ -217,7 +217,7 @@ run_install
 [[ $(hash_file "$ROOT/var/lib/cygnus/artifacts/tenant-0/opt/cygnus-console/server.js") == "$console_before" ]] || { echo 'idempotent rerun changed console root' >&2; exit 1; }
 
 # 5. Package content (console + binaries + engine) upgrades without --reconfigure.
-# Config/service files still require --reconfigure when they change.
+# Config/service files are preserved unless --reconfigure is explicit.
 printf '%s\n' 'changed console' >"$CONSOLE_BUILD/opt/cygnus-console/server.js"
 # Keep the fake CLI intact; only mutate daemon + bun payloads.
 printf '%s\n' '#!/usr/bin/env sh' 'exit 0' 'new-daemon-marker' >"$BUNDLE/cygnus-daemon"
@@ -232,8 +232,10 @@ grep -q 'new-bun-marker' "$ROOT/var/lib/cygnus/engines/bun-1.3.14/usr/local/bin/
 # Restore a full working fake bundle for later admin-mutation steps.
 make_bundle
 run_install
-# Changed listen address rewrites node.json; that still needs --reconfigure.
-expect_fail bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE"   --prefix "$ROOT/usr/local/bin" --config-dir "$ROOT/etc/cygnus"   --state-dir "$ROOT/var/lib/cygnus" --runtime-dir "$ROOT/run/cygnus"   --listen 127.0.0.1:3399 --https-listen 127.0.0.1:3443 --apps-domain apps.test   --acme-email ops@apps.test --dns-provider cloudflare --bun-version 1.3.14
+# A plain rerun with different generated defaults remains a successful package
+# upgrade and preserves operator configuration. `--reconfigure` opts into the
+# new values.
+bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE"   --prefix "$ROOT/usr/local/bin" --config-dir "$ROOT/etc/cygnus"   --state-dir "$ROOT/var/lib/cygnus" --runtime-dir "$ROOT/run/cygnus"   --listen 127.0.0.1:3399 --https-listen 127.0.0.1:3443 --apps-domain apps.test   --acme-email ops@apps.test --dns-provider cloudflare --bun-version 1.3.14
 [[ $(cat "$ROOT/etc/cygnus/node.json") == "$config_before" ]] || { echo 'config changed without --reconfigure' >&2; exit 1; }
 run_install --reconfigure --listen 127.0.0.1:3399
 grep -q '127.0.0.1:3399' "$ROOT/etc/cygnus/node.json" || { echo 'reconfigure did not replace node config' >&2; exit 1; }

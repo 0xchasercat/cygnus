@@ -105,6 +105,10 @@
     if (sslAuto) return { cls: 'build', text: 'issuing' };
     return { cls: 'ghost', text: 'self-signed' };
   });
+  const dashboardNeedsCertRetry = $derived(
+    sslAuto && dashboardCert != null
+      && (dashboardCert.kind === 'self_signed' || !dashboardCert.ok)
+  );
   function openDashEdit() {
     dashDomain = dashboardDomain;
     // UI "Apps domain" is apex; fall back to apps_domain for older nodes.
@@ -163,6 +167,15 @@
       return;
     }
     acmeEmailOpen = false;
+  }
+
+  async function retryDashboardCertificate() {
+    if (tlsBusy || !dashboardNeedsCertRetry) return;
+    tlsBusy = true;
+    dashError = '';
+    const r = await store.retryDashboardAcme();
+    tlsBusy = false;
+    if (!r.ok) dashError = r.error ?? 'Could not retry dashboard certificate issuance';
   }
 
   async function connectGithub(e) {
@@ -570,11 +583,21 @@
           {#if sslMode}
             <p class="dash-note mono">
               {#if sslAuto}
-                DNS A record must point at this node, and ports 80/443 must be reachable from the public internet. Until ACME succeeds, a self-signed cert (CN "Cygnus self-signed fallback") is served.
+                DNS A record must point at this node, and ports 80/443 must be reachable from the public internet. Cygnus retries automatically every two minutes while a trusted certificate is needed.
               {:else}
                 Switch to automatic HTTPS to issue a trusted certificate from Let's Encrypt. You will need a contact email.
               {/if}
             </p>
+            {#if dashboardNeedsCertRetry}
+              <button
+                type="button"
+                class="btn sm"
+                onclick={retryDashboardCertificate}
+                disabled={tlsBusy}
+              >
+                {tlsBusy ? 'Retrying…' : 'Retry certificate now'}
+              </button>
+            {/if}
           {/if}
         </div>
       </section>

@@ -30,6 +30,9 @@ const STATIC_SERVER_SOURCE =
 const REGISTRY = "https://registry.npmjs.org";
 const HOME = process.env.HOME ?? "/cygnus/home";
 const TMPDIR = process.env.TMPDIR ?? "/cygnus/tmp";
+// Build output is mounted at /app when the sealed artifact boots. Never bake
+// the build-cage publication path (/cygnus/output/app) into runtime launchers.
+const RUNTIME_ARTIFACT_ROOT = "/app";
 // Framework build scripts commonly shell out to `bun`/`bunx` by name (e.g.
 // "bun x vite build"). Put the running engine's own directory on PATH so those
 // resolve to the same Bun that drives the build — on rooted Linux this is
@@ -304,19 +307,12 @@ async function copyRuntimeTree(source, destination, ancestry = new Set()) {
   }
 }
 
-async function buildStartLauncher() {
-  phaseLog("detect", "package start script found → Bun runtime mode");
-  const runtimeWorkspace = join(OUTPUT, "workspace");
-  await rm(runtimeWorkspace, { recursive: true, force: true });
-  await copyRuntimeTree(WORKSPACE, runtimeWorkspace);
-
-  const launcher = join(OUTPUT, "cygnus-static-server.ts");
-  await writeFile(
-    launcher,
-    `import { join } from "node:path";
+export function runtimeLauncherSource() {
+  return `import { join } from "node:path";
 (async () => {
-const shim = join(import.meta.dir, "cygnus", "shim.js");
-const workspace = join(import.meta.dir, "workspace");
+const artifact = ${JSON.stringify(RUNTIME_ARTIFACT_ROOT)};
+const shim = join(artifact, "cygnus", "shim.js");
+const workspace = join(artifact, "workspace");
 const child = Bun.spawn([
   process.execPath,
   "run",
@@ -343,7 +339,19 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
 }
 process.exit(await child.exited);
 })();
-`,
+`;
+}
+
+async function buildStartLauncher() {
+  phaseLog("detect", "package start script found → Bun runtime mode");
+  const runtimeWorkspace = join(OUTPUT, "workspace");
+  await rm(runtimeWorkspace, { recursive: true, force: true });
+  await copyRuntimeTree(WORKSPACE, runtimeWorkspace);
+
+  const launcher = join(OUTPUT, "cygnus-static-server.ts");
+  await writeFile(
+    launcher,
+    runtimeLauncherSource(),
     { mode: 0o600 },
   );
   const result = await Bun.build({

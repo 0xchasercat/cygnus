@@ -10,6 +10,13 @@ if [[ ${CYGNUS_INSTALL_TEST_MODE:-0} == 1 || ${CYGNUS_INSTALL_TEST:-0} == 1 || $
 fi
 OS=$(uname -s)
 if (( TEST_MODE )) && [[ -n ${CYGNUS_INSTALL_TEST_UNAME:-} ]]; then OS=$CYGNUS_INSTALL_TEST_UNAME; fi
+host_arch() {
+  if (( TEST_MODE )) && [[ -n ${CYGNUS_INSTALL_TEST_ARCH:-} ]]; then
+    printf '%s\n' "$CYGNUS_INSTALL_TEST_ARCH"
+  else
+    uname -m
+  fi
+}
 case $OS in
   Linux|Darwin) ;;
   *) printf 'cygnus installer: ERROR: Unsupported OS: %s\n' "$OS" >&2; exit 1 ;;
@@ -162,7 +169,7 @@ fi
 
 downloaded_bundle=""
 if (( ! uninstall )) && [[ -z $bundle_dir ]]; then
-  ARCH=$(uname -m)
+  ARCH=$(host_arch)
   case $OS in
     Linux) OS_LOWER="unknown-linux-gnu" ;;
     Darwin) OS_LOWER="apple-darwin" ;;
@@ -494,10 +501,10 @@ else
   # staged as a dedicated lowerdir. Both binaries are glibc-linked against the
   # same loader path (/lib64/ld-linux-*.so.*); hostlib is their shared ABI root.
   hostlib_root=$state_dir/hostlib
-  case $(uname -m) in
+  case $(host_arch) in
     x86_64) hostlib_loader=/lib64/ld-linux-x86-64.so.2; hostlib_lib_dir=/lib/x86_64-linux-gnu ;;
     aarch64) hostlib_loader=/lib64/ld-linux-aarch64.so.1; hostlib_lib_dir=/lib/aarch64-linux-gnu ;;
-    *) fail "unsupported architecture for host lib staging: $(uname -m)" ;;
+    *) fail "unsupported architecture for host lib staging: $(host_arch)" ;;
   esac
 fi
 
@@ -656,27 +663,30 @@ fi
 service_stage=$stage/cygnus.service
 [[ $OS == Darwin ]] && service_stage=$stage/com.cygnus.daemon.plist
 
-# Config and service files keep their values across upgrades unless the
-# operator opts in with --reconfigure. Package content (binaries, console,
-# engine) always tracks the release being installed so a plain reinstall is
-# the upgrade path. Secrets only change with --rotate-secrets.
-existing_diff() { [[ -e $1 ]] && { [[ ! -L $1 && -f $1 ]] || fail "existing path is not a regular file: $1"; } && ! cmp -s "$2" "$1"; }
-check_change_allowed() {
-  local dest=$1 src=$2
-  if existing_diff "$dest" "$src" && (( ! reconfigure )); then
-    fail "existing $dest differs; re-run with --reconfigure (secrets require --rotate-secrets)"
+# Plain reruns are upgrades: preserve operator/dashboard configuration while
+# replacing package content. `--reconfigure` is the explicit request to use
+# newly supplied installer values. Previously the generated defaults differed
+# from any configured ACME install, so a normal rerun failed before upgrading.
+preserve_existing_file() {
+  local dest=$1 staged=$2 label=$3
+  if [[ ! -e $dest ]]; then
+    return
+  fi
+  [[ ! -L $dest && -f $dest ]] || fail "existing $label is not a regular file: $dest"
+  if (( ! reconfigure )) && ! cmp -s "$staged" "$dest"; then
+    cp -- "$dest" "$staged"
+    log "Preserve existing $label (use --reconfigure to replace it)"
   fi
 }
-check_change_allowed "$config_file" "$stage/node.json"
-check_change_allowed "$service_file" "$service_stage"
+preserve_existing_file "$config_file" "$stage/node.json" "node configuration"
+preserve_existing_file "$service_file" "$service_stage" "service configuration"
 if [[ -e $secrets_env ]]; then
   [[ ! -L $secrets_env && -f $secrets_env ]] || fail "existing secrets env is not a regular file"
   if (( ! rotate_secrets )); then
-    old_nonsecret=$(cat "$secrets_env")
-    new_nonsecret=$(cat "$stage/secrets.env")
-    if [[ $old_nonsecret != "$new_nonsecret" && $reconfigure -eq 0 ]]; then
-      fail "existing $secrets_env differs; re-run with --reconfigure"
-    fi
+    # Secret material and its associated environment remain stable unless the
+    # operator explicitly rotates it. Reconfiguration changes node.json, not
+    # recovery/session credentials.
+    cp -- "$secrets_env" "$stage/secrets.env"
   fi
 fi
 if [[ -L $console_root ]]; then
@@ -1060,6 +1070,16 @@ fi
 
 "$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun --default >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
 "$prefix/cygnus" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "node configuration apply failed; diagnostics: $diag_file"
+
+# Listener and ACME account changes are persisted by apply, then become active
+# after this controlled restart. Keeping the restart in the installer makes
+# `--reconfigure` a complete operation instead of returning a conflict that
+# forces users to manually delete state.
+if (( reconfigure )); then
+  log "Restart Cygnus with reconfigured node settings"
+  start_service
+  wait_for_socket "$admin_socket" 50 || fail "daemon did not come back after reconfiguration; diagnostics: $diag_file"
+fi
 
 # The Tenant Zero bridge socket binds at daemon startup from stored state. A
 # daemon that booted before the configuration was stored (an interrupted
