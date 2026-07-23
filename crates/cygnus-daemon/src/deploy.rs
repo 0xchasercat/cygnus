@@ -513,6 +513,10 @@ where
     })?;
     verify_engine(&engine)?;
     let source_root = canonical_source_root(&request.source_dir)?;
+    let source_root = resolve_application_root(
+        &source_root,
+        request.entry_explicit.then_some(request.entry.as_path()),
+    )?;
     let artifact_root = prepare_artifact_root(&request.artifact_root)?;
     let requested_entry = request.entry.clone();
     let deployment_id = request
@@ -1208,10 +1212,10 @@ fn preflight_workspace(
             let detection = format!("server app ({})", slash_path(&entry));
             (BuildMode::Server { entry }, detection)
         } else {
-            return Err(DeployError::InvalidInput(
-                "could not detect app type: looked for index.html, server entry (index.ts, index.js, src/index.ts, server.ts), or a build script; pass --entry for a server app"
-                    .into(),
-            ));
+            return Err(DeployError::InvalidInput(format!(
+                "could not detect app type: looked for index.html, server entry (index.ts, index.js, src/index.ts, server.ts), or a build script; pass --entry for a server app; workspace root contains: {}",
+                workspace_root_summary(workspace)?
+            )));
         }
     };
 
@@ -1220,6 +1224,36 @@ fn preflight_workspace(
         frozen: has_dependencies && frozen,
         mode,
         detection,
+    })
+}
+
+fn workspace_root_summary(workspace: &Path) -> Result<String, DeployError> {
+    let mut entries = fs::read_dir(workspace)?.collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let total = entries.len();
+    let mut names = entries
+        .into_iter()
+        .take(8)
+        .map(|entry| {
+            let mut name = entry
+                .file_name()
+                .to_string_lossy()
+                .chars()
+                .take(48)
+                .collect::<String>();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                name.push('/');
+            }
+            name
+        })
+        .collect::<Vec<_>>();
+    if total > names.len() {
+        names.push(format!("… and {} more", total - names.len()));
+    }
+    Ok(if names.is_empty() {
+        "<empty>".into()
+    } else {
+        names.join(", ")
     })
 }
 
@@ -1491,6 +1525,90 @@ pub fn canonical_source_root(path: &Path) -> Result<PathBuf, DeployError> {
         ));
     }
     Ok(fs::canonicalize(path)?)
+}
+
+/// Resolve an archive or uploaded-folder wrapper without encoding framework
+/// names. A repository root is any directory with package.json, index.html, a
+/// conventional server entry, or the explicitly requested entry. When the
+/// supplied root has no marker, select only a unique shallowest candidate so
+/// an ambiguous monorepo is never deployed by guesswork.
+fn resolve_application_root(
+    source_root: &Path,
+    explicit_entry: Option<&Path>,
+) -> Result<PathBuf, DeployError> {
+    if directory_has_app_marker(source_root, explicit_entry)? {
+        return Ok(source_root.to_path_buf());
+    }
+
+    let mut candidates = Vec::new();
+    collect_application_roots(source_root, explicit_entry, 0, &mut candidates)?;
+    let Some(min_depth) = candidates.iter().map(|(depth, _)| *depth).min() else {
+        return Ok(source_root.to_path_buf());
+    };
+    let mut shallowest = candidates
+        .into_iter()
+        .filter_map(|(depth, path)| (depth == min_depth).then_some(path));
+    let Some(candidate) = shallowest.next() else {
+        return Ok(source_root.to_path_buf());
+    };
+    if shallowest.next().is_some() {
+        return Ok(source_root.to_path_buf());
+    }
+    Ok(fs::canonicalize(candidate)?)
+}
+
+fn collect_application_roots(
+    directory: &Path,
+    explicit_entry: Option<&Path>,
+    depth: usize,
+    candidates: &mut Vec<(usize, PathBuf)>,
+) -> Result<(), DeployError> {
+    if depth > 16 {
+        return Ok(());
+    }
+    if directory_has_app_marker(directory, explicit_entry)? {
+        candidates.push((depth, directory.to_path_buf()));
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        if name == "node_modules" || name == ".git" {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() {
+            collect_application_roots(&entry.path(), explicit_entry, depth + 1, candidates)?;
+        }
+    }
+    Ok(())
+}
+
+fn directory_has_app_marker(
+    directory: &Path,
+    explicit_entry: Option<&Path>,
+) -> Result<bool, DeployError> {
+    let mut markers = vec![
+        Path::new("package.json"),
+        Path::new("index.html"),
+        Path::new("index.ts"),
+        Path::new("index.js"),
+        Path::new("src/index.ts"),
+        Path::new("server.ts"),
+    ];
+    if let Some(entry) = explicit_entry {
+        markers.push(entry);
+    }
+    for marker in markers {
+        match fs::symlink_metadata(directory.join(marker)) {
+            Ok(metadata) if metadata.file_type().is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn prepare_artifact_root(path: &Path) -> Result<PathBuf, DeployError> {
@@ -2403,6 +2521,38 @@ mod tests {
         assert!(!destination.join(".DS_Store").exists());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn source_intake_resolves_a_unique_wrapped_package_root() {
+        let root = temp_dir("wrapped-app-root");
+        fs::write(root.join("pax_global_header"), b"archive metadata").unwrap();
+        let repository = root.join("owner-cc-dev-9f0c6a7");
+        fs::create_dir_all(repository.join("app")).unwrap();
+        fs::write(
+            repository.join("package.json"),
+            br#"{"scripts":{"build":"next build","start":"next start"}}"#,
+        )
+        .unwrap();
+        fs::write(repository.join("app/page.tsx"), b"export default 1").unwrap();
+
+        assert_eq!(
+            resolve_application_root(&root, None).unwrap(),
+            fs::canonicalize(&repository).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_intake_does_not_guess_between_ambiguous_packages() {
+        let root = temp_dir("ambiguous-app-root");
+        for name in ["web", "api"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("package.json"), b"{}").unwrap();
+        }
+
+        assert_eq!(resolve_application_root(&root, None).unwrap(), root);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
