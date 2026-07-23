@@ -1246,7 +1246,7 @@ fn redact_public_error(value: &str) -> String {
     bounded_text(value.to_owned(), 512)
 }
 
-fn deployment_view(deployment: DeploymentRecord, role: AdminRole) -> DeploymentView {
+fn deployment_view(deployment: DeploymentRecord, _role: AdminRole) -> DeploymentView {
     DeploymentView {
         id: deployment.id,
         app: deployment.app,
@@ -1257,9 +1257,12 @@ fn deployment_view(deployment: DeploymentRecord, role: AdminRole) -> DeploymentV
         source: deployment.source,
         artifact_hash: deployment.artifact_hash,
         status: deployment_status_name(deployment.status).into(),
-        error: matches!(role, AdminRole::Host)
-            .then_some(deployment.error)
-            .flatten(),
+        // Tenant users can already read this deployment's compiler logs. The
+        // terminal summary is equally important, especially for source-fetch
+        // failures that occur before a compiler process exists.
+        error: deployment
+            .error
+            .map(|detail| bounded_text(detail, 4 * 1024)),
     }
 }
 
@@ -1849,6 +1852,39 @@ mod tests {
             AdminResponse::Error { error, .. } if error.code == AdminErrorCode::NotFound
         ));
         drop(handler);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tenant_deployment_view_includes_the_terminal_failure_reason() {
+        let (root, path) = state_with_engine("tenant-deployment-error");
+        let mut state = State::open(&path).unwrap();
+        state
+            .begin_deployment(&crate::state::DeploymentInput {
+                id: "gh-visible-failure".into(),
+                app: "hello".into(),
+                source_hash: "a".repeat(64),
+                engine_version: "bun".into(),
+                source: DeploymentSource::github(Some("main".into()), Some("b".repeat(40))),
+            })
+            .unwrap();
+        state
+            .mark_deployment_failed(
+                "gh-visible-failure",
+                "GitHub archive download exceeded its configured size",
+            )
+            .unwrap();
+
+        let view = deployment_view(
+            state.deployment("gh-visible-failure").unwrap().unwrap(),
+            AdminRole::TenantZero,
+        );
+
+        assert_eq!(
+            view.error.as_deref(),
+            Some("GitHub archive download exceeded its configured size")
+        );
+        drop(state);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -233,7 +233,7 @@ pub fn run_job_streaming(
     .completion)
 }
 
-/// Run a domain-restricted finite job through the host DNS forwarder.
+/// Run a networked finite job through the host DNS forwarder.
 #[cfg(target_os = "linux")]
 pub fn run_job_with_dns(config: JobConfig, dns: &DnsForwarder) -> Result<JobResult, CageError> {
     let run = run_job_with_boot(
@@ -251,7 +251,7 @@ pub fn run_job_with_dns(config: JobConfig, dns: &DnsForwarder) -> Result<JobResu
     })
 }
 
-/// Stream a domain-restricted finite job through the host DNS forwarder.
+/// Stream a networked finite job through the host DNS forwarder.
 #[cfg(target_os = "linux")]
 pub fn run_job_streaming_with_dns(
     config: JobConfig,

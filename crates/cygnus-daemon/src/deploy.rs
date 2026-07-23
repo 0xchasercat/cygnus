@@ -523,6 +523,7 @@ where
         .unwrap_or_else(new_deployment_id);
     if request.deployment_id.is_some() {
         remove_work(&artifact_root, &deployment_id)?;
+        reset_retry_state(&artifact_root, &deployment_id)?;
     }
     let workspace = artifact_root
         .join(WORKSPACE_REL)
@@ -637,7 +638,7 @@ where
             &deployment_id,
             &build_plan,
         );
-        let job_result = match run_build_job(job, build_plan.install, stdout_log, stderr_log) {
+        let job_result = match run_build_job(job, stdout_log, stderr_log) {
             Ok(result) => result,
             Err(error) => {
                 append_log(
@@ -847,20 +848,16 @@ where
     }
 }
 
-fn run_build_job(
-    job: JobConfig,
-    needs_dns: bool,
-    stdout: File,
-    stderr: File,
-) -> Result<JobCompletion, CageError> {
+fn run_build_job(job: JobConfig, stdout: File, stderr: File) -> Result<JobCompletion, CageError> {
     #[cfg(target_os = "linux")]
-    if needs_dns {
+    if matches!(
+        job.egress,
+        EgressMode::Public | EgressMode::BuildDomains { .. }
+    ) {
         let dns = DnsForwarder::start()?;
         return run_job_streaming_with_dns(job, stdout, stderr, &dns);
     }
 
-    #[cfg(not(target_os = "linux"))]
-    let _ = needs_dns;
     run_job_streaming(job, stdout, stderr)
 }
 
@@ -1087,6 +1084,16 @@ fn runtime_config(
         "CYGNUS_SOCKET".into(),
         socket.to_string_lossy().into_owned(),
     );
+    if !linux {
+        env.insert(
+            "CYGNUS_RUNTIME_ARTIFACT_ROOT".into(),
+            artifact_path.join("app").to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "CYGNUS_RUNTIME_SHIM".into(),
+            artifact_path.join(SHIM_REL).to_string_lossy().into_owned(),
+        );
+    }
     Ok(AppConfig {
         name: request.app.clone(),
         domains: vec![request.domain.clone()],
@@ -1801,6 +1808,11 @@ fn copy_output_tree(source: &Path, destination: &Path) -> Result<(), DeployError
                 .create_new(true)
                 .open(&destination_path)?;
             io::copy(&mut input, &mut output)?;
+            let executable = input.metadata()?.permissions().mode() & 0o111;
+            fs::set_permissions(
+                &destination_path,
+                fs::Permissions::from_mode(0o600 | executable),
+            )?;
         } else {
             return Err(DeployError::InvalidInput(format!(
                 "build output contains unsupported file {}",
@@ -1944,6 +1956,33 @@ fn append_log(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
     file.sync_all()
 }
 
+/// Persist a source/intake failure using the same deployment log contract as
+/// the build cage. GitHub archive and upload preparation can fail before the
+/// ordinary pipeline has created its log files, but the deployment is already
+/// user-visible at that point and must never become an opaque failed row.
+pub fn record_pre_pipeline_failure(
+    state: &mut State,
+    deployment_id: &str,
+    detail: &str,
+) -> Result<(), DeployError> {
+    let deployment = state.deployment(deployment_id)?.ok_or_else(|| {
+        DeployError::InvalidInput(format!("deployment {deployment_id:?} does not exist"))
+    })?;
+    if deployment.log_path.is_none() {
+        let artifact_root =
+            prepare_artifact_root(&state.deployment_artifact_root(&deployment.app))?;
+        reset_retry_state(&artifact_root, deployment_id)?;
+        let log_path = artifact_root.join(LOG_REL).join(deployment_id);
+        let (_stdout, mut stderr) = prepare_live_logs(&artifact_root, deployment_id)?;
+        writeln!(stderr, "[pipeline] {detail}")?;
+        stderr.flush()?;
+        stderr.sync_all()?;
+        state.set_deployment_log_path(deployment_id, &log_path)?;
+    }
+    state.mark_deployment_failed(deployment_id, detail)?;
+    Ok(())
+}
+
 fn sync_logs(logs: &Path) {
     for name in ["build.stdout.log", "build.stderr.log"] {
         if let Ok(file) = OpenOptions::new().write(true).open(logs.join(name)) {
@@ -2027,6 +2066,28 @@ fn remove_work(artifact_root: &Path, id: &str) -> Result<(), io::Error> {
         fs::remove_dir_all(work)?;
     }
     let _ = fs::remove_dir(artifact_root.join(WORKSPACE_REL));
+    Ok(())
+}
+
+fn reset_retry_state(artifact_root: &Path, id: &str) -> Result<(), io::Error> {
+    for path in [
+        artifact_root.join(LOG_REL).join(id),
+        artifact_root.join(FAILED_REL).join(id),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(path)?;
+            }
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "retry state path {} is not a directory",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(())
 }
 
@@ -2900,6 +2961,35 @@ mod tests {
     }
 
     #[test]
+    fn output_copy_preserves_executable_bits_for_runtime_bins() {
+        let root = temp_dir("output-executable");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("node_modules/.bin")).unwrap();
+        let executable = source.join("node_modules/.bin/next");
+        fs::write(&executable, b"#!/usr/bin/env node\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        copy_output_tree(&source, &destination).unwrap();
+        make_read_only(&destination).unwrap();
+
+        let mode = fs::metadata(destination.join("node_modules/.bin/next"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0);
+        assert_eq!(mode & 0o222, 0);
+        for directory in [
+            destination.join("node_modules/.bin"),
+            destination.join("node_modules"),
+            destination,
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn manifest_hash_changes_with_payload_and_is_sorted() {
         let root = temp_dir("manifest");
         fs::create_dir_all(root.join("app")).unwrap();
@@ -3023,6 +3113,28 @@ mod tests {
     }
 
     #[test]
+    fn retry_state_reset_replaces_previous_logs_and_failed_output() {
+        let root = temp_dir("retry-state");
+        let id = "gh-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let logs = root.join(LOG_REL).join(id);
+        let failed = root.join(FAILED_REL).join(id);
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(failed.join("output")).unwrap();
+        fs::write(logs.join("pipeline.error.log"), b"old failure").unwrap();
+        fs::write(failed.join("output/partial"), b"old output").unwrap();
+
+        reset_retry_state(&root, id).unwrap();
+
+        assert!(!logs.exists());
+        assert!(!failed.exists());
+        let (stdout, stderr) = prepare_live_logs(&root, id).unwrap();
+        drop((stdout, stderr));
+        assert!(logs.join("build.stdout.log").is_file());
+        assert!(logs.join("build.stderr.log").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_preflight_records_visible_logs_and_failed_state() {
         let root = temp_dir("failed-preflight");
         let source = root.join("source");
@@ -3103,6 +3215,52 @@ mod tests {
             0o600
         );
         assert!(!artifacts.join("c".repeat(64)).join("logs").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_pipeline_failure_registers_visible_logs_and_terminal_error() {
+        let root = temp_dir("source-failure-logs");
+        let mut state = State::open(root.join("state.db")).unwrap();
+        register_engine(
+            &mut state,
+            "shell",
+            "/",
+            fs::canonicalize("/bin/sh").unwrap(),
+        )
+        .unwrap();
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "gh-source-failure".into(),
+                app: "web".into(),
+                source_hash: "b".repeat(64),
+                engine_version: "shell".into(),
+                source: DeploymentSource::cli(),
+            })
+            .unwrap();
+
+        record_pre_pipeline_failure(
+            &mut state,
+            "gh-source-failure",
+            "GitHub archive download exceeded its configured size",
+        )
+        .unwrap();
+
+        let deployment = state.deployment("gh-source-failure").unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Failed);
+        assert_eq!(
+            deployment.error.as_deref(),
+            Some("GitHub archive download exceeded its configured size")
+        );
+        let logs = deployment.log_path.expect("failure log path");
+        assert_eq!(
+            fs::read_to_string(logs.join("build.stderr.log")).unwrap(),
+            "[pipeline] GitHub archive download exceeded its configured size\n"
+        );
+        assert_eq!(
+            fs::read(logs.join("build.stdout.log")).unwrap(),
+            Vec::<u8>::new()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

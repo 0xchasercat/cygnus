@@ -92,9 +92,13 @@ impl Cage {
         dns: Option<&DnsForwarder>,
     ) -> Result<Self, CageError> {
         spec.validate()?;
-        if matches!(spec.egress, EgressMode::BuildDomains { .. }) && dns.is_none() {
+        if matches!(
+            spec.egress,
+            EgressMode::BuildDomains { .. } | EgressMode::Public
+        ) && dns.is_none()
+        {
             return Err(CageError::InvalidSpec(
-                "build-domain egress requires a host DNS forwarder".into(),
+                "public and build-domain egress require a host DNS forwarder".into(),
             ));
         }
         let child_exec = ChildExec::new(&spec)?;
@@ -215,9 +219,19 @@ impl Cage {
                 return Err(error);
             }
         }
-        if let EgressMode::BuildDomains { allow } = &spec.egress {
+        if matches!(
+            spec.egress,
+            EgressMode::BuildDomains { .. } | EgressMode::Public
+        ) {
             let forwarder = dns.ok_or(CageError::Internal("missing host DNS forwarder"))?;
-            match forwarder.register(&spec.name, pid.as_raw(), allow) {
+            let registration = match &spec.egress {
+                EgressMode::BuildDomains { allow } => {
+                    forwarder.register(&spec.name, pid.as_raw(), allow)
+                }
+                EgressMode::Public => forwarder.register_public(&spec.name, pid.as_raw()),
+                _ => unreachable!("network mode checked above"),
+            };
+            match registration {
                 Ok(lease) => guard.dns_lease = Some(lease),
                 Err(error) => {
                     let _ = write_all_fd(&release_write, &[CHILD_ABORT]);
@@ -1247,6 +1261,16 @@ mod tests {
                 ports: vec![443],
             }],
         };
+
+        let error = Cage::boot(spec).expect_err("forwarder must be supplied");
+        assert!(matches!(error, CageError::InvalidSpec(_)));
+        assert!(error.to_string().contains("host DNS forwarder"));
+    }
+
+    #[test]
+    fn public_egress_requires_a_forwarder_before_clone() {
+        let mut spec = CageSpec::new("builder", "/bin/true");
+        spec.egress = EgressMode::Public;
 
         let error = Cage::boot(spec).expect_err("forwarder must be supplied");
         assert!(matches!(error, CageError::InvalidSpec(_)));

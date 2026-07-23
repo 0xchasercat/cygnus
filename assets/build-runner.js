@@ -1,8 +1,10 @@
 import {
+  chmod,
   copyFile,
   lstat,
   mkdir,
   readFile,
+  readlink,
   readdir,
   realpath,
   rm,
@@ -33,6 +35,7 @@ const TMPDIR = process.env.TMPDIR ?? "/cygnus/tmp";
 // Build output is mounted at /app when the sealed artifact boots. Never bake
 // the build-cage publication path (/cygnus/output/app) into runtime launchers.
 const RUNTIME_ARTIFACT_ROOT = "/app";
+const RUNTIME_SHIM_PATH = "/cygnus/shim.js";
 // Framework build scripts commonly shell out to `bun`/`bunx` by name (e.g.
 // "bun x vite build"). Put the running engine's own directory on PATH so those
 // resolve to the same Bun that drives the build — on rooted Linux this is
@@ -273,7 +276,9 @@ async function isInsideWorkspace(path) {
 async function copyRuntimeTree(source, destination, ancestry = new Set()) {
   let resolved = source;
   let metadata = await lstat(source);
+  let followedSymlink = false;
   if (metadata.isSymbolicLink()) {
+    followedSymlink = true;
     resolved = await realpath(source);
     if (!(await isInsideWorkspace(resolved))) {
       fail(`runtime tree symlink escapes workspace: ${source}`);
@@ -282,7 +287,28 @@ async function copyRuntimeTree(source, destination, ancestry = new Set()) {
   }
   if (metadata.isFile()) {
     await mkdir(dirname(destination), { recursive: true });
-    await copyFile(resolved, destination);
+    if (followedSymlink && isPackageBin(source)) {
+      const linkTarget = await readlink(source);
+      const target = (
+        isAbsolute(linkTarget)
+          ? relative(dirname(await realpath(dirname(source))), resolved)
+          : linkTarget
+      ).replaceAll("\\", "/");
+      const prefix = await Bun.file(resolved).slice(0, 256).text();
+      const shebang = prefix.split("\n", 1)[0] ?? "";
+      const runWithBun =
+        /\b(?:node|bun)\b/.test(shebang) ||
+        /\.(?:[cm]?js|tsx?)$/i.test(resolved);
+      const command = runWithBun ? "bun " : "";
+      await writeFile(
+        destination,
+        `#!/bin/sh\ncase "$0" in */*) d=\${0%/*};; *) d=.;; esac\nexec ${command}"$d"/'${shellSingleQuote(target)}' "$@"\n`,
+        { mode: 0o755 },
+      );
+    } else {
+      await copyFile(resolved, destination);
+      await chmod(destination, metadata.mode & 0o777);
+    }
     return;
   }
   if (!metadata.isDirectory()) fail(`runtime tree contains a special file: ${source}`);
@@ -307,12 +333,28 @@ async function copyRuntimeTree(source, destination, ancestry = new Set()) {
   }
 }
 
+function isPackageBin(path) {
+  const parts = relative(WORKSPACE, path).split(/[\\/]/);
+  return parts.length >= 3 &&
+    parts.at(-2) === ".bin" &&
+    parts.slice(0, -2).includes("node_modules");
+}
+
+function shellSingleQuote(value) {
+  return String(value).replaceAll("'", "'\"'\"'");
+}
+
 export function runtimeLauncherSource() {
-  return `import { join } from "node:path";
+  return `import { dirname, join } from "node:path";
 (async () => {
-const artifact = ${JSON.stringify(RUNTIME_ARTIFACT_ROOT)};
-const shim = join(artifact, "cygnus", "shim.js");
+const artifact = process.env.CYGNUS_RUNTIME_ARTIFACT_ROOT ??
+  ${JSON.stringify(RUNTIME_ARTIFACT_ROOT)};
+const shim = process.env.CYGNUS_RUNTIME_SHIM ??
+  ${JSON.stringify(RUNTIME_SHIM_PATH)};
 const workspace = join(artifact, "workspace");
+const runtimePath = [dirname(process.execPath), process.env.PATH]
+  .filter(Boolean)
+  .join(":");
 const child = Bun.spawn([
   process.execPath,
   "run",
@@ -325,6 +367,7 @@ const child = Bun.spawn([
   cwd: workspace,
   env: {
     ...process.env,
+    PATH: runtimePath,
     NODE_ENV: process.env.NODE_ENV ?? "production",
     BUN_OPTIONS: [process.env.BUN_OPTIONS, "--no-env-file", "--preload=" + shim]
       .filter(Boolean)

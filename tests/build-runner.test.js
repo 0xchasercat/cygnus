@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
 import {
   access,
+  chmod,
   copyFile,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -277,7 +279,7 @@ test("auto mode packages and runs a start-only Bun application", async () => {
   try {
     await writeFile(
       join(fixture.workspace, "package.json"),
-      JSON.stringify({ scripts: { start: "bun server.ts" } }),
+      JSON.stringify({ scripts: { start: "fixture-dependency && bun server.ts" } }),
     );
     await writeFile(
       join(fixture.workspace, "server.ts"),
@@ -286,7 +288,11 @@ test("auto mode packages and runs a start-only Bun application", async () => {
     await mkdir(join(fixture.workspace, "node_modules", "fixture-dependency"), { recursive: true });
     await writeFile(
       join(fixture.workspace, "node_modules", "fixture-dependency", "index.js"),
-      "export default true;\n",
+      "#!/usr/bin/env bun\nconsole.log('dependency bin ok');\n",
+    );
+    await chmod(
+      join(fixture.workspace, "node_modules", "fixture-dependency", "index.js"),
+      0o755,
     );
     await mkdir(join(fixture.workspace, "node_modules", ".bin"), { recursive: true });
     await symlink(
@@ -303,7 +309,12 @@ test("auto mode packages and runs a start-only Bun application", async () => {
     ).toBe(true);
     expect(
       await readFile(join(fixture.output, "workspace", "node_modules", ".bin", "fixture-dependency"), "utf8"),
-    ).toContain("export default true");
+    ).toContain("exec bun");
+    expect(
+      (await stat(
+        join(fixture.output, "workspace", "node_modules", ".bin", "fixture-dependency"),
+      )).mode & 0o111,
+    ).not.toBe(0);
 
     const runtimeShim = join(fixture.output, "cygnus", "shim.js");
     await mkdir(join(fixture.output, "cygnus"), { recursive: true });
@@ -314,14 +325,24 @@ test("auto mode packages and runs a start-only Bun application", async () => {
 
     const socket = join(fixture.root, "runtime.sock");
     const server = Bun.spawn([BUN, "--no-env-file", "--preload", runtimeShim, generatedServer], {
-      env: { ...process.env, CYGNUS_SOCKET: socket },
+      env: {
+        ...process.env,
+        CYGNUS_SOCKET: socket,
+        CYGNUS_RUNTIME_ARTIFACT_ROOT: fixture.output,
+        CYGNUS_RUNTIME_SHIM: runtimeShim,
+      },
       stdout: "pipe",
       stderr: "pipe",
     });
+    const runtimeStderr = new Response(server.stderr).text();
     try {
       const response = await unixRequestEventually(socket, "/");
       expect(response.status).toBe(200);
       expect(response.body).toBe("runtime ok");
+    } catch (error) {
+      server.kill();
+      await server.exited;
+      throw new Error(`${error}\nruntime stderr:\n${await runtimeStderr}`);
     } finally {
       server.kill();
       await server.exited;

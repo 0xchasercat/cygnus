@@ -1,10 +1,10 @@
-//! Host DNS forwarding for exact-domain build egress.
+//! Host DNS forwarding for networked cages.
 //!
 //! This is deliberately a small DNS wire proxy rather than a resolver. It
-//! admits one exact A question, forwards the original bytes to the host's
-//! upstream resolver, validates the response, installs public answer
-//! addresses into the requesting cage's timed nftables set, and only then
-//! returns the untouched upstream response.
+//! admits one A question, forwards the original bytes to the host's upstream
+//! resolver, validates the response, and returns the untouched upstream
+//! response. Exact-domain policies additionally install public answer
+//! addresses into the requesting cage's timed nftables set before replying.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind, Read, Write};
@@ -38,7 +38,7 @@ pub const MIN_TTL_SECS: u32 = 60;
 /// Upper TTL bound keeps this transient build policy from becoming permanent.
 pub const MAX_TTL_SECS: u32 = 3_600;
 
-/// Host-side DNS proxy shared by all domain-restricted build cages.
+/// Host-side DNS proxy shared by networked cages.
 ///
 /// [`start`](Self::start) binds both UDP and TCP specifically to
 /// `100.64.0.1:53`. A fixed worker pool serves a bounded queue; overload drops
@@ -145,6 +145,20 @@ impl DnsForwarder {
         }
         Ok(self.registry.register(cage_name, host_pid, rules))
     }
+
+    /// Register a cage whose egress policy already permits every public
+    /// address. DNS is still proxied through the gateway so the cage never
+    /// inherits a host-local resolver address such as `127.0.0.53`.
+    pub fn register_public(&self, cage_name: &str, host_pid: i32) -> Result<DnsLease, CageError> {
+        if host_pid <= 0 {
+            return Err(CageError::InvalidSpec(
+                "DNS registration host PID must be greater than zero".into(),
+            ));
+        }
+        Ok(self
+            .registry
+            .register_policy(cage_name, host_pid, DnsPolicy::Public))
+    }
 }
 
 impl Drop for DnsForwarder {
@@ -216,7 +230,13 @@ struct Registration {
     _cage_name: String,
     pid: i32,
     generation: u64,
-    domains: HashSet<String>,
+    policy: DnsPolicy,
+}
+
+#[derive(Debug)]
+enum DnsPolicy {
+    ExactDomains(HashSet<String>),
+    Public,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -233,8 +253,15 @@ impl Registry {
         pid: i32,
         rules: &[DomainEgressRule],
     ) -> DnsLease {
+        self.register_policy(
+            cage_name,
+            pid,
+            DnsPolicy::ExactDomains(rules.iter().map(|rule| rule.domain.clone()).collect()),
+        )
+    }
+
+    fn register_policy(self: &Arc<Self>, cage_name: &str, pid: i32, policy: DnsPolicy) -> DnsLease {
         let cage_ip = cage_ipv4(cage_name);
-        let domains = rules.iter().map(|rule| rule.domain.clone()).collect();
         let mut state = self.state.lock();
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
         let generation = state.next_generation;
@@ -244,7 +271,7 @@ impl Registry {
                 _cage_name: cage_name.to_owned(),
                 pid,
                 generation,
-                domains,
+                policy,
             },
         );
         DnsLease {
@@ -257,14 +284,15 @@ impl Registry {
     fn authorize(&self, cage_ip: Ipv4Addr, domain: &str) -> Option<RegistrationToken> {
         let state = self.state.lock();
         let registration = state.registrations.get(&cage_ip)?;
-        registration
-            .domains
-            .contains(domain)
-            .then_some(RegistrationToken {
-                cage_ip,
-                pid: registration.pid,
-                generation: registration.generation,
-            })
+        let authorized = match &registration.policy {
+            DnsPolicy::ExactDomains(domains) => domains.contains(domain),
+            DnsPolicy::Public => true,
+        };
+        authorized.then_some(RegistrationToken {
+            cage_ip,
+            pid: registration.pid,
+            generation: registration.generation,
+        })
     }
 
     fn install_answers(
@@ -286,8 +314,13 @@ impl Registry {
                 "DNS cage registration changed before nft update",
             ));
         }
-        for &(address, ttl) in answers {
-            update(token.pid, address, ttl.clamp(MIN_TTL_SECS, MAX_TTL_SECS))?;
+        if matches!(
+            current.map(|registration| &registration.policy),
+            Some(DnsPolicy::ExactDomains(_))
+        ) {
+            for &(address, ttl) in answers {
+                update(token.pid, address, ttl.clamp(MIN_TTL_SECS, MAX_TTL_SECS))?;
+            }
         }
         Ok(())
     }
@@ -764,6 +797,29 @@ mod tests {
 
         assert_eq!(response, upstream);
         assert_eq!(*observed_ttl.lock(), Some(MIN_TTL_SECS));
+    }
+
+    #[test]
+    fn public_registration_forwards_any_public_domain_without_nft_updates() {
+        let registry = Arc::new(Registry::default());
+        let lease = registry.register_policy("builder", 4242, DnsPolicy::Public);
+        let request = query_bytes(71, "cdn.example.net", RecordType::A);
+        let upstream = answer_bytes(&request, Ipv4Addr::new(203, 0, 113, 9), 30);
+        let updates = AtomicUsize::new(0);
+
+        let response = process_request(
+            &registry,
+            lease.cage_ip(),
+            &request,
+            |_| Ok(upstream.clone()),
+            &|_, _, _| {
+                updates.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        assert_eq!(response, upstream);
+        assert_eq!(updates.load(Ordering::Relaxed), 0);
     }
 
     #[test]

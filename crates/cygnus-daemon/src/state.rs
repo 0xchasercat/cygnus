@@ -3442,9 +3442,10 @@ impl State {
             });
         }
         transaction.execute(
-            "UPDATE deployments SET status = 'building', error = NULL, updated_at = CURRENT_TIMESTAMP
+            "UPDATE deployments SET status = 'building', artifact_hash = NULL, error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
              WHERE id = (SELECT deployment_id FROM deploy_jobs WHERE id = ?1)
-               AND status = 'failed' AND artifact_hash IS NULL",
+               AND status = 'failed'",
             [id],
         )?;
         if let Some(audit) = audit {
@@ -8270,6 +8271,62 @@ mod tests {
             kind: None,
             pull_request: None,
         }
+    }
+
+    #[test]
+    fn retry_clears_a_failed_deployments_sealed_artifact() {
+        let path = temp_db("retry-sealed-deployment");
+        let mut state = State::open(&path).unwrap();
+        state
+            .register_engine(&EngineRecord {
+                version: "bun".into(),
+                host_root: "/".into(),
+                cage_executable: "/usr/bin/true".into(),
+                sha256: "a".repeat(64),
+                is_default: false,
+            })
+            .unwrap();
+        let job = deploy_job_fixture("job-1", "site", DeployJobSource::Cli, "working-tree");
+        assert!(state.enqueue_deploy_job(&job).unwrap());
+        assert_eq!(state.claim_deploy_job().unwrap().unwrap().id, job.id);
+        state.attach_deployment_id(&job.id, "deployment-1").unwrap();
+        let source_hash = "b".repeat(64);
+        state
+            .begin_deployment(&DeploymentInput {
+                id: "deployment-1".into(),
+                app: "site".into(),
+                source_hash: source_hash.clone(),
+                engine_version: "bun".into(),
+                source: DeploymentSource::cli(),
+            })
+            .unwrap();
+        state
+            .seal_deployment(
+                "deployment-1",
+                &artifact_input(
+                    "site",
+                    &source_hash,
+                    &"c".repeat(64),
+                    "bun",
+                    "/var/lib/cygnus/artifacts/site/c",
+                    "/app/index.js",
+                ),
+            )
+            .unwrap();
+        state
+            .mark_deployment_failed("deployment-1", "boot failed")
+            .unwrap();
+        state
+            .finish_deploy_job(&job.id, DeployJobStatus::Failed, Some("boot failed"))
+            .unwrap();
+
+        state.retry_deploy_job(&job.id).unwrap();
+
+        let deployment = state.deployment("deployment-1").unwrap().unwrap();
+        assert_eq!(deployment.status, DeploymentStatus::Building);
+        assert!(deployment.artifact_hash.is_none());
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(path.parent().unwrap().join("node.key"));
     }
 
     #[test]

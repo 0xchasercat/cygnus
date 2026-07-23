@@ -397,6 +397,16 @@
       </span>
     </section>
 
+    {#if deploy.status === 'failed' && deploy.error}
+      <section class="failure-summary" role="alert" aria-live="polite">
+        <span class="failure-icon"><Icon name="x" size={13} stroke={2.6} /></span>
+        <div>
+          <strong>Deployment failed</strong>
+          <p class="mono">{deploy.error}</p>
+        </div>
+      </section>
+    {/if}
+
     <div class="grid">
       <section class="card logcard">
         <div class="cardhead">
@@ -688,6 +698,39 @@
     align-items: center;
     gap: 8px;
     font-variant-numeric: tabular-nums;
+  }
+  .failure-summary {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin: -4px 0 18px;
+    padding: 14px 16px;
+    border: 1px solid color-mix(in srgb, var(--red) 34%, var(--line));
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--red) 7%, var(--paper));
+    color: var(--ink);
+  }
+  .failure-icon {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--red);
+    color: #fff;
+  }
+  .failure-summary strong {
+    display: block;
+    margin: 1px 0 5px;
+    font-size: 12.5px;
+  }
+  .failure-summary p {
+    margin: 0;
+    color: var(--red);
+    font-size: 12px;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
   }
 
   .grid {

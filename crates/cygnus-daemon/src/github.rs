@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 use tar::Archive;
 use thiserror::Error;
 
-use crate::deploy::{DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare};
+use crate::deploy::{
+    DeployError, DeployRequest, DeployResult, deploy_with_audit_and_prepare,
+    record_pre_pipeline_failure,
+};
 use crate::state::{
     AuditContext, DeployJob, DeployJobSource, DeployJobSpec, DeploymentInput, DeploymentSource,
     GitHubAppRecord, GitHubAppSecrets, GitHubDelivery, GitHubDeployJob, GitHubDeployJobStatus,
@@ -231,15 +234,14 @@ impl UreqGitHubTransport {
             agent: Arc::new(ureq::Agent::new_with_defaults()),
         }
     }
-}
 
-impl GitHubTransport for UreqGitHubTransport {
-    fn request(
+    fn request_with_limit(
         &self,
         method: &str,
         path: &str,
         authorization: Option<&str>,
         body: Option<&[u8]>,
+        max_body_bytes: usize,
     ) -> Result<GitHubHttpResponse, GitHubError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = ureq::http::Request::builder()
@@ -274,6 +276,8 @@ impl GitHubTransport for UreqGitHubTransport {
             .collect();
         let body = response
             .into_body()
+            .with_config()
+            .limit(max_body_bytes as u64)
             .read_to_vec()
             .map_err(|error| GitHubError::Http(error.to_string()))?;
         Ok(GitHubHttpResponse {
@@ -281,6 +285,29 @@ impl GitHubTransport for UreqGitHubTransport {
             headers,
             body,
         })
+    }
+}
+
+impl GitHubTransport for UreqGitHubTransport {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<GitHubHttpResponse, GitHubError> {
+        self.request_with_limit(method, path, authorization, body, MAX_NORMAL_BODY_BYTES)
+    }
+
+    fn request_limited(
+        &self,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: Option<&[u8]>,
+        max_body_bytes: usize,
+    ) -> Result<GitHubHttpResponse, GitHubError> {
+        self.request_with_limit(method, path, authorization, body, max_body_bytes)
     }
 }
 
@@ -1635,14 +1662,17 @@ impl GitHubWorker {
                     state.retry_github_job_with_error(&job.id, &error.to_string())?;
                 } else {
                     // Archive/config/report failures can happen before the
-                    // deploy pipeline has a chance to create build logs. Keep
-                    // the pre-created deployment visible with the durable
-                    // error so the console never loses the failure in Events.
-                    let _ = state.mark_deployment_failed(&job.id, &error.to_string());
+                    // deploy pipeline has a chance to create build logs. Give
+                    // those failures the same durable log/error contract as a
+                    // compiler failure so the console can always explain them.
+                    let detail = error.to_string();
+                    if record_pre_pipeline_failure(&mut state, &job.id, &detail).is_err() {
+                        let _ = state.mark_deployment_failed(&job.id, &detail);
+                    }
                     state.finish_github_job(
                         &job.id,
                         GitHubDeployJobStatus::Failed,
-                        Some(&error.to_string()),
+                        Some(&detail),
                     )?;
                 }
                 let _ = self.finish_reports(&job, false, Some(&error.to_string()));
@@ -1930,7 +1960,9 @@ fn worker_audit(job: &GitHubDeployJob) -> AuditContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     type FakeRequest = (String, String, Option<String>, Vec<u8>);
 
@@ -1966,6 +1998,38 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn archive_transport_honors_the_explicit_limit_above_ureqs_default() {
+        const BODY_BYTES: usize = 11 * 1024 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {BODY_BYTES}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = BODY_BYTES;
+            while remaining > 0 {
+                let length = remaining.min(chunk.len());
+                socket.write_all(&chunk[..length]).unwrap();
+                remaining -= length;
+            }
+        });
+
+        let transport = UreqGitHubTransport::new(format!("http://{address}"));
+        let response = transport
+            .request_limited("GET", "/archive", None, None, 12 * 1024 * 1024)
+            .unwrap();
+
+        assert_eq!(response.body.len(), BODY_BYTES);
+        server.join().unwrap();
     }
 
     #[test]

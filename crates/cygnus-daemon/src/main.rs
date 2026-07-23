@@ -2706,7 +2706,9 @@ mod tests {
 
         drop(old_route);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while supervisor.state("r-old").is_some() && Instant::now() < deadline {
+        while (supervisor.state("r-old").is_some() || shutdowns.load(Ordering::SeqCst) < 1)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(supervisor.state("r-old"), None);
