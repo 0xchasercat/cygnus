@@ -1134,9 +1134,11 @@ fn runtime_config(
             artifact_path.join(SHIM_REL).to_string_lossy().into_owned(),
         );
     }
-    let mut limits = crate::state::LimitsConfig::default();
-    limits.memory_max = request.memory_max_bytes;
-    limits.memory_high = request.memory_max_bytes.saturating_mul(7) / 8;
+    let limits = crate::state::LimitsConfig {
+        memory_max: request.memory_max_bytes,
+        memory_high: request.memory_max_bytes.saturating_mul(7) / 8,
+        ..Default::default()
+    };
     Ok(AppConfig {
         name: request.app.clone(),
         domains: (!request.domain.is_empty())

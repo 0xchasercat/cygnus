@@ -2885,12 +2885,11 @@ impl State {
             let apps = {
                 let mut statement = transaction
                     .prepare("SELECT id, runtime_json FROM apps ORDER BY name COLLATE BINARY")?;
-                let ids = statement
+                statement
                     .query_map([], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                     })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                ids
+                    .collect::<Result<Vec<_>, _>>()?
             };
             for (app_id, runtime_json) in apps {
                 let stored: StoredAppJson =

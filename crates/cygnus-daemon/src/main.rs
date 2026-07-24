@@ -1258,11 +1258,11 @@ impl LiveAdminMutations {
                 candidate.spec.clone(),
                 candidate.lifecycle.clone(),
             );
-            if candidate.tenant_admin {
-                if let Err(error) = self.supervisor.set_memory_exempt(&generation_key, true) {
-                    let _ = self.supervisor.remove(&generation_key);
-                    return Err(AdminMutationError::new(AdminErrorCode::Internal, error));
-                }
+            if candidate.tenant_admin
+                && let Err(error) = self.supervisor.set_memory_exempt(&generation_key, true)
+            {
+                let _ = self.supervisor.remove(&generation_key);
+                return Err(AdminMutationError::new(AdminErrorCode::Internal, error));
             }
             if let Err(error) = self.supervisor.acquire(&generation_key) {
                 let _ = self.supervisor.remove(&generation_key);
@@ -3071,19 +3071,21 @@ mod tests {
         let port_probe = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
-        let mut config = NodeConfig::default();
-        config.listener = ListenerConfig::Tcp {
-            host: "127.0.0.1".parse().unwrap(),
-            port_start: port,
-            port_end: port,
-            advertise_host: Some("127.0.0.1".into()),
-        };
-        config.apps = vec![cygnus_daemon::state::AppConfig {
-            name: "api".into(),
-            upstream: directory.join("runtime.sock"),
-            command: "/bin/false".into(),
+        let config = NodeConfig {
+            listener: ListenerConfig::Tcp {
+                host: "127.0.0.1".parse().unwrap(),
+                port_start: port,
+                port_end: port,
+                advertise_host: Some("127.0.0.1".into()),
+            },
+            apps: vec![cygnus_daemon::state::AppConfig {
+                name: "api".into(),
+                upstream: directory.join("runtime.sock"),
+                command: "/bin/false".into(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let mut state = State::open(&state_path).unwrap();
         state.apply(&config).unwrap();
         let snapshot = state.load().unwrap();
@@ -3143,18 +3145,20 @@ mod tests {
         let socket_dir = directory.join("s");
         fs::create_dir_all(&directory).unwrap();
         let state_path = directory.join("state.db");
-        let mut config = NodeConfig::default();
-        config.listener = ListenerConfig::Uds {
-            socket_dir: socket_dir.clone(),
-            socket_group: None,
-            socket_mode: 0o620,
-        };
-        config.apps = vec![cygnus_daemon::state::AppConfig {
-            name: "api".into(),
-            upstream: directory.join("runtime.sock"),
-            command: "/bin/false".into(),
+        let config = NodeConfig {
+            listener: ListenerConfig::Uds {
+                socket_dir: socket_dir.clone(),
+                socket_group: None,
+                socket_mode: 0o620,
+            },
+            apps: vec![cygnus_daemon::state::AppConfig {
+                name: "api".into(),
+                upstream: directory.join("runtime.sock"),
+                command: "/bin/false".into(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let mut state = State::open(&state_path).unwrap();
         state.apply(&config).unwrap();
         let snapshot = state.load().unwrap();
