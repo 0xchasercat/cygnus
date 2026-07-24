@@ -121,6 +121,8 @@ pub struct DeployRequest {
     /// untouched (dedicated env var admin commands manage full lifecycle).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
     /// Optional preview slug (e.g. a branch or PR name). When present the
     /// deploy targets an isolated `{app}-{slug}` app and `{app}-{slug}.<apex>`
     /// domain instead of the production app/domain, so preview builds never
@@ -152,6 +154,7 @@ impl DeployRequest {
             artifact_root: Some(artifact_root.into()),
             upstream: Some(upstream.into()),
             env: BTreeMap::new(),
+            memory_max_bytes: None,
             preview: None,
             deployment_id: None,
             source: DeploymentSource::cli(),
@@ -181,6 +184,7 @@ pub struct ResolvedDeployRequest {
     pub artifact_root: PathBuf,
     pub upstream: PathBuf,
     pub env: BTreeMap<String, String>,
+    pub memory_max_bytes: u64,
     pub deployment_id: Option<String>,
     pub source: DeploymentSource,
 }
@@ -436,19 +440,54 @@ pub fn resolve_deploy_request(
             })?,
     };
     let domain = match request.domain {
-        Some(domain) if !domain.trim().is_empty() => domain,
+        Some(domain) if !domain.trim().is_empty() => {
+            if !matches!(
+                state.load()?.listener,
+                crate::state::ListenerConfig::Integrated { .. }
+            ) {
+                return Err(DeployError::InvalidInput(
+                    "domain is only valid in integrated listener mode".into(),
+                ));
+            }
+            domain
+        }
         _ => {
-            let edge = state.load()?.edge;
-            let apex = edge.apex_domain.or(edge.apps_domain).ok_or_else(|| {
+            let snapshot = state.load()?;
+            if !matches!(
+                snapshot.listener,
+                crate::state::ListenerConfig::Integrated { .. }
+            ) {
+                String::new()
+            } else {
+                let edge = snapshot.edge;
+                let apex = edge.apex_domain.or(edge.apps_domain).ok_or_else(|| {
                 DeployError::InvalidInput(
                     "domain was omitted and neither edge.apex_domain nor edge.apps_domain is configured"
                         .into(),
                 )
             })?;
-            format!("{app}.{apex}")
+                format!("{app}.{apex}")
+            }
         }
     };
     let entry_explicit = request.entry.is_some();
+    let snapshot = state.load()?;
+    let memory_max_bytes = request
+        .memory_max_bytes
+        .or_else(|| {
+            snapshot
+                .apps
+                .iter()
+                .find(|candidate| candidate.name == app)
+                .map(|candidate| candidate.spec.limits.memory_max)
+        })
+        .or(snapshot.resources.app_memory_default_bytes)
+        .unwrap_or_else(|| cygnus_cage::CgroupLimits::default().memory_max);
+    if memory_max_bytes < 16 * 1024 * 1024 {
+        return Err(DeployError::InvalidInput(
+            "memory_max_bytes must be at least 16 MiB".into(),
+        ));
+    }
     let entry = request.entry.unwrap_or_else(|| PathBuf::from("index.ts"));
     let artifact_root = request
         .artifact_root
@@ -473,6 +512,7 @@ pub fn resolve_deploy_request(
         artifact_root,
         upstream,
         env: request.env,
+        memory_max_bytes,
         deployment_id: request.deployment_id,
         source: request.source,
     })
@@ -1094,9 +1134,17 @@ fn runtime_config(
             artifact_path.join(SHIM_REL).to_string_lossy().into_owned(),
         );
     }
+    let limits = crate::state::LimitsConfig {
+        memory_max: request.memory_max_bytes,
+        memory_high: request.memory_max_bytes.saturating_mul(7) / 8,
+        ..Default::default()
+    };
     Ok(AppConfig {
         name: request.app.clone(),
-        domains: vec![request.domain.clone()],
+        domains: (!request.domain.is_empty())
+            .then(|| request.domain.clone())
+            .into_iter()
+            .collect(),
         upstream: host_upstream,
         command,
         args: vec![
@@ -1105,6 +1153,7 @@ fn runtime_config(
             entry.to_string_lossy().into_owned(),
         ],
         env,
+        limits,
         rootfs: Some(RootfsConfig {
             // Linux cages need the curated hostlib lowerdir (dynamic linker +
             // glibc) ahead of the engine and artifact layers; without it

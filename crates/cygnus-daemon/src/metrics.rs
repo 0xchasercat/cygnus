@@ -191,6 +191,12 @@ impl MetricsHub {
             .insert(runtime_key.into(), logical_app.into());
     }
 
+    /// Drop the alias for a runtime generation that never went live (e.g. a
+    /// failed redeploy), so abandoned generation keys don't accumulate.
+    pub fn remove_app_alias(&self, runtime_key: &str) {
+        self.lock().app_aliases.remove(runtime_key);
+    }
+
     /// Record a completed request. The path is truncated to at most 200 bytes at
     /// a valid UTF-8 boundary before the single metrics lock is acquired.
     pub fn record_request(&self, mut request: RequestRecord) {

@@ -87,6 +87,19 @@ pub enum AdminMutation {
         app: String,
         key: String,
     },
+    SetAppResources {
+        app: String,
+        memory_max_bytes: u64,
+    },
+    RedeployApp {
+        app: String,
+    },
+    SetNodeResources(crate::state::NodeResourcesConfig),
+    SetListener {
+        listener: crate::state::ListenerConfig,
+        dashboard_listen: Option<std::net::SocketAddr>,
+        https_listen: Option<std::net::SocketAddr>,
+    },
     Rollback {
         app: String,
         deployment: String,
@@ -346,6 +359,48 @@ impl StateAdminHandler {
                 AdminMutation::RemoveEnvVar { app, key },
                 "remove_env_var",
             ),
+            AdminCommand::SetAppResources {
+                app,
+                memory_max_bytes,
+            } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetAppResources {
+                    app,
+                    memory_max_bytes,
+                },
+                "set_app_resources",
+            ),
+            AdminCommand::RedeployApp { app } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::RedeployApp { app },
+                "redeploy_app",
+            ),
+            AdminCommand::SetNodeResources { resources } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetNodeResources(resources),
+                "set_node_resources",
+            ),
+            AdminCommand::SetListener {
+                listener,
+                dashboard_listen,
+                https_listen,
+            } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetListener {
+                    listener,
+                    dashboard_listen,
+                    https_listen,
+                },
+                "set_listener",
+            ),
             AdminCommand::GetMetrics => Ok(AdminData::Metrics {
                 metrics: self.metrics.metrics(),
             }),
@@ -383,7 +438,7 @@ impl StateAdminHandler {
                 let end = start.saturating_add(limit).min(snapshot.apps.len());
                 let mut apps = Vec::with_capacity(end.saturating_sub(start));
                 for app in &snapshot.apps[start..end] {
-                    apps.push(self.app_view(&state, app)?);
+                    apps.push(self.app_view(&state, app, &snapshot.listener)?);
                 }
                 let next_cursor =
                     (end < snapshot.apps.len()).then(|| snapshot.apps[end - 1].name.clone());
@@ -398,7 +453,7 @@ impl StateAdminHandler {
                     .find(|candidate| candidate.name == app)
                     .ok_or_else(|| HandlerFault::not_found("app does not exist"))?;
                 Ok(AdminData::App {
-                    app: self.app_view(&state, app)?,
+                    app: self.app_view(&state, app, &snapshot.listener)?,
                 })
             }
             AdminCommand::ListDeployments { app, cursor, limit } => {
@@ -502,6 +557,7 @@ impl StateAdminHandler {
                 engine_version,
                 entry,
                 env,
+                memory_max_bytes,
                 preview,
                 total_bytes,
             } => {
@@ -514,6 +570,7 @@ impl StateAdminHandler {
                             engine_version,
                             entry,
                             env,
+                            memory_max_bytes,
                             preview,
                         },
                         total_bytes,
@@ -744,6 +801,7 @@ impl StateAdminHandler {
             artifact_root: None,
             upstream: None,
             env: upload.metadata.env,
+            memory_max_bytes: upload.metadata.memory_max_bytes,
             preview: upload.metadata.preview.clone(),
             deployment_id: None,
             source: DeploymentSource::upload(),
@@ -898,6 +956,8 @@ impl StateAdminHandler {
         Ok(AdminData::Status {
             node: NodeView {
                 listen: snapshot.listen.to_string(),
+                listener: snapshot.listener,
+                resources: snapshot.resources,
                 https_listen: snapshot.edge.https_listen.map(|value| value.to_string()),
                 apps_domain: snapshot.edge.apps_domain,
                 dashboard_domain: snapshot.edge.dashboard_domain,
@@ -1013,7 +1073,12 @@ impl StateAdminHandler {
         State::open(&self.state_path).map_err(HandlerFault::internal)
     }
 
-    fn app_view(&self, state: &State, app: &LoadedApp) -> Result<AppView, HandlerFault> {
+    fn app_view(
+        &self,
+        state: &State,
+        app: &LoadedApp,
+        listener: &crate::state::ListenerConfig,
+    ) -> Result<AppView, HandlerFault> {
         let idle_ttl_ms = u64::try_from(app.lifecycle.idle_ttl.as_millis())
             .map_err(|_| HandlerFault::internal("idle TTL does not fit protocol"))?;
         let mut env_keys = app
@@ -1031,6 +1096,9 @@ impl StateAdminHandler {
                 artifact_hash: active.artifact_hash,
                 engine_version: active.engine_version,
             });
+        let (config_revision, applied_config_revision) = state
+            .app_config_revisions(&app.name)
+            .map_err(HandlerFault::internal)?;
         Ok(AppView {
             name: app.name.clone(),
             domains: app.domains.clone(),
@@ -1039,6 +1107,15 @@ impl StateAdminHandler {
             idle_ttl_ms,
             egress: egress_name(&app.spec.egress).into(),
             memory_max: app.spec.limits.memory_max,
+            config_revision,
+            applied_config_revision,
+            restart_required: config_revision != applied_config_revision,
+            endpoint: match listener {
+                crate::state::ListenerConfig::Integrated { .. } => app.domains.first().cloned(),
+                _ => state
+                    .app_endpoint(listener, &app.name)
+                    .map_err(HandlerFault::internal)?,
+            },
             env_keys,
             active,
         })
@@ -1656,6 +1733,7 @@ mod tests {
                 engine_version: None,
                 entry: None,
                 env: Default::default(),
+                memory_max_bytes: None,
                 preview: None,
                 total_bytes: 4,
             }),
@@ -1761,6 +1839,7 @@ mod tests {
                     artifact_root: None,
                     upstream: None,
                     env: Default::default(),
+                    memory_max_bytes: None,
                     preview: None,
                     deployment_id: None,
                     source: DeploymentSource::upload(),
@@ -1811,6 +1890,7 @@ mod tests {
                     artifact_root: None,
                     upstream: None,
                     env: Default::default(),
+                    memory_max_bytes: None,
                     preview: None,
                     deployment_id: None,
                     source: DeploymentSource::cli(),
@@ -1895,6 +1975,8 @@ mod tests {
         state
             .apply(&NodeConfig {
                 listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+                listener: Default::default(),
+                resources: Default::default(),
                 edge: Default::default(),
                 apps: vec![AppConfig {
                     name: "api".into(),
@@ -1996,6 +2078,8 @@ mod tests {
         state
             .apply(&NodeConfig {
                 listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+                listener: Default::default(),
+                resources: Default::default(),
                 edge: Default::default(),
                 apps: vec![app],
             })

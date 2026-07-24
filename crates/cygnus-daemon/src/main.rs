@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +38,7 @@ use cygnus_daemon::metrics::{EventRecord, MetricsHub};
 use cygnus_daemon::state::{
     AuditContext, AuditEndpointRole, DEFAULT_STATE_PATH, DeployJob, DeployJobSource,
     DeployJobStatus, DeploymentSource, DeploymentStatus, DomainRecord, DomainStatus, DomainTls,
-    LoadedApp, NodeConfig, Snapshot, State, StateError,
+    ListenerConfig, LoadedApp, NodeConfig, NodeResourcesConfig, Snapshot, State, StateError,
 };
 use cygnus_daemon::tls::{TlsServer, domain_certificate_id, self_signed_fallback};
 use cygnus_router::{Route, RouteTable, Router};
@@ -87,6 +89,14 @@ fn insert_runtime_app(
         .write()
         .insert(runtime_key.to_owned(), logical_app.to_owned());
     metrics.set_app_alias(runtime_key, logical_app);
+}
+
+/// Reverse [`insert_runtime_app`] for a generation that never went live, so
+/// failed replacements don't leave stale generation keys in the runtime map
+/// and metrics aliases forever.
+fn remove_runtime_app(runtime_apps: &RuntimeApps, metrics: &MetricsHub, runtime_key: &str) {
+    runtime_apps.write().remove(runtime_key);
+    metrics.remove_app_alias(runtime_key);
 }
 
 #[derive(Debug, Parser)]
@@ -236,17 +246,15 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         }
     }
 
-    fn install_after_commit(
-        &self,
-        snapshot: &Snapshot,
-        previous_runtime_key: Option<String>,
-        new_runtime_key: &str,
-    ) {
-        if previous_runtime_key.as_deref() == Some(new_runtime_key) {
-            return;
-        }
+    fn install_after_commit(&self, snapshot: &Snapshot, logical_app: &str, new_runtime_key: &str) {
+        let previous_runtime_key = self
+            .router
+            .resolve(&internal_app_route_key(logical_app))
+            .map(|route| route.app.clone());
         let retired = self.router.install(route_table(snapshot));
-        if let Some(previous) = previous_runtime_key {
+        if let Some(previous) = previous_runtime_key
+            && previous != new_runtime_key
+        {
             retire_runtime_after_quiescence(retired, Arc::clone(&self.supervisor), previous);
         }
     }
@@ -260,12 +268,19 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         let _deployment_gate = self.gate.lock();
         let app = request.app.clone();
         let result: Result<DeployResult, DeployError> = (|| {
-            let previous_runtime_key = state
-                .load()?
-                .apps
-                .into_iter()
-                .find(|candidate| candidate.name == app)
-                .map(|candidate| candidate.spec.name);
+            let previous_runtime_key = self
+                .router
+                .resolve(&internal_app_route_key(&app))
+                .map(|route| route.app.clone())
+                .or_else(|| {
+                    state
+                        .load()
+                        .ok()?
+                        .apps
+                        .into_iter()
+                        .find(|candidate| candidate.name == app)
+                        .map(|candidate| candidate.spec.name)
+                });
             let previous_for_prepare = previous_runtime_key.clone();
             let tenant_socket = self.tenant_admin_socket.clone();
             let result = deploy_with_audit_and_prepare(state, request, audit, |candidate| {
@@ -278,7 +293,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
             let new_runtime_key = format!("r-{}", result.artifact_hash);
             ensure_domain_fallbacks(state, self.tls.as_ref(), self.tls.is_some(), &self.metrics)
                 .map_err(|error| DeployError::InvalidInput(error.to_string()))?;
-            self.install_after_commit(&state.load()?, previous_runtime_key, &new_runtime_key);
+            self.install_after_commit(&state.load()?, &app, &new_runtime_key);
             Ok(result)
         })();
         match result {
@@ -323,17 +338,21 @@ impl GitHubDeployExecutor for ProductionGitHubDeployExecutor {
         source: &Path,
         audit: &AuditContext,
     ) -> Result<DeployResult, DeployError> {
+        let domain = matches!(state.load()?.listener, ListenerConfig::Integrated { .. })
+            .then(|| config.domain.clone())
+            .filter(|domain| !domain.is_empty());
         self.runtime.deploy(
             state,
             DeployRequest {
                 source_dir: source.to_path_buf(),
                 app: config.app.clone(),
-                domain: Some(config.domain.clone()),
+                domain,
                 engine_version: Some(config.engine_version.clone()),
                 entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
                 artifact_root: Some(config.artifact_root.clone()),
                 upstream: Some(config.upstream.clone()),
                 env: std::collections::BTreeMap::new(),
+                memory_max_bytes: config.memory_max_bytes,
                 preview: None,
                 // GitHub jobs pre-create the user-visible deployment row so
                 // build progress and failures share one durable identity.
@@ -472,12 +491,13 @@ fn generic_deploy_request(job: &DeployJob, source_dir: PathBuf) -> Result<Deploy
     Ok(DeployRequest {
         source_dir,
         app: job.app.clone(),
-        domain: Some(job.domain.clone()),
+        domain: (!job.domain.is_empty()).then(|| job.domain.clone()),
         engine_version: Some(job.engine_version.clone()),
         entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
         artifact_root: Some(job.artifact_root.clone()),
         upstream: Some(job.upstream.clone()),
         env: std::collections::BTreeMap::new(),
+        memory_max_bytes: None,
         preview: None,
         deployment_id: Some(deployment_id),
         source,
@@ -609,6 +629,8 @@ struct LiveAdminMutations {
     runtime: Arc<LiveDeployRuntime<Cage>>,
     tls: Option<TlsServer>,
     http01_challenges: Http01Challenges,
+    shutdown: Arc<AtomicBool>,
+    restart_requested: Arc<AtomicBool>,
 }
 
 impl AdminMutationHandler for LiveAdminMutations {
@@ -650,6 +672,19 @@ impl AdminMutationHandler for LiveAdminMutations {
                 self.set_env_var(&app, &key, &value, audit)
             }
             AdminMutation::RemoveEnvVar { app, key } => self.remove_env_var(&app, &key, audit),
+            AdminMutation::SetAppResources {
+                app,
+                memory_max_bytes,
+            } => self.set_app_resources(&app, memory_max_bytes, audit),
+            AdminMutation::RedeployApp { app } => self.redeploy_app(&app, audit),
+            AdminMutation::SetNodeResources(resources) => {
+                self.set_node_resources(&resources, audit)
+            }
+            AdminMutation::SetListener {
+                listener,
+                dashboard_listen,
+                https_listen,
+            } => self.set_listener(&listener, dashboard_listen, https_listen, audit),
             AdminMutation::Rollback {
                 app,
                 deployment,
@@ -659,6 +694,18 @@ impl AdminMutationHandler for LiveAdminMutations {
     }
 }
 impl LiveAdminMutations {
+    fn require_integrated_app_ingress(&self, state: &State) -> Result<(), AdminMutationError> {
+        let snapshot = state.load().map_err(map_admin_state_error)?;
+        if matches!(snapshot.listener, ListenerConfig::Integrated { .. }) {
+            Ok(())
+        } else {
+            Err(AdminMutationError::new(
+                AdminErrorCode::Conflict,
+                "app domains and Cygnus ACME are dormant outside integrated listener mode",
+            ))
+        }
+    }
+
     fn apply_config(
         &self,
         config: &NodeConfig,
@@ -900,6 +947,7 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        self.require_integrated_app_ingress(&state)?;
         let domain = state
             .add_custom_domain(app, host, audit)
             .map_err(map_admin_state_error)?;
@@ -932,6 +980,7 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        self.require_integrated_app_ingress(&state)?;
         state
             .remove_custom_domain(app, host, audit)
             .map_err(map_admin_state_error)?;
@@ -951,6 +1000,7 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        self.require_integrated_app_ingress(&state)?;
         let domain = state
             .set_app_domain_tls(app, host, mode, audit)
             .map_err(map_admin_state_error)?;
@@ -993,6 +1043,7 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        self.require_integrated_app_ingress(&state)?;
         let canonical = state
             .map_domain(app, domain, audit)
             .map_err(map_admin_state_error)?;
@@ -1022,6 +1073,7 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        self.require_integrated_app_ingress(&state)?;
         let domain = state
             .set_primary_domain(app, host, audit)
             .map_err(map_admin_state_error)?;
@@ -1037,6 +1089,7 @@ impl LiveAdminMutations {
         audit: &AuditContext,
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        self.require_integrated_app_ingress(&state)?;
         let domain = state
             .app_domains(Some(app))
             .map_err(map_admin_state_error)?
@@ -1113,6 +1166,246 @@ impl LiveAdminMutations {
         })
     }
 
+    fn set_app_resources(
+        &self,
+        app: &str,
+        memory_max_bytes: u64,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        state
+            .set_app_memory(app, memory_max_bytes, audit)
+            .map_err(map_admin_state_error)?;
+        Ok(AdminData::AppResourcesSet {
+            app: app.to_owned(),
+            memory_max_bytes,
+            redeploy_required: true,
+        })
+    }
+
+    fn redeploy_app(
+        &self,
+        app: &str,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let _deployment_gate = self.runtime.gate.lock();
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let active = state
+            .active_deployment(app)
+            .map_err(map_admin_state_error)?
+            .ok_or_else(|| {
+                AdminMutationError::new(
+                    AdminErrorCode::Conflict,
+                    "app has no active sealed artifact to restart",
+                )
+            })?;
+        let (desired_revision, _) = state
+            .app_config_revisions(app)
+            .map_err(map_admin_state_error)?;
+        let mut snapshot = state.load().map_err(map_admin_state_error)?;
+        let candidate = snapshot
+            .apps
+            .iter_mut()
+            .find(|candidate| candidate.name == app)
+            .ok_or_else(|| {
+                AdminMutationError::new(AdminErrorCode::NotFound, "app does not exist")
+            })?;
+        configure_tenant_admin(candidate, &self.tenant_admin_socket).map_err(|error| {
+            AdminMutationError::new(AdminErrorCode::Internal, error.to_string())
+        })?;
+        let previous_route = self
+            .router
+            .resolve(&internal_app_route_key(app))
+            .ok_or_else(|| {
+                AdminMutationError::new(
+                    AdminErrorCode::Conflict,
+                    "active app route is unavailable; restart the daemon and try again",
+                )
+            })?;
+        let base_runtime_key = previous_route
+            .app
+            .split_once("-cfg-")
+            .map_or(previous_route.app.as_str(), |(base, _)| base);
+        let nonce = unix_millis();
+        let generation_key = format!("{base_runtime_key}-cfg-{desired_revision}-{nonce}");
+        {
+            let parent = candidate.upstream.parent().ok_or_else(|| {
+                AdminMutationError::new(
+                    AdminErrorCode::Internal,
+                    "active runtime socket has no parent directory",
+                )
+            })?;
+            let socket_token = (nonce ^ desired_revision) as u32;
+            let generation_upstream = parent.join(format!("c{socket_token:08x}.sock"));
+            candidate.spec.name = generation_key.clone();
+            candidate.spec.readiness_uds = Some(generation_upstream.clone());
+            candidate.upstream = generation_upstream;
+            let previous_reservation = if candidate.tenant_admin {
+                None
+            } else {
+                Some(
+                    self.supervisor
+                        .prepare_memory_replacement(
+                            &previous_route.app,
+                            &generation_key,
+                            candidate.spec.limits.memory_max,
+                        )
+                        .map_err(|error| {
+                            AdminMutationError::new(
+                                AdminErrorCode::Conflict,
+                                format!(
+                                    "workload memory budget cannot admit the replacement: {error:?}"
+                                ),
+                            )
+                        })?,
+                )
+            };
+            insert_runtime_app(&self.runtime_apps, &self.metrics, &generation_key, app);
+            self.supervisor.register(
+                generation_key.clone(),
+                candidate.spec.clone(),
+                candidate.lifecycle.clone(),
+            );
+            if candidate.tenant_admin
+                && let Err(error) = self.supervisor.set_memory_exempt(&generation_key, true)
+            {
+                let _ = self.supervisor.remove(&generation_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &generation_key);
+                return Err(AdminMutationError::new(AdminErrorCode::Internal, error));
+            }
+            if let Err(error) = self.supervisor.acquire(&generation_key) {
+                let _ = self.supervisor.remove(&generation_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &generation_key);
+                if let Some(previous_reservation) = previous_reservation {
+                    self.supervisor.rollback_memory_replacement(
+                        &generation_key,
+                        &previous_route.app,
+                        previous_reservation,
+                    );
+                }
+                return Err(AdminMutationError::new(
+                    AdminErrorCode::Conflict,
+                    format!(
+                        "new app configuration did not become ready; the previous runtime remains active: {error:?}"
+                    ),
+                ));
+            }
+            if let Err(error) = state.mark_app_config_applied(app, desired_revision, audit) {
+                let _ = self.supervisor.remove(&generation_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &generation_key);
+                if let Some(previous_reservation) = previous_reservation {
+                    self.supervisor.rollback_memory_replacement(
+                        &generation_key,
+                        &previous_route.app,
+                        previous_reservation,
+                    );
+                }
+                return Err(map_admin_state_error(error));
+            }
+            let retired = self.router.install(route_table(&snapshot));
+            retire_runtime_after_quiescence(
+                retired,
+                Arc::clone(&self.supervisor),
+                previous_route.app.clone(),
+            );
+        }
+        let (config_revision, applied_config_revision) = state
+            .app_config_revisions(app)
+            .map_err(map_admin_state_error)?;
+        record_event(
+            &self.metrics,
+            "redeploy",
+            Some(app),
+            format!(
+                "current artifact restarted with configuration revision {applied_config_revision}"
+            ),
+        );
+        Ok(AdminData::AppRedeployed {
+            app: app.to_owned(),
+            active: ActiveDeploymentView {
+                deployment_id: active.deployment_id,
+                artifact_hash: active.artifact_hash,
+                engine_version: active.engine_version,
+            },
+            config_revision,
+            applied_config_revision,
+            restart_required: config_revision != applied_config_revision,
+        })
+    }
+
+    fn set_node_resources(
+        &self,
+        resources: &NodeResourcesConfig,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let previous = state
+            .load()
+            .map_err(map_admin_state_error)?
+            .resources
+            .node_memory_budget_bytes;
+        self.supervisor
+            .set_memory_budget(resources.node_memory_budget_bytes)
+            .map_err(|error| AdminMutationError::new(AdminErrorCode::Conflict, error))?;
+        if let Err(error) = state.set_node_resources(resources, audit) {
+            let _ = self.supervisor.set_memory_budget(previous);
+            return Err(map_admin_state_error(error));
+        }
+        Ok(AdminData::NodeResourcesSet {
+            resources: resources.clone(),
+        })
+    }
+
+    fn set_listener(
+        &self,
+        listener: &ListenerConfig,
+        dashboard_listen: Option<SocketAddr>,
+        https_listen: Option<SocketAddr>,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        let current = state.load().map_err(map_admin_state_error)?;
+        // Detect no-op saves before probing or restarting: re-submitting the
+        // active configuration (e.g. the setup wizard finishing with defaults
+        // untouched) must not bounce the daemon and every app on it.
+        let next_dashboard = dashboard_listen.unwrap_or(current.listen);
+        let next_https = https_listen.or(current.edge.https_listen);
+        if *listener == current.listener
+            && next_dashboard == current.listen
+            && next_https == current.edge.https_listen
+        {
+            return Ok(AdminData::ListenerSet {
+                listener: listener.clone(),
+                restart_required: false,
+            });
+        }
+        preflight_listener_update(&state, &current, listener, dashboard_listen, https_listen)
+            .map_err(|error| {
+                AdminMutationError::new(
+                    AdminErrorCode::Conflict,
+                    format!("listener preflight failed: {error}"),
+                )
+            })?;
+        state
+            .set_listener(listener, dashboard_listen, https_listen, audit)
+            .map_err(map_admin_state_error)?;
+        let response = AdminData::ListenerSet {
+            listener: listener.clone(),
+            restart_required: true,
+        };
+        // Allow the framed admin response to flush before deliberately
+        // exiting non-zero. systemd's Restart=on-failure (and launchd's
+        // KeepAlive) then re-exec the daemon on the newly persisted listeners.
+        let shutdown = Arc::clone(&self.shutdown);
+        let restart_requested = Arc::clone(&self.restart_requested);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            restart_requested.store(true, Ordering::Release);
+            shutdown.store(true, Ordering::Release);
+        });
+        Ok(response)
+    }
+
     fn rollback(
         &self,
         app: &str,
@@ -1146,7 +1439,12 @@ impl LiveAdminMutations {
             })?;
         *current = plan.candidate.clone();
         let routes = route_table(&snapshot);
-        let runtime_changed = plan.previous_runtime_key.as_deref() != Some(&plan.runtime_key);
+        let actual_previous_runtime_key = self
+            .router
+            .resolve(&internal_app_route_key(app))
+            .map(|route| route.app.clone());
+        let runtime_changed =
+            actual_previous_runtime_key.as_deref() != Some(plan.runtime_key.as_str());
         insert_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key, app);
         if runtime_changed {
             self.supervisor.register(
@@ -1156,6 +1454,7 @@ impl LiveAdminMutations {
             );
             if self.supervisor.acquire(&plan.runtime_key).is_err() {
                 let _ = self.supervisor.remove(&plan.runtime_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key);
                 return Err(AdminMutationError::new(
                     AdminErrorCode::Internal,
                     "rollback candidate did not become ready",
@@ -1163,13 +1462,16 @@ impl LiveAdminMutations {
             }
         }
         if let Err(error) = state.commit_activation(&plan, audit) {
+            // Only unwind the runtime map when this call created the entry —
+            // with an unchanged runtime the key still names the live cage.
             if runtime_changed {
                 let _ = self.supervisor.remove(&plan.runtime_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key);
             }
             return Err(map_admin_state_error(error));
         }
         let retired = self.router.install(routes);
-        if runtime_changed && let Some(previous) = plan.previous_runtime_key.clone() {
+        if runtime_changed && let Some(previous) = actual_previous_runtime_key {
             let supervisor = Arc::clone(&self.supervisor);
             thread::spawn(move || {
                 while !retired.is_quiescent() {
@@ -1251,15 +1553,18 @@ fn route_table(snapshot: &Snapshot) -> RouteTable {
     let mut routes = RouteTable::new();
     let mut tenant_zero = None;
     for app in &snapshot.apps {
+        let app_route = Route {
+            app: app.spec.name.clone(),
+            upstream: app.upstream.clone(),
+        };
         for domain in &app.domains {
-            routes.insert(
-                domain,
-                Route {
-                    app: app.spec.name.clone(),
-                    upstream: app.upstream.clone(),
-                },
-            );
+            routes.insert(domain, app_route.clone());
         }
+        // App-specific TCP/UDS listeners resolve this private key instead of
+        // the request Host header. Keeping it in the same atomically swapped
+        // table means deploys, rollbacks, and config restarts update every
+        // ingress mode at the exact same cutover point.
+        routes.insert(&internal_app_route_key(&app.name), app_route);
         // Tenant Zero is the node's control plane: make it the fallback route
         // so the console answers at the node's own address — a bare IP, an
         // SSH-forwarded localhost, or a domain not yet mapped to an app —
@@ -1280,10 +1585,518 @@ fn route_table(snapshot: &Snapshot) -> RouteTable {
     routes
 }
 
-/// Application edge / ingress HTTP address. Always bound; this is the public
-/// reverse-proxy port that routes by Host header to app UNIX sockets.
-fn edge_http_listen() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 80))
+fn internal_app_route_key(app: &str) -> String {
+    format!("__cygnus_app__.{app}")
+}
+
+struct AppListenerWorker {
+    stop: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+    socket_path: Option<PathBuf>,
+}
+
+impl AppListenerWorker {
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.thread.join();
+        if let Some(path) = self.socket_path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn active_app_route(router: &Router, app: &str) -> Option<Arc<Route>> {
+    router.resolve(&internal_app_route_key(app))
+}
+
+fn spawn_tcp_app_worker(
+    listener: TcpListener,
+    app: String,
+    router: Arc<Router>,
+    frontend: Arc<Frontend>,
+    shutdown: Arc<AtomicBool>,
+) -> AppListenerWorker {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        if let Err(error) = listener.set_nonblocking(true) {
+            eprintln!("cygnus-daemon: app {app:?} TCP listener setup failed: {error}");
+            return;
+        }
+        while !shutdown.load(Ordering::Acquire) && !worker_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut client, _)) => {
+                    if let Err(error) = client.set_nonblocking(false) {
+                        eprintln!("cygnus-daemon: app {app:?} TCP client setup failed: {error}");
+                        continue;
+                    }
+                    let Some(route) = active_app_route(&router, &app) else {
+                        let _ = client.write_all(cygnus_daemon::error_response(
+                            cygnus_daemon::Status::Unavailable,
+                        ));
+                        continue;
+                    };
+                    let front = Arc::clone(&frontend);
+                    thread::spawn(move || front.serve_app_tcp_connection(client, route));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!("cygnus-daemon: app {app:?} TCP listener failed: {error}");
+                    return;
+                }
+            }
+        }
+    });
+    AppListenerWorker {
+        stop,
+        thread,
+        socket_path: None,
+    }
+}
+
+fn spawn_uds_app_worker(
+    listener: UnixListener,
+    socket_path: PathBuf,
+    app: String,
+    router: Arc<Router>,
+    frontend: Arc<Frontend>,
+    shutdown: Arc<AtomicBool>,
+) -> AppListenerWorker {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let cleanup_path = socket_path.clone();
+    let thread = thread::spawn(move || {
+        if let Err(error) = listener.set_nonblocking(true) {
+            eprintln!("cygnus-daemon: app {app:?} UDS listener setup failed: {error}");
+            return;
+        }
+        while !shutdown.load(Ordering::Acquire) && !worker_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut client, _)) => {
+                    if let Err(error) = client.set_nonblocking(false) {
+                        eprintln!("cygnus-daemon: app {app:?} UDS client setup failed: {error}");
+                        continue;
+                    }
+                    let Some(route) = active_app_route(&router, &app) else {
+                        let _ = client.write_all(cygnus_daemon::error_response(
+                            cygnus_daemon::Status::Unavailable,
+                        ));
+                        continue;
+                    };
+                    let front = Arc::clone(&frontend);
+                    thread::spawn(move || front.serve_app_unix_connection(client, route));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!("cygnus-daemon: app {app:?} UDS listener failed: {error}");
+                    return;
+                }
+            }
+        }
+    });
+    AppListenerWorker {
+        stop,
+        thread,
+        socket_path: Some(cleanup_path),
+    }
+}
+
+fn listener_group_gid(group: &str) -> io::Result<u32> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    let name = CString::new(group)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group contains NUL"))?;
+    // SAFETY: `name` is a valid NUL-terminated C string. We copy the gid while
+    // the libc-owned record is valid and never retain the pointer.
+    let record = unsafe { libc::getgrnam(name.as_ptr()) };
+    if record.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("proxy group {group:?} does not exist"),
+        ));
+    }
+    Ok(unsafe { (*record).gr_gid })
+}
+
+fn chown_group(path: &Path, gid: u32) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: `path` is NUL terminated and points to an existing filesystem
+    // object. uid=-1 preserves the current owner.
+    if unsafe { libc::chown(path.as_ptr(), u32::MAX, gid) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn prepare_socket_dir(path: &Path, group: Option<&str>) -> io::Result<Option<u32>> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket directory must not be a symlink",
+        ));
+    }
+    fs::create_dir_all(path)?;
+    let canonical = fs::canonicalize(path)?;
+    if canonical != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket directory must be canonical (use {})",
+                canonical.display()
+            ),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path parent is not a directory",
+        ));
+    }
+    let gid = group.map(listener_group_gid).transpose()?;
+    if let Some(gid) = gid {
+        chown_group(path, gid)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o770))?;
+    }
+    Ok(gid)
+}
+
+fn bind_public_uds(
+    path: &Path,
+    socket_mode: u32,
+    group_gid: Option<u32>,
+) -> io::Result<UnixListener> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to replace a non-socket endpoint",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(path)?;
+    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(socket_mode)) {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    if let Some(gid) = group_gid
+        && let Err(error) = chown_group(path, gid)
+    {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(listener)
+}
+
+fn preflight_listener_update(
+    state: &State,
+    current: &Snapshot,
+    listener: &ListenerConfig,
+    dashboard_listen: Option<SocketAddr>,
+    https_listen: Option<SocketAddr>,
+) -> io::Result<()> {
+    let next_dashboard = dashboard_listen.unwrap_or(current.listen);
+    let mut probes = Vec::<TcpListener>::new();
+    if next_dashboard != current.listen {
+        probes.push(TcpListener::bind(next_dashboard).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("dashboard address {next_dashboard} is unavailable: {error}"),
+            )
+        })?);
+    }
+    match listener {
+        ListenerConfig::Integrated { http_listen } => {
+            let current_http = match current.listener {
+                ListenerConfig::Integrated { http_listen } => Some(http_listen),
+                ListenerConfig::Tcp { .. } | ListenerConfig::Uds { .. } => None,
+            };
+            if current_http != Some(*http_listen) {
+                probes.push(TcpListener::bind(*http_listen).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("integrated HTTP address {http_listen} is unavailable: {error}"),
+                    )
+                })?);
+            }
+            let next_https = https_listen.or(current.edge.https_listen);
+            if let Some(https) = next_https
+                && current_http.is_none_or(|_| current.edge.https_listen != Some(https))
+            {
+                probes.push(TcpListener::bind(https).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("integrated HTTPS address {https} is unavailable: {error}"),
+                    )
+                })?);
+            }
+        }
+        ListenerConfig::Tcp {
+            host,
+            port_start,
+            port_end,
+            ..
+        } => {
+            let apps = current
+                .apps
+                .iter()
+                .filter(|app| !app.tenant_admin)
+                .collect::<Vec<_>>();
+            let mut assignments = BTreeMap::<String, u16>::new();
+            let mut used = BTreeSet::<u16>::new();
+            for app in &apps {
+                let port = state
+                    .app_endpoint(listener, &app.name)
+                    .map_err(io::Error::other)?
+                    .and_then(|endpoint| {
+                        endpoint
+                            .rsplit_once(':')
+                            .and_then(|(_, port)| port.parse::<u16>().ok())
+                    });
+                if let Some(port) = port {
+                    assignments.insert(app.name.clone(), port);
+                    used.insert(port);
+                }
+            }
+            for app in &apps {
+                if assignments.contains_key(&app.name) {
+                    continue;
+                }
+                let port = (*port_start..=*port_end)
+                    .find(|port| !used.contains(port))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "TCP app port range is exhausted",
+                        )
+                    })?;
+                assignments.insert(app.name.clone(), port);
+                used.insert(port);
+            }
+            for app in apps {
+                let port = assignments[&app.name];
+                let address = SocketAddr::new(*host, port);
+                let already_bound = match current.listener {
+                    ListenerConfig::Tcp { host: old_host, .. } => state
+                        .app_endpoint(&current.listener, &app.name)
+                        .ok()
+                        .flatten()
+                        .and_then(|value| {
+                            value
+                                .rsplit_once(':')
+                                .and_then(|(_, port)| port.parse::<u16>().ok())
+                        })
+                        .is_some_and(|old_port| SocketAddr::new(old_host, old_port) == address),
+                    ListenerConfig::Integrated { .. } | ListenerConfig::Uds { .. } => false,
+                };
+                if !already_bound {
+                    probes.push(TcpListener::bind(address).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("app TCP address {address} is unavailable: {error}"),
+                        )
+                    })?);
+                }
+            }
+        }
+        ListenerConfig::Uds {
+            socket_dir,
+            socket_group,
+            socket_mode,
+        } => {
+            let gid = prepare_socket_dir(socket_dir, socket_group.as_deref())?;
+            let probe = socket_dir.join(format!(".cygnus-preflight-{}.sock", std::process::id()));
+            let listener = bind_public_uds(&probe, *socket_mode, gid).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Unix socket directory is unusable: {error}"),
+                )
+            })?;
+            drop(listener);
+            fs::remove_file(probe)?;
+        }
+    }
+    drop(probes);
+    Ok(())
+}
+
+fn spawn_app_listener_reconciler(
+    state_path: PathBuf,
+    router: Arc<Router>,
+    frontend: Arc<Frontend>,
+    shutdown: Arc<AtomicBool>,
+    metrics: MetricsHub,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut workers = BTreeMap::<String, AppListenerWorker>::new();
+        let mut reported_failures = BTreeSet::<String>::new();
+        while !shutdown.load(Ordering::Acquire) {
+            let desired = (|| -> Result<Vec<(String, Option<u16>)>, StateError> {
+                let state = State::open(&state_path)?;
+                let snapshot = state.load()?;
+                let mut apps = Vec::new();
+                for app in snapshot.apps.iter().filter(|app| !app.tenant_admin) {
+                    let port = match snapshot.listener {
+                        ListenerConfig::Tcp { .. } => state
+                            .app_endpoint(&snapshot.listener, &app.name)?
+                            .and_then(|endpoint| {
+                                endpoint
+                                    .rsplit_once(':')
+                                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                            }),
+                        ListenerConfig::Integrated { .. } | ListenerConfig::Uds { .. } => None,
+                    };
+                    apps.push((app.name.clone(), port));
+                }
+                Ok(apps)
+            })();
+            let snapshot = State::open(&state_path).and_then(|state| state.load());
+            let (desired, snapshot) = match (desired, snapshot) {
+                (Ok(desired), Ok(snapshot)) => (desired, snapshot),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("cygnus-daemon: app listener reconcile failed: {error}");
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            };
+            let desired_names = desired
+                .iter()
+                .map(|(app, _)| app.as_str())
+                .collect::<BTreeSet<_>>();
+            let retired = workers
+                .keys()
+                .filter(|app| !desired_names.contains(app.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for app in retired {
+                if let Some(worker) = workers.remove(&app) {
+                    worker.stop();
+                }
+                reported_failures.remove(&app);
+            }
+            match &snapshot.listener {
+                ListenerConfig::Tcp { host, .. } => {
+                    for (app, port) in desired {
+                        if workers.contains_key(&app) {
+                            continue;
+                        }
+                        let result = port
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "stable TCP port is not allocated",
+                                )
+                            })
+                            .and_then(|port| TcpListener::bind(SocketAddr::new(*host, port)));
+                        match result {
+                            Ok(listener) => {
+                                let address = local_addr(&listener);
+                                eprintln!("cygnus-daemon: app {app:?} TCP listening on {address}");
+                                workers.insert(
+                                    app.clone(),
+                                    spawn_tcp_app_worker(
+                                        listener,
+                                        app.clone(),
+                                        Arc::clone(&router),
+                                        Arc::clone(&frontend),
+                                        Arc::clone(&shutdown),
+                                    ),
+                                );
+                                reported_failures.remove(&app);
+                            }
+                            Err(error) if reported_failures.insert(app.clone()) => {
+                                eprintln!(
+                                    "cygnus-daemon: app {app:?} TCP endpoint unavailable: {error}"
+                                );
+                                record_event(
+                                    &metrics,
+                                    "listener_failed",
+                                    Some(&app),
+                                    format!("TCP endpoint unavailable: {error}"),
+                                );
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                ListenerConfig::Uds {
+                    socket_dir,
+                    socket_group,
+                    socket_mode,
+                } => match prepare_socket_dir(socket_dir, socket_group.as_deref()) {
+                    Ok(group_gid) => {
+                        for (app, _) in desired {
+                            if workers.contains_key(&app) {
+                                continue;
+                            }
+                            let path = socket_dir.join(format!("{app}.sock"));
+                            match bind_public_uds(&path, *socket_mode, group_gid) {
+                                Ok(listener) => {
+                                    eprintln!(
+                                        "cygnus-daemon: app {app:?} UDS listening on {}",
+                                        path.display()
+                                    );
+                                    workers.insert(
+                                        app.clone(),
+                                        spawn_uds_app_worker(
+                                            listener,
+                                            path,
+                                            app.clone(),
+                                            Arc::clone(&router),
+                                            Arc::clone(&frontend),
+                                            Arc::clone(&shutdown),
+                                        ),
+                                    );
+                                    reported_failures.remove(&app);
+                                }
+                                Err(error) if reported_failures.insert(app.clone()) => {
+                                    eprintln!(
+                                        "cygnus-daemon: app {app:?} UDS endpoint unavailable: {error}"
+                                    );
+                                    record_event(
+                                        &metrics,
+                                        "listener_failed",
+                                        Some(&app),
+                                        format!("UDS endpoint unavailable: {error}"),
+                                    );
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    Err(error) if reported_failures.insert("<socket-dir>".into()) => {
+                        eprintln!("cygnus-daemon: UDS socket directory unavailable: {error}");
+                        record_event(
+                            &metrics,
+                            "listener_failed",
+                            None,
+                            format!("UDS socket directory unavailable: {error}"),
+                        );
+                    }
+                    Err(_) => {}
+                },
+                ListenerConfig::Integrated { .. } => break,
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        for (_, worker) in workers {
+            worker.stop();
+        }
+    })
 }
 
 fn serve(
@@ -1292,17 +2105,21 @@ fn serve(
     tenant_admin_socket: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let restart_requested = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))?;
     let state = State::open(state_path)?;
     let mut snapshot = state.load()?;
     drop(state);
-    // HTTPS edge: explicit https_listen wins. Otherwise try :443 so dashboard
-    // https:// links and apps.localhost work with self-signed certs. A missing
-    // bind permission on the default port must not brick the node — only an
-    // operator-configured https_listen is fatal when it fails.
-    let explicit_https = snapshot.edge.https_listen;
-    let https_bind = explicit_https.or(Some(SocketAddr::from(([0, 0, 0, 0], 443))));
+    let integrated_http = match &snapshot.listener {
+        ListenerConfig::Integrated { http_listen } => Some(*http_listen),
+        ListenerConfig::Tcp { .. } | ListenerConfig::Uds { .. } => None,
+    };
+    // TLS belongs to the integrated edge only. TCP/UDS modes leave app TLS
+    // termination to the operator's proxy and never bind an app HTTPS port.
+    let explicit_https = integrated_http.and(snapshot.edge.https_listen);
+    let https_bind =
+        integrated_http.map(|_| explicit_https.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 443))));
     let https_listener = match https_bind.map(TcpListener::bind) {
         Some(Ok(listener)) => Some(listener),
         Some(Err(error)) if explicit_https.is_some() => {
@@ -1321,18 +2138,18 @@ fn serve(
         }
         None => None,
     };
-    // Edge ingress is mandatory on :80. No fallback to the management port —
-    // without this bind Cygnus is not an edge router.
-    let edge_addr = edge_http_listen();
-    let edge_listener = TcpListener::bind(edge_addr).map_err(|error| {
-        format!(
-            "failed to bind application ingress on {edge_addr}: {error}. \
-             Cygnus must run with permission to bind port 80 (e.g. as root)."
-        )
-    })?;
-    // Management / dashboard listener (typically :3000). Same Frontend and
-    // host-based router as the edge; only omitted when already covered by :80.
-    let management_listener = if snapshot.listen.port() == 80 {
+    let edge_listener = integrated_http
+        .map(|edge_addr| {
+            TcpListener::bind(edge_addr).map_err(|error| {
+                format!(
+                    "failed to bind integrated application ingress on {edge_addr}: {error}. \
+                     Cygnus must run with permission to bind that address."
+                )
+            })
+        })
+        .transpose()?;
+    // The management/dashboard listener remains TCP in every mode.
+    let management_listener = if integrated_http == Some(snapshot.listen) {
         None
     } else {
         Some(TcpListener::bind(snapshot.listen).map_err(|error| {
@@ -1392,6 +2209,9 @@ fn serve(
             }
         }
     }));
+    supervisor
+        .set_memory_budget(snapshot.resources.node_memory_budget_bytes)
+        .map_err(|error| format!("invalid workload memory budget: {error}"))?;
     let mut routes = RouteTable::new();
     let mut pinned = Vec::new();
     for app in &mut snapshot.apps {
@@ -1424,18 +2244,32 @@ fn serve(
     let frontend = Arc::new(
         Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)).with_metrics(metrics.clone()),
     );
-    let edge_address = local_addr(&edge_listener);
-    let edge_frontend = Arc::clone(&frontend);
-    let edge_shutdown = Arc::clone(&shutdown);
-    let edge_failure = Arc::clone(&shutdown);
-    eprintln!("cygnus-daemon: edge HTTP listening on {edge_address}");
-    let edge_thread = thread::spawn(move || {
-        let result = edge_frontend.serve_until(edge_listener, &edge_shutdown);
-        if result.is_err() {
-            edge_failure.store(true, Ordering::Release);
-        }
-        result
+    let edge_thread = edge_listener.map(|listener| {
+        let edge_address = local_addr(&listener);
+        let edge_frontend = Arc::clone(&frontend);
+        let edge_shutdown = Arc::clone(&shutdown);
+        let edge_failure = Arc::clone(&shutdown);
+        eprintln!("cygnus-daemon: integrated HTTP listening on {edge_address}");
+        thread::spawn(move || {
+            let result = edge_frontend.serve_until(listener, &edge_shutdown);
+            if result.is_err() {
+                edge_failure.store(true, Ordering::Release);
+            }
+            result
+        })
     });
+    let app_listener_thread = match &routing_snapshot.listener {
+        ListenerConfig::Integrated { .. } => None,
+        ListenerConfig::Tcp { .. } | ListenerConfig::Uds { .. } => {
+            Some(spawn_app_listener_reconciler(
+                state_path.to_owned(),
+                Arc::clone(&router),
+                Arc::clone(&frontend),
+                Arc::clone(&shutdown),
+                metrics.clone(),
+            ))
+        }
+    };
     let management_thread = management_listener.map(|listener| {
         let address = local_addr(&listener);
         let front = Arc::clone(&frontend);
@@ -1506,6 +2340,8 @@ fn serve(
         runtime: Arc::clone(&live_runtime),
         tls: live_tls,
         http01_challenges,
+        shutdown: Arc::clone(&shutdown),
+        restart_requested: Arc::clone(&restart_requested),
     });
     let github = Arc::new(GitHubManager::new(state_path));
     let github_worker = GitHubWorker::new(
@@ -1594,8 +2430,12 @@ fn serve(
     }
     shutdown.store(true, Ordering::Release);
     let edge_result = edge_thread
-        .join()
-        .map_err(|_| io::Error::other("edge HTTP server thread panicked"))?;
+        .map(|thread| {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("edge HTTP server thread panicked"))
+        })
+        .transpose()?;
     if let Some(thread) = management_thread {
         thread
             .join()
@@ -1619,14 +2459,24 @@ fn serve(
     worker_thread
         .join()
         .map_err(|_| io::Error::other("deploy worker thread panicked"))?;
+    if let Some(thread) = app_listener_thread {
+        thread
+            .join()
+            .map_err(|_| io::Error::other("app listener reconciler panicked"))?;
+    }
     for (app, error) in supervisor.shutdown_all() {
         eprintln!("cygnus-daemon: app {app:?} did not shut down cleanly: {error}");
     }
     if let Some(result) = tls_result {
         result?;
     }
-    edge_result?;
+    if let Some(result) = edge_result {
+        result?;
+    }
     admin_result?;
+    if restart_requested.load(Ordering::Acquire) {
+        return Err("listener configuration changed; restarting under the service manager".into());
+    }
     Ok(())
 }
 
@@ -2021,7 +2871,7 @@ fn install_app(
         upstream,
         spec,
         lifecycle,
-        tenant_admin: _,
+        tenant_admin,
     } = app;
 
     let runtime_key = spec.name.clone();
@@ -2030,6 +2880,11 @@ fn install_app(
         pinned.push(runtime_key.clone());
     }
     supervisor.register(runtime_key.clone(), spec, lifecycle);
+    if tenant_admin && let Err(error) = supervisor.set_memory_exempt(&runtime_key, true) {
+        eprintln!(
+            "cygnus-daemon: tenant control-plane memory exemption failed for {runtime_key:?}: {error}"
+        );
+    }
     for domain in domains {
         routes.insert(
             &domain,
@@ -2216,6 +3071,152 @@ mod tests {
             "tenant-zero"
         );
         assert_eq!(routes.resolve("api.example.com").unwrap().app, "api");
+        drop(state);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tcp_mode_binds_stable_app_port_and_uses_named_route() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        let directory = unique_dir("tcp-listener");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = directory.join("state.db");
+        let port_probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let config = NodeConfig {
+            listener: ListenerConfig::Tcp {
+                host: "127.0.0.1".parse().unwrap(),
+                port_start: port,
+                port_end: port,
+                advertise_host: Some("127.0.0.1".into()),
+            },
+            apps: vec![cygnus_daemon::state::AppConfig {
+                name: "api".into(),
+                upstream: directory.join("runtime.sock"),
+                command: "/bin/false".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut state = State::open(&state_path).unwrap();
+        state.apply(&config).unwrap();
+        let snapshot = state.load().unwrap();
+        let supervisor = Arc::new(Supervisor::<Cage>::new(|_| {
+            Err("expected boot failure".into())
+        }));
+        supervisor.register(
+            snapshot.apps[0].spec.name.clone(),
+            snapshot.apps[0].spec.clone(),
+            snapshot.apps[0].lifecycle.clone(),
+        );
+        let router = Arc::new(Router::new(route_table(&snapshot)));
+        let frontend = Arc::new(Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = spawn_app_listener_reconciler(
+            state_path.clone(),
+            router,
+            frontend,
+            Arc::clone(&shutdown),
+            MetricsHub::new(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut client = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(client) => break client,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("TCP app listener did not bind: {error}"),
+            }
+        };
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: unrelated.example\r\n\r\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway"));
+        shutdown.store(true, Ordering::Release);
+        worker.join().unwrap();
+        supervisor.shutdown_all();
+        drop(state);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uds_mode_binds_stable_proxy_socket_with_configured_mode() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+
+        let short_base = Path::new("/tmp").canonicalize().unwrap();
+        let directory = short_base.join(format!(
+            "cyg-u-{:x}-{:08x}",
+            std::process::id(),
+            unix_millis() as u32
+        ));
+        let socket_dir = directory.join("s");
+        fs::create_dir_all(&directory).unwrap();
+        let state_path = directory.join("state.db");
+        let config = NodeConfig {
+            listener: ListenerConfig::Uds {
+                socket_dir: socket_dir.clone(),
+                socket_group: None,
+                socket_mode: 0o620,
+            },
+            apps: vec![cygnus_daemon::state::AppConfig {
+                name: "api".into(),
+                upstream: directory.join("runtime.sock"),
+                command: "/bin/false".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut state = State::open(&state_path).unwrap();
+        state.apply(&config).unwrap();
+        let snapshot = state.load().unwrap();
+        let supervisor = Arc::new(Supervisor::<Cage>::new(|_| {
+            Err("expected boot failure".into())
+        }));
+        supervisor.register(
+            snapshot.apps[0].spec.name.clone(),
+            snapshot.apps[0].spec.clone(),
+            snapshot.apps[0].lifecycle.clone(),
+        );
+        let router = Arc::new(Router::new(route_table(&snapshot)));
+        let frontend = Arc::new(Frontend::new(Arc::clone(&router), Arc::clone(&supervisor)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = spawn_app_listener_reconciler(
+            state_path.clone(),
+            router,
+            frontend,
+            Arc::clone(&shutdown),
+            MetricsHub::new(),
+        );
+        let socket = socket_dir.join("api.sock");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut client = loop {
+            match UnixStream::connect(&socket) {
+                Ok(client) => break client,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("UDS app listener did not bind: {error}"),
+            }
+        };
+        let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o620);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: unrelated.example\r\n\r\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway"));
+        shutdown.store(true, Ordering::Release);
+        worker.join().unwrap();
+        supervisor.shutdown_all();
+        assert!(!socket.exists());
         drop(state);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2691,16 +3692,25 @@ mod tests {
                 upstream: old.upstream.clone(),
             },
         );
+        old_routes.insert(
+            &internal_app_route_key(&old.name),
+            Route {
+                app: "r-old".into(),
+                upstream: old.upstream.clone(),
+            },
+        );
         drop(router.install(old_routes));
         let old_route = router.resolve("app.example").unwrap();
 
         let new = runtime_candidate("r-new");
         let snapshot = Snapshot {
             listen: "127.0.0.1:3000".parse().unwrap(),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: Default::default(),
             apps: vec![new.clone()],
         };
-        runtime.install_after_commit(&snapshot, Some("r-old".into()), "r-new");
+        runtime.install_after_commit(&snapshot, &new.name, "r-new");
         assert_eq!(router.resolve("app.example").unwrap().app, "r-new");
         assert_eq!(supervisor.state("r-old"), Some(LifecycleState::Ready));
 
@@ -2730,16 +3740,25 @@ mod tests {
                 upstream: current.upstream.clone(),
             },
         );
+        routes.insert(
+            &internal_app_route_key(&current.name),
+            Route {
+                app: "r-current".into(),
+                upstream: current.upstream.clone(),
+            },
+        );
         drop(router.install(routes));
         let before = router.resolve("app.example").unwrap();
         let snapshot = Snapshot {
             listen: "127.0.0.1:3000".parse().unwrap(),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: Default::default(),
             apps: vec![current],
         };
-        runtime.install_after_commit(&snapshot, Some("r-current".into()), "r-current");
+        runtime.install_after_commit(&snapshot, "app", "r-current");
         let after = router.resolve("app.example").unwrap();
-        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(before.app, after.app);
         assert_eq!(supervisor.state("r-current"), Some(LifecycleState::Ready));
         supervisor.shutdown_all();
     }
@@ -2875,8 +3894,8 @@ mod tests {
         app.env.insert("CYGNUS_FIXTURE_MODE".into(), "uds".into());
         let config = NodeConfig {
             listen: "127.0.0.1:0".parse().expect("listen address"),
-            edge: Default::default(),
             apps: vec![app],
+            ..NodeConfig::default()
         };
         let mut state = State::open(&state_path).expect("open state");
         state.apply(&config).expect("apply state");

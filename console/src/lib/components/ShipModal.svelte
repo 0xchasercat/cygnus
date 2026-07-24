@@ -2,6 +2,7 @@
   import { ui } from '../stores.svelte.js';
   import { store } from '../live.svelte.js';
   import { bytes } from '../fmt.js';
+  import { endpointKind, listenerMode } from '../endpoints.js';
   import { collectEntries, packTarball } from '../tar.js';
   import Icon from './Icon.svelte';
 
@@ -15,6 +16,7 @@
   let domain = $state('');
   let domainTouched = $state(false);
   let engineVersion = $state('');
+  let memoryMiB = $state('256');
   // Empty = auto-detect (static site vs server entry). Never invent index.ts —
   // static apps like SvelteKit have no index.ts and would fail the build.
   let entry = $state('');
@@ -43,7 +45,7 @@
   let selectedRepoId = $state(null);
   let mapBusy = $state(false);
   let mapError = $state('');
-  let mapDraft = $state({ app: '', domain: '', engine_version: '', entry: '' });
+  let mapDraft = $state({ app: '', domain: '', engine_version: '', entry: '', memory_mib: '256' });
 
   const discoverableRepos = $derived(store.github.discoverable ?? []);
   const installationCount = $derived((store.github.installations ?? []).length);
@@ -68,6 +70,7 @@
     ?? ''
   );
   const live = $derived(store.mode === 'live');
+  const ingressMode = $derived(listenerMode(store.node));
   const tab = $derived(ui.shipTab ?? 'upload');
 
   function setTab(t) {
@@ -205,6 +208,9 @@
       const stream = new Blob([tarball]).stream().pipeThrough(cs);
       const gzBuf = new Uint8Array(await new Response(stream).arrayBuffer());
 
+      // Empty memory falls back to the node default server-side — never send
+      // Number('') === 0 bytes, which the API rejects with a 422.
+      const memoryMiBValue = String(memoryMiB ?? '').trim();
       const r = await store.deployUpload({
         app: appName,
         domain: domain || undefined,
@@ -214,6 +220,7 @@
         entry: entry.trim() || undefined,
         env: envRowsToMap(),
         preview: previewEnabled ? (previewSlug.trim() || undefined) : undefined,
+        memoryMaxBytes: memoryMiBValue ? Number(memoryMiBValue) * 1024 * 1024 : undefined,
         tarball: gzBuf,
         totalBytes: gzBuf.length,
         onProgress: (p) => (progress = p),
@@ -246,6 +253,7 @@
     envPasteText = '';
     previewEnabled = false;
     previewSlug = '';
+    memoryMiB = String(Math.round((store.node?.resources?.app_memory_default_bytes ?? 256 * 1024 * 1024) / (1024 * 1024)));
     if (fileInput) fileInput.value = '';
   }
 
@@ -265,6 +273,7 @@
       domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
       engine_version: defaultEngine,
       entry: '',
+      memory_mib: String(Math.round((store.node?.resources?.app_memory_default_bytes ?? 256 * 1024 * 1024) / (1024 * 1024))),
     };
   }
 
@@ -297,6 +306,9 @@
     if (!repo || mapBusy) return;
     mapBusy = true;
     mapError = '';
+    // Empty memory falls back to the node default server-side — never send
+    // Number('') === 0 bytes, which the API rejects with a 422.
+    const memoryMiBValue = String(mapDraft.memory_mib ?? '').trim();
     const r = await store.configureRepository({
       installation_id: repo.installation_id,
       repository_id: repo.repository_id,
@@ -304,9 +316,10 @@
       name: repo.name,
       branch: repo.default_branch,
       app: mapDraft.app || repo.name,
-      domain: mapDraft.domain || '',
+      ...(ingressMode === 'integrated' ? { domain: mapDraft.domain || '' } : {}),
       engine_version: mapDraft.engine_version || defaultEngine,
       entry: (mapDraft.entry ?? '').trim() || undefined,
+      ...(memoryMiBValue ? { memory_max_bytes: Number(memoryMiBValue) * 1024 * 1024 } : {}),
     });
     if (!r.ok) {
       mapBusy = false;
@@ -351,7 +364,7 @@
       <header>
         <div class="htitle">
           <div>
-            <h2>Ship to {appsDomain || 'this node'}</h2>
+            <h2>Ship to {ingressMode === 'integrated' ? (appsDomain || 'this node') : `this node · ${endpointKind(store.node)}`}</h2>
             <p>{live ? 'Choose how the next artifact reaches this node.' : 'Preview dataset · daemon bridge offline.'}</p>
           </div>
         </div>
@@ -378,9 +391,18 @@
             {#if picked}
               <form class="uform" onsubmit={startUpload}>
                 <label>App name<input bind:value={appName} maxlength="64" autocomplete="off" required /></label>
-                <label>Domain<input value={domain} oninput={onDomainInput} placeholder={appsDomain ? `app.${appsDomain}` : 'app.example.com'} maxlength="253" autocomplete="off" /></label>
+                {#if ingressMode === 'integrated'}
+                  <label>Domain<input value={domain} oninput={onDomainInput} placeholder={appsDomain ? `app.${appsDomain}` : 'app.example.com'} maxlength="253" autocomplete="off" /></label>
+                {:else}
+                  <div class="endpoint-preview">
+                    <span>{endpointKind(store.node)}</span>
+                    <strong class="num">allocated after deploy</strong>
+                    <small>{ingressMode === 'tcp' ? 'A stable host port will be assigned.' : 'A socket path will be created for your proxy.'}</small>
+                  </div>
+                {/if}
                 <label>Engine<input bind:value={engineVersion} maxlength="128" autocomplete="off" /></label>
                 <label>Entry <span class="optional">(optional — auto-detect if empty)</span><input bind:value={entry} placeholder="auto-detect" maxlength="4096" autocomplete="off" /></label>
+                <label>Memory limit <span class="optional">(MiB)</span><input bind:value={memoryMiB} type="number" min="64" step="1" inputmode="numeric" placeholder="node default" /></label>
 
                 <label class="preview-toggle">
                   <input type="checkbox" bind:checked={previewEnabled} />
@@ -487,7 +509,15 @@
                   </div>
                   <div class="repo-fields">
                     <label>App<input bind:value={mapDraft.app} maxlength="64" required /></label>
-                    <label>Domain<input bind:value={mapDraft.domain} maxlength="253" placeholder="app.example.com" required /></label>
+                    {#if ingressMode === 'integrated'}
+                      <label>Domain<input bind:value={mapDraft.domain} maxlength="253" placeholder="app.example.com" required /></label>
+                    {:else}
+                      <div class="endpoint-preview compact">
+                        <span>{endpointKind(store.node)}</span>
+                        <strong class="num">allocated after deploy</strong>
+                      </div>
+                    {/if}
+                    <label>Memory limit <span class="optional">(MiB)</span><input bind:value={mapDraft.memory_mib} type="number" min="64" step="1" placeholder="node default" /></label>
                   </div>
                   {#if mapError}<p class="inline-error" role="alert">{mapError}</p>{/if}
                   <div class="map-actions">
@@ -663,6 +693,20 @@
     border-radius: 8px; background: var(--surface); color: var(--ink);
     padding: 9px 10px; font-family: var(--mono); font-size: 12px;
   }
+  .endpoint-preview {
+    display: grid;
+    gap: 3px;
+    align-content: center;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface-2);
+  }
+  .endpoint-preview span { font: 500 9.5px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+  .endpoint-preview strong { font-size: 11.5px; color: var(--ink-2); }
+  .endpoint-preview small { font-size: 10px; color: var(--ink-4); }
+  .endpoint-preview.compact { padding: 7px 9px; }
   .summary { grid-column: 1 / -1; font-size: 11px; color: var(--ink-3); }
   .progress {
     grid-column: 1 / -1;

@@ -70,8 +70,8 @@ Options:
   --config-dir DIR       Configuration/secrets destination (Linux: /etc/cygnus; macOS: ~/.cygnus/etc)
   --state-dir DIR        Durable state/artifacts destination (Linux: /var/lib/cygnus; macOS: ~/.cygnus/state)
   --runtime-dir DIR      Runtime sockets destination (Linux: /run/cygnus; macOS: ~/.cygnus/run)
-  --listen ADDR          Management/dashboard HTTP listener (default: 0.0.0.0:3000 Linux, 127.0.0.1:3000 macOS). Application ingress always binds :80.
-  --https-listen ADDR    Optional HTTPS listener (default: disabled)
+  --listen ADDR          Management/dashboard HTTP listener (default: 0.0.0.0:3000 Linux, 127.0.0.1:3000 macOS)
+  --https-listen ADDR    Integrated-mode HTTPS listener (default: disabled)
   --apps-domain DOMAIN   Default application domain (default: apps.localhost)
   --acme-email EMAIL     ACME account email (optional unless HTTPS is enabled)
   --dns-provider NAME    DNS provider (default: none)
@@ -168,6 +168,9 @@ then rerun this installer without sudo."
 fi
 
 downloaded_bundle=""
+transaction_active=0
+transaction_committed=0
+transaction_backup=""
 if (( ! uninstall )) && [[ -z $bundle_dir ]]; then
   ARCH=$(host_arch)
   case $OS in
@@ -368,6 +371,10 @@ chmod 0600 "$diag_file"
 exec 3>>"$diag_file"
 cleanup() {
   local status=$?
+  if (( status != 0 && transaction_active && ! transaction_committed )); then
+    printf 'cygnus installer: restoring the previous working installation\n' >&2
+    restore_install_transaction || printf 'cygnus installer: ERROR: automatic restore was incomplete; backup retained at %s\n' "$transaction_backup" >&2
+  fi
   exec 3>&- || true
   rm -rf -- "$stage"
   [[ -n ${downloaded_bundle:-} ]] && rm -rf -- "$downloaded_bundle"
@@ -585,10 +592,10 @@ if [[ $OS == Darwin ]]; then
   json_console_script=$(json_safe_string "$console_root/opt/cygnus-console/server.js")
   # tenant-0 has no product hostname. Operators set dashboard_domain in the
   # console; the management listener + Host default route reach it until then.
-  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":[],"tenant_admin":true,"upstream":"%s","command":"%s","args":["%s"],"env":{"CYGNUS_SOCKET":"%s","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"lifecycle":{"min_instances":1}}]}\n' \
+  printf '{"listen":"%s","listener":{"mode":"integrated","http_listen":"0.0.0.0:80"},"resources":{},"edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":[],"tenant_admin":true,"upstream":"%s","command":"%s","args":["%s"],"env":{"CYGNUS_SOCKET":"%s","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"lifecycle":{"min_instances":1}}]}\n' \
     "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_upstream" "$json_command" "$json_console_script" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" >"$stage/node.json"
 else
-  printf '{"listen":"%s","edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":[],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
+  printf '{"listen":"%s","listener":{"mode":"integrated","http_listen":"0.0.0.0:80"},"resources":{},"edge":{"https_listen":%s,"apps_domain":"%s","acme":%s},"apps":[{"name":"tenant-0","domains":[],"tenant_admin":true,"upstream":"%s","command":"/usr/local/bin/bun","args":["/opt/cygnus-console/server.js"],"init":"/usr/local/bin/cygnus-init","env":{"CYGNUS_SOCKET":"/cygnus/io/console.sock","CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE":"%s","CYGNUS_CONSOLE_SESSION_KEY_FILE":"%s"},"rootfs":{"lowerdirs":["%s","%s","%s","%s"]},"lifecycle":{"min_instances":1}}]}\n' \
     "$json_listen" "$json_https" "$json_domain" "$json_acme" "$json_console_upstream" "$json_secret_bootstrap_path" "$json_secret_session_path" "$json_hostlib_root" "$json_engine_root" "$json_console_root" "$json_secret_root" >"$stage/node.json"
 fi
 printf '%s\n' \
@@ -667,6 +674,8 @@ service_stage=$stage/cygnus.service
 # replacing package content. `--reconfigure` is the explicit request to use
 # newly supplied installer values. Previously the generated defaults differed
 # from any configured ACME install, so a normal rerun failed before upgrading.
+existing_state_before=0
+[[ -e $state_dir/state.db ]] && existing_state_before=1
 preserve_existing_file() {
   local dest=$1 staged=$2 label=$3
   if [[ ! -e $dest ]]; then
@@ -678,7 +687,17 @@ preserve_existing_file() {
     log "Preserve existing $label (use --reconfigure to replace it)"
   fi
 }
-preserve_existing_file "$config_file" "$stage/node.json" "node configuration"
+# node.json is a first-boot seed. Once state.db exists, dashboard and CLI
+# mutations are authoritative and may include apps that are not represented in
+# this old bootstrap file. Never replace/apply it during an upgrade; the
+# node-only commands below update just the requested settings.
+if (( existing_state_before )) && [[ -e $config_file ]]; then
+  [[ ! -L $config_file && -f $config_file ]] || fail "existing node configuration is not a regular file: $config_file"
+  cp -- "$config_file" "$stage/node.json"
+  log "Preserve existing node configuration; live node settings are updated in place"
+else
+  preserve_existing_file "$config_file" "$stage/node.json" "node configuration"
+fi
 preserve_existing_file "$service_file" "$service_stage" "service configuration"
 if [[ -e $secrets_env ]]; then
   [[ ! -L $secrets_env && -f $secrets_env ]] || fail "existing secrets env is not a regular file"
@@ -797,6 +816,143 @@ atomic_install_dir() {
   [[ ! -e $old ]] || rm -rf -- "$old"
 }
 
+# Upgrades and reconfiguration are transactions around the stopped daemon. Keep
+# a durable copy of every mutable boot/runtime input we replace, including the
+# quiesced SQLite database. A failed start or health check restores these files
+# and starts the previous release again instead of stranding the node.
+transaction_backup_target() {
+  local source=$1 key=$2
+  local target=$transaction_backup/files/$key
+  mkdir -p -- "${target%/*}" "$transaction_backup/present/${key%/*}"
+  if [[ -e $source || -L $source ]]; then
+    [[ ! -L $source ]] || fail "refusing to back up symlinked install target: $source"
+    : >"$transaction_backup/present/$key"
+    if [[ -d $source ]]; then
+      mkdir -p -- "$target"
+      cp -Rp -- "$source/." "$target/"
+    else
+      cp -p -- "$source" "$target"
+    fi
+  fi
+}
+
+restore_transaction_target() {
+  local destination=$1 key=$2
+  local source=$transaction_backup/files/$key
+  rm -rf -- "$destination"
+  if [[ -e $transaction_backup/present/$key ]]; then
+    mkdir -p -- "${destination%/*}"
+    if [[ -d $source ]]; then
+      mkdir -p -- "$destination"
+      cp -Rp -- "$source/." "$destination/"
+    else
+      cp -p -- "$source" "$destination"
+    fi
+  fi
+}
+
+begin_install_transaction() {
+  local state_file=$state_dir/state.db
+  if [[ ! -e $state_file && ! -e $config_file && ! -e $prefix/cygnus-daemon ]]; then
+    return
+  fi
+  ensure_dir "$state_dir" 0700
+  ensure_dir "$state_dir/install-backups" 0700
+  transaction_backup=$state_dir/install-backups/.transaction-$$
+  rm -rf -- "$transaction_backup"
+  mkdir -p -- "$transaction_backup/files" "$transaction_backup/present"
+  chmod 0700 "$transaction_backup" "$transaction_backup/files" "$transaction_backup/present"
+
+  transaction_backup_target "$state_file" state/state.db
+  transaction_backup_target "$state_file-wal" state/state.db-wal
+  transaction_backup_target "$state_file-shm" state/state.db-shm
+  transaction_backup_target "$config_file" config/node.json
+  transaction_backup_target "$secrets_env" config/secrets.env
+  transaction_backup_target "$service_file" service/service
+  transaction_backup_target "$prefix/cygnus-daemon" bin/cygnus-daemon
+  transaction_backup_target "$prefix/cygnus" bin/cygnus
+  transaction_backup_target "$prefix/cygnus-init" bin/cygnus-init
+  transaction_backup_target "$prefix/bun" bin/bun
+  transaction_backup_target "$console_root" package/console
+  transaction_backup_target "$secret_root" package/console-secrets
+  transaction_backup_target "$engine_root" package/engine
+  if [[ $OS == Linux ]]; then
+    transaction_backup_target "$hostlib_root" package/hostlib
+  fi
+  {
+    printf 'created_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'state=%s\n' "$state_file"
+    printf 'config=%s\n' "$config_file"
+    printf 'daemon=%s\n' "$prefix/cygnus-daemon"
+  } >"$transaction_backup/manifest"
+  chmod 0600 "$transaction_backup/manifest"
+  transaction_active=1
+  log "Backed up current installation to $transaction_backup"
+}
+
+restart_restored_service() {
+  if [[ $OS == Darwin ]]; then
+    local launchctl_bin
+    launchctl_bin=$(command -v launchctl || true)
+    if [[ -n $launchctl_bin ]]; then
+      "$launchctl_bin" bootout "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
+      "$launchctl_bin" enable "gui/$(id -u)/com.cygnus.daemon" >>"$diag_file" 2>&1 || true
+      "$launchctl_bin" bootstrap "gui/$(id -u)" "$service_file" >>"$diag_file" 2>&1 \
+        || "$launchctl_bin" load -w "$service_file" >>"$diag_file" 2>&1 \
+        || true
+    fi
+  else
+    local systemctl_bin
+    systemctl_bin=$(command -v systemctl || true)
+    if [[ -n $systemctl_bin ]]; then
+      "$systemctl_bin" daemon-reload >>"$diag_file" 2>&1 || true
+      "$systemctl_bin" restart cygnus.service >>"$diag_file" 2>&1 || true
+    fi
+  fi
+}
+
+restore_install_transaction() {
+  [[ -n $transaction_backup && -d $transaction_backup ]] || return 1
+  stop_existing_service
+  restore_transaction_target "$state_dir/state.db" state/state.db
+  restore_transaction_target "$state_dir/state.db-wal" state/state.db-wal
+  restore_transaction_target "$state_dir/state.db-shm" state/state.db-shm
+  restore_transaction_target "$config_file" config/node.json
+  restore_transaction_target "$secrets_env" config/secrets.env
+  restore_transaction_target "$service_file" service/service
+  restore_transaction_target "$prefix/cygnus-daemon" bin/cygnus-daemon
+  restore_transaction_target "$prefix/cygnus" bin/cygnus
+  restore_transaction_target "$prefix/cygnus-init" bin/cygnus-init
+  restore_transaction_target "$prefix/bun" bin/bun
+  restore_transaction_target "$console_root" package/console
+  restore_transaction_target "$secret_root" package/console-secrets
+  restore_transaction_target "$engine_root" package/engine
+  if [[ $OS == Linux ]]; then
+    restore_transaction_target "$hostlib_root" package/hostlib
+  fi
+  rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
+  restart_restored_service
+  mv -- "$transaction_backup" "$transaction_backup.failed-restore-source" 2>/dev/null || true
+  transaction_active=0
+}
+
+commit_install_transaction() {
+  (( transaction_active )) || return 0
+  local completed
+  completed=$state_dir/install-backups/install-$(date -u '+%Y%m%dT%H%M%SZ')-$$
+  mv -- "$transaction_backup" "$completed"
+  transaction_backup=$completed
+  transaction_committed=1
+  transaction_active=0
+  log "Previous working installation retained at $completed"
+  # Retain the three newest completed backups. Transaction/failed-restore
+  # directories are never pruned automatically.
+  local stale
+  while IFS= read -r stale; do
+    [[ -n $stale ]] && rm -rf -- "$stale"
+  done < <(find "$state_dir/install-backups" -mindepth 1 -maxdepth 1 -type d -name 'install-*' -print | sort -r | tail -n +4)
+}
+
 # Tear down any previous install before replacing binaries or rebinding sockets.
 # Reinstalls must not fight a live daemon holding the old binary/sockets.
 stop_existing_service() {
@@ -833,13 +989,24 @@ stop_existing_service() {
     local systemctl_bin
     systemctl_bin=$(command -v systemctl || true)
     if [[ -n $systemctl_bin ]]; then
-      "$systemctl_bin" stop cygnus.service >>"$diag_file" 2>&1 || true
+      if ! "$systemctl_bin" stop cygnus.service >>"$diag_file" 2>&1; then
+        # A missing/disabled unit is a repairable partial install. Only refuse
+        # to mutate files when systemd says the old service is still active.
+        if (( existing_state_before && ! transaction_active )) \
+          && "$systemctl_bin" is-active --quiet cygnus.service >>"$diag_file" 2>&1; then
+          fail "could not stop the existing cygnus.service safely; no files were changed. Diagnostics: $diag_file"
+        fi
+      fi
     fi
   fi
 }
 
 log "Stop existing Cygnus"
 stop_existing_service
+begin_install_transaction
+# A filesystem entry alone is not a health signal. Remove stopped-daemon
+# sockets so readiness below cannot succeed against stale paths.
+rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
 
 log "Install Cygnus"
 ensure_dir "$prefix" 0755
@@ -1059,17 +1226,58 @@ wait_for_socket() {
   done
   return 1
 }
+wait_for_health() {
+  local attempts=$1 i
+  for ((i=1; i<=attempts; i++)); do
+    if socket_present "$admin_socket" \
+      && "$prefix/cygnus" --admin-socket "$admin_socket" health >>"$diag_file" 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
 
-if ! wait_for_socket "$admin_socket" 50; then
+if ! wait_for_health 50; then
   if [[ $OS == Darwin && $service_started -eq 0 ]]; then
     log "Cygnus is installed; start it with the foreground command above to finish configuration."
     exit 0
   fi
-  fail "daemon admin socket did not become ready at $admin_socket; diagnostics: $diag_file$([[ $OS == Darwin ]] && printf '%s' '. If a previous sudo run is fighting this install, check: sudo launchctl print system/com.cygnus.daemon (remove with sudo launchctl bootout system/com.cygnus.daemon), then rerun')"
+  fail "daemon health check did not become ready at $admin_socket; diagnostics: $diag_file$([[ $OS == Darwin ]] && printf '%s' '. If a previous sudo run is fighting this install, check: sudo launchctl print system/com.cygnus.daemon (remove with sudo launchctl bootout system/com.cygnus.daemon), then rerun')"
 fi
 
 "$prefix/cygnus" --admin-socket "$admin_socket" engine register --version "$bun_version" --host-root "$engine_root" --cage-executable /usr/local/bin/bun --default >>"$diag_file" 2>&1 || fail "engine registration failed; diagnostics: $diag_file"
-"$prefix/cygnus" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "node configuration apply failed; diagnostics: $diag_file"
+if (( ! existing_state_before )); then
+  "$prefix/cygnus" --admin-socket "$admin_socket" apply "$config_file" >>"$diag_file" 2>&1 || fail "initial node configuration apply failed; diagnostics: $diag_file"
+elif (( reconfigure )); then
+  # Never run full apply against an established node: apply replaces the app
+  # set. These commands mutate only the requested node settings.
+  if (( domain_set )); then
+    "$prefix/cygnus" --admin-socket "$admin_socket" dashboard-domain --apex "$apps_domain" >>"$diag_file" 2>&1 \
+      || fail "application domain reconfiguration failed; diagnostics: $diag_file"
+  fi
+  if (( email_set )); then
+    if [[ -n $acme_email ]]; then
+      "$prefix/cygnus" --admin-socket "$admin_socket" dashboard-tls --mode acme --email "$acme_email" >>"$diag_file" 2>&1 \
+        || fail "TLS reconfiguration failed; diagnostics: $diag_file"
+    else
+      "$prefix/cygnus" --admin-socket "$admin_socket" dashboard-tls --mode self-signed >>"$diag_file" 2>&1 \
+        || fail "TLS reconfiguration failed; diagnostics: $diag_file"
+    fi
+  fi
+  if (( dns_set )); then
+    log "DNS provider remains dashboard-managed; preserving the live provider during safe reconfiguration"
+  fi
+  if (( listen_set || https_set )); then
+    dashboard_args=(dashboard-listen)
+    (( listen_set )) && dashboard_args+=(--listen "$listen")
+    if (( https_set )) && [[ -n $https_listen ]]; then
+      dashboard_args+=(--https-listen "$https_listen")
+    fi
+    "$prefix/cygnus" --admin-socket "$admin_socket" "${dashboard_args[@]}" >>"$diag_file" 2>&1 \
+      || fail "dashboard listener reconfiguration failed; diagnostics: $diag_file"
+  fi
+fi
 
 # Listener and ACME account changes are persisted by apply, then become active
 # after this controlled restart. Keeping the restart in the installer makes
@@ -1077,8 +1285,9 @@ fi
 # forces users to manually delete state.
 if (( reconfigure )); then
   log "Restart Cygnus with reconfigured node settings"
+  rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
   start_service
-  wait_for_socket "$admin_socket" 50 || fail "daemon did not come back after reconfiguration; diagnostics: $diag_file"
+  wait_for_health 50 || fail "daemon did not pass health checks after reconfiguration; diagnostics: $diag_file"
 fi
 
 # The Tenant Zero bridge socket binds at daemon startup from stored state. A
@@ -1087,10 +1296,12 @@ fi
 # restart picks the bridge up.
 if ! wait_for_socket "$tenant_admin_socket" 20; then
   log "Restart Cygnus to bind the Tenant Zero bridge"
+  rm -f -- "$admin_socket" "$tenant_admin_socket" "$console_socket" 2>/dev/null || true
   start_service
-  wait_for_socket "$admin_socket" 50 || fail "daemon did not come back after restart; diagnostics: $diag_file"
+  wait_for_health 50 || fail "daemon did not pass health checks after restart; diagnostics: $diag_file"
   wait_for_socket "$tenant_admin_socket" 50 || fail "Tenant Zero bridge socket did not become ready at $tenant_admin_socket; diagnostics: $diag_file"
 fi
+commit_install_transaction
 
 console_scheme=http
 console_listener=$listen

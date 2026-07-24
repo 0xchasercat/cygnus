@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_ACCOUNT_EMAIL_BYTES: usize = 254;
 pub const MIN_ACCOUNT_PASSWORD_BYTES: usize = 12;
@@ -339,6 +339,14 @@ pub struct ActivationRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeConfig {
     pub listen: SocketAddr,
+    /// How deployed applications are exposed. Omitted preserves Cygnus'
+    /// traditional host-routed HTTP/TLS edge.
+    #[serde(default)]
+    pub listener: ListenerConfig,
+    /// Node-wide workload resource policy. Physical host memory remains
+    /// observational; an explicit budget is enforced independently.
+    #[serde(default)]
+    pub resources: NodeResourcesConfig,
     #[serde(default)]
     pub edge: EdgeConfig,
     #[serde(default)]
@@ -349,10 +357,105 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: EdgeConfig::default(),
             apps: Vec::new(),
         }
     }
+}
+
+fn default_edge_http_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 80))
+}
+
+fn default_tcp_host() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+fn default_tcp_port_start() -> u16 {
+    10_000
+}
+
+fn default_tcp_port_end() -> u16 {
+    19_999
+}
+
+fn default_socket_dir() -> PathBuf {
+    PathBuf::from("/run/cygnus/apps")
+}
+
+fn default_socket_mode() -> u32 {
+    0o660
+}
+
+/// Application listener strategy. The dashboard always uses [`NodeConfig::listen`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum ListenerConfig {
+    Integrated {
+        #[serde(default = "default_edge_http_listen")]
+        http_listen: SocketAddr,
+    },
+    Tcp {
+        #[serde(default = "default_tcp_host")]
+        host: IpAddr,
+        #[serde(default = "default_tcp_port_start")]
+        port_start: u16,
+        #[serde(default = "default_tcp_port_end")]
+        port_end: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advertise_host: Option<String>,
+    },
+    Uds {
+        #[serde(default = "default_socket_dir")]
+        socket_dir: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket_group: Option<String>,
+        #[serde(default = "default_socket_mode", with = "octal_mode")]
+        socket_mode: u32,
+    },
+}
+
+mod octal_mode {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(mode: &u32, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{mode:04o}"))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            String(String),
+            Number(u32),
+        }
+        match Input::deserialize(deserializer)? {
+            Input::String(value) => u32::from_str_radix(value.trim_start_matches("0o"), 8)
+                .map_err(serde::de::Error::custom),
+            Input::Number(value) => Ok(value),
+        }
+    }
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self::Integrated {
+            http_listen: default_edge_http_listen(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeResourcesConfig {
+    /// Aggregate concurrent workload memory budget. `None` preserves the
+    /// current unlimited/host-controlled behavior for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_memory_budget_bytes: Option<u64>,
+    /// Default assigned to newly created apps that do not specify an override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_memory_default_bytes: Option<u64>,
 }
 
 /// One app in a [`NodeConfig`]. Durations are represented as milliseconds in
@@ -625,6 +728,8 @@ fn default_crash_loop_threshold() -> u32 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub listen: SocketAddr,
+    pub listener: ListenerConfig,
+    pub resources: NodeResourcesConfig,
     pub edge: EdgeConfig,
     pub apps: Vec<LoadedApp>,
 }
@@ -673,6 +778,7 @@ pub struct GitHubRepositoryConfig {
     pub entry: PathBuf,
     pub artifact_root: PathBuf,
     pub upstream: PathBuf,
+    pub memory_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1004,6 +1110,7 @@ impl State {
                 8 => migrate_v8_to_v9(&transaction)?,
                 9 => migrate_v9_to_v10(&transaction)?,
                 10 => migrate_v10_to_v11(&transaction)?,
+                11 => migrate_v11_to_v12(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -1203,6 +1310,71 @@ impl State {
         self.state_root.join("upstreams").join(app)
     }
 
+    pub fn app_endpoint(
+        &self,
+        listener: &ListenerConfig,
+        app: &str,
+    ) -> Result<Option<String>, StateError> {
+        let port = self
+            .connection
+            .query_row(
+                "SELECT p.port FROM app_listener_ports p
+                 JOIN apps a ON a.id = p.app_id WHERE a.name = ?1",
+                [app],
+                |row| row.get::<_, u16>(0),
+            )
+            .optional()?;
+        Ok(app_endpoint(listener, app, port))
+    }
+
+    pub fn app_config_revisions(&self, app: &str) -> Result<(u64, u64), StateError> {
+        self.connection
+            .query_row(
+                "SELECT r.desired_revision, r.applied_revision
+                 FROM app_config_revisions r JOIN apps a ON a.id = r.app_id
+                 WHERE a.name = ?1",
+                [app],
+                |row| {
+                    let desired = row.get::<_, i64>(0)?;
+                    let applied = row.get::<_, i64>(1)?;
+                    Ok((desired as u64, applied as u64))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StateError::AppNotFound(app.to_owned()))
+    }
+
+    /// Mark one successfully booted configuration generation active. The CAS
+    /// prevents an env/resource edit racing the boot from being acknowledged
+    /// as applied when it was not part of that runtime.
+    pub fn mark_app_config_applied(
+        &mut self,
+        app: &str,
+        expected_desired_revision: u64,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        let expected = i64::try_from(expected_desired_revision).map_err(|_| {
+            StateError::InvalidConfig("configuration revision exceeds SQLite range".into())
+        })?;
+        let transaction = self.connection.transaction()?;
+        let app_id = app_id_tx(&transaction, app)?;
+        let changed = transaction.execute(
+            "UPDATE app_config_revisions
+             SET applied_revision = desired_revision
+             WHERE app_id = ?1 AND desired_revision = ?2",
+            params![app_id, expected],
+        )?;
+        if changed == 0 {
+            return Err(StateError::InvalidConfig(
+                "app configuration changed while the replacement runtime was booting".into(),
+            ));
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Validate and atomically replace the complete persisted configuration.
     pub fn apply(&mut self, config: &NodeConfig) -> Result<(), StateError> {
         let snapshot = snapshot_from_config(config)?;
@@ -1244,17 +1416,42 @@ impl State {
             });
         }
 
-        let listen = self
+        let (listen, listener, resources) = self
             .connection
-            .query_row("SELECT listen FROM node_config WHERE id = 1", [], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT listen, listener_json, resources_json FROM node_config WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
             .optional()?
-            .ok_or_else(|| StateError::IncompleteState("singleton node config is missing".into()))?
-            .parse::<SocketAddr>()
-            .map_err(|error| StateError::InvalidPersisted {
-                app: "<node>".into(),
-                detail: format!("invalid listen address: {error}"),
+            .ok_or_else(|| {
+                StateError::IncompleteState("singleton node config is missing".into())
+            })?;
+        let listen =
+            listen
+                .parse::<SocketAddr>()
+                .map_err(|error| StateError::InvalidPersisted {
+                    app: "<node>".into(),
+                    detail: format!("invalid listen address: {error}"),
+                })?;
+        let listener = serde_json::from_str::<ListenerConfig>(&listener).map_err(|source| {
+            StateError::PersistedJson {
+                app: "<node listener>".into(),
+                source,
+            }
+        })?;
+        let resources =
+            serde_json::from_str::<NodeResourcesConfig>(&resources).map_err(|source| {
+                StateError::PersistedJson {
+                    app: "<node resources>".into(),
+                    source,
+                }
             })?;
 
         let edge = self
@@ -1368,7 +1565,13 @@ impl State {
             }
             apps.push(loaded);
         }
-        let snapshot = Snapshot { listen, edge, apps };
+        let snapshot = Snapshot {
+            listen,
+            listener,
+            resources,
+            edge,
+            apps,
+        };
         validate_snapshot(&snapshot)?;
         Ok(snapshot)
     }
@@ -1991,6 +2194,8 @@ impl State {
         }
         let snapshot = snapshot_from_config(&NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: EdgeConfig::default(),
             apps: vec![candidate.clone()],
         })?;
@@ -2079,6 +2284,8 @@ impl State {
         );
         validate_snapshot(&Snapshot {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: EdgeConfig::default(),
             apps: vec![loaded.clone()],
         })?;
@@ -2127,6 +2334,8 @@ impl State {
         }
         validate_snapshot(&Snapshot {
             listen: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: EdgeConfig::default(),
             apps: vec![plan.candidate.clone()],
         })?;
@@ -2219,6 +2428,24 @@ impl State {
                 |row| row.get::<_, i64>(0),
             )?
         };
+        let listener_json: String = transaction.query_row(
+            "SELECT listener_json FROM node_config WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let listener: ListenerConfig =
+            serde_json::from_str(&listener_json).map_err(|source| StateError::PersistedJson {
+                app: "<node listener>".into(),
+                source,
+            })?;
+        if !plan.candidate.tenant_admin {
+            ensure_tcp_port_tx(&transaction, app_id, &listener)?;
+        }
+        transaction.execute(
+            "INSERT INTO app_config_revisions (app_id) VALUES (?1)
+             ON CONFLICT(app_id) DO UPDATE SET applied_revision = desired_revision",
+            [app_id],
+        )?;
         let (apex, mode) = transaction.query_row(
             "SELECT apex_domain, ssl_mode FROM edge_config WHERE id = 1",
             [],
@@ -2530,6 +2757,7 @@ impl State {
              ON CONFLICT(app_id, key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
             params![app_id, key, encrypted],
         )?;
+        bump_desired_revision_tx(&transaction, app_id)?;
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
         Ok(())
@@ -2547,10 +2775,140 @@ impl State {
         validate_env_var_key(key)?;
         let transaction = self.connection.transaction()?;
         let app_id = app_id_tx(&transaction, app)?;
-        transaction.execute(
+        let removed = transaction.execute(
             "DELETE FROM env_vars WHERE app_id = ?1 AND key = ?2",
             params![app_id, key],
         )?;
+        if removed > 0 {
+            bump_desired_revision_tx(&transaction, app_id)?;
+        }
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_app_memory(
+        &mut self,
+        app: &str,
+        memory_max: u64,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        if memory_max < 16 * 1024 * 1024 {
+            return Err(StateError::InvalidConfig(
+                "app memory_max_bytes must be at least 16 MiB".into(),
+            ));
+        }
+        let mut snapshot = self.load()?;
+        let loaded = snapshot
+            .apps
+            .iter_mut()
+            .find(|candidate| candidate.name == app)
+            .ok_or_else(|| StateError::AppNotFound(app.to_owned()))?;
+        loaded.spec.limits.memory_max = memory_max;
+        loaded.spec.limits.memory_high = memory_max.saturating_mul(7) / 8;
+        validate_snapshot(&snapshot)?;
+        let transaction = self.connection.transaction()?;
+        let (app_id, json): (i64, String) = transaction.query_row(
+            "SELECT id, runtime_json FROM apps WHERE name = ?1",
+            [app],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut stored: StoredAppJson =
+            serde_json::from_str(&json).map_err(|source| StateError::PersistedJson {
+                app: app.to_owned(),
+                source,
+            })?;
+        stored.runtime.limits.memory_max = memory_max;
+        stored.runtime.limits.memory_high = memory_max.saturating_mul(7) / 8;
+        let runtime_json = serde_json::to_string(&StoredApp {
+            name: app,
+            upstream: &stored.upstream,
+            domains: &[],
+            runtime: &stored.runtime,
+        })
+        .map_err(|error| StateError::InvalidConfig(format!("serialize app {app:?}: {error}")))?;
+        transaction.execute(
+            "UPDATE apps SET runtime_json = ?2 WHERE id = ?1",
+            params![app_id, runtime_json],
+        )?;
+        bump_desired_revision_tx(&transaction, app_id)?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_node_resources(
+        &mut self,
+        resources: &NodeResourcesConfig,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        let mut snapshot = self.load()?;
+        snapshot.resources = resources.clone();
+        validate_snapshot(&snapshot)?;
+        let json = serde_json::to_string(resources).map_err(|error| {
+            StateError::InvalidConfig(format!("serialize node resources: {error}"))
+        })?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE node_config SET resources_json = ?1 WHERE id = 1",
+            [json],
+        )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_listener(
+        &mut self,
+        listener: &ListenerConfig,
+        dashboard_listen: Option<SocketAddr>,
+        https_listen: Option<SocketAddr>,
+        audit: &AuditContext,
+    ) -> Result<(), StateError> {
+        validate_audit_context(audit)?;
+        let mut snapshot = self.load()?;
+        snapshot.listener = listener.clone();
+        if let Some(listen) = dashboard_listen {
+            snapshot.listen = listen;
+        }
+        if https_listen.is_some() {
+            snapshot.edge.https_listen = https_listen;
+        }
+        validate_snapshot(&snapshot)?;
+        let json = serde_json::to_string(listener).map_err(|error| {
+            StateError::InvalidConfig(format!("serialize listener configuration: {error}"))
+        })?;
+        let transaction = self.connection.transaction()?;
+        if matches!(listener, ListenerConfig::Tcp { .. }) {
+            let apps = {
+                let mut statement = transaction
+                    .prepare("SELECT id, runtime_json FROM apps ORDER BY name COLLATE BINARY")?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (app_id, runtime_json) in apps {
+                let stored: StoredAppJson =
+                    serde_json::from_str(&runtime_json).map_err(|source| {
+                        StateError::PersistedJson {
+                            app: format!("id:{app_id}"),
+                            source,
+                        }
+                    })?;
+                if !stored.runtime.tenant_admin {
+                    ensure_tcp_port_tx(&transaction, app_id, listener)?;
+                }
+            }
+        }
+        transaction.execute(
+            "UPDATE node_config SET listener_json = ?1, listen = ?2 WHERE id = 1",
+            params![json, snapshot.listen.to_string()],
+        )?;
+        store_edge_config_tx(&transaction, &snapshot.edge)?;
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
         Ok(())
@@ -3028,7 +3386,7 @@ impl State {
     }
 
     pub fn github_repositories(&self) -> Result<Vec<GitHubRepositoryConfig>, StateError> {
-        let mut statement = self.connection.prepare("SELECT installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream FROM github_repositories WHERE enabled = 1 ORDER BY owner, name")?;
+        let mut statement = self.connection.prepare("SELECT installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream, memory_max_bytes FROM github_repositories WHERE enabled = 1 ORDER BY owner, name")?;
         let rows = statement.query_map([], github_repository_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StateError::from)
@@ -3040,7 +3398,7 @@ impl State {
         repository_id: i64,
     ) -> Result<Option<GitHubRepositoryConfig>, StateError> {
         self.connection.query_row(
-            "SELECT installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream FROM github_repositories WHERE installation_id = ?1 AND repository_id = ?2 AND enabled = 1",
+            "SELECT installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream, memory_max_bytes FROM github_repositories WHERE installation_id = ?1 AND repository_id = ?2 AND enabled = 1",
             params![installation_id, repository_id], github_repository_from_row,
         ).optional().map_err(StateError::from)
     }
@@ -3981,10 +4339,21 @@ fn validate_github_repository(config: &GitHubRepositoryConfig) -> Result<(), Sta
         (&config.name, "name"),
         (&config.branch, "branch"),
         (&config.app, "app"),
-        (&config.domain, "domain"),
         (&config.engine_version, "engine version"),
     ] {
         github_text(value, field)?;
+    }
+    if !config.domain.is_empty() {
+        github_text(&config.domain, "domain")?;
+    }
+    if config
+        .memory_max_bytes
+        .is_some_and(|value| value < 16 * 1024 * 1024)
+    {
+        return Err(StateError::InvalidRecord {
+            kind: "github repository",
+            detail: "memory_max_bytes must be at least 16 MiB".into(),
+        });
     }
     if !config.entry.as_os_str().is_empty()
         && (config.entry.is_absolute()
@@ -4056,10 +4425,12 @@ fn validate_deploy_job_spec(job: &DeployJobSpec) -> Result<(), StateError> {
         (&job.key, "job key"),
         (&job.source_ref, "source ref"),
         (&job.app, "app"),
-        (&job.domain, "domain"),
         (&job.engine_version, "engine version"),
     ] {
         github_text(value, field)?;
+    }
+    if !job.domain.is_empty() {
+        github_text(&job.domain, "domain")?;
     }
     if job.source_path.as_os_str().is_empty()
         || job.source_path.as_os_str().as_bytes().len() > 4096
@@ -4187,7 +4558,12 @@ fn upsert_github_repository_tx(
     transaction: &Transaction<'_>,
     config: &GitHubRepositoryConfig,
 ) -> Result<(), StateError> {
-    transaction.execute("INSERT INTO github_repositories (installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1) ON CONFLICT(installation_id, repository_id) DO UPDATE SET owner=excluded.owner, name=excluded.name, branch=excluded.branch, app=excluded.app, domain=excluded.domain, engine_version=excluded.engine_version, entry=excluded.entry, artifact_root=excluded.artifact_root, upstream=excluded.upstream, enabled=1", params![config.installation_id, config.repository_id, config.owner, config.name, config.branch, config.app, config.domain, config.engine_version, config.entry.to_string_lossy(), config.artifact_root.to_string_lossy(), config.upstream.to_string_lossy()])?;
+    let memory_max_bytes = config
+        .memory_max_bytes
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| StateError::InvalidConfig("memory_max_bytes exceeds SQLite range".into()))?;
+    transaction.execute("INSERT INTO github_repositories (installation_id, repository_id, owner, name, branch, app, domain, engine_version, entry, artifact_root, upstream, memory_max_bytes, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1) ON CONFLICT(installation_id, repository_id) DO UPDATE SET owner=excluded.owner, name=excluded.name, branch=excluded.branch, app=excluded.app, domain=excluded.domain, engine_version=excluded.engine_version, entry=excluded.entry, artifact_root=excluded.artifact_root, upstream=excluded.upstream, memory_max_bytes=excluded.memory_max_bytes, enabled=1", params![config.installation_id, config.repository_id, config.owner, config.name, config.branch, config.app, config.domain, config.engine_version, config.entry.to_string_lossy(), config.artifact_root.to_string_lossy(), config.upstream.to_string_lossy(), memory_max_bytes])?;
     Ok(())
 }
 
@@ -4206,6 +4582,11 @@ fn github_repository_from_row(
         entry: PathBuf::from(row.get::<_, String>(8)?),
         artifact_root: PathBuf::from(row.get::<_, String>(9)?),
         upstream: PathBuf::from(row.get::<_, String>(10)?),
+        memory_max_bytes: row
+            .get::<_, Option<i64>>(11)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(11, -1))?,
     })
 }
 
@@ -4650,6 +5031,26 @@ fn migrate_v10_to_v11(connection: &Connection) -> Result<(), StateError> {
              UNIQUE (app_id, key)
          );
          CREATE INDEX env_vars_app_id ON env_vars(app_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v11_to_v12(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "ALTER TABLE node_config ADD COLUMN listener_json TEXT NOT NULL
+             DEFAULT '{\"mode\":\"integrated\",\"http_listen\":\"0.0.0.0:80\"}';
+         ALTER TABLE node_config ADD COLUMN resources_json TEXT NOT NULL DEFAULT '{}';
+         CREATE TABLE app_listener_ports (
+             app_id INTEGER PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
+             port INTEGER NOT NULL UNIQUE CHECK (port BETWEEN 1 AND 65535)
+         );
+         CREATE TABLE app_config_revisions (
+             app_id INTEGER PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
+             desired_revision INTEGER NOT NULL DEFAULT 1 CHECK (desired_revision > 0),
+             applied_revision INTEGER NOT NULL DEFAULT 1 CHECK (applied_revision > 0)
+         );
+         INSERT INTO app_config_revisions (app_id) SELECT id FROM apps;
+         ALTER TABLE github_repositories ADD COLUMN memory_max_bytes INTEGER;",
     )?;
     Ok(())
 }
@@ -5517,6 +5918,8 @@ struct StoredAppJson {
 #[derive(Clone, Debug)]
 struct StoredSnapshot {
     listen: SocketAddr,
+    listener: ListenerConfig,
+    resources: NodeResourcesConfig,
     edge: EdgeConfig,
     apps: Vec<StoredAppOwned>,
 }
@@ -5665,6 +6068,8 @@ fn snapshot_to_stored(snapshot: &Snapshot) -> Result<StoredSnapshot, StateError>
         .collect::<Result<Vec<_>, StateError>>()?;
     Ok(StoredSnapshot {
         listen: snapshot.listen,
+        listener: snapshot.listener.clone(),
+        resources: snapshot.resources.clone(),
         edge: snapshot.edge.clone(),
         apps,
     })
@@ -5857,9 +6262,16 @@ fn replace_database(
     }
     transaction.execute("DELETE FROM node_config", [])?;
     transaction.execute("DELETE FROM apps", [])?;
+    let listener_json = serde_json::to_string(&snapshot.listener).map_err(|error| {
+        StateError::InvalidConfig(format!("serialize listener configuration: {error}"))
+    })?;
+    let resources_json = serde_json::to_string(&snapshot.resources).map_err(|error| {
+        StateError::InvalidConfig(format!("serialize resource configuration: {error}"))
+    })?;
     transaction.execute(
-        "INSERT INTO node_config (id, listen) VALUES (1, ?1)",
-        [snapshot.listen.to_string()],
+        "INSERT INTO node_config (id, listen, listener_json, resources_json)
+         VALUES (1, ?1, ?2, ?3)",
+        params![snapshot.listen.to_string(), listener_json, resources_json],
     )?;
     store_edge_config_tx(transaction, &snapshot.edge)?;
     for app in &snapshot.apps {
@@ -5876,6 +6288,13 @@ fn replace_database(
             "INSERT INTO apps (name, upstream, runtime_json) VALUES (?1, ?2, ?3) RETURNING id",
             params![app.name, app.upstream, runtime_json],
             |row| row.get::<_, i64>(0),
+        )?;
+        if !app.runtime.tenant_admin {
+            ensure_tcp_port_tx(transaction, app_id, &snapshot.listener)?;
+        }
+        transaction.execute(
+            "INSERT INTO app_config_revisions (app_id) VALUES (?1)",
+            [app_id],
         )?;
         let native = snapshot
             .edge
@@ -5898,6 +6317,65 @@ fn replace_database(
         transaction,
         snapshot.edge.apex_domain.as_deref(),
         snapshot.edge.ssl_mode,
+    )?;
+    Ok(())
+}
+
+fn ensure_tcp_port_tx(
+    transaction: &Transaction<'_>,
+    app_id: i64,
+    listener: &ListenerConfig,
+) -> Result<Option<u16>, StateError> {
+    let ListenerConfig::Tcp {
+        port_start,
+        port_end,
+        ..
+    } = listener
+    else {
+        return Ok(None);
+    };
+    if let Some(port) = transaction
+        .query_row(
+            "SELECT port FROM app_listener_ports WHERE app_id = ?1",
+            [app_id],
+            |row| row.get::<_, u16>(0),
+        )
+        .optional()?
+    {
+        if (*port_start..=*port_end).contains(&port) {
+            return Ok(Some(port));
+        }
+        return Err(StateError::InvalidConfig(format!(
+            "existing stable app port {port} falls outside the requested TCP range; widen the range or explicitly recreate the app assignment"
+        )));
+    }
+    let port = transaction
+        .query_row(
+            "WITH RECURSIVE ports(port) AS (
+                 SELECT ?1 UNION ALL SELECT port + 1 FROM ports WHERE port < ?2
+             )
+             SELECT port FROM ports
+             WHERE NOT EXISTS (SELECT 1 FROM app_listener_ports p WHERE p.port = ports.port)
+             ORDER BY port LIMIT 1",
+            params![port_start, port_end],
+            |row| row.get::<_, u16>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StateError::InvalidConfig("TCP app port range is exhausted".into()))?;
+    transaction.execute(
+        "INSERT INTO app_listener_ports (app_id, port) VALUES (?1, ?2)",
+        params![app_id, port],
+    )?;
+    Ok(Some(port))
+}
+
+fn bump_desired_revision_tx(transaction: &Transaction<'_>, app_id: i64) -> Result<(), StateError> {
+    transaction.execute(
+        "INSERT INTO app_config_revisions (app_id, desired_revision, applied_revision)
+         VALUES (?1, 2, 1)
+         ON CONFLICT(app_id) DO UPDATE
+         SET desired_revision = desired_revision + 1",
+        [app_id],
     )?;
     Ok(())
 }
@@ -5949,6 +6427,8 @@ fn snapshot_from_config(config: &NodeConfig) -> Result<Snapshot, StateError> {
     }
     let snapshot = Snapshot {
         listen: config.listen,
+        listener: config.listener.clone(),
+        resources: config.resources.clone(),
         edge,
         apps,
     };
@@ -5963,6 +6443,56 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), StateError> {
     if canonical_edge_config(snapshot.listen, &snapshot.edge)? != snapshot.edge {
         return Err(StateError::InvalidConfig(
             "edge configuration is not canonical".into(),
+        ));
+    }
+    validate_listener_config(snapshot.listen, &snapshot.listener)?;
+    match &snapshot.listener {
+        ListenerConfig::Integrated { http_listen } => {
+            if snapshot.edge.https_listen == Some(*http_listen) {
+                return Err(StateError::InvalidConfig(
+                    "application HTTP and HTTPS listeners must be distinct".into(),
+                ));
+            }
+        }
+        ListenerConfig::Tcp {
+            host,
+            port_start,
+            port_end,
+            ..
+        } => {
+            for (kind, address) in [
+                ("dashboard", Some(snapshot.listen)),
+                ("HTTPS", snapshot.edge.https_listen),
+            ] {
+                if let Some(address) = address
+                    && addresses_overlap(*host, address.ip())
+                    && (*port_start..=*port_end).contains(&address.port())
+                {
+                    return Err(StateError::InvalidConfig(format!(
+                        "TCP app port range overlaps the {kind} listener on port {}",
+                        address.port()
+                    )));
+                }
+            }
+        }
+        ListenerConfig::Uds { .. } => {}
+    }
+    if snapshot
+        .resources
+        .app_memory_default_bytes
+        .is_some_and(|value| value < 16 * 1024 * 1024)
+    {
+        return Err(StateError::InvalidConfig(
+            "app_memory_default_bytes must be at least 16 MiB".into(),
+        ));
+    }
+    if snapshot
+        .resources
+        .node_memory_budget_bytes
+        .is_some_and(|value| value < 16 * 1024 * 1024)
+    {
+        return Err(StateError::InvalidConfig(
+            "node_memory_budget_bytes must be at least 16 MiB".into(),
         ));
     }
     let mut tenant_admin_count = 0;
@@ -5980,6 +6510,15 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), StateError> {
                 "duplicate app name {:?}",
                 app.name
             )));
+        }
+        if let ListenerConfig::Uds { socket_dir, .. } = &snapshot.listener {
+            let endpoint = socket_dir.join(format!("{}.sock", app.name));
+            if endpoint.as_os_str().as_bytes().len() > 100 {
+                return Err(StateError::InvalidConfig(format!(
+                    "UDS endpoint for app {:?} exceeds the portable Unix socket path limit",
+                    app.name
+                )));
+            }
         }
         let upstream = app.upstream.to_string_lossy().into_owned();
         if !upstreams.insert(upstream) {
@@ -6032,7 +6571,135 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), StateError> {
             }
         }
     }
+    if let Some(budget) = snapshot.resources.node_memory_budget_bytes {
+        if snapshot
+            .resources
+            .app_memory_default_bytes
+            .is_some_and(|default| default > budget)
+        {
+            return Err(StateError::InvalidConfig(
+                "app_memory_default_bytes cannot exceed node_memory_budget_bytes".into(),
+            ));
+        }
+        let configured = snapshot
+            .apps
+            .iter()
+            .filter(|app| !app.tenant_admin && app.lifecycle.min_instances > 0)
+            .try_fold(0_u64, |sum, app| {
+                sum.checked_add(app.spec.limits.memory_max)
+                    .ok_or_else(|| StateError::InvalidConfig("app memory total overflowed".into()))
+            })?;
+        if configured > budget {
+            return Err(StateError::InvalidConfig(format!(
+                "pinned app memory ({configured} bytes) exceeds node_memory_budget_bytes ({budget} bytes)"
+            )));
+        }
+    }
     Ok(())
+}
+
+fn addresses_overlap(left: IpAddr, right: IpAddr) -> bool {
+    left == right
+        || left.is_unspecified()
+        || right.is_unspecified()
+        || (left.is_loopback() && right.is_loopback())
+}
+
+fn validate_listener_config(
+    dashboard_listen: SocketAddr,
+    listener: &ListenerConfig,
+) -> Result<(), StateError> {
+    match listener {
+        ListenerConfig::Integrated { http_listen } => {
+            if *http_listen == dashboard_listen {
+                return Err(StateError::InvalidConfig(
+                    "application HTTP and dashboard listeners must be distinct".into(),
+                ));
+            }
+        }
+        ListenerConfig::Tcp {
+            host,
+            port_start,
+            port_end,
+            advertise_host,
+        } => {
+            if *port_start == 0 || port_start > port_end {
+                return Err(StateError::InvalidConfig(
+                    "TCP app port range must be a non-empty ascending range".into(),
+                ));
+            }
+            if host.is_unspecified() && advertise_host.is_none() {
+                return Err(StateError::InvalidConfig(
+                    "TCP mode on 0.0.0.0/:: requires advertise_host so users receive a usable endpoint"
+                        .into(),
+                ));
+            }
+            if u32::from(*port_end) - u32::from(*port_start) + 1 > 20_000 {
+                return Err(StateError::InvalidConfig(
+                    "TCP app port range may contain at most 20000 ports".into(),
+                ));
+            }
+            if let Some(host) = advertise_host
+                && (host.trim() != host
+                    || host.is_empty()
+                    || host.len() > 253
+                    || host.chars().any(char::is_whitespace))
+            {
+                return Err(StateError::InvalidConfig(
+                    "TCP advertise_host must be a canonical host or IP".into(),
+                ));
+            }
+        }
+        ListenerConfig::Uds {
+            socket_dir,
+            socket_group,
+            socket_mode,
+        } => {
+            validate_absolute_path(socket_dir, "listener socket_dir")?;
+            if *socket_mode == 0 || *socket_mode > 0o777 {
+                return Err(StateError::InvalidConfig(
+                    "listener socket_mode must be an octal permission value in 0001..0777".into(),
+                ));
+            }
+            if let Some(group) = socket_group
+                && (group.is_empty()
+                    || group.len() > 64
+                    || !group
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+            {
+                return Err(StateError::InvalidConfig(
+                    "listener socket_group must be a group name or numeric gid".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stable externally advertised endpoint for an app. TCP assignments are
+/// persisted separately and supplied by the caller.
+pub fn app_endpoint(listener: &ListenerConfig, app: &str, tcp_port: Option<u16>) -> Option<String> {
+    match listener {
+        ListenerConfig::Integrated { .. } => None,
+        ListenerConfig::Tcp {
+            host,
+            advertise_host,
+            ..
+        } => {
+            let port = tcp_port?;
+            let host = advertise_host.clone().unwrap_or_else(|| host.to_string());
+            let host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host
+            };
+            Some(format!("{host}:{port}"))
+        }
+        ListenerConfig::Uds { socket_dir, .. } => {
+            Some(socket_dir.join(format!("{app}.sock")).display().to_string())
+        }
+    }
 }
 
 fn sort_snapshot(mut snapshot: Snapshot) -> Snapshot {
@@ -6263,6 +6930,8 @@ mod tests {
     fn config() -> NodeConfig {
         NodeConfig {
             listen: "127.0.0.1:8080".parse().expect("address"),
+            listener: ListenerConfig::default(),
+            resources: NodeResourcesConfig::default(),
             edge: EdgeConfig::default(),
             apps: vec![AppConfig {
                 name: "api".into(),
@@ -8022,7 +8691,76 @@ mod tests {
             entry: "index.ts".into(),
             artifact_root: "/var/lib/cygnus/artifacts/site".into(),
             upstream: "/run/cygnus/site.sock".into(),
+            memory_max_bytes: None,
         }
+    }
+
+    #[test]
+    fn tcp_listener_assignments_are_unique_persisted_and_range_safe() {
+        let path = temp_db("tcp-listener-assignments");
+        let mut state = State::open(&path).unwrap();
+        let mut input = config();
+        let mut worker = input.apps[0].clone();
+        worker.name = "worker".into();
+        worker.upstream = "/run/cygnus/worker.sock".into();
+        worker.domains = vec!["worker.example.com".into()];
+        input.apps.push(worker);
+        input.listener = ListenerConfig::Tcp {
+            host: "127.0.0.1".parse().unwrap(),
+            port_start: 12_000,
+            port_end: 12_001,
+            advertise_host: None,
+        };
+        state.apply(&input).unwrap();
+        let loaded = state.load().unwrap();
+        let api = state
+            .app_endpoint(&loaded.listener, "api")
+            .unwrap()
+            .unwrap();
+        let worker = state
+            .app_endpoint(&loaded.listener, "worker")
+            .unwrap()
+            .unwrap();
+        assert_ne!(api, worker);
+        drop(state);
+        let reopened = State::open(&path).unwrap();
+        let loaded = reopened.load().unwrap();
+        assert_eq!(
+            reopened
+                .app_endpoint(&loaded.listener, "api")
+                .unwrap()
+                .as_deref(),
+            Some(api.as_str())
+        );
+    }
+
+    #[test]
+    fn resource_updates_are_audited_and_preserved_for_future_activation() {
+        let path = temp_db("resource-updates");
+        let mut state = State::open(&path).unwrap();
+        state.apply(&config()).unwrap();
+        let audit = audit_context("resources-1");
+        state
+            .set_app_memory("api", 512 * 1024 * 1024, &audit)
+            .unwrap();
+        let loaded = state.load().unwrap();
+        let app = loaded.apps.iter().find(|app| app.name == "api").unwrap();
+        assert_eq!(app.spec.limits.memory_max, 512 * 1024 * 1024);
+        assert_eq!(app.spec.limits.memory_high, 448 * 1024 * 1024);
+        assert_eq!(state.app_config_revisions("api").unwrap(), (2, 1));
+        state
+            .mark_app_config_applied("api", 2, &audit_context("resources-applied"))
+            .unwrap();
+        assert_eq!(state.app_config_revisions("api").unwrap(), (2, 2));
+
+        let resources = NodeResourcesConfig {
+            node_memory_budget_bytes: Some(1024 * 1024 * 1024),
+            app_memory_default_bytes: Some(384 * 1024 * 1024),
+        };
+        state
+            .set_node_resources(&resources, &audit_context("resources-2"))
+            .unwrap();
+        assert_eq!(state.load().unwrap().resources, resources);
     }
 
     fn github_job_fixture(id: &str, sha: &str) -> GitHubJobSpec {

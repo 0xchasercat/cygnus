@@ -10,7 +10,8 @@ pub use crate::github::{
 };
 use crate::metrics::{EventRecord, MetricsSnapshot, RequestRecord};
 use crate::state::{
-    DeployJobSource, DeploymentSource, DomainKind, DomainStatus, DomainTls, NodeConfig,
+    DeployJobSource, DeploymentSource, DomainKind, DomainStatus, DomainTls, ListenerConfig,
+    NodeConfig, NodeResourcesConfig,
 };
 
 pub const ADMIN_PROTOCOL_VERSION: u16 = 1;
@@ -95,6 +96,23 @@ pub enum AdminCommand {
         app: String,
         key: String,
     },
+    SetAppResources {
+        app: String,
+        memory_max_bytes: u64,
+    },
+    RedeployApp {
+        app: String,
+    },
+    SetNodeResources {
+        resources: NodeResourcesConfig,
+    },
+    SetListener {
+        listener: ListenerConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dashboard_listen: Option<std::net::SocketAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        https_listen: Option<std::net::SocketAddr>,
+    },
     GetMetrics,
     ListRequests {
         #[serde(default = "default_metrics_list_limit")]
@@ -153,6 +171,8 @@ pub enum AdminCommand {
         entry: Option<std::path::PathBuf>,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         env: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_max_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
         total_bytes: u64,
@@ -397,6 +417,25 @@ pub enum AdminData {
     EnvVarRemoved {
         key: String,
     },
+    AppResourcesSet {
+        app: String,
+        memory_max_bytes: u64,
+        redeploy_required: bool,
+    },
+    AppRedeployed {
+        app: String,
+        active: ActiveDeploymentView,
+        config_revision: u64,
+        applied_config_revision: u64,
+        restart_required: bool,
+    },
+    NodeResourcesSet {
+        resources: NodeResourcesConfig,
+    },
+    ListenerSet {
+        listener: ListenerConfig,
+        restart_required: bool,
+    },
     ConfigApplied {
         listen: String,
         app_count: usize,
@@ -525,6 +564,10 @@ pub struct AppDomainView {
 #[serde(deny_unknown_fields)]
 pub struct NodeView {
     pub listen: String,
+    #[serde(default)]
+    pub listener: ListenerConfig,
+    #[serde(default)]
+    pub resources: NodeResourcesConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https_listen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -584,6 +627,15 @@ pub struct AppView {
     pub idle_ttl_ms: u64,
     pub egress: String,
     pub memory_max: u64,
+    #[serde(default)]
+    pub config_revision: u64,
+    #[serde(default)]
+    pub applied_config_revision: u64,
+    #[serde(default)]
+    pub restart_required: bool,
+    /// Domain, host:port, or Unix socket path according to the node listener mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub env_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<ActiveDeploymentView>,
@@ -940,6 +992,7 @@ mod tests {
             engine_version: None,
             entry: Some("src/index.ts".into()),
             env: Default::default(),
+            memory_max_bytes: None,
             preview: None,
             total_bytes: 123,
         };
@@ -987,6 +1040,7 @@ mod tests {
                 artifact_root: None,
                 upstream: None,
                 env: Default::default(),
+                memory_max_bytes: None,
                 preview: None,
                 deployment_id: None,
                 source: DeploymentSource::cli(),
@@ -1034,6 +1088,26 @@ mod tests {
     }
 
     #[test]
+    fn redeploy_and_resource_commands_have_stable_wire_shapes() {
+        assert_eq!(
+            serde_json::to_value(AdminCommand::RedeployApp { app: "api".into() }).unwrap(),
+            serde_json::json!({"type":"redeploy_app","app":"api"})
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetAppResources {
+                app: "api".into(),
+                memory_max_bytes: 536_870_912,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type":"set_app_resources",
+                "app":"api",
+                "memory_max_bytes":536870912_u64
+            })
+        );
+    }
+
+    #[test]
     fn installation_repository_command_and_data_have_stable_nested_shapes() {
         let request: AdminRequest = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -1075,6 +1149,7 @@ mod tests {
                 domain: "web.example".into(),
                 engine_version: "bun".into(),
                 entry: "src/index.ts".into(),
+                memory_max_bytes: None,
             },
         })
         .unwrap();

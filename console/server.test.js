@@ -222,30 +222,85 @@ describe("console first-run setup", () => {
         dashboard_domain: "dashboard.cygnus.run",
         apex_domain: "cygnus.run",
         ssl: true,
+        listener: { mode: "integrated", http_listen: "0.0.0.0:80" },
+        dashboard_listen: "0.0.0.0:3000",
+        https_listen: "0.0.0.0:443",
       }),
     }), requestAdmin, "/admin.sock");
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, data: { apex_domain: "cygnus.run", dashboard_domain: "dashboard.cygnus.run" } });
+    expect(await response.json()).toEqual({ ok: true, data: { apex_domain: "cygnus.run", dashboard_domain: "dashboard.cygnus.run", listener_restart_required: false } });
     expect(verifySessionCookie(response.headers.get("set-cookie"))?.sub).toBe("account:1");
     expect(calls).toEqual([
       { socket: "/admin.sock", command: { type: "account_status" }, actor: undefined },
       { socket: "/admin.sock", command: { type: "create_initial_account", email: "admin@example.com", password: "correct horse battery staple" }, actor: undefined },
       { socket: "/admin.sock", command: { type: "set_dashboard_domain", domain: "dashboard.cygnus.run", apex: "cygnus.run" }, actor: "account:1" },
       { socket: "/admin.sock", command: { type: "set_dashboard_tls", mode: "acme", email: "admin@example.com" }, actor: "account:1" },
+      { socket: "/admin.sock", command: { type: "set_listener", listener: { mode: "integrated", http_listen: "0.0.0.0:80" }, dashboard_listen: "0.0.0.0:3000", https_listen: "0.0.0.0:443" }, actor: "account:1" },
     ]);
   });
 
-  test("returns conflict when setup already exists or loses the first-run race", async () => {
+  test("null dashboard/https listens keep the current binds and surface the restart flag", async () => {
+    process.env.CYGNUS_CONSOLE_SESSION_KEY = "setup-session-key";
+    delete process.env.CYGNUS_CONSOLE_BOOTSTRAP_TOKEN;
+    const url = new URL("https://console.example/api/v1/setup");
+    const calls = [];
+    const requestAdmin = async (socket, command, actor) => {
+      calls.push({ socket, command, actor });
+      if (command.type === "account_status") return { data: { configured: false } };
+      if (command.type === "create_initial_account") return { data: { subject: "account:1" } };
+      if (command.type === "set_listener") return { data: { restart_required: true } };
+      return { data: { ok: true } };
+    };
+    const response = await setup(new Request(url, {
+      method: "POST",
+      headers: { origin: url.origin, "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "admin@example.com",
+        password: "correct horse battery staple",
+        dashboard_domain: "",
+        apex_domain: "",
+        ssl: false,
+        listener: { mode: "uds", socket_dir: "/run/cygnus/apps", socket_mode: 432 },
+        dashboard_listen: null,
+        https_listen: null,
+      }),
+    }), requestAdmin, "/admin.sock");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, data: { apex_domain: "", dashboard_domain: "", listener_restart_required: true } });
+    const listenerCall = calls.find((entry) => entry.command.type === "set_listener");
+    expect(listenerCall.command).toEqual({
+      type: "set_listener",
+      listener: { mode: "uds", socket_dir: "/run/cygnus/apps", socket_mode: 432 },
+    });
+    expect("dashboard_listen" in listenerCall.command).toBe(false);
+    expect("https_listen" in listenerCall.command).toBe(false);
+  });
+
+  test("resumes an interrupted setup with the existing account and reports a lost first-run race", async () => {
     process.env.CYGNUS_CONSOLE_SESSION_KEY = "setup-session-key";
     const url = new URL("https://console.example/api/v1/setup");
     const request = () => new Request(url, {
       method: "POST",
       headers: { origin: url.origin, "content-type": "application/json" },
-      body: JSON.stringify({ email: "admin@example.com", password: "correct horse battery staple", dashboard_domain: "dashboard.cygnus.run", apex_domain: "cygnus.run", ssl: false }),
+      body: JSON.stringify({
+        email: "admin@example.com",
+        password: "correct horse battery staple",
+        dashboard_domain: "dashboard.cygnus.run",
+        apex_domain: "cygnus.run",
+        ssl: false,
+        listener: { mode: "integrated", http_listen: "0.0.0.0:80" },
+        dashboard_listen: "0.0.0.0:3000",
+        https_listen: null,
+      }),
     });
-    const configured = await setup(request(), async () => ({ data: { configured: true } }), "/admin.sock");
-    expect(configured.status).toBe(409);
+    const configured = await setup(request(), async (_socket, command) => {
+      if (command.type === "account_status") return { data: { configured: true } };
+      if (command.type === "verify_credentials") return { data: { ok: true, subject: "account:1" } };
+      return { data: { ok: true } };
+    }, "/admin.sock");
+    expect(configured.status).toBe(200);
 
     let calls = 0;
     const raced = await setup(request(), async (_socket, command) => {
@@ -386,6 +441,47 @@ describe("console request validation", () => {
 
     expect(await command("/api/v1/settings/dashboard-domain", "POST", { domain: "dashboard.cygnus.run", apex: "cygnus.run" })).toEqual({ type: "set_dashboard_domain", domain: "dashboard.cygnus.run", apex: "cygnus.run" });
     expect(await command("/api/v1/settings/dashboard-tls", "POST", { mode: "acme" })).toEqual({ type: "set_dashboard_tls", mode: "acme" });
+    expect(await command("/api/v1/settings/listener", "POST", {
+      listener: { mode: "tcp", host: "0.0.0.0", port_start: 10000, port_end: 19999, advertise_host: "node.example.com" },
+      dashboard_listen: "0.0.0.0:3000",
+    })).toEqual({
+      type: "set_listener",
+      listener: { mode: "tcp", host: "0.0.0.0", port_start: 10000, port_end: 19999, advertise_host: "node.example.com" },
+      dashboard_listen: "0.0.0.0:3000",
+    });
+    // Null (or omitted) dashboard/https listens mean "keep the current bind" —
+    // the daemon preserves the stored addresses when the fields are absent.
+    expect(await command("/api/v1/settings/listener", "POST", {
+      listener: { mode: "integrated", http_listen: "127.0.0.1:8080" },
+      dashboard_listen: null,
+      https_listen: null,
+    })).toEqual({
+      type: "set_listener",
+      listener: { mode: "integrated", http_listen: "127.0.0.1:8080" },
+    });
+    expect(await command("/api/v1/settings/listener", "POST", {
+      listener: { mode: "integrated", http_listen: "0.0.0.0:80" },
+    })).toEqual({
+      type: "set_listener",
+      listener: { mode: "integrated", http_listen: "0.0.0.0:80" },
+    });
+    // socket_mode 0 is rejected by the daemon — surface a clean 422 here.
+    await expect(command("/api/v1/settings/listener", "POST", {
+      listener: { mode: "uds", socket_dir: "/run/cygnus/apps", socket_mode: 0 },
+    })).rejects.toThrow("socket_mode must be an integer between 1 and 511");
+    expect(await command("/api/v1/settings/node-resources", "POST", {
+      node_memory_budget_bytes: null,
+      app_memory_default_bytes: 268435456,
+    })).toEqual({
+      type: "set_node_resources",
+      resources: { node_memory_budget_bytes: null, app_memory_default_bytes: 268435456 },
+    });
+    expect(await command("/api/v1/apps/demo/resources", "POST", { memory_max_bytes: 536870912 })).toEqual({
+      type: "set_app_resources",
+      app: "demo",
+      memory_max_bytes: 536870912,
+    });
+    expect(await command("/api/v1/apps/demo/redeploy", "POST")).toEqual({ type: "redeploy_app", app: "demo" });
     expect(await command("/api/v1/apps/demo/domains")).toEqual({ type: "list_app_domains", app: "demo" });
     expect(await command("/api/v1/apps/demo/domains", "POST", { host: "www.example.com" })).toEqual({ type: "add_app_domain", app: "demo", host: "www.example.com" });
     expect(await command("/api/v1/apps/demo/domains/www.example.com", "DELETE")).toEqual({ type: "remove_app_domain", app: "demo", host: "www.example.com" });

@@ -6,6 +6,7 @@
   import Identicon from '../components/Identicon.svelte';
   import Icon from '../components/Icon.svelte';
   import Spark from '../components/Spark.svelte';
+  import { appEndpoint, endpointKind, listenerMode } from '../endpoints.js';
 
   const app = $derived(store.appByName(ui.appId) ?? store.apps[0] ?? null);
   const appDeploys = $derived(app ? store.deploymentsFor(app.name) : []);
@@ -13,6 +14,8 @@
     app?.active ? appDeploys.find((d) => d.id === app.active.deployment_id) ?? appDeploys[0] : appDeploys[0] ?? null
   );
   const am = $derived(app ? store.appMetrics(app.name) : null);
+  const ingressMode = $derived(listenerMode(store.node));
+  const endpoint = $derived(appEndpoint(store.node, app));
 
   const LED = { active: 'live', building: 'build', failed: 'fail', sealed: 'cold' };
   const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'sealed' };
@@ -99,7 +102,7 @@
   // between apps). Preview mode skips the fetch — fixtures render the card.
   $effect(() => {
     const name = app?.name;
-    if (name && store.mode === 'live') {
+    if (name && store.mode === 'live' && ingressMode === 'integrated') {
       store.refreshAppDomains(name);
     }
   });
@@ -111,6 +114,38 @@
   let envVarError = $state('');
   let envVarPending = $state({}); // key -> true while removing
   let envValueVisible = $state({}); // key -> true while revealed
+  let envNeedsRedeploy = $state(false);
+  const configPending = $derived(
+    envNeedsRedeploy
+      || app?.restart_required === true
+      || (
+        app?.config_revision != null
+        && app?.applied_config_revision != null
+        && app.config_revision !== app.applied_config_revision
+      )
+  );
+  let redeployBusy = $state(false);
+  let redeployError = $state('');
+
+  let memoryMiB = $state('');
+  let memoryBusy = $state(false);
+  let memoryError = $state('');
+
+  // The poll replaces store.apps every few seconds, handing this screen a
+  // fresh app object each tick. Resyncing the field from it unconditionally
+  // clobbered whatever the operator was typing. Only resync when the app
+  // changes or its server-side value actually moved.
+  let syncedMemoryApp = null;
+  let syncedMemoryBytes = null;
+  $effect(() => {
+    const name = app?.name ?? null;
+    const memory = app?.memory_max ?? null;
+    if (name !== syncedMemoryApp || memory !== syncedMemoryBytes) {
+      syncedMemoryApp = name;
+      syncedMemoryBytes = memory;
+      memoryMiB = memory ? String(Math.round(memory / (1024 * 1024))) : '';
+    }
+  });
 
   // Live values come from store.envVars (fetched below). Preview mode has
   // no values to show (they're sealed secrets in the fixture data) — render
@@ -145,6 +180,7 @@
     }
     newEnvKey = '';
     newEnvValue = '';
+    envNeedsRedeploy = true;
   }
 
   async function removeEnvVarRow(key) {
@@ -153,6 +189,37 @@
     const r = await store.removeEnvVar(app.name, key);
     envVarPending = { ...envVarPending, [key]: false };
     if (!r.ok) envVarError = r.error ?? 'Could not remove env var';
+    else envNeedsRedeploy = true;
+  }
+
+  async function redeploy() {
+    if (!app || redeployBusy) return;
+    redeployBusy = true;
+    redeployError = '';
+    const r = await store.redeployApp(app.name);
+    redeployBusy = false;
+    if (!r.ok) {
+      redeployError = r.error ?? 'Could not queue redeploy';
+      return;
+    }
+    envNeedsRedeploy = false;
+    if (r.deploymentId) openDeploy(app.name, r.deploymentId);
+  }
+
+  async function saveMemory(e) {
+    e.preventDefault();
+    if (!app || memoryBusy) return;
+    const mib = Number(memoryMiB);
+    if (!Number.isInteger(mib) || mib < 64 || mib > 1_048_576) {
+      memoryError = 'Enter a whole number from 64 MiB to 1 TiB.';
+      return;
+    }
+    memoryBusy = true;
+    memoryError = '';
+    const r = await store.setAppResources(app.name, { memoryMaxBytes: mib * 1024 * 1024 });
+    memoryBusy = false;
+    if (!r.ok) memoryError = r.error ?? 'Could not update memory limit';
+    else envNeedsRedeploy = true;
   }
 
   async function submitDomain(e) {
@@ -286,7 +353,9 @@
           <span class="pill {app.name.startsWith('pr-') ? 'preview' : 'ghost'}">{app.name.startsWith('pr-') ? 'preview' : 'production'}</span>
         </div>
         <div class="domains num">
-          {#if isTenantZero}
+          {#if ingressMode !== 'integrated'}
+            <span class="dom" title={endpoint}>{endpoint}</span>
+          {:else if isTenantZero}
             {#if store.node?.dashboard_domain}
               <a href={appUrl(store.node.dashboard_domain)} target="_blank" rel="noopener noreferrer" class="dom"
                 >{store.node.dashboard_domain} <Icon name="ext" size={11} /></a
@@ -306,7 +375,9 @@
         <button class="btn" onclick={() => go('observe', { observeAppFilter: app.name })}>
           <Icon name="observe" size={13} />Observe
         </button>
-        {#if isTenantZero}
+        {#if ingressMode !== 'integrated'}
+          <button class="btn" type="button" onclick={() => navigator.clipboard?.writeText(endpoint)}><Icon name="copy" size={13} />Copy endpoint</button>
+        {:else if isTenantZero}
           {#if store.node?.dashboard_domain}
             <a class="btn primary" href={appUrl(store.node.dashboard_domain)} target="_blank" rel="noopener noreferrer"><Icon name="ext" size={13} />Visit</a>
           {/if}
@@ -393,6 +464,7 @@
 
       <aside class="side">
         <!-- ————— domains ————— -->
+        {#if ingressMode === 'integrated'}
         <section class="card">
           <div class="cardhead">
             <span
@@ -523,6 +595,20 @@
             <div class="empty mono">loading domains…</div>
           {/if}
         </section>
+        {:else}
+          <section class="card">
+            <div class="cardhead"><span class="label">App {endpointKind(store.node)}</span></div>
+            <div class="endpoint-card">
+              <code>{endpoint}</code>
+              <button class="btn sm" type="button" onclick={() => navigator.clipboard?.writeText(endpoint)}>Copy</button>
+              <p>
+                {ingressMode === 'tcp'
+                  ? 'Connect directly or point your TLS proxy at this stable host port.'
+                  : 'Point Caddy or Nginx at this Unix socket. TLS and public routing stay with your proxy.'}
+              </p>
+            </div>
+          </section>
+        {/if}
 
         <!-- ————— the cage ————— -->
         <section class="card">
@@ -556,15 +642,26 @@
           {/if}
         </section>
 
-        <!-- ————— controls (read-only facts) ————— -->
+        <!-- ————— controls ————— -->
         <section class="card">
           <div class="cardhead"><span class="label">Controls</span></div>
           <div class="kv">
             <div class="kvrow"><span>Pinned</span><span class="factpill {app.pinned ? 'on' : ''}">{app.pinned ? 'pinned warm' : 'unpinned'}</span></div>
             <div class="kvrow"><span>Egress</span><b class="num">{app.egress ?? '—'}</b></div>
             <div class="kvrow"><span>Idle TTL</span><b class="num">{fmtIdle(app.idle_ttl_ms)}</b></div>
-            <div class="kvrow"><span>Memory cap</span><b class="num">{app.memory_max ? bytes(app.memory_max) : '—'}</b></div>
           </div>
+          <form class="memory-form" onsubmit={saveMemory}>
+            <label for="app-memory">Memory limit</label>
+            <div class="memory-input">
+              <input id="app-memory" bind:value={memoryMiB} type="number" min="64" max="1048576" step="1" inputmode="numeric" required />
+              <span class="num">MiB</span>
+            </div>
+            <button class="btn sm" type="submit" disabled={memoryBusy || !memoryMiB}>
+              {memoryBusy ? 'Saving…' : 'Save'}
+            </button>
+            <p>Applied the next time this app starts. Redeploy now to replace the running cage immediately.</p>
+            {#if memoryError}<span class="dom-err" role="alert">{memoryError}</span>{/if}
+          </form>
         </section>
 
         <!-- ————— environment variables ————— -->
@@ -581,6 +678,16 @@
             </button>
           </form>
           {#if envVarError}<p class="dom-err" role="alert">{envVarError}</p>{/if}
+            <div class="redeploy-note" class:attention={configPending} role="status">
+              <div>
+                <strong>{configPending ? 'Restart required' : 'Restart current deployment'}</strong>
+                <span>{configPending ? 'Saved configuration applies when the current artifact starts again.' : 'Restart the sealed artifact without rebuilding source.'}</span>
+              </div>
+              <button class="btn cobalt sm" type="button" onclick={redeploy} disabled={redeployBusy}>
+                {redeployBusy ? 'Queuing…' : 'Redeploy current artifact'}
+              </button>
+            </div>
+          {#if redeployError}<p class="dom-err" role="alert">{redeployError}</p>{/if}
           {#if envVarEntries.length}
             <div class="kv">
               {#each envVarEntries as [key, value] (key)}
@@ -836,6 +943,73 @@
   }
 
   .envcount { font-size: 11px; color: var(--ink-3); }
+  .memory-form {
+    display: grid;
+    grid-template-columns: 1fr minmax(120px, 150px) auto;
+    gap: 8px 10px;
+    align-items: center;
+    margin: 8px 14px 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line-2);
+  }
+  .memory-form label { font-size: 12px; color: var(--ink-2); }
+  .memory-form p {
+    grid-column: 1 / -1;
+    font-size: 10.5px;
+    line-height: 1.55;
+    color: var(--ink-4);
+  }
+  .memory-form .dom-err { grid-column: 1 / -1; }
+  .memory-input {
+    display: flex;
+    align-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .memory-input input {
+    width: 100%;
+    min-width: 0;
+    border: 0;
+    padding: 8px 9px;
+    font: 11.5px var(--mono);
+    background: var(--surface);
+  }
+  .memory-input span { padding: 0 9px; font-size: 10px; color: var(--ink-3); }
+  .redeploy-note {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    justify-content: space-between;
+    margin: 0 14px 12px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--surface-2);
+  }
+  .redeploy-note div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .redeploy-note strong { font-size: 11.5px; color: var(--ink-2); }
+  .redeploy-note span { font-size: 10.5px; color: var(--ink-3); }
+  .redeploy-note.attention { border-color: color-mix(in srgb, var(--amber) 28%, var(--line)); background: var(--amber-soft); }
+  .redeploy-note.attention strong { color: #875604; }
+  .redeploy-note.attention span { color: #9a690f; }
+  .endpoint-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    padding: 4px 16px 16px;
+  }
+  .endpoint-card code {
+    min-width: 0;
+    padding: 9px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface-3);
+    font: 11px var(--mono);
+    overflow-wrap: anywhere;
+  }
+  .endpoint-card p { grid-column: 1 / -1; color: var(--ink-3); font-size: 10.5px; line-height: 1.55; }
   .sealed {
     display: flex;
     align-items: center;
@@ -869,6 +1043,13 @@
     min-width: 0;
   }
   .env-add input:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
+
+  @media (max-width: 620px) {
+    .memory-form { grid-template-columns: 1fr auto; }
+    .memory-form label { grid-column: 1 / -1; }
+    .redeploy-note { align-items: stretch; flex-direction: column; }
+    .redeploy-note .btn { min-height: 40px; justify-content: center; }
+  }
 
   /* domains card */
   .dom-add {

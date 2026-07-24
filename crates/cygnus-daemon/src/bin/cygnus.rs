@@ -20,8 +20,9 @@ use cygnus_daemon::admin::{
     MAX_LOG_CHUNK_BYTES, NodeView,
 };
 use cygnus_daemon::deploy::DeployRequest;
+use cygnus_daemon::edge::SslMode;
 use cygnus_daemon::state::DeploymentSource;
-use cygnus_daemon::state::NodeConfig;
+use cygnus_daemon::state::{ListenerConfig, NodeConfig, NodeResourcesConfig};
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
 
@@ -89,6 +90,9 @@ enum Command {
         /// Environment variable to set, as KEY=VALUE. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Per-app memory ceiling in bytes.
+        #[arg(long)]
+        memory_max_bytes: Option<u64>,
         /// Deploy as an isolated preview under `<app>-<slug>` instead of
         /// touching the production app/domain.
         #[arg(long)]
@@ -115,6 +119,73 @@ enum Command {
         app: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Configure an application's memory ceiling. Takes effect on redeploy.
+    AppResources {
+        app: String,
+        #[arg(long, value_name = "BYTES")]
+        memory_max_bytes: u64,
+    },
+    /// Restart the active artifact with the latest environment and resources.
+    Redeploy { app: String },
+    /// Configure node-wide workload memory policy.
+    NodeResources {
+        #[arg(long, value_name = "BYTES")]
+        node_memory_budget_bytes: Option<u64>,
+        #[arg(long, value_name = "BYTES")]
+        app_memory_default_bytes: Option<u64>,
+    },
+    /// Configure application ingress. The supervised daemon must restart.
+    Listener {
+        #[arg(long, value_enum)]
+        mode: ListenerModeArg,
+        #[arg(long)]
+        dashboard_listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        http_listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        https_listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        host: Option<std::net::IpAddr>,
+        #[arg(long)]
+        advertise_host: Option<String>,
+        #[arg(long)]
+        port_start: Option<u16>,
+        #[arg(long)]
+        port_end: Option<u16>,
+        #[arg(long)]
+        socket_dir: Option<PathBuf>,
+        #[arg(long)]
+        socket_group: Option<String>,
+        /// Unix socket permissions in octal, for example 0660.
+        #[arg(long, default_value = "0660", value_parser = parse_octal_mode)]
+        socket_mode: u32,
+    },
+    /// Configure dashboard and native application domains without replacing apps.
+    DashboardDomain {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        apex: Option<String>,
+    },
+    /// Change dashboard HTTP/HTTPS listeners while preserving app ingress mode.
+    DashboardListen {
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        https_listen: Option<std::net::SocketAddr>,
+    },
+    /// Configure dashboard/application TLS policy without replacing apps.
+    DashboardTls {
+        #[arg(long, value_enum)]
+        mode: TlsModeArg,
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Manage persisted application environment variables.
+    Env {
+        #[command(subcommand)]
+        command: EnvCommand,
     },
     /// List one page of deployments.
     Deployments {
@@ -183,6 +254,37 @@ enum EngineCommand {
         #[arg(long)]
         default: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnvCommand {
+    Set {
+        app: String,
+        key: String,
+        value: String,
+    },
+    Remove {
+        app: String,
+        key: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ListenerModeArg {
+    Integrated,
+    Tcp,
+    Uds,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum TlsModeArg {
+    Acme,
+    SelfSigned,
+}
+
+fn parse_octal_mode(value: &str) -> Result<u32, String> {
+    u32::from_str_radix(value.trim_start_matches("0o"), 8)
+        .map_err(|_| "socket mode must be octal, for example 0660".to_owned())
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -274,6 +376,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             artifact_root,
             upstream,
             env,
+            memory_max_bytes,
             preview,
         } => {
             let source_dir = resolve_deploy_source(source_dir.or(source))?;
@@ -288,6 +391,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 artifact_root,
                 upstream,
                 env,
+                memory_max_bytes,
                 preview,
                 deployment_id: None,
                 source: DeploymentSource::cli(),
@@ -338,6 +442,218 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 return Err("daemon returned an unexpected response to GetApp".into());
             };
             theme.app(&app);
+        }
+        Command::AppResources {
+            app,
+            memory_max_bytes,
+        } => {
+            let data = call(
+                &client,
+                AdminCommand::SetAppResources {
+                    app,
+                    memory_max_bytes,
+                },
+            )?;
+            let AdminData::AppResourcesSet {
+                app,
+                memory_max_bytes,
+                redeploy_required,
+            } = data
+            else {
+                return Err("daemon returned an unexpected resource response".into());
+            };
+            theme.line_kv(
+                "resources",
+                &format!(
+                    "{app} · {}{}",
+                    format_bytes(memory_max_bytes),
+                    if redeploy_required {
+                        " · redeploy required"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+        Command::Redeploy { app } => {
+            let data = call(&client, AdminCommand::RedeployApp { app })?;
+            let AdminData::AppRedeployed {
+                app,
+                active,
+                restart_required,
+                ..
+            } = data
+            else {
+                return Err("daemon returned an unexpected redeploy response".into());
+            };
+            theme.line_kv(
+                "redeployed",
+                &format!(
+                    "{app} · {}{}",
+                    short_hash(&active.artifact_hash),
+                    if restart_required {
+                        " · newer changes pending"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+        Command::NodeResources {
+            node_memory_budget_bytes,
+            app_memory_default_bytes,
+        } => {
+            // The daemon replaces the whole policy object, so an invocation
+            // with no flags must not silently clear both fields. Require an
+            // explicit flag and merge unspecified fields from the live policy.
+            if node_memory_budget_bytes.is_none() && app_memory_default_bytes.is_none() {
+                return Err(
+                    "provide --node-memory-budget-bytes and/or --app-memory-default-bytes; \
+                     omitted fields keep their current value"
+                        .into(),
+                );
+            }
+            let status = call(&client, AdminCommand::Status)?;
+            let AdminData::Status { node } = status else {
+                return Err("daemon returned an unexpected status response".into());
+            };
+            let resources = NodeResourcesConfig {
+                node_memory_budget_bytes: node_memory_budget_bytes
+                    .or(node.resources.node_memory_budget_bytes),
+                app_memory_default_bytes: app_memory_default_bytes
+                    .or(node.resources.app_memory_default_bytes),
+            };
+            let data = call(
+                &client,
+                AdminCommand::SetNodeResources {
+                    resources: resources.clone(),
+                },
+            )?;
+            let AdminData::NodeResourcesSet { .. } = data else {
+                return Err("daemon returned an unexpected node resource response".into());
+            };
+            theme.line_kv("resources", "node policy updated");
+        }
+        Command::Listener {
+            mode,
+            dashboard_listen,
+            http_listen,
+            https_listen,
+            host,
+            advertise_host,
+            port_start,
+            port_end,
+            socket_dir,
+            socket_group,
+            socket_mode,
+        } => {
+            let listener = match mode {
+                ListenerModeArg::Integrated => ListenerConfig::Integrated {
+                    http_listen: http_listen
+                        .unwrap_or_else(|| "0.0.0.0:80".parse().expect("static address")),
+                },
+                ListenerModeArg::Tcp => ListenerConfig::Tcp {
+                    host: host.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    port_start: port_start.unwrap_or(10_000),
+                    port_end: port_end.unwrap_or(19_999),
+                    advertise_host,
+                },
+                ListenerModeArg::Uds => ListenerConfig::Uds {
+                    socket_dir: socket_dir.unwrap_or_else(|| "/run/cygnus/apps".into()),
+                    socket_group,
+                    socket_mode,
+                },
+            };
+            let data = call(
+                &client,
+                AdminCommand::SetListener {
+                    listener,
+                    dashboard_listen,
+                    https_listen,
+                },
+            )?;
+            let AdminData::ListenerSet {
+                restart_required, ..
+            } = data
+            else {
+                return Err("daemon returned an unexpected listener response".into());
+            };
+            theme.line_kv(
+                "listener",
+                if restart_required {
+                    "saved · daemon restart required"
+                } else {
+                    "saved"
+                },
+            );
+        }
+        Command::DashboardDomain { domain, apex } => {
+            let data = call(&client, AdminCommand::SetDashboardDomain { domain, apex })?;
+            let AdminData::DashboardDomainSet { .. } = data else {
+                return Err("daemon returned an unexpected dashboard domain response".into());
+            };
+            theme.line_kv("domains", "dashboard configuration updated");
+        }
+        Command::DashboardListen {
+            listen,
+            https_listen,
+        } => {
+            let status = call(&client, AdminCommand::Status)?;
+            let AdminData::Status { node } = status else {
+                return Err("daemon returned an unexpected status response".into());
+            };
+            let dashboard_listen = listen.or_else(|| node.listen.parse().ok());
+            let data = call(
+                &client,
+                AdminCommand::SetListener {
+                    listener: node.listener,
+                    dashboard_listen,
+                    https_listen,
+                },
+            )?;
+            let AdminData::ListenerSet {
+                restart_required, ..
+            } = data
+            else {
+                return Err("daemon returned an unexpected listener response".into());
+            };
+            theme.line_kv(
+                "dashboard",
+                if restart_required {
+                    "saved · daemon restart required"
+                } else {
+                    "saved"
+                },
+            );
+        }
+        Command::DashboardTls { mode, email } => {
+            let mode = match mode {
+                TlsModeArg::Acme => SslMode::Acme,
+                TlsModeArg::SelfSigned => SslMode::SelfSigned,
+            };
+            let data = call(&client, AdminCommand::SetDashboardTls { mode, email })?;
+            let AdminData::DashboardTlsSet { .. } = data else {
+                return Err("daemon returned an unexpected dashboard TLS response".into());
+            };
+            theme.line_kv("tls", "dashboard TLS policy updated");
+        }
+        Command::Env { command } => {
+            let (data, action) = match command {
+                EnvCommand::Set { app, key, value } => (
+                    call(&client, AdminCommand::SetEnvVar { app, key, value })?,
+                    "set",
+                ),
+                EnvCommand::Remove { app, key } => (
+                    call(&client, AdminCommand::RemoveEnvVar { app, key })?,
+                    "removed",
+                ),
+            };
+            match data {
+                AdminData::EnvVarSet { key } | AdminData::EnvVarRemoved { key } => {
+                    theme.line_kv("env", &format!("{key} {action} · redeploy to apply"));
+                }
+                _ => return Err("daemon returned an unexpected environment response".into()),
+            }
         }
         Command::Deployments {
             app,
@@ -913,7 +1229,24 @@ impl Theme {
             ),
         );
         kv(&mut out, "isolation", &node.isolation);
-        kv(&mut out, "edge", "0.0.0.0:80");
+        kv(
+            &mut out,
+            "listener",
+            &match &node.listener {
+                ListenerConfig::Integrated { http_listen } => {
+                    format!("integrated · {http_listen}")
+                }
+                ListenerConfig::Tcp {
+                    host,
+                    port_start,
+                    port_end,
+                    ..
+                } => format!("tcp · {host}:{port_start}-{port_end}"),
+                ListenerConfig::Uds { socket_dir, .. } => {
+                    format!("uds · {}", socket_dir.display())
+                }
+            },
+        );
         kv(&mut out, "management", &node.listen);
         if let Some(https) = node.https_listen.as_deref() {
             kv(&mut out, "https", https);
@@ -937,6 +1270,12 @@ impl Theme {
                     format_bytes(memory.total_bytes)
                 ),
             );
+        }
+        if let Some(budget) = node.resources.node_memory_budget_bytes {
+            kv(&mut out, "app budget", &format_bytes(budget));
+        }
+        if let Some(default) = node.resources.app_memory_default_bytes {
+            kv(&mut out, "app default", &format_bytes(default));
         }
         if !node.engines.is_empty() {
             let _ = writeln!(out);
@@ -992,7 +1331,9 @@ impl Theme {
                 [
                     app.name.clone(),
                     state_cell(self, &app.lifecycle_state),
-                    app.domains.join(", "),
+                    app.endpoint
+                        .clone()
+                        .unwrap_or_else(|| app.domains.join(", ")),
                     format!("egress {}", app.egress),
                     format_bytes(app.memory_max),
                     app.active
@@ -1002,7 +1343,7 @@ impl Theme {
                 ]
             })
             .collect();
-        let headers = ["NAME", "STATE", "DOMAINS", "POLICY", "MEMORY", "ARTIFACT"];
+        let headers = ["NAME", "STATE", "ENDPOINT", "POLICY", "MEMORY", "ARTIFACT"];
         print_table(self, &headers, &rows);
         if let Some(cursor) = next_cursor {
             let stdout = io::stdout();
@@ -1024,7 +1365,14 @@ impl Theme {
             self.dot(&app.lifecycle_state),
             self.paint(&app.name).blue(),
         );
-        write_kv(&mut out, self, "domains", &app.domains.join(", "));
+        write_kv(
+            &mut out,
+            self,
+            "endpoint",
+            app.endpoint
+                .as_deref()
+                .unwrap_or_else(|| app.domains.first().map_or("—", String::as_str)),
+        );
         write_kv(&mut out, self, "state", &app.lifecycle_state);
         write_kv(&mut out, self, "egress", &app.egress);
         write_kv(&mut out, self, "memory", &format_bytes(app.memory_max));
@@ -1403,10 +1751,13 @@ fn render_deploy(
             write_kv(&mut out, theme, "engine", &deployment.engine_version);
             let status = call(client, AdminCommand::Status).ok();
             let domain = requested_domain.or_else(|| match &status {
-                Some(AdminData::Status { node }) => node
-                    .apps_domain
-                    .as_ref()
-                    .map(|apps_domain| format!("{app}.{apps_domain}")),
+                Some(AdminData::Status { node })
+                    if matches!(node.listener, ListenerConfig::Integrated { .. }) =>
+                {
+                    node.apps_domain
+                        .as_ref()
+                        .map(|apps_domain| format!("{app}.{apps_domain}"))
+                }
                 _ => None,
             });
             if let Some(domain) = domain {
@@ -1417,6 +1768,11 @@ fn render_deploy(
                     _ => "http",
                 };
                 write_kv(&mut out, theme, "url", &format!("{scheme}://{domain}"));
+            } else if let Ok(AdminData::App { app: deployed_app }) =
+                call(client, AdminCommand::GetApp { app: app.clone() })
+                && let Some(endpoint) = deployed_app.endpoint
+            {
+                write_kv(&mut out, theme, "endpoint", &endpoint);
             }
             write_kv(
                 &mut out,
@@ -1609,6 +1965,42 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Logs { follow: true, .. }
+        ));
+    }
+
+    #[test]
+    fn listener_and_resource_commands_parse_with_safe_defaults() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cygnus",
+                "listener",
+                "--mode",
+                "tcp",
+                "--advertise-host",
+                "node.example",
+            ])
+            .unwrap()
+            .command,
+            Command::Listener {
+                mode: ListenerModeArg::Tcp,
+                socket_mode: 0o660,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cygnus",
+                "app-resources",
+                "api",
+                "--memory-max-bytes",
+                "536870912",
+            ])
+            .unwrap()
+            .command,
+            Command::AppResources {
+                memory_max_bytes: 536_870_912,
+                ..
+            }
         ));
     }
 

@@ -131,6 +131,8 @@ pub struct GitHubRepositoryInput {
     pub engine_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,6 +147,8 @@ pub struct GitHubRepositoryView {
     pub domain: String,
     pub engine_version: String,
     pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
 }
 
 impl From<GitHubRepositoryConfig> for GitHubRepositoryView {
@@ -159,6 +163,7 @@ impl From<GitHubRepositoryConfig> for GitHubRepositoryView {
             domain: value.domain,
             engine_version: value.engine_version,
             entry: value.entry.to_string_lossy().into_owned(),
+            memory_max_bytes: value.memory_max_bytes,
         }
     }
 }
@@ -560,16 +565,34 @@ impl GitHubManager {
         }
         let app = input.app.clone();
         let domain = match input.domain {
-            Some(domain) if !domain.trim().is_empty() => domain,
+            Some(domain) if !domain.trim().is_empty() => {
+                if !matches!(
+                    state.load()?.listener,
+                    crate::state::ListenerConfig::Integrated { .. }
+                ) {
+                    return Err(GitHubError::InvalidInput(
+                        "domain is only valid in integrated listener mode".into(),
+                    ));
+                }
+                domain
+            }
             _ => {
-                let edge = state.load()?.edge;
-                let apex = edge.apex_domain.or(edge.apps_domain).ok_or_else(|| {
+                let snapshot = state.load()?;
+                if !matches!(
+                    snapshot.listener,
+                    crate::state::ListenerConfig::Integrated { .. }
+                ) {
+                    String::new()
+                } else {
+                    let edge = snapshot.edge;
+                    let apex = edge.apex_domain.or(edge.apps_domain).ok_or_else(|| {
                     GitHubError::InvalidInput(
                         "domain was omitted and neither edge.apex_domain nor edge.apps_domain is configured"
                             .into(),
                     )
                 })?;
-                format!("{app}.{apex}")
+                    format!("{app}.{apex}")
+                }
             }
         };
         let engine_version = match input.engine_version {
@@ -595,6 +618,7 @@ impl GitHubManager {
             entry,
             artifact_root: state.deployment_artifact_root(&app),
             upstream: state.deployment_upstream(&app),
+            memory_max_bytes: input.memory_max_bytes,
         };
         state.configure_github_repository_with_audit(&config, audit)?;
         Ok(config.into())
@@ -1558,17 +1582,22 @@ impl GitHubDeployExecutor for TrustedDeployExecutor {
         audit: &AuditContext,
     ) -> Result<DeployResult, DeployError> {
         let preassigned = state.deployment(&job.id)?.map(|_| job.id.clone());
+        let integrated = matches!(
+            state.load()?.listener,
+            crate::state::ListenerConfig::Integrated { .. }
+        );
         deploy_with_audit_and_prepare(
             state,
             DeployRequest {
                 source_dir: source.to_path_buf(),
                 app: config.app.clone(),
-                domain: Some(config.domain.clone()),
+                domain: (integrated && !config.domain.is_empty()).then(|| config.domain.clone()),
                 engine_version: Some(config.engine_version.clone()),
                 entry: (!job.entry.as_os_str().is_empty()).then(|| job.entry.clone()),
                 artifact_root: Some(config.artifact_root.clone()),
                 upstream: Some(config.upstream.clone()),
                 env: std::collections::BTreeMap::new(),
+                memory_max_bytes: config.memory_max_bytes,
                 preview: None,
                 deployment_id: preassigned,
                 source: DeploymentSource::github(

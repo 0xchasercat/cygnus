@@ -3,6 +3,7 @@
   import { store } from '../live.svelte.js';
   import Icon from './Icon.svelte';
   import SwanMark from './SwanMark.svelte';
+  import { listenerMode } from '../endpoints.js';
 
   const app = $derived(store.appByName(ui.appId) ?? store.apps.find((a) => a.name === ui.appId) ?? null);
 
@@ -15,7 +16,12 @@
 
   const tenantLine = $derived.by(() => {
     if (store.mode === 'live') {
-      const host = store.node?.apps_domain ?? store.node?.listen ?? '—';
+      const mode = listenerMode(store.node);
+      const host = mode === 'integrated'
+        ? (store.node?.apps_domain ?? store.node?.listen ?? '—')
+        : mode === 'tcp'
+          ? (store.node?.listener?.advertise_host ?? 'TCP endpoints')
+          : (store.node?.listener?.socket_dir ?? '/run/cygnus/apps');
       return { id: 'tenant zero', mid: 'live', tail: host, live: true };
     }
     return { id: 'tenant zero', mid: 'preview', tail: 'cygnus 0.9.2', live: false };
