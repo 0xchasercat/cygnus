@@ -204,6 +204,7 @@ fn acquire_status(error: &AcquireError) -> Status {
         AcquireError::Unknown => Status::NotFound,
         AcquireError::CrashLooping
         | AcquireError::BackingOff { .. }
+        | AcquireError::InsufficientMemory { .. }
         | AcquireError::ShuttingDown => Status::Unavailable,
         AcquireError::BootFailed(_) => Status::BadGateway,
     }
@@ -560,6 +561,175 @@ impl Frontend {
             Err(_) => span.relay_error(),
         }
     }
+
+    /// Serve one connection that arrived through an app-specific listener.
+    ///
+    /// TCP and Unix-socket listener modes already identify the destination app
+    /// by the listener itself, so the HTTP Host header is deliberately not
+    /// consulted. The request still travels through the normal ingress
+    /// admission, cold-start, metering, framing, and relay path.
+    pub fn serve_app_tcp_connection(&self, client: TcpStream, route: Arc<Route>) {
+        let Ok(peer) = client.peer_addr().map(|address| address.ip()) else {
+            return;
+        };
+        self.serve_app_connection(client, peer, "tcp", route);
+    }
+
+    /// Unix-domain-socket counterpart to [`Self::serve_app_tcp_connection`].
+    /// Local proxy clients share the loopback admission identity; filesystem
+    /// ownership and mode are the primary authorization boundary.
+    pub fn serve_app_unix_connection(&self, client: UnixStream, route: Arc<Route>) {
+        self.serve_app_connection(
+            client,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "uds",
+            route,
+        );
+    }
+
+    fn serve_app_connection<S>(
+        &self,
+        mut client: S,
+        peer: std::net::IpAddr,
+        transport: &'static str,
+        route: Arc<Route>,
+    ) where
+        S: ClientSocket,
+    {
+        let mut span = RequestSpan::new(self.metrics.clone(), transport, peer);
+        let _connection_permit = match self.ingress.enter_connection(peer) {
+            Ok(permit) => permit,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::TooManyRequests,
+                    "peer_concurrency",
+                );
+                return;
+            }
+        };
+        let _ = client.set_read_timeout_socket(Some(HEAD_READ_TIMEOUT));
+        let (head, buffered) = match read_head(&mut client) {
+            Ok(parsed) => parsed,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "invalid_head");
+                return;
+            }
+        };
+        span.set_head(
+            &head.method,
+            head.host.as_deref(),
+            &head.target,
+            buffered.len(),
+        );
+        let limits = request_body_limits(&head, self.ingress.limits());
+        let body_guard = match body_guard(&head, &buffered, &limits) {
+            Ok(guard) => guard,
+            Err(status) => {
+                reject(&mut client, &mut span, status, "body_rejected");
+                return;
+            }
+        };
+        span.set_app(&route.app);
+        let _request_permit = match self.ingress.enter_request(peer, &route.app) {
+            Ok(permit) => permit,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::TooManyRequests,
+                    "request_admission",
+                );
+                return;
+            }
+        };
+        match self.supervisor.acquire_with_outcome(&route.app) {
+            Ok(outcome) => span.set_cold(outcome.cold),
+            Err(error) => {
+                eprintln!(
+                    "cygnus-daemon: app {app:?} is unavailable: {error:?}",
+                    app = route.app
+                );
+                reject(
+                    &mut client,
+                    &mut span,
+                    acquire_status(&error),
+                    "app_unavailable",
+                );
+                return;
+            }
+        }
+        let upstream = match UnixStream::connect(&route.upstream) {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                reject(
+                    &mut client,
+                    &mut span,
+                    Status::BadGateway,
+                    "upstream_connect",
+                );
+                return;
+            }
+        };
+        let buffered = upstream_request_bytes(&head, &buffered, "http");
+        if (&upstream).write_all(&buffered).is_err() {
+            reject(&mut client, &mut span, Status::BadGateway, "upstream_write");
+            return;
+        }
+        let _ = client.set_read_timeout_socket(Some(RELAY_IDLE_TIMEOUT));
+        let _ = client.set_write_timeout_socket(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_read_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(RELAY_IDLE_TIMEOUT));
+        let request_is_head = head.method.eq_ignore_ascii_case("HEAD");
+        match relay(client, upstream, body_guard, request_is_head) {
+            Ok(stats) => span.proxied(stats.status, stats.to_upstream, stats.to_client),
+            Err(_) => span.relay_error(),
+        }
+    }
+}
+
+trait ClientSocket: Read + Write + Send + Sized + 'static {
+    fn try_clone_socket(&self) -> io::Result<Self>;
+    fn shutdown_socket(&self, how: Shutdown) -> io::Result<()>;
+    fn set_read_timeout_socket(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout_socket(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl ClientSocket for TcpStream {
+    fn try_clone_socket(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+
+    fn shutdown_socket(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
+    }
+
+    fn set_read_timeout_socket(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout_socket(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_write_timeout(timeout)
+    }
+}
+
+impl ClientSocket for UnixStream {
+    fn try_clone_socket(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+
+    fn shutdown_socket(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
+    }
+
+    fn set_read_timeout_socket(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout_socket(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_write_timeout(timeout)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -643,16 +813,16 @@ fn upstream_request_bytes(head: &RequestHead, buffered: &[u8], forwarded_proto: 
     rewritten
 }
 
-fn relay(
-    client: TcpStream,
+fn relay<S: ClientSocket>(
+    client: S,
     upstream: UnixStream,
     body_guard: BodyGuard,
     request_is_head: bool,
 ) -> io::Result<RelayStats> {
-    let mut client_reader = client.try_clone()?;
+    let mut client_reader = client.try_clone_socket()?;
     let mut upstream_writer = upstream.try_clone()?;
     let mut upstream_reader = upstream.try_clone()?;
-    let mut client_writer = client.try_clone()?;
+    let mut client_writer = client.try_clone_socket()?;
     let tunnel = Arc::new(AtomicBool::new(false));
 
     let request_tunnel = Arc::clone(&tunnel);
@@ -672,11 +842,11 @@ fn relay(
         request_is_head,
         &tunnel,
     );
-    let _ = client_writer.shutdown(Shutdown::Write);
+    let _ = client_writer.shutdown_socket(Shutdown::Write);
     // End the exchange decisively: closing the read sides unblocks the
     // request-direction thread immediately instead of holding both sockets
     // until a peer close or idle timeout.
-    let _ = client.shutdown(Shutdown::Read);
+    let _ = client.shutdown_socket(Shutdown::Read);
     let _ = upstream.shutdown(Shutdown::Both);
     let to_upstream = client_to_upstream
         .join()
@@ -1351,6 +1521,59 @@ console.log("ready", server.hostname);"#,
         }
         worker.join().unwrap();
         response
+    }
+
+    fn unavailable_named_frontend() -> (Arc<Frontend>, Arc<Route>) {
+        let router = Arc::new(Router::new(RouteTable::new()));
+        let supervisor = Arc::new(Supervisor::<Cage>::new(|_| Err("boot failed".into())));
+        let spec = cygnus_cage::CageSpec::new("runtime-api", "/bin/false");
+        supervisor.register(
+            "runtime-api",
+            spec,
+            cygnus_supervisor::LifecycleConfig::default(),
+        );
+        (
+            Arc::new(Frontend::new(router, supervisor)),
+            Arc::new(Route {
+                app: "runtime-api".into(),
+                upstream: PathBuf::from("/does/not/exist.sock"),
+            }),
+        )
+    }
+
+    #[test]
+    fn app_specific_tcp_listener_routes_without_matching_host() {
+        let (frontend, route) = unavailable_named_frontend();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            frontend.serve_app_tcp_connection(client, route);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: deliberately-unmapped.example\r\n\r\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway"));
+    }
+
+    #[test]
+    fn app_specific_uds_listener_routes_without_matching_host() {
+        let (frontend, route) = unavailable_named_frontend();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || frontend.serve_app_unix_connection(server, route));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: deliberately-unmapped.example\r\n\r\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway"));
     }
 
     #[test]

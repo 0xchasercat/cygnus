@@ -488,6 +488,10 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             validate_app_name(app)?;
             validate_text(key, MAX_ADMIN_APP_BYTES, "env var key")?;
         }
+        AdminCommand::SetAppResources { app, .. } | AdminCommand::RedeployApp { app } => {
+            validate_app_name(app)?
+        }
+        AdminCommand::SetNodeResources { .. } | AdminCommand::SetListener { .. } => {}
         AdminCommand::CreateInitialAccount { email, password }
         | AdminCommand::VerifyCredentials { email, password } => {
             validate_account_email(email)?;
@@ -574,6 +578,12 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
                 validate_path(upstream, MAX_ADMIN_DEPLOYMENT_BYTES, "upstream")?;
             }
             validate_env_vars(&request.env)?;
+            if request
+                .memory_max_bytes
+                .is_some_and(|value| value < 16 * 1024 * 1024)
+            {
+                return Err("memory_max_bytes must be at least 16 MiB".into());
+            }
             if let Some(preview) = request.preview.as_deref() {
                 validate_preview_slug(preview)?;
             }
@@ -584,6 +594,7 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             engine_version,
             entry,
             env,
+            memory_max_bytes,
             preview,
             total_bytes,
         } => {
@@ -601,6 +612,9 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
                 return Err("total_bytes must be between 1 byte and 64 MiB".into());
             }
             validate_env_vars(env)?;
+            if memory_max_bytes.is_some_and(|value| value < 16 * 1024 * 1024) {
+                return Err("memory_max_bytes must be at least 16 MiB".into());
+            }
             if let Some(preview) = preview.as_deref() {
                 validate_preview_slug(preview)?;
             }
@@ -1235,6 +1249,7 @@ mod tests {
             engine_version: None,
             entry: Some("src/index.ts".into()),
             env: Default::default(),
+            memory_max_bytes: None,
             preview: None,
             total_bytes: MAX_UPLOAD_BYTES,
         };
@@ -1269,6 +1284,7 @@ mod tests {
                 artifact_root: None,
                 upstream: None,
                 env: Default::default(),
+                memory_max_bytes: None,
                 preview: None,
                 deployment_id: None,
                 source: crate::state::DeploymentSource::cli(),

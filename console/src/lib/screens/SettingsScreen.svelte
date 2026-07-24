@@ -49,7 +49,7 @@
   let selectedRepoId = $state(null);
   let mapBusy = $state(false);
   let mapError = $state('');
-  let mapDraft = $state({ app: '', domain: '', engine_version: '', entry: '' });
+  let mapDraft = $state({ app: '', domain: '', engine_version: '', entry: '', memory_mib: '256' });
 
   const discoverableRepos = $derived(store.github.discoverable ?? []);
   const installationCount = $derived((store.github.installations ?? []).length);
@@ -90,6 +90,77 @@
     ?? store.node?.engines?.[0]?.version
     ?? ''
   );
+
+  // ——— ingress / listener ———
+  let listenerEditOpen = $state(false);
+  let listenerBusy = $state(false);
+  let listenerError = $state('');
+  let listenerRestartUrl = $state('');
+  let listenerRestartReady = $state(false);
+  let listenerDraft = $state({});
+  const listenerMode = $derived(store.node?.listener?.mode ?? store.node?.listener_mode ?? 'integrated');
+  const socketExample = $derived(`${listenerDraft.socket_dir || '/run/cygnus/apps'}/my-app.sock`);
+
+  function editListener() {
+    const l = store.node?.listener ?? {};
+    listenerDraft = {
+      mode: l.mode ?? listenerMode,
+      http_port: l.http_port ?? 80,
+      https_port: l.https_port ?? 443,
+      dashboard_port: l.dashboard_port ?? 3000,
+      app_port_start: l.port_start ?? 10000,
+      app_port_end: l.port_end ?? 19999,
+      advertise_host: l.advertise_host ?? store.node?.advertise_host ?? '',
+      socket_dir: l.socket_dir ?? '/run/cygnus/apps',
+      socket_group: l.socket_group ?? 'www-data',
+      socket_mode: typeof l.socket_mode === 'number' ? `0${l.socket_mode.toString(8).padStart(3, '0')}` : (l.socket_mode ?? '0660'),
+    };
+    listenerError = '';
+    listenerEditOpen = !listenerEditOpen;
+  }
+
+  async function saveListener(e) {
+    e.preventDefault();
+    if (listenerBusy) return;
+    const d = listenerDraft;
+    if (!window.confirm('Apply this listener configuration? Active app endpoints may change and the dashboard may reconnect on a new port.')) return;
+    const payload = d.mode === 'integrated'
+      ? { listener: { mode: d.mode, http_listen: `0.0.0.0:${d.http_port}` }, https_listen: `0.0.0.0:${d.https_port}`, dashboard_listen: `0.0.0.0:${d.dashboard_port}` }
+      : d.mode === 'tcp'
+        ? { listener: { mode: d.mode, host: '0.0.0.0', port_start: Number(d.app_port_start), port_end: Number(d.app_port_end), advertise_host: d.advertise_host.trim() }, dashboard_listen: `0.0.0.0:${d.dashboard_port}` }
+        : { listener: { mode: d.mode, socket_dir: d.socket_dir, socket_group: d.socket_group || null, socket_mode: parseInt(d.socket_mode, 8) }, dashboard_listen: `0.0.0.0:${d.dashboard_port}` };
+    listenerBusy = true;
+    listenerError = '';
+    const r = await store.setListener(payload);
+    listenerBusy = false;
+    if (!r.ok) {
+      listenerError = r.error ?? 'Could not update listener';
+      return;
+    }
+    if (r.restartRequired) {
+      const url = new URL(window.location.href);
+      url.port = String(d.dashboard_port);
+      listenerRestartUrl = url.origin;
+      listenerRestartReady = false;
+      void waitForListener(listenerRestartUrl);
+    }
+    listenerEditOpen = false;
+  }
+
+  async function waitForListener(origin) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      try {
+        const response = await fetch(`${origin}/healthz`, { cache: 'no-store' });
+        if (response.ok) {
+          listenerRestartReady = true;
+          return;
+        }
+      } catch {
+        // Expected while the daemon restarts or the new listener comes up.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
 
   // Dashboard's own cert status, from the node's certificate list when present.
   const dashboardCert = $derived.by(() => {
@@ -194,6 +265,7 @@
       domain: appsDomain ? `${repo.name}.${appsDomain}` : '',
       engine_version: defaultEngine,
       entry: '',
+      memory_mib: String(Math.round((store.node?.resources?.app_memory_default_bytes ?? 256 * 1024 * 1024) / (1024 * 1024))),
     };
   }
 
@@ -234,9 +306,10 @@
       name: repo.name,
       branch: repo.default_branch,
       app: mapDraft.app || repo.name,
-      domain: mapDraft.domain || '',
+      ...(listenerMode === 'integrated' ? { domain: mapDraft.domain || '' } : {}),
       engine_version: mapDraft.engine_version || defaultEngine,
       entry: (mapDraft.entry ?? '').trim() || undefined,
+      memory_max_bytes: Number(mapDraft.memory_mib) * 1024 * 1024,
     });
     mapBusy = false;
     if (!r.ok) {
@@ -325,6 +398,7 @@
   <div class="grid">
     <div class="col">
       <!-- domains -->
+      {#if listenerMode === 'integrated'}
       <section class="card">
         <div class="cardhead">
           <span class="label">Domains</span>
@@ -364,6 +438,7 @@
           {#if !allDomains.length}<div class="empty mono">no domains mapped</div>{/if}
         </div>
       </section>
+      {/if}
 
       <!-- gitops -->
       <section class="card">
@@ -433,9 +508,14 @@
                 </div>
                 <div class="repo-fields">
                   <label>App<input bind:value={mapDraft.app} maxlength="64" required /></label>
-                  <label>Domain<input bind:value={mapDraft.domain} maxlength="253" placeholder="app.example.com" required /></label>
+                  {#if listenerMode === 'integrated'}
+                    <label>Domain<input bind:value={mapDraft.domain} maxlength="253" placeholder="app.example.com" required /></label>
+                  {:else}
+                    <div class="endpoint-config"><span class="label">Endpoint</span><code>allocated after first deploy</code></div>
+                  {/if}
                   <label>Engine<input bind:value={mapDraft.engine_version} maxlength="128" required /></label>
                   <label>Entry <span class="optional">(optional)</span><input bind:value={mapDraft.entry} maxlength="128" placeholder="auto" /></label>
+                  <label>Memory <span class="optional">(MiB)</span><input bind:value={mapDraft.memory_mib} type="number" min="64" step="64" required /></label>
                 </div>
                 {#if mapError}<p class="inline-error" role="alert">{mapError}</p>{/if}
                 <div class="map-actions">
@@ -507,6 +587,73 @@
     </div>
 
     <div class="col">
+      <section class="card">
+        <div class="cardhead">
+          <span class="label">App listener</span>
+          <span class="pill cobalt">{listenerMode}</span>
+        </div>
+        <div class="pad">
+          {#if listenerRestartUrl}
+            <div class="listener-restart" role="status">
+              <span><strong>{listenerRestartReady ? 'Listener ready' : 'Listener restarting'}</strong> · reconnect at <code>{listenerRestartUrl}</code></span>
+              <a class="btn cobalt sm" href={listenerRestartUrl}>{listenerRestartReady ? 'Open dashboard' : 'Try now'}</a>
+            </div>
+          {/if}
+          <div class="dash-row">
+            <div class="dash-domain">
+              <span class="mname">
+                {listenerMode === 'integrated' ? 'Domains + TLS termination' : listenerMode === 'tcp' ? 'Direct TCP ports' : 'Unix domain sockets'}
+              </span>
+              <span class="tmeta num">
+                {listenerMode === 'integrated'
+                  ? `${store.node?.listener?.http_listen ?? ':80'} · ${store.node?.https_listen ?? ':443'}`
+                  : listenerMode === 'tcp'
+                    ? `${store.node?.listener?.advertise_host ?? 'host'}:${store.node?.listener?.port_start ?? 10000}–${store.node?.listener?.port_end ?? 19999}`
+                    : (store.node?.listener?.socket_dir ?? '/run/cygnus/apps')}
+              </span>
+            </div>
+            <button class="btn sm" type="button" onclick={editListener}>{listenerEditOpen ? 'Cancel' : 'Configure'}</button>
+          </div>
+          {#if listenerEditOpen}
+            <form class="listener-form" onsubmit={saveListener}>
+              <fieldset class="listener-modes">
+                <legend>Mode</legend>
+                {#each ['integrated', 'tcp', 'uds'] as mode}
+                  <label class:chosen={listenerDraft.mode === mode}>
+                    <input type="radio" name="settings-listener" value={mode} bind:group={listenerDraft.mode} />
+                    <span>{mode === 'integrated' ? 'Integrated' : mode === 'tcp' ? 'TCP ports' : 'Unix sockets'}</span>
+                  </label>
+                {/each}
+              </fieldset>
+              <div class="listener-fields">
+                <label>Dashboard port<input bind:value={listenerDraft.dashboard_port} type="number" min="1" max="65535" required /></label>
+                {#if listenerDraft.mode === 'integrated'}
+                  <label>HTTP port<input bind:value={listenerDraft.http_port} type="number" min="1" max="65535" required /></label>
+                  <label>HTTPS port<input bind:value={listenerDraft.https_port} type="number" min="1" max="65535" required /></label>
+                  <p>Cygnus owns app routing and TLS. Domain and certificate controls remain available below.</p>
+                {:else if listenerDraft.mode === 'tcp'}
+                  <label>App ports · from<input bind:value={listenerDraft.app_port_start} type="number" min="1" max="65535" required /></label>
+                  <label>App ports · through<input bind:value={listenerDraft.app_port_end} type="number" min="1" max="65535" required /></label>
+                  <label class="wide">Public host or IP<input bind:value={listenerDraft.advertise_host} placeholder="node.example.com or 203.0.113.10" maxlength="253" required /></label>
+                  <p>Each app receives a stable address such as <code>node:3100</code>. Your proxy or clients terminate TLS.</p>
+                {:else}
+                  <label class="wide">Socket directory<input bind:value={listenerDraft.socket_dir} maxlength="4096" required /></label>
+                  <label>Proxy group<input bind:value={listenerDraft.socket_group} maxlength="64" placeholder="www-data" /></label>
+                  <label>Socket mode<input bind:value={listenerDraft.socket_mode} pattern="0[0-7]{3}" maxlength="4" required /></label>
+                  <p>Apps use <code>{listenerDraft.socket_dir || '/run/cygnus/apps'}/&lt;app&gt;.sock</code>. Configure Caddy or Nginx with a Unix-socket upstream.</p>
+                  <div class="proxy-examples">
+                    <div><span>Caddy</span><code>reverse_proxy unix//{socketExample}</code><button type="button" onclick={() => navigator.clipboard?.writeText(`reverse_proxy unix//${socketExample}`)}>Copy</button></div>
+                    <div><span>Nginx</span><code>proxy_pass http://unix:{socketExample}:</code><button type="button" onclick={() => navigator.clipboard?.writeText(`proxy_pass http://unix:${socketExample}:;`)}>Copy</button></div>
+                  </div>
+                {/if}
+              </div>
+              {#if listenerError}<p class="inline-error" role="alert">{listenerError}</p>{/if}
+              <div class="map-actions"><button class="btn cobalt sm" type="submit" disabled={listenerBusy}>{listenerBusy ? 'Applying…' : 'Apply listener'}</button></div>
+            </form>
+          {/if}
+        </div>
+      </section>
+
       <!-- dashboard domain + SSL -->
       <section class="card">
         <div class="cardhead">
@@ -545,6 +692,7 @@
             </form>
           {/if}
 
+          {#if listenerMode === 'integrated'}
           <div class="hairline-h dash-hl"></div>
 
           <div class="tls-row">
@@ -598,6 +746,9 @@
                 {tlsBusy ? 'Retrying…' : 'Retry certificate now'}
               </button>
             {/if}
+          {/if}
+          {:else}
+            <p class="dash-note mono">The dashboard remains reachable on its TCP listener. App traffic and TLS are handled by your external proxy in {listenerMode.toUpperCase()} mode.</p>
           {/if}
         </div>
       </section>
@@ -882,6 +1033,8 @@
     border-radius: 7px; background: var(--surface); color: var(--ink);
     padding: 7px 9px; font-family: var(--mono); font-size: 11.5px;
   }
+  .endpoint-config { display: grid; gap: 5px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); }
+  .endpoint-config code { font: 10.5px var(--mono); color: var(--ink-3); }
   .map-actions { display: flex; justify-content: flex-end; }
 
   .jobs { border-top: 1px solid var(--line-2); }
@@ -1017,6 +1170,37 @@
     transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .toggle.on .thumb { transform: translateX(16px); }
+  .listener-form { display: grid; gap: 12px; border-top: 1px solid var(--line-2); padding-top: 14px; }
+  .listener-modes { display: flex; flex-wrap: wrap; gap: 7px; margin: 0; padding: 0; border: 0; }
+  .listener-modes legend { width: 100%; margin-bottom: 7px; font: 500 10px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+  .listener-modes label { flex: 1; display: flex; align-items: center; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; font-size: 11.5px; cursor: pointer; }
+  .listener-modes label.chosen { border-color: color-mix(in srgb, var(--cobalt) 40%, var(--line)); background: var(--cobalt-ghost); }
+  .listener-modes input { accent-color: var(--cobalt); }
+  .listener-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .listener-fields label { display: grid; gap: 5px; font: 500 10px var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); }
+  .listener-fields input { min-width: 0; border: 1px solid var(--line-strong); border-radius: 8px; padding: 9px 10px; font: 12px var(--mono); background: var(--surface); }
+  .listener-fields .wide, .listener-fields p { grid-column: 1 / -1; }
+  .listener-fields p { color: var(--ink-3); font-size: 10.5px; line-height: 1.55; }
+  .listener-fields code { font: 10.5px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
+  .listener-restart {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+    padding: 10px;
+    border: 1px solid color-mix(in srgb, var(--amber) 30%, var(--line));
+    border-radius: 9px;
+    background: var(--amber-soft);
+    color: #875604;
+    font-size: 11px;
+  }
+  .listener-restart code { overflow-wrap: anywhere; font-family: var(--mono); }
+  .proxy-examples { grid-column: 1 / -1; display: grid; gap: 6px; }
+  .proxy-examples div { display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 8px; background: var(--surface-3); border-radius: 7px; }
+  .proxy-examples span { font-size: 10px; color: var(--ink-3); }
+  .proxy-examples code { min-width: 0; font: 10px var(--mono); overflow-wrap: anywhere; }
+  .proxy-examples button { min-height: 30px; padding: 0 8px; color: var(--cobalt-deep); font-size: 10px; font-weight: 600; }
 
   .empty {
     padding: 28px 18px;
@@ -1031,5 +1215,11 @@
     .grid { grid-template-columns: 1fr; }
     .addform, .dash-form, .repo-search { grid-template-columns: 1fr; }
     .repo-fields { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 620px) {
+    .listener-modes { flex-direction: column; }
+    .listener-modes label { min-height: 42px; }
+    .listener-fields { grid-template-columns: 1fr; }
+    .listener-fields .wide, .listener-fields p { grid-column: auto; }
   }
 </style>

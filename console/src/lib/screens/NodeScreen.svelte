@@ -6,13 +6,24 @@
   import Anatomy from '../components/Anatomy.svelte';
   import Constellation from '../components/Constellation.svelte';
   import Icon from '../components/Icon.svelte';
+  import { listenerMode } from '../endpoints.js';
 
   const node = $derived(store.node);
+  const ingressMode = $derived(listenerMode(node));
 
   const hasMemory = $derived(!!node?.memory && Number(node.memory.total_bytes) > 0);
   const usedBytes = $derived(hasMemory ? node.memory.total_bytes - node.memory.available_bytes : 0);
   const usedPct = $derived(hasMemory ? (usedBytes / node.memory.total_bytes) * 100 : 0);
   const totalGb = $derived(hasMemory ? node.memory.total_bytes / (1024 ** 3) : 0);
+  let budgetMiB = $state('');
+  let defaultMiB = $state('');
+  let resourcesBusy = $state(false);
+  let resourcesError = $state('');
+
+  $effect(() => {
+    budgetMiB = node?.resources?.node_memory_budget_bytes ? String(Math.round(node.resources.node_memory_budget_bytes / (1024 * 1024))) : '';
+    defaultMiB = node?.resources?.app_memory_default_bytes ? String(Math.round(node.resources.app_memory_default_bytes / (1024 * 1024))) : '256';
+  });
 
   const bootPhases = $derived(
     store.metrics?.boot_phases?.phases
@@ -41,13 +52,36 @@
     if (!sha) return '—';
     return sha.slice(0, 8);
   }
+
+  async function saveResources(e) {
+    e.preventDefault();
+    if (resourcesBusy) return;
+    const budget = budgetMiB === '' ? null : Number(budgetMiB);
+    const appDefault = Number(defaultMiB);
+    if ((budget != null && (!Number.isInteger(budget) || budget < 128)) || !Number.isInteger(appDefault) || appDefault < 64) {
+      resourcesError = 'Use whole MiB values (budget ≥ 128 MiB, app default ≥ 64 MiB).';
+      return;
+    }
+    if (budget != null && appDefault > budget) {
+      resourcesError = 'Default app memory cannot exceed the workload budget.';
+      return;
+    }
+    resourcesBusy = true;
+    resourcesError = '';
+    const r = await store.setNodeResources({
+      nodeMemoryBudgetBytes: budget == null ? null : budget * 1024 * 1024,
+      appMemoryDefaultBytes: appDefault * 1024 * 1024,
+    });
+    resourcesBusy = false;
+    if (!r.ok) resourcesError = r.error ?? 'Could not update memory policy';
+  }
 </script>
 
 <div class="page screen-enter">
   <header class="head">
     <div>
       <div class="row1">
-        <h1>{node?.apps_domain ?? 'cygnus'}</h1>
+        <h1>{ingressMode === 'integrated' ? (node?.apps_domain ?? 'cygnus') : ingressMode === 'tcp' ? (node?.listener?.advertise_host ?? 'TCP listener') : (node?.listener?.socket_dir ?? 'Unix sockets')}</h1>
       </div>
       <p class="sub num">{node?.version ?? 'cygnus dev'}</p>
       <div class="hostchips">
@@ -69,7 +103,7 @@
       <div class="cardhead"><span class="label">Identity</span></div>
       <div class="pad">
         <div class="kv">
-          <div class="kvrow"><span>Apps domain</span><b class="num">{node?.apps_domain ?? '—'}</b></div>
+          <div class="kvrow"><span>App endpoints</span><b class="num">{ingressMode === 'integrated' ? (node?.apps_domain ?? '—') : ingressMode === 'tcp' ? `${node?.listener?.advertise_host ?? 'host'}:${node?.listener?.port_start ?? '—'}–${node?.listener?.port_end ?? '—'}` : (node?.listener?.socket_dir ?? '/run/cygnus/apps')}</b></div>
           <div class="kvrow"><span>Listener</span><b class="num">{node?.listen ?? '—'}</b></div>
           {#if node?.https_listen}<div class="kvrow"><span>HTTPS</span><b class="num">{node.https_listen}</b></div>{/if}
           {#if node?.isolation}<div class="kvrow"><span>Isolation</span><b class="num">{node.isolation}</b></div>{/if}
@@ -78,6 +112,30 @@
           {#if node?.warm_count != null}<div class="kvrow"><span>Warm</span><b class="num">{node.warm_count}</b></div>{/if}
         </div>
       </div>
+    </section>
+
+    <section class="card">
+      <div class="cardhead">
+        <span class="label">Workload memory policy</span>
+        <span class="hint num">physical RAM · {hasMemory ? bytes(node.memory.total_bytes) : 'unknown'}</span>
+      </div>
+      <form class="resource-form" onsubmit={saveResources}>
+        <label>
+          <span>Workload memory budget</span>
+          <span class="field"><input bind:value={budgetMiB} type="number" min="128" step="64" inputmode="numeric" placeholder="auto" /><i class="num">MiB</i></span>
+          <small>Caps the memory Cygnus may promise across configured apps. Leave empty to size it safely from the host.</small>
+        </label>
+        <label>
+          <span>Default app memory</span>
+          <span class="field"><input bind:value={defaultMiB} type="number" min="64" step="64" inputmode="numeric" required /><i class="num">MiB</i></span>
+          <small>Used for new apps unless their own memory limit overrides it.</small>
+        </label>
+        {#if resourcesError}<p class="resource-error" role="alert">{resourcesError}</p>{/if}
+        <div class="resource-actions">
+          <span>Physical RAM is detected from the host and cannot be changed here.</span>
+          <button class="btn cobalt sm" type="submit" disabled={resourcesBusy}>{resourcesBusy ? 'Saving…' : 'Save policy'}</button>
+        </div>
+      </form>
     </section>
 
     <!-- ————— memory density ————— -->
@@ -383,8 +441,43 @@
   }
   .code .p { color: var(--ink-4); margin-right: 8px; }
 
+  .resource-form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    padding: 6px 18px 16px;
+  }
+  .resource-form label { display: grid; gap: 6px; font-size: 12px; font-weight: 600; }
+  .resource-form small { color: var(--ink-3); font-size: 10.5px; line-height: 1.5; font-weight: 400; }
+  .field {
+    display: flex;
+    align-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .field input { width: 100%; min-width: 0; border: 0; padding: 9px 10px; font: 12px var(--mono); }
+  .field i { padding: 0 10px; font-style: normal; font-size: 10px; color: var(--ink-3); }
+  .resource-actions {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-top: 1px solid var(--line-2);
+    padding-top: 12px;
+  }
+  .resource-actions span { color: var(--ink-4); font-size: 10.5px; }
+  .resource-error { grid-column: 1 / -1; color: var(--red); font-size: 11.5px; }
+
   @media (max-width: 1080px) {
     .grid { grid-template-columns: 1fr; }
     .constellation { display: none; }
+  }
+  @media (max-width: 620px) {
+    .page { padding: 18px 16px 0; }
+    .resource-form { grid-template-columns: 1fr; }
+    .resource-actions { align-items: stretch; flex-direction: column; }
+    .resource-actions .btn { min-height: 40px; justify-content: center; }
   }
 </style>

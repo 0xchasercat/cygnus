@@ -50,6 +50,8 @@ pub struct UploadMetadata {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }
 
@@ -657,6 +659,7 @@ mod tests {
             engine_version: Some("1.0.0".into()),
             entry: Some("src/index.ts".into()),
             env: Default::default(),
+            memory_max_bytes: None,
             preview: None,
         }
     }

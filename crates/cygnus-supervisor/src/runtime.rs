@@ -14,7 +14,7 @@
 //! the condvar rather than each starting a boot — so N simultaneous callers
 //! trigger exactly one boot. No lock is ever held across a boot or a shutdown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +60,8 @@ pub enum AcquireError {
     BackingOff { retry_after: Duration },
     /// The boot this call attempted failed.
     BootFailed(String),
+    /// The configured concurrent workload budget cannot admit this cage yet.
+    InsufficientMemory { requested: u64, available: u64 },
 }
 
 /// The result of successfully acquiring an app instance.
@@ -97,7 +99,15 @@ struct Slot<I> {
 pub struct Supervisor<I> {
     boot: Box<BootFn<I>>,
     apps: Mutex<HashMap<String, Arc<Slot<I>>>>,
+    memory: Mutex<MemoryBudget>,
     shutting_down: AtomicBool,
+}
+
+#[derive(Default)]
+struct MemoryBudget {
+    limit: Option<u64>,
+    reserved: HashMap<String, u64>,
+    exempt: HashSet<String>,
 }
 
 impl<I: Instance> Supervisor<I> {
@@ -106,14 +116,118 @@ impl<I: Instance> Supervisor<I> {
         Self {
             boot: Box::new(boot),
             apps: Mutex::new(HashMap::new()),
+            memory: Mutex::new(MemoryBudget::default()),
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Set the aggregate memory reservation available to concurrently Booting
+    /// and Ready cages. Cold registrations consume nothing.
+    pub fn set_memory_budget(&self, limit: Option<u64>) -> Result<(), String> {
+        let mut memory = recover(self.memory.lock());
+        let reserved = memory.reserved.values().copied().sum::<u64>();
+        if let Some(limit) = limit
+            && reserved > limit
+        {
+            return Err(format!(
+                "active workload reservations ({reserved} bytes) exceed requested budget ({limit} bytes)"
+            ));
+        }
+        memory.limit = limit;
+        Ok(())
+    }
+
+    /// Exempt a control-plane runtime from the user workload reservation
+    /// budget. Call this before its first acquire.
+    pub fn set_memory_exempt(&self, name: &str, exempt: bool) -> Result<(), String> {
+        let mut memory = recover(self.memory.lock());
+        if memory.reserved.contains_key(name) {
+            return Err("cannot change memory exemption while the app is active".into());
+        }
+        if exempt {
+            memory.exempt.insert(name.to_owned());
+        } else {
+            memory.exempt.remove(name);
+        }
+        Ok(())
+    }
+
+    /// Move one live app's reservation to a preboot replacement generation.
+    /// This permits a rolling config restart at a full budget without
+    /// pretending that two independently routable apps fit. The caller must
+    /// restore the returned reservation if the replacement fails.
+    pub fn prepare_memory_replacement(
+        &self,
+        previous: &str,
+        replacement: &str,
+        requested: u64,
+    ) -> Result<Option<u64>, AcquireError> {
+        let mut memory = recover(self.memory.lock());
+        let previous_reservation = memory.reserved.remove(previous);
+        let reserved = memory.reserved.values().copied().sum::<u64>();
+        if let Some(limit) = memory.limit {
+            let available = limit.saturating_sub(reserved);
+            if requested > available {
+                if let Some(previous_reservation) = previous_reservation {
+                    memory
+                        .reserved
+                        .insert(previous.to_owned(), previous_reservation);
+                }
+                return Err(AcquireError::InsufficientMemory {
+                    requested,
+                    available,
+                });
+            }
+        }
+        memory.reserved.insert(replacement.to_owned(), requested);
+        Ok(previous_reservation)
+    }
+
+    /// Roll back a reservation move performed by
+    /// [`Self::prepare_memory_replacement`].
+    pub fn rollback_memory_replacement(
+        &self,
+        replacement: &str,
+        previous: &str,
+        previous_reservation: Option<u64>,
+    ) {
+        let mut memory = recover(self.memory.lock());
+        memory.reserved.remove(replacement);
+        if let Some(previous_reservation) = previous_reservation {
+            memory
+                .reserved
+                .insert(previous.to_owned(), previous_reservation);
+        }
+    }
+
+    fn reserve_memory(&self, name: &str, requested: u64) -> Result<(), AcquireError> {
+        let mut memory = recover(self.memory.lock());
+        if memory.exempt.contains(name) || memory.reserved.contains_key(name) {
+            return Ok(());
+        }
+        let reserved = memory.reserved.values().copied().sum::<u64>();
+        if let Some(limit) = memory.limit {
+            let available = limit.saturating_sub(reserved);
+            if requested > available {
+                return Err(AcquireError::InsufficientMemory {
+                    requested,
+                    available,
+                });
+            }
+        }
+        memory.reserved.insert(name.to_owned(), requested);
+        Ok(())
+    }
+
+    fn release_memory(&self, name: &str) {
+        recover(self.memory.lock()).reserved.remove(name);
     }
 
     /// Register an app with its boot spec and lifecycle policy. Replaces any
     /// existing registration (the previous instance, if any, is dropped, which
     /// tears it down). Starts cold.
     pub fn register(&self, name: impl Into<String>, spec: CageSpec, config: LifecycleConfig) {
+        let name = name.into();
         let slot = Arc::new(Slot {
             spec,
             state: Mutex::new(SlotState {
@@ -123,7 +237,12 @@ impl<I: Instance> Supervisor<I> {
             }),
             progress: Condvar::new(),
         });
-        recover(self.apps.lock()).insert(name.into(), slot);
+        if recover(self.apps.lock())
+            .insert(name.clone(), slot)
+            .is_some()
+        {
+            self.release_memory(&name);
+        }
     }
 
     /// Ensure the named app is booted and ready, booting it on demand. Callers
@@ -181,6 +300,7 @@ impl<I: Instance> Supervisor<I> {
                     // This caller owns the boot. Mark Booting and release the
                     // lock so the slow boot does not block other callers (which
                     // will wait on the condvar).
+                    self.reserve_memory(name, slot.spec.limits.memory_max)?;
                     state.lifecycle.begin_boot(Instant::now());
                     drop(state);
                     let result = (self.boot)(&slot.spec);
@@ -189,6 +309,7 @@ impl<I: Instance> Supervisor<I> {
                         let instance = result.ok();
                         state.lifecycle.mark_cold();
                         state.retry_after = None;
+                        self.release_memory(name);
                         slot.progress.notify_all();
                         drop(state);
                         if let Some(instance) = instance {
@@ -205,6 +326,7 @@ impl<I: Instance> Supervisor<I> {
                             return Ok(AcquireOutcome { cold: true });
                         }
                         Err(error) => {
+                            self.release_memory(name);
                             let outcome = state.lifecycle.note_crash(Instant::now());
                             slot.progress.notify_all();
                             return match outcome {
@@ -265,6 +387,7 @@ impl<I: Instance> Supervisor<I> {
             if let Some(instance) = instance {
                 let _ = instance.shutdown();
             }
+            self.release_memory(&name);
 
             let mut state = recover(slot.state.lock());
             let crash_loop = match state.lifecycle.note_crash(now) {
@@ -311,6 +434,7 @@ impl<I: Instance> Supervisor<I> {
             if let Some(instance) = instance {
                 let _ = instance.shutdown();
             }
+            self.release_memory(&name);
 
             let mut state = recover(slot.state.lock());
             state.lifecycle.mark_cold();
@@ -347,6 +471,7 @@ impl<I: Instance> Supervisor<I> {
         drop(state);
 
         let shutdown = instance.map(Instance::shutdown).transpose();
+        self.release_memory(name);
         let mut state = recover(slot.state.lock());
         state.lifecycle.mark_cold();
         state.retry_after = None;
@@ -385,8 +510,9 @@ impl<I: Instance> Supervisor<I> {
             if let Some(instance) = instance
                 && let Err(error) = instance.shutdown()
             {
-                failures.push((name, error));
+                failures.push((name.clone(), error));
             }
+            self.release_memory(&name);
 
             let mut state = recover(slot.state.lock());
             state.lifecycle.mark_cold();
@@ -457,6 +583,74 @@ mod tests {
     fn unknown_app_is_rejected() {
         let supervisor = Supervisor::new(|_spec| Ok(FakeInstance));
         assert_eq!(supervisor.acquire("nope"), Err(AcquireError::Unknown));
+    }
+
+    #[test]
+    fn concurrent_memory_budget_counts_ready_not_cold_apps_and_releases() {
+        let supervisor = Supervisor::new(|_spec| Ok(FakeInstance));
+        supervisor.set_memory_budget(Some(256)).unwrap();
+        let mut first = spec();
+        first.limits.memory_max = 256;
+        let mut second = spec();
+        second.name = "second".into();
+        second.limits.memory_max = 256;
+        supervisor.register("first", first, LifecycleConfig::default());
+        supervisor.register("second", second, LifecycleConfig::default());
+
+        // Merely registering the second cold app consumes no capacity.
+        assert_eq!(supervisor.acquire("first"), Ok(()));
+        assert_eq!(
+            supervisor.acquire("second"),
+            Err(AcquireError::InsufficientMemory {
+                requested: 256,
+                available: 0,
+            })
+        );
+        supervisor.remove("first").unwrap();
+        assert_eq!(supervisor.acquire("second"), Ok(()));
+    }
+
+    #[test]
+    fn control_plane_exemption_does_not_consume_workload_budget() {
+        let supervisor = Supervisor::new(|_spec| Ok(FakeInstance));
+        supervisor.set_memory_budget(Some(128)).unwrap();
+        let mut control = spec();
+        control.limits.memory_max = 512;
+        let mut app = spec();
+        app.name = "app-runtime".into();
+        app.limits.memory_max = 128;
+        supervisor.register("control", control, LifecycleConfig::default());
+        supervisor.set_memory_exempt("control", true).unwrap();
+        supervisor.register("app", app, LifecycleConfig::default());
+
+        assert_eq!(supervisor.acquire("control"), Ok(()));
+        assert_eq!(supervisor.acquire("app"), Ok(()));
+        assert!(supervisor.set_memory_budget(Some(127)).is_err());
+    }
+
+    #[test]
+    fn rolling_replacement_transfers_then_can_restore_reservation() {
+        let supervisor = Supervisor::new(|_spec| Ok(FakeInstance));
+        supervisor.set_memory_budget(Some(256)).unwrap();
+        let mut old = spec();
+        old.limits.memory_max = 256;
+        let mut new = spec();
+        new.name = "new".into();
+        new.limits.memory_max = 256;
+        supervisor.register("old", old, LifecycleConfig::default());
+        supervisor.register("new", new, LifecycleConfig::default());
+        supervisor.acquire("old").unwrap();
+
+        let previous = supervisor
+            .prepare_memory_replacement("old", "new", 256)
+            .unwrap();
+        assert_eq!(previous, Some(256));
+        assert_eq!(supervisor.acquire("new"), Ok(()));
+        supervisor.remove("new").unwrap();
+        supervisor.rollback_memory_replacement("new", "old", previous);
+        assert!(supervisor.set_memory_budget(Some(255)).is_err());
+        supervisor.remove("old").unwrap();
+        assert!(supervisor.set_memory_budget(Some(255)).is_ok());
     }
 
     #[test]

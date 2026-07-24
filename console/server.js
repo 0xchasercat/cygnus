@@ -159,6 +159,10 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   const dashboardDomainRoute = path === "/api/v1/settings/dashboard-domain";
   const dashboardTlsRoute = path === "/api/v1/settings/dashboard-tls";
   const passwordRoute = path === "/api/v1/settings/password";
+  const listenerRoute = path === "/api/v1/settings/listener";
+  const nodeResourcesRoute = path === "/api/v1/settings/node-resources";
+  const appResourcesRoute = /^\/api\/v1\/apps\/[^/]+\/resources$/u.test(path);
+  const appRedeployRoute = /^\/api\/v1\/apps\/[^/]+\/redeploy$/u.test(path);
   const appDomainsRoute = /^\/api\/v1\/apps\/[^/]+\/domains$/u.test(path);
   const appDomainRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+$/u.test(path);
   const appDomainTlsRoute = /^\/api\/v1\/apps\/[^/]+\/domains\/[^/]+\/tls$/u.test(path);
@@ -168,7 +172,7 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   const appEnvKeyRoute = /^\/api\/v1\/apps\/[^/]+\/env\/[^/]+$/u.test(path);
   const githubReposRoute = path === "/api/v1/github/repositories";
   const githubTriggerRoute = /^\/api\/v1\/github\/trigger-deploy$/u.test(path);
-  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || passwordRoute || [
+  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || passwordRoute || listenerRoute || nodeResourcesRoute || appResourcesRoute || appRedeployRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
@@ -338,25 +342,38 @@ export async function setup(request, requestAdmin = adminRequest, socket = admin
   let body;
   try {
     body = await readJsonBody(request);
-    assertExactKeys(body, ["email", "password", "dashboard_domain", "apex_domain", "ssl"]);
+    assertExactKeys(body, ["email", "password", "dashboard_domain", "apex_domain", "ssl", "listener", "dashboard_listen", "https_listen"]);
     safeEmail(body.email);
     safePassword(body.password);
     safeDomain(body.dashboard_domain);
     safeDomain(body.apex_domain);
     if (typeof body.ssl !== "boolean") throw new HttpInputError(422, "validation", "ssl must be a boolean");
+    safeListener(body.listener);
+    safeSocketAddress(body.dashboard_listen, "dashboard_listen");
+    if (body.https_listen !== null) safeSocketAddress(body.https_listen, "https_listen");
   } catch (error) {
     return inputErrorResponse(error);
   }
 
   try {
     const status = await requestAdmin(socket, { type: "account_status" });
-    if (status?.data?.configured !== false) return apiError(409, "conflict", "initial account is already configured");
-    const created = await requestAdmin(socket, {
-      type: "create_initial_account",
-      email: body.email,
-      password: body.password,
-    });
-    const subject = created?.data?.subject;
+    let subject;
+    if (status?.data?.configured === false) {
+      const created = await requestAdmin(socket, {
+        type: "create_initial_account",
+        email: body.email,
+        password: body.password,
+      });
+      subject = created?.data?.subject;
+    } else {
+      const verified = await requestAdmin(socket, {
+        type: "verify_credentials",
+        email: body.email,
+        password: body.password,
+      });
+      if (verified?.data?.ok !== true) return apiError(401, "unauthorized", "initial account exists; enter its credentials to resume setup");
+      subject = verified?.data?.subject;
+    }
     if (!safeAccountSubject(subject)) throw new Error("daemon returned an invalid account subject");
     await requestAdmin(socket, {
       type: "set_dashboard_domain",
@@ -367,6 +384,15 @@ export async function setup(request, requestAdmin = adminRequest, socket = admin
       type: "set_dashboard_tls",
       mode: body.ssl ? "acme" : "self_signed",
       ...(body.ssl ? { email: body.email } : {}),
+    }, subject);
+    // Listener changes deliberately restart the supervised daemon after their
+    // response flushes. Apply the non-restarting setup mutations first so the
+    // wizard cannot race that restart and surface a misleading partial error.
+    await requestAdmin(socket, {
+      type: "set_listener",
+      listener: safeListener(body.listener),
+      dashboard_listen: safeSocketAddress(body.dashboard_listen, "dashboard_listen"),
+      ...(body.https_listen ? { https_listen: safeSocketAddress(body.https_listen, "https_listen") } : {}),
     }, subject);
     const cookie = signSession({ sub: subject });
     return jsonResponse(
@@ -576,6 +602,23 @@ export async function commandForRequest(request, url) {
     assertQueryKeys(url, []);
     return changePasswordCommand(await readJsonBody(request));
   }
+  if (parts.length === 4 && parts[2] === "settings" && parts[3] === "listener") {
+    assertQueryKeys(url, []);
+    return listenerCommand(await readJsonBody(request));
+  }
+  if (parts.length === 4 && parts[2] === "settings" && parts[3] === "node-resources") {
+    assertQueryKeys(url, []);
+    return nodeResourcesCommand(await readJsonBody(request));
+  }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "resources") {
+    assertQueryKeys(url, []);
+    return appResourcesCommand(decodeSegment(parts[3], "app"), await readJsonBody(request));
+  }
+  if (parts.length === 5 && parts[2] === "apps" && parts[4] === "redeploy") {
+    assertQueryKeys(url, []);
+    await assertEmptyBody(request);
+    return { type: "redeploy_app", app: safeApp(decodeSegment(parts[3], "app")) };
+  }
   if (parts.length === 5 && parts[2] === "apps" && parts[4] === "domains") {
     assertQueryKeys(url, []);
     return addAppDomainCommand(decodeSegment(parts[3], "app"), await readJsonBody(request));
@@ -661,7 +704,7 @@ export async function deployUploadIngress(request, url, requestAdmin = adminRequ
 }
 
 export function deployUploadBeginCommand(body) {
-  assertObjectKeys(body, ["app", "total_bytes"], ["domain", "engine_version", "entry", "env", "preview"]);
+  assertObjectKeys(body, ["app", "total_bytes"], ["domain", "engine_version", "entry", "env", "preview", "memory_max_bytes"]);
   const command = {
     type: "deploy_upload_begin",
     app: safeApp(body.app),
@@ -672,6 +715,7 @@ export function deployUploadBeginCommand(body) {
   if (body.entry !== undefined) command.entry = safeEntry(body.entry);
   if (body.env !== undefined) command.env = safeEnvMap(body.env);
   if (body.preview !== undefined) command.preview = safePreviewSlug(body.preview);
+  if (body.memory_max_bytes !== undefined) command.memory_max_bytes = safeInteger(body.memory_max_bytes, "memory_max_bytes", 64 * 1024 * 1024, Number.MAX_SAFE_INTEGER);
   return command;
 }
 
@@ -806,6 +850,39 @@ export function dashboardTlsCommand(body) {
   return command;
 }
 
+export function listenerCommand(body) {
+  assertObjectKeys(body, ["listener", "dashboard_listen"], ["https_listen"]);
+  const command = {
+    type: "set_listener",
+    listener: safeListener(body.listener),
+    dashboard_listen: safeSocketAddress(body.dashboard_listen, "dashboard_listen"),
+  };
+  if (body.https_listen !== undefined && body.https_listen !== null) {
+    command.https_listen = safeSocketAddress(body.https_listen, "https_listen");
+  }
+  return command;
+}
+
+export function nodeResourcesCommand(body) {
+  assertExactKeys(body, ["node_memory_budget_bytes", "app_memory_default_bytes"]);
+  const resources = {
+    node_memory_budget_bytes: body.node_memory_budget_bytes === null
+      ? null
+      : safeInteger(body.node_memory_budget_bytes, "node_memory_budget_bytes", 128 * 1024 * 1024, Number.MAX_SAFE_INTEGER),
+    app_memory_default_bytes: safeInteger(body.app_memory_default_bytes, "app_memory_default_bytes", 64 * 1024 * 1024, Number.MAX_SAFE_INTEGER),
+  };
+  return { type: "set_node_resources", resources };
+}
+
+export function appResourcesCommand(app, body) {
+  assertExactKeys(body, ["memory_max_bytes"]);
+  return {
+    type: "set_app_resources",
+    app: safeApp(app),
+    memory_max_bytes: safeInteger(body.memory_max_bytes, "memory_max_bytes", 64 * 1024 * 1024, Number.MAX_SAFE_INTEGER),
+  };
+}
+
 export function changePasswordCommand(body) {
   assertExactKeys(body, ["email", "current_password", "new_password"]);
   return {
@@ -906,8 +983,8 @@ export function listRepositoriesCommand(limit = 50) {
 export function configureRepositoryCommand(body) {
   assertObjectKeys(
     body,
-    ["installation_id", "repository_id", "owner", "name", "branch", "app", "domain", "engine_version"],
-    ["entry"],
+    ["installation_id", "repository_id", "owner", "name", "branch", "app", "engine_version"],
+    ["entry", "domain", "memory_max_bytes"],
   );
   const repository = {
     installation_id: safePositiveId(body.installation_id),
@@ -916,9 +993,10 @@ export function configureRepositoryCommand(body) {
     name: safeGithubName(body.name),
     branch: safeGithubBranch(body.branch),
     app: safeApp(body.app),
-    domain: safeDomain(body.domain),
     engine_version: safeVersion(body.engine_version),
   };
+  if (body.domain) repository.domain = safeDomain(body.domain);
+  if (body.memory_max_bytes !== undefined) repository.memory_max_bytes = safeInteger(body.memory_max_bytes, "memory_max_bytes", 64 * 1024 * 1024, Number.MAX_SAFE_INTEGER);
   // Empty/omitted entry → daemon auto-detects static vs server.
   if (body.entry !== undefined && body.entry !== null && String(body.entry).trim() !== "") {
     repository.entry = safeEntry(body.entry);
@@ -1029,6 +1107,47 @@ function safeDomain(value) {
     throw new HttpInputError(422, "validation", "domain is invalid");
   }
   return value;
+}
+
+function safeSocketAddress(value, name) {
+  if (typeof value !== "string" || value.length > 512 || !/^(?:\[[0-9a-f:]+\]|[^:\s]+):\d{1,5}$/iu.test(value)) {
+    throw new HttpInputError(422, "validation", `${name} must be a host:port socket address`);
+  }
+  const port = Number(value.slice(value.lastIndexOf(":") + 1));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new HttpInputError(422, "validation", `${name} port must be between 1 and 65535`);
+  }
+  return value;
+}
+
+function safeListener(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpInputError(422, "validation", "listener must be an object");
+  }
+  if (value.mode === "integrated") {
+    assertExactKeys(value, ["mode", "http_listen"]);
+    return { mode: "integrated", http_listen: safeSocketAddress(value.http_listen, "http_listen") };
+  }
+  if (value.mode === "tcp") {
+    assertExactKeys(value, ["mode", "host", "port_start", "port_end", "advertise_host"]);
+    const portStart = safeInteger(value.port_start, "port_start", 1, 65535);
+    const portEnd = safeInteger(value.port_end, "port_end", portStart, 65535);
+    if (typeof value.host !== "string" || !value.host || value.host.length > 253) throw new HttpInputError(422, "validation", "host is invalid");
+    if (typeof value.advertise_host !== "string" || !value.advertise_host.trim() || value.advertise_host.length > 253) throw new HttpInputError(422, "validation", "advertise_host is required");
+    return { mode: "tcp", host: value.host, port_start: portStart, port_end: portEnd, advertise_host: value.advertise_host.trim() };
+  }
+  if (value.mode === "uds") {
+    assertObjectKeys(value, ["mode", "socket_dir", "socket_mode"], ["socket_group"]);
+    if (typeof value.socket_dir !== "string" || !value.socket_dir.startsWith("/") || value.socket_dir.length > 4096) throw new HttpInputError(422, "validation", "socket_dir must be an absolute path");
+    if (value.socket_group !== null && value.socket_group !== undefined && (typeof value.socket_group !== "string" || value.socket_group.length > 64)) throw new HttpInputError(422, "validation", "socket_group is invalid");
+    return {
+      mode: "uds",
+      socket_dir: value.socket_dir,
+      ...(value.socket_group ? { socket_group: value.socket_group } : {}),
+      socket_mode: safeInteger(value.socket_mode, "socket_mode", 0, 0o777),
+    };
+  }
+  throw new HttpInputError(422, "validation", "listener mode must be integrated, tcp, or uds");
 }
 function nullableDomain(value, name) {
   if (value === null) return null;

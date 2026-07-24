@@ -6,6 +6,7 @@
   import Icon from '../components/Icon.svelte';
   import Terminal from '../components/Terminal.svelte';
   import Anatomy from '../components/Anatomy.svelte';
+  import { appEndpoint, listenerMode } from '../endpoints.js';
 
   const app = $derived(
     store.appByName(ui.appId) ??
@@ -261,7 +262,9 @@
   const anatomyPhases = $derived(
     bootPhases.map((p) => ({ ...p, hot: hotPhase && p.name === hotPhase.name })),
   );
-  const liveUrl = $derived(app?.domains?.[0] ? `https://${app.domains[0]}` : null);
+  const ingressMode = $derived(listenerMode(store.node));
+  const endpoint = $derived(app ? appEndpoint(store.node, app) : null);
+  const liveUrl = $derived(ingressMode === 'integrated' && app?.domains?.[0] ? `https://${app.domains[0]}` : null);
 
   let rollbackOpen = $state(false);
   let rollbackTarget = $state(null);
@@ -350,6 +353,10 @@
         {#if liveUrl}
           <a class="btn primary" href={liveUrl} target="_blank" rel="noopener noreferrer"
             ><Icon name="ext" size={13} />Visit</a
+          >
+        {:else if endpoint}
+          <button class="btn primary" type="button" onclick={() => navigator.clipboard?.writeText(endpoint)}
+            ><Icon name="copy" size={13} />Copy endpoint</button
           >
         {/if}
       </div>
@@ -490,6 +497,11 @@
                 <a class="num liveurl" href={liveUrl} target="_blank" rel="noopener noreferrer"
                   >{app.domains[0]}</a
                 >
+              </div>
+            {:else if endpoint}
+              <div class="kvrow">
+                <span>Endpoint</span>
+                <button class="num liveurl" type="button" onclick={() => navigator.clipboard?.writeText(endpoint)}>{endpoint}</button>
               </div>
             {/if}
             {#if elapsedMs != null}

@@ -12,6 +12,11 @@ function ts(minAgo) {
 export const previewNode = {
   listen: '0.0.0.0:3443',
   https_listen: '0.0.0.0:3443',
+  listener: { mode: 'integrated', http_listen: '0.0.0.0:3080' },
+  resources: {
+    node_memory_budget_bytes: 24 * 1024 * 1024 * 1024,
+    app_memory_default_bytes: 256 * 1024 * 1024,
+  },
   apps_domain: 'swan.host',
   app_count: 8,
   version: 'cygnus 0.9.2',

@@ -82,6 +82,55 @@ cygnus deploy --source-dir . --app my-app
 
 The build output streams to your terminal and the live URL prints at the end.
 
+### Listener modes and resources
+
+The default `integrated` mode remains the simplest setup: Cygnus owns HTTP
+and TLS ingress and routes domains to apps. Advanced installations can select
+`tcp` (one stable, persisted port per app) or `uds` (one stable daemon-owned
+socket per app for an external reverse proxy). The dashboard keeps its own
+TCP listener in every mode.
+
+The same settings are accepted in `node.json`:
+
+```json
+{
+  "listen": "0.0.0.0:3000",
+  "listener": {
+    "mode": "integrated",
+    "http_listen": "0.0.0.0:80"
+  },
+  "resources": {
+    "node_memory_budget_bytes": 4294967296,
+    "app_memory_default_bytes": 536870912
+  },
+  "edge": {
+    "https_listen": "0.0.0.0:443"
+  },
+  "apps": []
+}
+```
+
+TCP mode uses `host`, `port_start`, `port_end`, and (when binding a wildcard
+address) `advertise_host`. UDS mode uses `socket_dir`, optional
+`socket_group`, and an octal `socket_mode` such as `"0660"`. Existing
+configuration files with no `listener` or `resources` fields retain the
+integrated behavior and current app limits.
+
+Useful node-only CLI updates—none replace the app list—include:
+
+```sh
+cygnus listener --mode tcp --advertise-host node.example.com
+cygnus dashboard-listen --listen 0.0.0.0:3000
+cygnus node-resources --node-memory-budget-bytes 4294967296 \
+  --app-memory-default-bytes 536870912
+cygnus app-resources my-app --memory-max-bytes 1073741824
+cygnus env set my-app API_URL https://api.example.com
+```
+
+Environment and per-app resource changes are durable and reported as pending
+until the app is redeployed; the dashboard and API expose both desired and
+applied configuration revisions.
+
 ## 5. Operate
 
 - **Dashboard** — latency charts, cold-start anatomy, live request stream,

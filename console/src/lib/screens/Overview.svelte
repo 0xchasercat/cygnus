@@ -7,6 +7,7 @@
   import Identicon from '../components/Identicon.svelte';
   import Icon from '../components/Icon.svelte';
   import Spark from '../components/Spark.svelte';
+  import { appEndpoint } from '../endpoints.js';
 
   let filter = $state('all');
   const filtered = $derived(
@@ -114,7 +115,7 @@
               </div>
               <span class="led {ledFor(a)}" class:breathe={a.lifecycle_state === 'ready'}></span>
             </div>
-            <span class="domain num">{a.domains?.[0] ?? (a.name === 'tenant-0' ? store.node?.dashboard_domain : null) ?? 'unrouted'}</span>
+            <span class="domain num" title={appEndpoint(store.node, a)}>{appEndpoint(store.node, a)}</span>
             <div class="foot">
               <span class="meta num">
                 {#if a.lifecycle_state === 'building'}
@@ -313,6 +314,10 @@
     border-radius: 7px;
     padding: 4px 8px;
     width: fit-content;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .foot {
     display: flex;
@@ -397,11 +402,13 @@
     letter-spacing: 0.06em;
   }
   .event {
-    display: flex;
+    display: grid;
+    grid-template-columns: 26px minmax(0, 1fr) auto;
     gap: 11px;
     padding: 10px 9px;
     align-items: flex-start;
     border-top: none !important;
+    overflow: hidden;
   }
   .event + .event { border-top: 1px solid var(--line-2) !important; }
   .event-btn {
@@ -427,6 +434,7 @@
     flex-direction: column;
     gap: 1px;
     min-width: 0;
+    overflow: hidden;
   }
   .eapp {
     font-size: 11px;
@@ -437,12 +445,14 @@
     font-size: 11.5px;
     color: var(--ink-3);
     line-height: 1.45;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
   .ewhen {
-    margin-left: auto;
     font-size: 10.5px;
     color: var(--ink-4);
     flex: none;
+    white-space: nowrap;
   }
 
   /* node card */
@@ -496,5 +506,17 @@
     .appgrid { grid-template-columns: 1fr; }
     .pulse { flex-wrap: wrap; gap: 18px; }
     .hairline-v { display: none; }
+    .side { position: static; }
+  }
+
+  @media (max-width: 620px) {
+    .page { padding: 14px 16px 0; }
+    .pulse { padding: 18px 0; }
+    .cell { flex: 1 1 46%; padding: 0 18px; }
+    .colhead { align-items: flex-start; flex-wrap: wrap; }
+    .seg { order: 2; width: 100%; }
+    .seg button { flex: 1; min-height: 40px; }
+    .event { grid-template-columns: 26px minmax(0, 1fr); }
+    .ewhen { grid-column: 2; margin-top: 2px; }
   }
 </style>

@@ -316,7 +316,7 @@ class Store {
   // First-run setup: create the admin account, store the dashboard/apex
   // domains + SSL baseline, and log in. The backend sets the session cookie.
   // 409 means an admin already exists — fall back to the login screen.
-  async setup({ email, password, dashboardDomain, apexDomain, ssl }) {
+  async setup({ email, password, dashboardDomain, apexDomain, ssl, listener, dashboardListen, httpsListen }) {
     try {
       await post('/api/v1/setup', {
         email,
@@ -324,6 +324,9 @@ class Store {
         dashboard_domain: dashboardDomain || '',
         apex_domain: apexDomain || '',
         ssl,
+        listener,
+        dashboard_listen: dashboardListen,
+        https_listen: httpsListen,
       });
       this.auth = 'ready';
       this.start();
@@ -510,6 +513,61 @@ class Store {
       return { ok: true };
     } catch (cause) {
       return { ok: false, error: cause instanceof Error ? cause.message : 'Could not remove env var' };
+    }
+  }
+
+  async setAppResources(appName, { memoryMaxBytes }) {
+    try {
+      await post(`/api/v1/apps/${encodeURIComponent(appName)}/resources`, {
+        memory_max_bytes: memoryMaxBytes,
+      });
+      this.notice = `Memory limit updated for ${appName}.`;
+      await this.#safeGet('/api/v1/apps?limit=50', (d) => {
+        this.apps = Array.isArray(d?.apps) ? d.apps : this.apps;
+      });
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not update app resources' };
+    }
+  }
+
+  async redeployApp(appName) {
+    try {
+      const data = await post(`/api/v1/apps/${encodeURIComponent(appName)}/redeploy`);
+      this.notice = `Redeploy queued for ${appName}.`;
+      await Promise.all([this.#poll(), this.#pollDeployments()]);
+      return {
+        ok: true,
+        deploymentId: data?.deployment_id ?? data?.id ?? null,
+      };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not queue redeploy' };
+    }
+  }
+
+  async setNodeResources({ nodeMemoryBudgetBytes, appMemoryDefaultBytes }) {
+    try {
+      await post('/api/v1/settings/node-resources', {
+        node_memory_budget_bytes: nodeMemoryBudgetBytes,
+        app_memory_default_bytes: appMemoryDefaultBytes,
+      });
+      this.notice = 'Node memory policy updated.';
+      await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not update node resources' };
+    }
+  }
+
+  async setListener(listener) {
+    try {
+      const data = await post('/api/v1/settings/listener', listener);
+      this.notice = 'Listener configuration updated.';
+      // The daemon may restart and briefly drop the current origin.
+      void this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
+      return { ok: true, restartRequired: data?.restart_required === true };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not update listener configuration' };
     }
   }
 
@@ -818,7 +876,7 @@ class Store {
   // Packs an already-built tarball (Uint8Array) through begin/chunk/finish,
   // reporting progress via the onProgress callback (0..1). Returns the
   // deployment_id on success.
-  async deployUpload({ app, domain, engineVersion, entry, env, preview, tarball, totalBytes, onProgress }) {
+  async deployUpload({ app, domain, engineVersion, entry, env, preview, memoryMaxBytes, tarball, totalBytes, onProgress }) {
     const begin = {
       app,
       total_bytes: totalBytes,
@@ -827,6 +885,7 @@ class Store {
       ...(entry ? { entry } : {}),
       ...(env && Object.keys(env).length ? { env } : {}),
       ...(preview ? { preview } : {}),
+      ...(memoryMaxBytes ? { memory_max_bytes: memoryMaxBytes } : {}),
     };
     let uploadId;
     try {

@@ -38,6 +38,10 @@ make_bundle() {
 case "$(basename "$0")" in
   cygnus)
     printf '%s\n' "$*" >> "${CYGNUS_TEST_CTL_LOG:?}"
+    case " $* " in
+      *" health "*) exit "${CYGNUS_TEST_HEALTH_STATUS:-0}" ;;
+      *" dashboard-listen "*) exit "${CYGNUS_TEST_RECONFIGURE_STATUS:-0}" ;;
+    esac
     exit 0
     ;;
   *) exit 0 ;;
@@ -57,6 +61,10 @@ if [ "$1" = restart ] && [ "${CYGNUS_TEST_NO_READY:-0}" != 1 ]; then
   mkdir -p "$(dirname "$CYGNUS_TEST_READY_FILE")" "$(dirname "$CYGNUS_TEST_TENANT_READY_FILE")"
   : >"$CYGNUS_TEST_READY_FILE"
   : >"$CYGNUS_TEST_TENANT_READY_FILE"
+  if [ -n "${CYGNUS_TEST_STATE_FILE:-}" ] && [ ! -e "$CYGNUS_TEST_STATE_FILE" ]; then
+    mkdir -p "$(dirname "$CYGNUS_TEST_STATE_FILE")"
+    : >"$CYGNUS_TEST_STATE_FILE"
+  fi
 fi
 exit "${CYGNUS_TEST_SYSTEMCTL_STATUS:-0}"
 EOF
@@ -78,6 +86,10 @@ if [ "$status" = 0 ] && [ "${CYGNUS_TEST_NO_READY:-0}" != 1 ]; then
   mkdir -p "$(dirname "$CYGNUS_TEST_READY_FILE")" "$(dirname "$CYGNUS_TEST_TENANT_READY_FILE")"
   : >"$CYGNUS_TEST_READY_FILE"
   : >"$CYGNUS_TEST_TENANT_READY_FILE"
+  if [ -n "${CYGNUS_TEST_STATE_FILE:-}" ] && [ ! -e "$CYGNUS_TEST_STATE_FILE" ]; then
+    mkdir -p "$(dirname "$CYGNUS_TEST_STATE_FILE")"
+    : >"$CYGNUS_TEST_STATE_FILE"
+  fi
 fi
 exit "$status"
 EOF
@@ -89,6 +101,7 @@ export CYGNUS_TEST_CTL_LOG="$ROOT/ctl.log"
 export CYGNUS_TEST_SYSTEMCTL_LOG="$ROOT/systemctl.log"
 export CYGNUS_TEST_READY_FILE="$ROOT/run/cygnus/admin.sock"
 export CYGNUS_TEST_TENANT_READY_FILE="$ROOT/run/cygnus/tenant-0/admin.sock"
+export CYGNUS_TEST_STATE_FILE="$ROOT/var/lib/cygnus/state.db"
 export PATH="$FAKEBIN:$PATH"
 
 run_install() {
@@ -132,7 +145,7 @@ make_bundle
 
 # 3. First install creates the rooted console, pinned Tenant Zero config, and
 # least-privilege files/directories.
-run_install >"$ROOT/install-output" 2>&1
+run_install >"$ROOT/install-output" 2>&1 || { cat "$ROOT/install-output" >&2; echo 'first install failed' >&2; exit 1; }
 [[ -x $ROOT/usr/local/bin/cygnus-daemon && -x $ROOT/usr/local/bin/cygnus && -x $ROOT/usr/local/bin/cygnus-init ]] || { echo 'binaries missing' >&2; exit 1; }
 [[ -L $ROOT/usr/local/bin/cygnusctl ]] || { echo 'cygnusctl compatibility symlink missing' >&2; exit 1; }
 [[ $(readlink "$ROOT/usr/local/bin/cygnusctl") == cygnus ]] || { echo 'cygnusctl symlink does not point at cygnus' >&2; exit 1; }
@@ -234,11 +247,14 @@ make_bundle
 run_install
 # A plain rerun with different generated defaults remains a successful package
 # upgrade and preserves operator configuration. `--reconfigure` opts into the
-# new values.
+# requested node-only values without applying the bootstrap document.
 bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE"   --prefix "$ROOT/usr/local/bin" --config-dir "$ROOT/etc/cygnus"   --state-dir "$ROOT/var/lib/cygnus" --runtime-dir "$ROOT/run/cygnus"   --listen 127.0.0.1:3399 --https-listen 127.0.0.1:3443 --apps-domain apps.test   --acme-email ops@apps.test --dns-provider cloudflare --bun-version 1.3.14
 [[ $(cat "$ROOT/etc/cygnus/node.json") == "$config_before" ]] || { echo 'config changed without --reconfigure' >&2; exit 1; }
+: >"$ROOT/ctl.log"
 run_install --reconfigure --listen 127.0.0.1:3399
-grep -q '127.0.0.1:3399' "$ROOT/etc/cygnus/node.json" || { echo 'reconfigure did not replace node config' >&2; exit 1; }
+[[ $(cat "$ROOT/etc/cygnus/node.json") == "$config_before" ]] || { echo 'reconfigure replaced bootstrap config or app set' >&2; exit 1; }
+grep -q 'dashboard-listen.*--listen 127.0.0.1:3399' "$ROOT/ctl.log" || { echo 'reconfigure did not use node-only listener command' >&2; exit 1; }
+! grep -q ' apply ' "$ROOT/ctl.log" || { echo 'reconfigure used destructive full apply' >&2; exit 1; }
 # Restore the original listen address for later readiness checks.
 run_install --reconfigure --listen 127.0.0.1:3300
 
@@ -259,10 +275,29 @@ assert app["env"]["CYGNUS_CONSOLE_BOOTSTRAP_TOKEN_FILE"] == "/cygnus/secrets/boo
 assert app["env"]["CYGNUS_CONSOLE_SESSION_KEY_FILE"] == "/cygnus/secrets/session.key"
 PY
 
-# 7. Noninteractive mode fails when required bundle input is absent.
+# 7. A bad upgrade is rolled back after health fails: binary, config, and the
+# quiesced state database all return to the previous working bytes.
+rollback_daemon_before=$(hash_file "$ROOT/usr/local/bin/cygnus-daemon")
+rollback_config_before=$(hash_file "$ROOT/etc/cygnus/node.json")
+printf '%s\n' 'durable-state-before-upgrade' >"$ROOT/var/lib/cygnus/state.db"
+rollback_state_before=$(hash_file "$ROOT/var/lib/cygnus/state.db")
+printf '%s\n' '#!/usr/bin/env sh' 'exit 0' '# unhealthy-candidate' >"$BUNDLE/cygnus-daemon"
+chmod 0755 "$BUNDLE/cygnus-daemon"
+write_checksums
+export CYGNUS_TEST_HEALTH_STATUS=1
+expect_fail run_install --reconfigure
+unset CYGNUS_TEST_HEALTH_STATUS
+[[ $(hash_file "$ROOT/usr/local/bin/cygnus-daemon") == "$rollback_daemon_before" ]] || { echo 'failed upgrade did not restore daemon binary' >&2; exit 1; }
+[[ $(hash_file "$ROOT/etc/cygnus/node.json") == "$rollback_config_before" ]] || { echo 'failed upgrade did not restore node config' >&2; exit 1; }
+[[ $(hash_file "$ROOT/var/lib/cygnus/state.db") == "$rollback_state_before" ]] || { echo 'failed upgrade did not restore state database' >&2; exit 1; }
+grep -q 'restart cygnus.service' "$ROOT/systemctl.log" || { echo 'failed upgrade did not restart restored service' >&2; exit 1; }
+make_bundle
+run_install
+
+# 8. Noninteractive mode fails when required bundle input is absent.
 expect_fail env CYGNUS_INSTALL_TEST_MODE=1 CYGNUS_INSTALL_TEST_ROOT="$ROOT/missing" PATH="$PATH" bash "$INSTALLER" --noninteractive --prefix "$ROOT/missing/bin"
 
-# 8. Daemon readiness failure stops before either admin mutation.
+# 9. Daemon readiness failure stops before either admin mutation.
 ROOT_FAIL=$ROOT/failure
 BUNDLE_FAIL=$ROOT_FAIL/release
 mkdir -p "$BUNDLE_FAIL"
@@ -281,7 +316,7 @@ expect_fail bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE_FAIL" \
 [[ ! -e ${CYGNUS_TEST_CTL_LOG:-} ]] || { echo 'admin mutation ran before readiness' >&2; exit 1; }
 unset CYGNUS_TEST_NO_READY
 
-# 9. Darwin accepts exactly the four-member bundle and installs a rootless,
+# 10. Darwin accepts exactly the four-member bundle and installs a rootless,
 # launchd-managed Tenant Zero using user-owned defaults.
 DARWIN_ROOT=$ROOT/darwin
 DARWIN_HOME=$DARWIN_ROOT/home
@@ -297,6 +332,7 @@ export CYGNUS_TEST_SYSTEMCTL_LOG="$DARWIN_ROOT/systemctl.log"
 export CYGNUS_TEST_LAUNCHCTL_LOG="$DARWIN_ROOT/launchctl.log"
 export CYGNUS_TEST_READY_FILE="$DARWIN_HOME/.cygnus/run/admin.sock"
 export CYGNUS_TEST_TENANT_READY_FILE="$DARWIN_HOME/.cygnus/run/tenant-0/admin.sock"
+export CYGNUS_TEST_STATE_FILE="$DARWIN_HOME/.cygnus/state/state.db"
 run_darwin_install() {
   bash "$INSTALLER" --noninteractive --bundle-dir "$BUNDLE" \
     --listen 127.0.0.1:3000 --apps-domain apps.localhost --bun-version 1.3.14 "$@"

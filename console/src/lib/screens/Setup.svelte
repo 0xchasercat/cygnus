@@ -4,10 +4,10 @@
 
   // Three quiet steps. Progress reads as "1 · 2 · 3" hairline segments,
   // not a loud stepper — the wizard should feel like turning a precision knob.
-  const STEPS = ['admin', 'domain', 'ssl'];
-  const STEP_LABEL = { admin: 'Create admin', domain: 'Dashboard URL', ssl: 'Encryption' };
+  const STEPS = ['admin', 'listener', 'domain', 'ssl'];
+  const STEP_LABEL = { admin: 'Create admin', listener: 'Listener', domain: 'Endpoint', ssl: 'Finish' };
 
-  let step = $state(0); // 0..2
+  let step = $state(0); // 0..3
 
   // step 1 — admin
   let email = $state('');
@@ -24,6 +24,19 @@
 
   // step 3 — ssl
   let sslAuto = $state(true);
+
+  // Working-default ingress, with advanced modes disclosed only when chosen.
+  let listenerMode = $state('integrated');
+  let httpPort = $state(80);
+  let httpsPort = $state(443);
+  let dashboardPort = $state(3000);
+  let appPortStart = $state(10000);
+  let appPortEnd = $state(19999);
+  let advertiseHost = $state('');
+  let socketDir = $state('/run/cygnus/apps');
+  let socketGroup = $state('www-data');
+  let socketMode = $state('0660');
+  let listenerError = $state('');
 
   let submitting = $state(false);
   let submitError = $state('');
@@ -101,12 +114,12 @@
     const dash = dashboardDomain.trim().toLowerCase();
     if (dash && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(dash)) {
       domainError = 'Enter a domain like dashboard.example.com.';
-      step = 1;
+      step = 2;
       return;
     }
-    if (effectiveApex && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(effectiveApex)) {
+    if (listenerMode === 'integrated' && effectiveApex && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(effectiveApex)) {
       domainError = 'Apps domain looks off — check the spelling.';
-      step = 1;
+      step = 2;
       return;
     }
     submitting = true;
@@ -115,8 +128,11 @@
       email: email.trim(),
       password,
       dashboardDomain: dash,
-      apexDomain: effectiveApex,
-      ssl: sslAuto,
+      apexDomain: listenerMode === 'integrated' ? effectiveApex : '',
+      ssl: listenerMode === 'integrated' && sslAuto,
+      listener: listenerPayload(),
+      dashboardListen: `0.0.0.0:${dashboardPort}`,
+      httpsListen: listenerMode === 'integrated' ? `0.0.0.0:${httpsPort}` : null,
     });
     submitting = false;
     if (!r.ok) {
@@ -127,6 +143,52 @@
       }
       submitError = r.error ?? 'Setup could not complete.';
     }
+  }
+
+  function listenerPayload() {
+    if (listenerMode === 'tcp') {
+      return {
+        mode: 'tcp',
+        host: '0.0.0.0',
+        port_start: Number(appPortStart),
+        port_end: Number(appPortEnd),
+        advertise_host: advertiseHost.trim(),
+      };
+    }
+    if (listenerMode === 'uds') {
+      return {
+        mode: 'uds',
+        socket_dir: socketDir.trim(),
+        socket_group: socketGroup.trim() || null,
+        socket_mode: parseInt(socketMode, 8),
+      };
+    }
+    return {
+      mode: 'integrated',
+      http_listen: `0.0.0.0:${httpPort}`,
+    };
+  }
+
+  function nextFromListener() {
+    listenerError = '';
+    const ports = [dashboardPort, ...(listenerMode === 'integrated' ? [httpPort, httpsPort] : [])].map(Number);
+    if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535) || new Set(ports).size !== ports.length) {
+      listenerError = 'Ports must be unique whole numbers from 1 to 65535.';
+      return;
+    }
+    if (listenerMode === 'tcp' && (!Number.isInteger(Number(appPortStart)) || !Number.isInteger(Number(appPortEnd)) || Number(appPortStart) < 1 || Number(appPortEnd) > 65535 || Number(appPortStart) > Number(appPortEnd))) {
+      listenerError = 'Enter a valid app port range within 1–65535.';
+      return;
+    }
+    if (listenerMode === 'tcp' && !advertiseHost.trim()) {
+      listenerError = 'Enter the public host or IP users will connect to.';
+      return;
+    }
+    if (listenerMode === 'uds' && (!socketDir.startsWith('/') || !/^0[0-7]{3}$/.test(socketMode))) {
+      listenerError = 'Use an absolute socket directory and a four-digit octal mode such as 0660.';
+      return;
+    }
+    step = 2;
   }
 
   function onKeydown(e) {
@@ -146,7 +208,7 @@
     <p class="line">First-run setup · create the admin account</p>
 
     <!-- quiet hairline progress: 1 · 2 · 3 -->
-    <div class="steps" aria-label={`Step ${step + 1} of 3`}>
+    <div class="steps" aria-label={`Step ${step + 1} of ${STEPS.length}`}>
       {#each STEPS as s, i}
         <span class="seg {i === step ? 'on' : i < step ? 'done' : ''}">
           <span class="seg-bar"></span>
@@ -213,8 +275,54 @@
       </div>
     {:else if step === 1}
       <div class="body screen-enter">
-        <p class="lede">Where will the console live? Add a domain now, or skip it — Cygnus is reachable by IP until you point DNS.</p>
-        <form class="form" onsubmit={(e) => { e.preventDefault(); step = 2; }}>
+        <p class="lede">Choose how apps leave this node. Integrated is the fuss-free default: Cygnus owns ingress and HTTPS.</p>
+        <form class="form" onsubmit={(e) => { e.preventDefault(); nextFromListener(); }}>
+          <fieldset class="mode-picker">
+            <legend>Listener mode</legend>
+            {#each [
+              { id: 'integrated', title: 'Integrated', copy: 'Domains + automatic HTTPS. Recommended.' },
+              { id: 'tcp', title: 'TCP ports', copy: 'One host port per app; TLS stays upstream.' },
+              { id: 'uds', title: 'Unix sockets', copy: 'No app TCP ports; connect a local proxy.' },
+            ] as mode}
+              <label class:chosen={listenerMode === mode.id}>
+                <input type="radio" name="listener-mode" value={mode.id} bind:group={listenerMode} />
+                <span><strong>{mode.title}</strong><small>{mode.copy}</small></span>
+              </label>
+            {/each}
+          </fieldset>
+
+          <div class="listener-fields">
+            <label>Dashboard port<input bind:value={dashboardPort} type="number" min="1" max="65535" required /></label>
+            {#if listenerMode === 'integrated'}
+              <label>HTTP port<input bind:value={httpPort} type="number" min="1" max="65535" required /></label>
+              <label>HTTPS port<input bind:value={httpsPort} type="number" min="1" max="65535" required /></label>
+            {:else if listenerMode === 'tcp'}
+              <label>App ports · from<input bind:value={appPortStart} type="number" min="1" max="65535" required /></label>
+              <label>App ports · through<input bind:value={appPortEnd} type="number" min="1" max="65535" required /></label>
+              <label class="wide">Public host or IP<input bind:value={advertiseHost} maxlength="253" placeholder="node.example.com or 203.0.113.10" required /></label>
+              <p class="note mono">Apps receive the next free port in this range. Open the range in your firewall or proxy only as broadly as needed.</p>
+            {:else}
+              <label class="wide">Socket directory<input bind:value={socketDir} maxlength="4096" required /></label>
+              <label>Proxy group<input bind:value={socketGroup} maxlength="64" placeholder="www-data" /></label>
+              <label>Socket mode<input bind:value={socketMode} inputmode="numeric" pattern="0[0-7]{3}" maxlength="4" required /></label>
+              <p class="note mono">Apps appear as {socketDir || '/run/cygnus/apps'}/&lt;app&gt;.sock · point Caddy or Nginx upstream at that path.</p>
+            {/if}
+          </div>
+          {#if listenerError}<p class="err" role="alert">{listenerError}</p>{/if}
+          <div class="rowbtns">
+            <button class="btn" type="button" onclick={back}>Back</button>
+            <button class="btn cobalt" type="submit">Continue</button>
+          </div>
+        </form>
+      </div>
+    {:else if step === 2}
+      <div class="body screen-enter">
+        <p class="lede">
+          {listenerMode === 'integrated'
+            ? 'Where will the console live? Add a domain now, or skip it — Cygnus remains reachable by IP.'
+            : 'Your dashboard remains on TCP; app endpoints are allocated automatically from the listener policy.'}
+        </p>
+        <form class="form" onsubmit={(e) => { e.preventDefault(); step = 3; }}>
           <label for="su-dash">Dashboard domain
             <input
               id="su-dash"
@@ -229,29 +337,24 @@
           </label>
           {#if domainError}<p class="err" role="alert">{domainError}</p>{/if}
 
-          <div class="derived">
-            <span class="dlabel">Apps will be served at</span>
-            <span class="dvalue num">*.{effectiveApex || 'apps.localhost'}</span>
-          </div>
-
-          <label for="su-apex" class="apexlab">
-            <span>Apps domain <span class="muted">· editable</span></span>
-            <span class="apex-row">
-              <input
-                id="su-apex"
-                value={apexDomain}
-                oninput={apexInput}
-                type="text"
-                autocapitalize="off"
-                spellcheck="false"
-                maxlength="253"
-                placeholder="example.com"
-              />
-              {#if apexTouched}
-                <button type="button" class="reset" onclick={resetApexToDerived}>reset</button>
-              {/if}
-            </span>
-          </label>
+          {#if listenerMode === 'integrated'}
+            <div class="derived">
+              <span class="dlabel">Apps will be served at</span>
+              <span class="dvalue num">*.{effectiveApex || 'apps.localhost'}</span>
+            </div>
+            <label for="su-apex" class="apexlab">
+              <span>Apps domain <span class="muted">· editable</span></span>
+              <span class="apex-row">
+                <input id="su-apex" value={apexDomain} oninput={apexInput} type="text" autocapitalize="off" spellcheck="false" maxlength="253" placeholder="example.com" />
+                {#if apexTouched}<button type="button" class="reset" onclick={resetApexToDerived}>reset</button>{/if}
+              </span>
+            </label>
+          {:else}
+            <div class="derived">
+              <span class="dlabel">App endpoint</span>
+              <span class="dvalue num">{listenerMode === 'tcp' ? `node:${appPortStart}–${appPortEnd}` : `${socketDir}/<app>.sock`}</span>
+            </div>
+          {/if}
 
           <p class="note mono">You don't need to own this domain or have DNS configured yet — you can point it later.</p>
 
@@ -263,8 +366,9 @@
       </div>
     {:else}
       <div class="body screen-enter">
-        <p class="lede">Last knob. HTTPS is on by default — Cygnus issues a trusted certificate the moment DNS propagates.</p>
+        <p class="lede">{listenerMode === 'integrated' ? 'Last knob. HTTPS is on by default — Cygnus issues a trusted certificate when DNS propagates.' : 'Everything is ready. TLS for app traffic stays with your upstream proxy.'}</p>
         <form class="form" onsubmit={(e) => { e.preventDefault(); finish(); }}>
+          {#if listenerMode === 'integrated'}
           <button type="button" class="toggle {sslAuto ? 'on' : ''}" onclick={() => (sslAuto = !sslAuto)} aria-pressed={sslAuto}>
             <span class="track"><span class="thumb"></span></span>
             <span class="tmeta">
@@ -280,6 +384,13 @@
               Self-signed only. Browsers will warn until you switch to automatic HTTPS from Settings.
             {/if}
           </p>
+          {:else}
+            <div class="derived">
+              <span class="dlabel">{listenerMode === 'tcp' ? 'App ports' : 'Socket directory'}</span>
+              <span class="dvalue num">{listenerMode === 'tcp' ? `${appPortStart}–${appPortEnd}` : socketDir}</span>
+            </div>
+            <p class="note mono">Dashboard listens on port {dashboardPort}. App TLS termination and public routing remain under your control.</p>
+          {/if}
 
           {#if submitError}<p class="err" role="alert">{submitError}</p>{/if}
 
@@ -305,7 +416,7 @@
     padding: 24px;
   }
   .card {
-    width: 460px;
+    width: 520px;
     max-width: 100%;
     background: var(--surface);
     border: 1px solid var(--line);
@@ -376,6 +487,44 @@
     flex-direction: column;
     gap: 10px;
   }
+  .mode-picker {
+    display: grid;
+    gap: 7px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  .mode-picker legend {
+    margin-bottom: 6px;
+    font: 500 10px var(--mono);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .mode-picker label {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    align-items: start;
+    gap: 10px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .mode-picker label.chosen { border-color: color-mix(in srgb, var(--cobalt) 42%, var(--line)); background: var(--cobalt-ghost); }
+  .mode-picker input { width: 15px; height: 15px; margin-top: 2px; accent-color: var(--cobalt); }
+  .mode-picker span { display: grid; gap: 2px; }
+  .mode-picker strong { font: 600 12.5px var(--sans); color: var(--ink); }
+  .mode-picker small { font: 400 11px var(--sans); color: var(--ink-3); }
+  .listener-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    padding-top: 4px;
+  }
+  .listener-fields .wide, .listener-fields .note { grid-column: 1 / -1; }
   label {
     display: grid;
     gap: 6px;
@@ -530,5 +679,7 @@
     .card { padding: 28px 22px 24px; }
     .seg-label { display: none; }
     .rowbtns .btn:first-child { flex: 0 0 90px; }
+    .listener-fields { grid-template-columns: 1fr; }
+    .listener-fields .wide, .listener-fields .note { grid-column: auto; }
   }
 </style>
