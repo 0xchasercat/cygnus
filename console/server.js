@@ -345,11 +345,15 @@ export async function setup(request, requestAdmin = adminRequest, socket = admin
     assertExactKeys(body, ["email", "password", "dashboard_domain", "apex_domain", "ssl", "listener", "dashboard_listen", "https_listen"]);
     safeEmail(body.email);
     safePassword(body.password);
-    safeDomain(body.dashboard_domain);
-    safeDomain(body.apex_domain);
+    // Empty means "no domain yet" — the wizard allows skipping the dashboard
+    // domain entirely, and TCP/UDS modes never configure an apps domain.
+    if (body.dashboard_domain !== "") safeDomain(body.dashboard_domain);
+    if (body.apex_domain !== "") safeDomain(body.apex_domain);
     if (typeof body.ssl !== "boolean") throw new HttpInputError(422, "validation", "ssl must be a boolean");
     safeListener(body.listener);
-    safeSocketAddress(body.dashboard_listen, "dashboard_listen");
+    // Null means "keep the current bind" — the wizard sends null unless the
+    // operator actually edited the port, so a custom bind host survives setup.
+    if (body.dashboard_listen !== null) safeSocketAddress(body.dashboard_listen, "dashboard_listen");
     if (body.https_listen !== null) safeSocketAddress(body.https_listen, "https_listen");
   } catch (error) {
     return inputErrorResponse(error);
@@ -377,8 +381,9 @@ export async function setup(request, requestAdmin = adminRequest, socket = admin
     if (!safeAccountSubject(subject)) throw new Error("daemon returned an invalid account subject");
     await requestAdmin(socket, {
       type: "set_dashboard_domain",
-      domain: body.dashboard_domain,
-      apex: body.apex_domain,
+      // The daemon models "unset" as null, not the empty string.
+      domain: body.dashboard_domain === "" ? null : body.dashboard_domain,
+      apex: body.apex_domain === "" ? null : body.apex_domain,
     }, subject);
     await requestAdmin(socket, {
       type: "set_dashboard_tls",
@@ -388,15 +393,27 @@ export async function setup(request, requestAdmin = adminRequest, socket = admin
     // Listener changes deliberately restart the supervised daemon after their
     // response flushes. Apply the non-restarting setup mutations first so the
     // wizard cannot race that restart and surface a misleading partial error.
-    await requestAdmin(socket, {
+    // Re-submitting the active configuration is a daemon-side no-op
+    // (restart_required: false), so finishing setup with defaults untouched
+    // never bounces the daemon.
+    const listenerResult = await requestAdmin(socket, {
       type: "set_listener",
       listener: safeListener(body.listener),
-      dashboard_listen: safeSocketAddress(body.dashboard_listen, "dashboard_listen"),
+      ...(body.dashboard_listen ? { dashboard_listen: safeSocketAddress(body.dashboard_listen, "dashboard_listen") } : {}),
       ...(body.https_listen ? { https_listen: safeSocketAddress(body.https_listen, "https_listen") } : {}),
     }, subject);
     const cookie = signSession({ sub: subject });
     return jsonResponse(
-      { ok: true, data: { apex_domain: body.apex_domain, dashboard_domain: body.dashboard_domain } },
+      {
+        ok: true,
+        data: {
+          apex_domain: body.apex_domain,
+          dashboard_domain: body.dashboard_domain,
+          // Lets the wizard hand the browser to the new origin instead of
+          // stranding it on a dead port when the dashboard listener moved.
+          listener_restart_required: listenerResult?.data?.restart_required === true,
+        },
+      },
       false,
       200,
       { "set-cookie": sessionSetCookie(cookie, request) },
@@ -851,12 +868,17 @@ export function dashboardTlsCommand(body) {
 }
 
 export function listenerCommand(body) {
-  assertObjectKeys(body, ["listener", "dashboard_listen"], ["https_listen"]);
+  assertObjectKeys(body, ["listener"], ["dashboard_listen", "https_listen"]);
   const command = {
     type: "set_listener",
     listener: safeListener(body.listener),
-    dashboard_listen: safeSocketAddress(body.dashboard_listen, "dashboard_listen"),
   };
+  // Null/absent means "keep the current bind" — the daemon preserves the
+  // existing dashboard and HTTPS listeners when these fields are omitted.
+  // Never rewrite a custom bind host the operator didn't touch.
+  if (body.dashboard_listen !== undefined && body.dashboard_listen !== null) {
+    command.dashboard_listen = safeSocketAddress(body.dashboard_listen, "dashboard_listen");
+  }
   if (body.https_listen !== undefined && body.https_listen !== null) {
     command.https_listen = safeSocketAddress(body.https_listen, "https_listen");
   }

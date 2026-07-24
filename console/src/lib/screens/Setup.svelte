@@ -26,10 +26,18 @@
   let sslAuto = $state(true);
 
   // Working-default ingress, with advanced modes disclosed only when chosen.
+  // The dashboard port seeds from the origin currently serving the wizard so
+  // the field reflects reality; leaving it untouched sends null ("keep the
+  // current bind") instead of rewriting a custom bind host to 0.0.0.0.
+  const initialDashboardPort = (() => {
+    if (typeof window === 'undefined') return 3000;
+    const port = Number(window.location.port);
+    return Number.isInteger(port) && port > 0 ? port : 3000;
+  })();
   let listenerMode = $state('integrated');
   let httpPort = $state(80);
   let httpsPort = $state(443);
-  let dashboardPort = $state(3000);
+  let dashboardPort = $state(initialDashboardPort);
   let appPortStart = $state(10000);
   let appPortEnd = $state(19999);
   let advertiseHost = $state('');
@@ -41,6 +49,12 @@
   let submitting = $state(false);
   let submitError = $state('');
   let emailEl = $state();
+
+  // Post-finish handoff: when the dashboard listener moved, the origin this
+  // wizard is loaded from dies with the restart. Keep the wizard mounted,
+  // probe the new origin, and walk the browser over instead of stranding it.
+  let restartOrigin = $state('');
+  let restartReady = $state(false);
 
   $effect(() => {
     if (store.auth === 'setup') queueMicrotask(() => emailEl?.focus());
@@ -124,6 +138,7 @@
     }
     submitting = true;
     submitError = '';
+    const dashboardChanged = Number(dashboardPort) !== initialDashboardPort;
     const r = await store.setup({
       email: email.trim(),
       password,
@@ -131,8 +146,11 @@
       apexDomain: listenerMode === 'integrated' ? effectiveApex : '',
       ssl: listenerMode === 'integrated' && sslAuto,
       listener: listenerPayload(),
-      dashboardListen: `0.0.0.0:${dashboardPort}`,
-      httpsListen: listenerMode === 'integrated' ? `0.0.0.0:${httpsPort}` : null,
+      // Null keeps the current binds. An untouched dashboard port must not
+      // rewrite a custom bind host, and an untouched HTTPS port must not
+      // convert the daemon's best-effort :443 into an explicit bind-or-fail.
+      dashboardListen: dashboardChanged ? `0.0.0.0:${dashboardPort}` : null,
+      httpsListen: listenerMode === 'integrated' && Number(httpsPort) !== 443 ? `0.0.0.0:${httpsPort}` : null,
     });
     submitting = false;
     if (!r.ok) {
@@ -142,6 +160,35 @@
         return;
       }
       submitError = r.error ?? 'Setup could not complete.';
+      return;
+    }
+    if (r.listenerRestartRequired && dashboardChanged) {
+      // The origin serving this page is about to go away. Hold the wizard on
+      // a handoff panel instead of letting the dashboard mount on a dead port.
+      store.auth = 'setup';
+      store.stop();
+      const url = new URL(window.location.href);
+      url.port = String(dashboardPort);
+      restartOrigin = url.origin;
+      restartReady = false;
+      void waitForRestart(restartOrigin);
+    }
+  }
+
+  async function waitForRestart(origin) {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      try {
+        // Another port is another origin — probe with no-cors and treat any
+        // resolved response as "the listener answers". CORS-blocked reads
+        // reject the promise while the daemon is down, which is the signal.
+        await fetch(`${origin}/healthz`, { cache: 'no-store', mode: 'no-cors' });
+        restartReady = true;
+        window.location.assign(origin);
+        return;
+      } catch {
+        // Expected while the daemon restarts on the new listener.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 
@@ -219,7 +266,25 @@
       {/each}
     </div>
 
-    {#if step === 0}
+    {#if restartOrigin}
+      <div class="body screen-enter">
+        <p class="lede">
+          Setup is complete. The dashboard is moving to its new port — this page's address stops answering, so continue at the new one.
+        </p>
+        <div class="derived" role="status">
+          <span class="dlabel">{restartReady ? 'Dashboard ready' : 'Listener restarting…'}</span>
+          <span class="dvalue num">{restartOrigin}</span>
+        </div>
+        <p class="note mono">
+          {restartReady
+            ? 'Redirecting you now — use the button if nothing happens.'
+            : 'Waiting for the new listener to answer. You will be redirected automatically.'}
+        </p>
+        <a class="btn cobalt primary handoff-btn" href={restartOrigin}>
+          {restartReady ? 'Open dashboard' : 'Try now'}
+        </a>
+      </div>
+    {:else if step === 0}
       <div class="body screen-enter">
         <p class="lede">You're the first person here. Create the admin account that owns this node — there's only one, and it's all you need.</p>
         <form class="form" onsubmit={(e) => { e.preventDefault(); nextFromAdmin(); }}>
@@ -651,6 +716,14 @@
   .tmeta { display: flex; flex-direction: column; gap: 2px; }
   .ttitle { font-size: 13px; font-weight: 600; color: var(--ink); }
   .tsub { font-size: 11px; color: var(--ink-3); }
+
+  .handoff-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 6px;
+    text-decoration: none;
+  }
 
   .rowbtns {
     display: flex;

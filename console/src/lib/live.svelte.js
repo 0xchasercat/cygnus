@@ -318,19 +318,21 @@ class Store {
   // 409 means an admin already exists — fall back to the login screen.
   async setup({ email, password, dashboardDomain, apexDomain, ssl, listener, dashboardListen, httpsListen }) {
     try {
-      await post('/api/v1/setup', {
+      const data = await post('/api/v1/setup', {
         email,
         password,
         dashboard_domain: dashboardDomain || '',
         apex_domain: apexDomain || '',
         ssl,
         listener,
-        dashboard_listen: dashboardListen,
-        https_listen: httpsListen,
+        // Null means "keep the current bind"; only an explicit port edit in
+        // the wizard sends a concrete address.
+        dashboard_listen: dashboardListen ?? null,
+        https_listen: httpsListen ?? null,
       });
       this.auth = 'ready';
       this.start();
-      return { ok: true };
+      return { ok: true, listenerRestartRequired: data?.listener_restart_required === true };
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 409) {
         this.auth = 'signin';
@@ -610,7 +612,8 @@ class Store {
   // ——— dashboard domain + SSL (settings) ———
   async setDashboardDomain(domain, apex) {
     try {
-      await post('/api/v1/settings/dashboard-domain', { domain, apex });
+      // The API models "unset" as null; an empty field means "clear it".
+      await post('/api/v1/settings/dashboard-domain', { domain: domain || null, apex: apex || null });
       this.notice = 'Dashboard domain updated.';
       await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
       return { ok: true };

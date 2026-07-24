@@ -101,13 +101,39 @@
   const listenerMode = $derived(store.node?.listener?.mode ?? store.node?.listener_mode ?? 'integrated');
   const socketExample = $derived(`${listenerDraft.socket_dir || '/run/cygnus/apps'}/my-app.sock`);
 
+  // "host:port" → parts, tolerating IPv6 brackets. The status API reports
+  // listen addresses as strings; the editor only exposes the port, so the
+  // parsed host rides along untouched and survives a save.
+  function splitAddress(value, fallbackHost, fallbackPort) {
+    const raw = typeof value === 'string' ? value : '';
+    const at = raw.lastIndexOf(':');
+    if (at > 0) {
+      const port = Number(raw.slice(at + 1));
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+        return { host: raw.slice(0, at), port };
+      }
+    }
+    return { host: fallbackHost, port: fallbackPort };
+  }
+
   function editListener() {
     const l = store.node?.listener ?? {};
+    const dash = splitAddress(store.node?.listen, '0.0.0.0', 3000);
+    const http = splitAddress(l.http_listen, '0.0.0.0', 80);
+    const https = splitAddress(store.node?.https_listen, '0.0.0.0', 443);
     listenerDraft = {
       mode: l.mode ?? listenerMode,
-      http_port: l.http_port ?? 80,
-      https_port: l.https_port ?? 443,
-      dashboard_port: l.dashboard_port ?? 3000,
+      http_host: http.host,
+      http_port: http.port,
+      https_host: https.host,
+      https_port: https.port,
+      // Null https_listen means the daemon binds :443 best-effort; an
+      // explicit address is bind-or-fail. Remember which one we started
+      // from so an untouched port never hardens the failure mode.
+      https_explicit: store.node?.https_listen != null,
+      dashboard_host: dash.host,
+      dashboard_port: dash.port,
+      tcp_host: l.host ?? '0.0.0.0',
       app_port_start: l.port_start ?? 10000,
       app_port_end: l.port_end ?? 19999,
       advertise_host: l.advertise_host ?? store.node?.advertise_host ?? '',
@@ -124,11 +150,25 @@
     if (listenerBusy) return;
     const d = listenerDraft;
     if (!window.confirm('Apply this listener configuration? Active app endpoints may change and the dashboard may reconnect on a new port.')) return;
+    const dashboardCurrent = splitAddress(store.node?.listen, '0.0.0.0', 3000);
+    const dashboardChanged = Number(d.dashboard_port) !== dashboardCurrent.port;
+    // Null means "keep the current bind" — an untouched dashboard port must
+    // not rewrite a custom bind host to 0.0.0.0.
+    const dashboardListen = dashboardChanged ? `${d.dashboard_host}:${d.dashboard_port}` : null;
+    const httpsChanged = Number(d.https_port) !== (d.https_explicit
+      ? splitAddress(store.node?.https_listen, '0.0.0.0', 443).port
+      : 443);
     const payload = d.mode === 'integrated'
-      ? { listener: { mode: d.mode, http_listen: `0.0.0.0:${d.http_port}` }, https_listen: `0.0.0.0:${d.https_port}`, dashboard_listen: `0.0.0.0:${d.dashboard_port}` }
+      ? {
+          listener: { mode: d.mode, http_listen: `${d.http_host}:${d.http_port}` },
+          // Sending https_listen converts the daemon's best-effort default
+          // into an explicit bind-or-fail — only do that for a real change.
+          ...(httpsChanged ? { https_listen: `${d.https_host}:${d.https_port}` } : {}),
+          dashboard_listen: dashboardListen,
+        }
       : d.mode === 'tcp'
-        ? { listener: { mode: d.mode, host: '0.0.0.0', port_start: Number(d.app_port_start), port_end: Number(d.app_port_end), advertise_host: d.advertise_host.trim() }, dashboard_listen: `0.0.0.0:${d.dashboard_port}` }
-        : { listener: { mode: d.mode, socket_dir: d.socket_dir, socket_group: d.socket_group || null, socket_mode: parseInt(d.socket_mode, 8) }, dashboard_listen: `0.0.0.0:${d.dashboard_port}` };
+        ? { listener: { mode: d.mode, host: d.tcp_host, port_start: Number(d.app_port_start), port_end: Number(d.app_port_end), advertise_host: d.advertise_host.trim() }, dashboard_listen: dashboardListen }
+        : { listener: { mode: d.mode, socket_dir: d.socket_dir, socket_group: d.socket_group || null, socket_mode: parseInt(d.socket_mode, 8) }, dashboard_listen: dashboardListen };
     listenerBusy = true;
     listenerError = '';
     const r = await store.setListener(payload);
@@ -139,7 +179,7 @@
     }
     if (r.restartRequired) {
       const url = new URL(window.location.href);
-      url.port = String(d.dashboard_port);
+      if (dashboardChanged) url.port = String(d.dashboard_port);
       listenerRestartUrl = url.origin;
       listenerRestartReady = false;
       void waitForListener(listenerRestartUrl);
@@ -148,13 +188,15 @@
   }
 
   async function waitForListener(origin) {
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
       try {
-        const response = await fetch(`${origin}/healthz`, { cache: 'no-store' });
-        if (response.ok) {
-          listenerRestartReady = true;
-          return;
-        }
+        // The new dashboard port is another origin — probe with no-cors and
+        // treat any resolved response as "the listener answers". A plain
+        // fetch never reports ok across origins (no CORS headers on
+        // /healthz), which left this banner stuck on "restarting" forever.
+        await fetch(`${origin}/healthz`, { cache: 'no-store', mode: 'no-cors' });
+        listenerRestartReady = true;
+        return;
       } catch {
         // Expected while the daemon restarts or the new listener comes up.
       }
@@ -299,6 +341,9 @@
     if (!repo || mapBusy) return;
     mapBusy = true;
     mapError = '';
+    // Empty memory falls back to the node default server-side — never send
+    // Number('') === 0 bytes, which the API rejects with a 422.
+    const memoryMiBValue = String(mapDraft.memory_mib ?? '').trim();
     const r = await store.configureRepository({
       installation_id: repo.installation_id,
       repository_id: repo.repository_id,
@@ -309,7 +354,7 @@
       ...(listenerMode === 'integrated' ? { domain: mapDraft.domain || '' } : {}),
       engine_version: mapDraft.engine_version || defaultEngine,
       entry: (mapDraft.entry ?? '').trim() || undefined,
-      memory_max_bytes: Number(mapDraft.memory_mib) * 1024 * 1024,
+      ...(memoryMiBValue ? { memory_max_bytes: Number(memoryMiBValue) * 1024 * 1024 } : {}),
     });
     mapBusy = false;
     if (!r.ok) {
@@ -515,7 +560,7 @@
                   {/if}
                   <label>Engine<input bind:value={mapDraft.engine_version} maxlength="128" required /></label>
                   <label>Entry <span class="optional">(optional)</span><input bind:value={mapDraft.entry} maxlength="128" placeholder="auto" /></label>
-                  <label>Memory <span class="optional">(MiB)</span><input bind:value={mapDraft.memory_mib} type="number" min="64" step="64" required /></label>
+                  <label>Memory <span class="optional">(MiB)</span><input bind:value={mapDraft.memory_mib} type="number" min="64" step="1" placeholder="node default" /></label>
                 </div>
                 {#if mapError}<p class="inline-error" role="alert">{mapError}</p>{/if}
                 <div class="map-actions">

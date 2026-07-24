@@ -16,13 +16,26 @@
   const usedPct = $derived(hasMemory ? (usedBytes / node.memory.total_bytes) * 100 : 0);
   const totalGb = $derived(hasMemory ? node.memory.total_bytes / (1024 ** 3) : 0);
   let budgetMiB = $state('');
-  let defaultMiB = $state('');
+  let defaultMiB = $state('256');
   let resourcesBusy = $state(false);
   let resourcesError = $state('');
 
+  // The poll replaces store.node every few seconds, so a naive "sync from
+  // node" effect would clobber whatever the operator is typing on every
+  // tick. Only resync a field when its server-side value actually changed.
+  let syncedBudgetBytes = null;
+  let syncedDefaultBytes = null;
   $effect(() => {
-    budgetMiB = node?.resources?.node_memory_budget_bytes ? String(Math.round(node.resources.node_memory_budget_bytes / (1024 * 1024))) : '';
-    defaultMiB = node?.resources?.app_memory_default_bytes ? String(Math.round(node.resources.app_memory_default_bytes / (1024 * 1024))) : '256';
+    const budgetBytes = node?.resources?.node_memory_budget_bytes ?? null;
+    const defaultBytes = node?.resources?.app_memory_default_bytes ?? null;
+    if (budgetBytes !== syncedBudgetBytes) {
+      syncedBudgetBytes = budgetBytes;
+      budgetMiB = budgetBytes ? String(Math.round(budgetBytes / (1024 * 1024))) : '';
+    }
+    if (defaultBytes !== syncedDefaultBytes) {
+      syncedDefaultBytes = defaultBytes;
+      defaultMiB = defaultBytes ? String(Math.round(defaultBytes / (1024 * 1024))) : '256';
+    }
   });
 
   const bootPhases = $derived(
@@ -122,12 +135,12 @@
       <form class="resource-form" onsubmit={saveResources}>
         <label>
           <span>Workload memory budget</span>
-          <span class="field"><input bind:value={budgetMiB} type="number" min="128" step="64" inputmode="numeric" placeholder="auto" /><i class="num">MiB</i></span>
+          <span class="field"><input bind:value={budgetMiB} type="number" min="128" step="1" inputmode="numeric" placeholder="auto" /><i class="num">MiB</i></span>
           <small>Caps the memory Cygnus may promise across configured apps. Leave empty to size it safely from the host.</small>
         </label>
         <label>
           <span>Default app memory</span>
-          <span class="field"><input bind:value={defaultMiB} type="number" min="64" step="64" inputmode="numeric" required /><i class="num">MiB</i></span>
+          <span class="field"><input bind:value={defaultMiB} type="number" min="64" step="1" inputmode="numeric" required /><i class="num">MiB</i></span>
           <small>Used for new apps unless their own memory limit overrides it.</small>
         </label>
         {#if resourcesError}<p class="resource-error" role="alert">{resourcesError}</p>{/if}

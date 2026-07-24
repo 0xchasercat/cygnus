@@ -503,9 +503,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             node_memory_budget_bytes,
             app_memory_default_bytes,
         } => {
+            // The daemon replaces the whole policy object, so an invocation
+            // with no flags must not silently clear both fields. Require an
+            // explicit flag and merge unspecified fields from the live policy.
+            if node_memory_budget_bytes.is_none() && app_memory_default_bytes.is_none() {
+                return Err(
+                    "provide --node-memory-budget-bytes and/or --app-memory-default-bytes; \
+                     omitted fields keep their current value"
+                        .into(),
+                );
+            }
+            let status = call(&client, AdminCommand::Status)?;
+            let AdminData::Status { node } = status else {
+                return Err("daemon returned an unexpected status response".into());
+            };
             let resources = NodeResourcesConfig {
-                node_memory_budget_bytes,
-                app_memory_default_bytes,
+                node_memory_budget_bytes: node_memory_budget_bytes
+                    .or(node.resources.node_memory_budget_bytes),
+                app_memory_default_bytes: app_memory_default_bytes
+                    .or(node.resources.app_memory_default_bytes),
             };
             let data = call(
                 &client,

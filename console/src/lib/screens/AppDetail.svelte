@@ -131,9 +131,20 @@
   let memoryBusy = $state(false);
   let memoryError = $state('');
 
+  // The poll replaces store.apps every few seconds, handing this screen a
+  // fresh app object each tick. Resyncing the field from it unconditionally
+  // clobbered whatever the operator was typing. Only resync when the app
+  // changes or its server-side value actually moved.
+  let syncedMemoryApp = null;
+  let syncedMemoryBytes = null;
   $effect(() => {
-    const memory = app?.memory_max;
-    memoryMiB = memory ? String(Math.round(memory / (1024 * 1024))) : '';
+    const name = app?.name ?? null;
+    const memory = app?.memory_max ?? null;
+    if (name !== syncedMemoryApp || memory !== syncedMemoryBytes) {
+      syncedMemoryApp = name;
+      syncedMemoryBytes = memory;
+      memoryMiB = memory ? String(Math.round(memory / (1024 * 1024))) : '';
+    }
   });
 
   // Live values come from store.envVars (fetched below). Preview mode has
@@ -642,7 +653,7 @@
           <form class="memory-form" onsubmit={saveMemory}>
             <label for="app-memory">Memory limit</label>
             <div class="memory-input">
-              <input id="app-memory" bind:value={memoryMiB} type="number" min="64" max="1048576" step="64" inputmode="numeric" required />
+              <input id="app-memory" bind:value={memoryMiB} type="number" min="64" max="1048576" step="1" inputmode="numeric" required />
               <span class="num">MiB</span>
             </div>
             <button class="btn sm" type="submit" disabled={memoryBusy || !memoryMiB}>

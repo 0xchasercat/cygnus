@@ -208,6 +208,9 @@
       const stream = new Blob([tarball]).stream().pipeThrough(cs);
       const gzBuf = new Uint8Array(await new Response(stream).arrayBuffer());
 
+      // Empty memory falls back to the node default server-side — never send
+      // Number('') === 0 bytes, which the API rejects with a 422.
+      const memoryMiBValue = String(memoryMiB ?? '').trim();
       const r = await store.deployUpload({
         app: appName,
         domain: domain || undefined,
@@ -217,7 +220,7 @@
         entry: entry.trim() || undefined,
         env: envRowsToMap(),
         preview: previewEnabled ? (previewSlug.trim() || undefined) : undefined,
-        memoryMaxBytes: Number(memoryMiB) * 1024 * 1024,
+        memoryMaxBytes: memoryMiBValue ? Number(memoryMiBValue) * 1024 * 1024 : undefined,
         tarball: gzBuf,
         totalBytes: gzBuf.length,
         onProgress: (p) => (progress = p),
@@ -303,6 +306,9 @@
     if (!repo || mapBusy) return;
     mapBusy = true;
     mapError = '';
+    // Empty memory falls back to the node default server-side — never send
+    // Number('') === 0 bytes, which the API rejects with a 422.
+    const memoryMiBValue = String(mapDraft.memory_mib ?? '').trim();
     const r = await store.configureRepository({
       installation_id: repo.installation_id,
       repository_id: repo.repository_id,
@@ -313,7 +319,7 @@
       ...(ingressMode === 'integrated' ? { domain: mapDraft.domain || '' } : {}),
       engine_version: mapDraft.engine_version || defaultEngine,
       entry: (mapDraft.entry ?? '').trim() || undefined,
-      memory_max_bytes: Number(mapDraft.memory_mib) * 1024 * 1024,
+      ...(memoryMiBValue ? { memory_max_bytes: Number(memoryMiBValue) * 1024 * 1024 } : {}),
     });
     if (!r.ok) {
       mapBusy = false;
@@ -396,7 +402,7 @@
                 {/if}
                 <label>Engine<input bind:value={engineVersion} maxlength="128" autocomplete="off" /></label>
                 <label>Entry <span class="optional">(optional — auto-detect if empty)</span><input bind:value={entry} placeholder="auto-detect" maxlength="4096" autocomplete="off" /></label>
-                <label>Memory limit <span class="optional">(MiB)</span><input bind:value={memoryMiB} type="number" min="64" step="64" inputmode="numeric" required /></label>
+                <label>Memory limit <span class="optional">(MiB)</span><input bind:value={memoryMiB} type="number" min="64" step="1" inputmode="numeric" placeholder="node default" /></label>
 
                 <label class="preview-toggle">
                   <input type="checkbox" bind:checked={previewEnabled} />
@@ -511,7 +517,7 @@
                         <strong class="num">allocated after deploy</strong>
                       </div>
                     {/if}
-                    <label>Memory limit <span class="optional">(MiB)</span><input bind:value={mapDraft.memory_mib} type="number" min="64" step="64" required /></label>
+                    <label>Memory limit <span class="optional">(MiB)</span><input bind:value={mapDraft.memory_mib} type="number" min="64" step="1" placeholder="node default" /></label>
                   </div>
                   {#if mapError}<p class="inline-error" role="alert">{mapError}</p>{/if}
                   <div class="map-actions">

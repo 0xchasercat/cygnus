@@ -1354,6 +1354,20 @@ impl LiveAdminMutations {
     ) -> Result<AdminData, AdminMutationError> {
         let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
         let current = state.load().map_err(map_admin_state_error)?;
+        // Detect no-op saves before probing or restarting: re-submitting the
+        // active configuration (e.g. the setup wizard finishing with defaults
+        // untouched) must not bounce the daemon and every app on it.
+        let next_dashboard = dashboard_listen.unwrap_or(current.listen);
+        let next_https = https_listen.or(current.edge.https_listen);
+        if *listener == current.listener
+            && next_dashboard == current.listen
+            && next_https == current.edge.https_listen
+        {
+            return Ok(AdminData::ListenerSet {
+                listener: listener.clone(),
+                restart_required: false,
+            });
+        }
         preflight_listener_update(&state, &current, listener, dashboard_listen, https_listen)
             .map_err(|error| {
                 AdminMutationError::new(
@@ -3861,8 +3875,8 @@ mod tests {
         app.env.insert("CYGNUS_FIXTURE_MODE".into(), "uds".into());
         let config = NodeConfig {
             listen: "127.0.0.1:0".parse().expect("listen address"),
-            edge: Default::default(),
             apps: vec![app],
+            ..NodeConfig::default()
         };
         let mut state = State::open(&state_path).expect("open state");
         state.apply(&config).expect("apply state");
