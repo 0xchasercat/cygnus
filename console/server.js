@@ -1166,7 +1166,10 @@ function safeListener(value) {
       mode: "uds",
       socket_dir: value.socket_dir,
       ...(value.socket_group ? { socket_group: value.socket_group } : {}),
-      socket_mode: safeInteger(value.socket_mode, "socket_mode", 0, 0o777),
+      // The daemon rejects mode 0000 ("must be an octal permission value in
+      // 0001..0777") — catch it here as a clean 422 instead of relaying an
+      // opaque daemon error.
+      socket_mode: safeInteger(value.socket_mode, "socket_mode", 1, 0o777),
     };
   }
   throw new HttpInputError(422, "validation", "listener mode must be integrated, tcp, or uds");

@@ -465,6 +465,10 @@ describe("console request validation", () => {
       type: "set_listener",
       listener: { mode: "integrated", http_listen: "0.0.0.0:80" },
     });
+    // socket_mode 0 is rejected by the daemon — surface a clean 422 here.
+    await expect(command("/api/v1/settings/listener", "POST", {
+      listener: { mode: "uds", socket_dir: "/run/cygnus/apps", socket_mode: 0 },
+    })).rejects.toThrow("socket_mode must be an integer between 1 and 511");
     expect(await command("/api/v1/settings/node-resources", "POST", {
       node_memory_budget_bytes: null,
       app_memory_default_bytes: 268435456,

@@ -91,6 +91,14 @@ fn insert_runtime_app(
     metrics.set_app_alias(runtime_key, logical_app);
 }
 
+/// Reverse [`insert_runtime_app`] for a generation that never went live, so
+/// failed replacements don't leave stale generation keys in the runtime map
+/// and metrics aliases forever.
+fn remove_runtime_app(runtime_apps: &RuntimeApps, metrics: &MetricsHub, runtime_key: &str) {
+    runtime_apps.write().remove(runtime_key);
+    metrics.remove_app_alias(runtime_key);
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cygnus-daemon", about = "Run the Cygnus request plane")]
 struct Cli {
@@ -1262,10 +1270,12 @@ impl LiveAdminMutations {
                 && let Err(error) = self.supervisor.set_memory_exempt(&generation_key, true)
             {
                 let _ = self.supervisor.remove(&generation_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &generation_key);
                 return Err(AdminMutationError::new(AdminErrorCode::Internal, error));
             }
             if let Err(error) = self.supervisor.acquire(&generation_key) {
                 let _ = self.supervisor.remove(&generation_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &generation_key);
                 if let Some(previous_reservation) = previous_reservation {
                     self.supervisor.rollback_memory_replacement(
                         &generation_key,
@@ -1282,6 +1292,7 @@ impl LiveAdminMutations {
             }
             if let Err(error) = state.mark_app_config_applied(app, desired_revision, audit) {
                 let _ = self.supervisor.remove(&generation_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &generation_key);
                 if let Some(previous_reservation) = previous_reservation {
                     self.supervisor.rollback_memory_replacement(
                         &generation_key,
@@ -1443,6 +1454,7 @@ impl LiveAdminMutations {
             );
             if self.supervisor.acquire(&plan.runtime_key).is_err() {
                 let _ = self.supervisor.remove(&plan.runtime_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key);
                 return Err(AdminMutationError::new(
                     AdminErrorCode::Internal,
                     "rollback candidate did not become ready",
@@ -1450,8 +1462,11 @@ impl LiveAdminMutations {
             }
         }
         if let Err(error) = state.commit_activation(&plan, audit) {
+            // Only unwind the runtime map when this call created the entry —
+            // with an unchanged runtime the key still names the live cage.
             if runtime_changed {
                 let _ = self.supervisor.remove(&plan.runtime_key);
+                remove_runtime_app(&self.runtime_apps, &self.metrics, &plan.runtime_key);
             }
             return Err(map_admin_state_error(error));
         }
