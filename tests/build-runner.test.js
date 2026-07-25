@@ -328,6 +328,37 @@ test("auto mode serves the assets directory from wrangler config", async () => {
   }
 });
 
+test("auto mode serves wrangler assets when the start script is wrangler dev", async () => {
+  // The Greptile-flagged ordering case: start is "wrangler dev" (a dev
+  // server) and the assets live in a directory named ONLY in wrangler
+  // config — the dev-server branch must consult wrangler config instead of
+  // failing before the Workers rescue step is reached.
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "package.json"),
+      JSON.stringify({ scripts: { start: "wrangler dev" } }),
+    );
+    await writeFile(
+      join(fixture.workspace, "wrangler.toml"),
+      'name = "edge-site"\ncompatibility_date = "2026-01-01"\n\n[assets]\ndirectory = "./edge-assets"\n',
+    );
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync("edge-assets", { recursive: true });\n' +
+        'writeFileSync("edge-assets/index.html", "<h1>edge start ok</h1>");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("start script launches a dev server (wrangler dev)");
+    expect(result.stderr).toContain("serving Cloudflare Workers assets from edge-assets");
+    expect(await exists(join(fixture.output, "public", "index.html"))).toBe(true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("auto mode explains adapter options for worker-only wrangler projects", async () => {
   const fixture = await staticFixture("noop.ts");
   try {

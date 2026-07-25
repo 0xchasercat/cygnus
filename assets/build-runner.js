@@ -319,6 +319,49 @@ function wranglerField(config, field) {
   }
 }
 
+// Resolve the Workers deployment described by wrangler config: the worker
+// entry (`main`) and — when the configured assets directory is a complete
+// site with index.html — a servable static output. Returns null when no
+// wrangler config exists.
+async function wranglerDeployment() {
+  const config = await wranglerConfigFile();
+  if (config === null) return null;
+  const main = wranglerField(config, "main");
+  const assetsDir = safeWorkspaceRelative(wranglerField(config, "assets"));
+  let servable = null;
+  if (assetsDir !== null) {
+    const candidate = join(WORKSPACE, assetsDir);
+    try {
+      const metadata = await lstat(candidate);
+      if (
+        metadata.isDirectory() &&
+        (await lstat(join(candidate, "index.html"))).isFile()
+      ) {
+        servable = { path: candidate, relativePath: assetsDir };
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+  }
+  return { configName: config.name, main, servable };
+}
+
+function workerCaveat(main) {
+  return main
+    ? ` — the worker script (${main}) does not run on Cygnus, so routes it handles will not respond`
+    : "";
+}
+
+function failWorkersRuntime(deployment) {
+  fail(
+    `this project targets the Cloudflare Workers runtime (${deployment.configName}` +
+      (deployment.main ? `, main: ${deployment.main}` : "") +
+      `) and the build produced no servable static output. Cygnus runs Bun/Node servers — ` +
+      `switch the framework adapter (SvelteKit: @sveltejs/adapter-node, Astro: @astrojs/node, ` +
+      `React Router/Remix: the node server build) or prerender the site to static output`,
+  );
+}
+
 function safeWorkspaceRelative(value) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim().replace(/^\.\//, "");
@@ -639,6 +682,18 @@ async function buildAuto() {
       if (error?.code !== "CYGNUS_NO_STATIC_OUTPUT") throw error;
     }
     if (output === null) {
+      // Workers projects commonly pair `start: "wrangler dev"` with assets
+      // declared only in wrangler config — consult it before giving up.
+      const workers = await wranglerDeployment();
+      if (workers?.servable) {
+        phaseLog(
+          "detect",
+          `start script launches a dev server (${devServer}); serving Cloudflare Workers assets ` +
+            `from ${workers.servable.relativePath} instead${workerCaveat(workers.main)}`,
+        );
+        return publishStaticOutput(workers.servable);
+      }
+      if (workers !== null) failWorkersRuntime(workers);
       fail(
         `the start script launches a development server (${devServer}) and the build ` +
           `produced no static output directory with index.html — add a build script that ` +
@@ -705,39 +760,17 @@ async function buildAuto() {
   // 3. Cloudflare Workers projects: the deployment contract lives in
   // wrangler config. Serve the configured static assets when they are a
   // complete site; otherwise explain exactly which adapter to switch to.
-  const wrangler = await wranglerConfigFile();
-  if (wrangler !== null) {
-    const workerMain = wranglerField(wrangler, "main");
-    const assetsDir = safeWorkspaceRelative(wranglerField(wrangler, "assets"));
-    if (assetsDir !== null) {
-      const candidate = join(WORKSPACE, assetsDir);
-      let servable = false;
-      try {
-        const metadata = await lstat(candidate);
-        servable =
-          metadata.isDirectory() &&
-          (await lstat(join(candidate, "index.html"))).isFile();
-      } catch (error) {
-        if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
-      }
-      if (servable) {
-        phaseLog(
-          "detect",
-          `Cloudflare Workers config found (${wrangler.name}); serving its static assets from ${assetsDir}` +
-            (workerMain
-              ? ` — the worker script (${workerMain}) does not run on Cygnus, so routes it handles will not respond`
-              : ""),
-        );
-        return publishStaticOutput({ path: candidate, relativePath: assetsDir });
-      }
+  const workers = await wranglerDeployment();
+  if (workers !== null) {
+    if (workers.servable) {
+      phaseLog(
+        "detect",
+        `Cloudflare Workers config found (${workers.configName}); serving its static assets ` +
+          `from ${workers.servable.relativePath}${workerCaveat(workers.main)}`,
+      );
+      return publishStaticOutput(workers.servable);
     }
-    fail(
-      `this project targets the Cloudflare Workers runtime (${wrangler.name}` +
-        (workerMain ? `, main: ${workerMain}` : "") +
-        `) and the build produced no servable static output. Cygnus runs Bun/Node servers — ` +
-        `switch the framework adapter (SvelteKit: @sveltejs/adapter-node, Astro: @astrojs/node, ` +
-        `React Router/Remix: the node server build) or prerender the site to static output`,
-    );
+    failWorkersRuntime(workers);
   }
 
   // 4. Nothing worked — fail with enough context to act on.
