@@ -82,4 +82,61 @@ describe("adminRequest", () => {
       "response envelope is invalid",
     );
   });
+
+  test("surfaces the daemon's error for a reply it could not correlate", async () => {
+    // The daemon answers an unparseable request with a synthetic request id
+    // — the caller must see the daemon's explanation, not "envelope is
+    // invalid".
+    const path = listen(() => ({
+      version: 1,
+      request_id: "00000000000000000000000000000000",
+      status: "error",
+      error: { code: "invalid_request", message: "invalid admin request frame" },
+    }));
+
+    await expect(adminRequest(path, { type: "health" })).rejects.toThrow(
+      "invalid admin request frame",
+    );
+  });
+
+  test("delivers frames larger than the socket send buffer intact", async () => {
+    // Deploy chunk requests are ~43 KiB framed; macOS unix sockets buffer
+    // ~8 KiB, so the client must keep writing on drain. The server here
+    // accumulates until one full frame arrived and echoes its length back.
+    socketPath = `/tmp/cygnus-console-test-${process.pid}-${Date.now()}-big.sock`;
+    let received = Buffer.alloc(0);
+    listener = Bun.listen({
+      unix: socketPath,
+      socket: {
+        data(socket, chunk) {
+          received = Buffer.concat([received, Buffer.from(chunk)]);
+          if (received.length < 4) return;
+          const length = received.readUInt32BE(0);
+          if (received.length < length + 4) return;
+          const request = JSON.parse(received.subarray(4, length + 4).toString("utf8"));
+          const response = Buffer.from(
+            JSON.stringify({
+              version: 1,
+              request_id: request.request_id,
+              status: "ok",
+              data: { kind: "deploy_upload_chunk", received_bytes: request.command.chunk_base64.length },
+            }),
+          );
+          const encoded = Buffer.allocUnsafe(response.length + 4);
+          encoded.writeUInt32BE(response.length, 0);
+          response.copy(encoded, 4);
+          socket.write(encoded);
+          socket.end();
+        },
+      },
+    });
+
+    const chunk = "A".repeat(256 * 1024);
+    const result = await adminRequest(socketPath, {
+      type: "deploy_upload_chunk",
+      upload_id: "u-1",
+      chunk_base64: chunk,
+    });
+    expect(result.data.received_bytes).toBe(chunk.length);
+  });
 });

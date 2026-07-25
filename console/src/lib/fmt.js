@@ -56,3 +56,14 @@ const PHASE_LABELS = {
 export function phaseLabel(name) {
   return PHASE_LABELS[name] ?? String(name).replaceAll('_', ' ');
 }
+
+// ANSI escape sequences (CSI colors/cursor moves, OSC titles, single-char
+// escapes). Build tools emit them even when piped; rendered raw they turn
+// logs into per-character garbage. Stripped at display time — stored logs
+// stay byte-exact for the CLI, where a real terminal interprets them.
+// eslint-disable-next-line no-control-regex
+const ANSI_PATTERN = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[0-~])/g;
+
+export function stripAnsi(text) {
+  return String(text).replace(ANSI_PATTERN, '');
+}

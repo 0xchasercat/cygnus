@@ -72,6 +72,11 @@ const CONTROL_ENV = Object.freeze({
   PATH,
   BUN_INSTALL_CACHE_DIR: CACHE,
   NPM_CONFIG_REGISTRY: REGISTRY,
+  // Build output is captured to log files, never a TTY. Most tools respect
+  // NO_COLOR / FORCE_COLOR=0 and skip ANSI escapes; the console strips any
+  // that remain, but clean-at-the-source keeps `cygnus logs` readable too.
+  NO_COLOR: "1",
+  FORCE_COLOR: "0",
   // Forward cage-staged CA paths when the daemon sets them (Linux). On
   // macOS host builds leave these unset so Bun uses the system trust store.
   ...(process.env.SSL_CERT_FILE
@@ -227,6 +232,23 @@ async function runStaticBuildScript() {
   return 0;
 }
 
+// The file that makes a directory a servable site. index.html is the
+// canonical entry; 200.html is the widely used SPA fallback convention
+// (SvelteKit adapter-static's SPA recipe, surge-style hosts) for apps whose
+// routes render client-side and therefore prerender no index.html at all.
+const STATIC_ENTRY_FILES = Object.freeze(["index.html", "200.html"]);
+
+async function staticEntryIn(directory) {
+  for (const name of STATIC_ENTRY_FILES) {
+    try {
+      if ((await lstat(join(directory, name))).isFile()) return name;
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+  }
+  return null;
+}
+
 async function firstStaticOutputDirectory() {
   for (const relativePath of STATIC_OUTPUT_DIRECTORIES) {
     const candidate = join(WORKSPACE, relativePath);
@@ -236,13 +258,8 @@ async function firstStaticOutputDirectory() {
         fail(`static output ${relativePath} must not be a symlink`);
       }
       if (metadata.isDirectory()) {
-        const index = join(candidate, "index.html");
-        try {
-          const indexMetadata = await lstat(index);
-          if (indexMetadata.isFile()) return { path: candidate, relativePath };
-        } catch (error) {
-          if (error?.code !== "ENOENT") throw error;
-        }
+        const entry = await staticEntryIn(candidate);
+        if (entry !== null) return { path: candidate, relativePath, entry };
       }
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
@@ -252,16 +269,12 @@ async function firstStaticOutputDirectory() {
   // segment is repo-specific, so probe exactly one level below dist.
   try {
     const distPath = join(WORKSPACE, "dist");
-    for (const entry of await readdir(distPath, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const relativePath = join("dist", entry.name, "browser");
-      const candidate = join(distPath, entry.name, "browser");
-      try {
-        const indexMetadata = await lstat(join(candidate, "index.html"));
-        if (indexMetadata.isFile()) return { path: candidate, relativePath };
-      } catch (error) {
-        if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
-      }
+    for (const dirent of await readdir(distPath, { withFileTypes: true })) {
+      if (!dirent.isDirectory()) continue;
+      const relativePath = join("dist", dirent.name, "browser");
+      const candidate = join(distPath, dirent.name, "browser");
+      const entry = await staticEntryIn(candidate);
+      if (entry !== null) return { path: candidate, relativePath, entry };
     }
   } catch (error) {
     if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
@@ -333,11 +346,11 @@ async function wranglerDeployment() {
     const candidate = join(WORKSPACE, assetsDir);
     try {
       const metadata = await lstat(candidate);
-      if (
-        metadata.isDirectory() &&
-        (await lstat(join(candidate, "index.html"))).isFile()
-      ) {
-        servable = { path: candidate, relativePath: assetsDir };
+      if (metadata.isDirectory()) {
+        const entry = await staticEntryIn(candidate);
+        if (entry !== null) {
+          servable = { path: candidate, relativePath: assetsDir, entry };
+        }
       }
     } catch (error) {
       if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
@@ -427,6 +440,13 @@ async function publishStaticOutput(output) {
   const publicOutput = join(OUTPUT, "public");
   await rm(publicOutput, { recursive: true, force: true });
   await copyStaticTree(output.path, publicOutput, true);
+  // SPA builds ship a fallback document instead of index.html — promote it
+  // so the static server (which already falls back to index.html for
+  // client-side routes) serves the app at every path.
+  if (output.entry && output.entry !== "index.html") {
+    await copyFile(join(publicOutput, output.entry), join(publicOutput, "index.html"));
+    phaseLog("build", `published SPA fallback ${output.entry} as index.html`);
+  }
   phaseLog("build", "static output copy completed");
   return buildStaticServer();
 }
@@ -773,7 +793,10 @@ async function buildAuto() {
     failWorkersRuntime(workers);
   }
 
-  // 4. Nothing worked — fail with enough context to act on.
+  // 4. Nothing worked — fail with enough context to act on. Show what the
+  // build actually produced: "no output found" is a shrug, "build/ exists
+  // but contains no HTML entry" is a diagnosis.
+  await logWorkspaceInventory();
   phaseLog(
     "detect",
     `build completed but no static output or server entry found — looked for index.html under ` +
@@ -781,6 +804,48 @@ async function buildAuto() {
       `pass --entry <path> for a custom server entry or add a start script`,
   );
   return 1;
+}
+
+// Best-effort listing of the workspace after the build, so a detection miss
+// is diagnosable from the build log alone. Never throws.
+async function logWorkspaceInventory() {
+  const list = async (directory) => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    return entries
+      .slice(0, 30)
+      .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name))
+      .join(", ");
+  };
+  try {
+    phaseLog("detect", `workspace after build: ${await list(WORKSPACE)}`);
+    for (const relativePath of ["dist", "build", "out", ".svelte-kit", ".output"]) {
+      const directory = join(WORKSPACE, relativePath);
+      let contents;
+      try {
+        contents = await list(directory);
+      } catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") continue;
+        throw error;
+      }
+      phaseLog("detect", `${relativePath}/ contains: ${contents || "(empty)"}`);
+      // The telltale SvelteKit asset directory without any HTML page means
+      // the adapter wrote assets but prerendered nothing — a config issue
+      // worth naming precisely.
+      if (
+        contents.includes("_app/") &&
+        (await staticEntryIn(directory)) === null
+      ) {
+        phaseLog(
+          "detect",
+          `${relativePath}/ has SvelteKit assets but no HTML pages — with @sveltejs/adapter-static, ` +
+            `enable prerendering (export const prerender = true in the root +layout) or set ` +
+            `fallback: 'index.html' for single-page apps`,
+        );
+      }
+    }
+  } catch {
+    // Diagnostics must never mask the real failure.
+  }
 }
 
 export async function runRunner(argv) {

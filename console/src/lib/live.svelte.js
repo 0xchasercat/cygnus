@@ -5,6 +5,7 @@
 // metrics/events/requests branch never poisons status/apps/deployments.
 
 import { api, post, ApiError } from './api.js';
+import { stripAnsi } from './fmt.js';
 import { go, ui } from './stores.svelte.js';
 import {
   previewNode,
@@ -958,7 +959,7 @@ class Store {
         `/api/v1/deployments/${encodeURIComponent(deploymentId)}/logs?stream=${stream}&offset=${offset}`,
       );
       if (!data) return { lines: [], nextOffset: offset, eof: true };
-      const text = decodeBase64(data.data_base64);
+      const text = stripAnsi(decodeBase64(data.data_base64));
       const lines = text.length ? text.split('\n') : [];
       return {
         lines,
@@ -979,7 +980,7 @@ class Store {
         `/api/v1/apps/${encodeURIComponent(app)}/logs?stream=${stream}&offset=${offset}`,
       );
       if (!data) return { lines: [], nextOffset: offset, eof: true };
-      const text = decodeBase64(data.data_base64);
+      const text = stripAnsi(decodeBase64(data.data_base64));
       const lines = text.length ? text.split('\n') : [];
       return {
         lines,

@@ -61,6 +61,7 @@ export function adminRequest(socketPath, command, actor, options = {}) {
     let connection = null;
     let expectedLength = null;
     let received = Buffer.alloc(0);
+    let sent = 0;
     const timeoutMs =
       typeof options.timeoutMs === "number" && options.timeoutMs > 0
         ? options.timeoutMs
@@ -73,9 +74,23 @@ export function adminRequest(socketPath, command, actor, options = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      socket?.end();
+      (socket ?? connection)?.end();
       if (error) reject(error);
       else resolve(value);
+    };
+
+    // Unix sockets have small send buffers on macOS (~8 KiB) while a deploy
+    // chunk frame is ~43 KiB: write() takes what fits and the remainder MUST
+    // be flushed on drain. A single fire-and-forget write left the daemon
+    // waiting on a half frame until its read timed out, and its "invalid
+    // admin request frame" reply carried a synthetic request id the caller
+    // could not correlate.
+    const pump = (socket) => {
+      while (sent < frame.length) {
+        const wrote = socket.write(frame.subarray(sent));
+        if (wrote <= 0) return;
+        sent += wrote;
+      }
     };
 
     const acceptChunk = (socket, chunk) => {
@@ -106,6 +121,23 @@ export function adminRequest(socketPath, command, actor, options = {}) {
         return;
       }
       if (
+        response?.version === ADMIN_PROTOCOL_VERSION &&
+        response?.status === "error" &&
+        response?.request_id !== requestId
+      ) {
+        // The daemon rejected a request it could not parse or correlate, so
+        // its reply carries a synthetic request id. Surface the daemon's own
+        // explanation — "envelope is invalid" would bury the real failure.
+        finish(
+          socket,
+          new AdminProtocolError(
+            response.error?.message || "daemon rejected the admin request",
+            response.error?.code || "internal",
+          ),
+        );
+        return;
+      }
+      if (
         response?.version !== ADMIN_PROTOCOL_VERSION ||
         response?.request_id !== requestId ||
         (response?.status !== "ok" && response?.status !== "error")
@@ -130,7 +162,10 @@ export function adminRequest(socketPath, command, actor, options = {}) {
       unix: socketPath,
       socket: {
         open(socket) {
-          socket.write(frame);
+          pump(socket);
+        },
+        drain(socket) {
+          if (!settled) pump(socket);
         },
         data(socket, data) {
           acceptChunk(socket, data);

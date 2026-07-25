@@ -413,6 +413,56 @@ test("auto mode serves prerendered SvelteKit cloudflare output", async () => {
   }
 });
 
+test("auto mode publishes an SPA fallback document as index.html", async () => {
+  // SvelteKit adapter-static's SPA recipe (fallback: "200.html") produces a
+  // build/ with assets and 200.html but no index.html. The site is fully
+  // servable — the fallback must be promoted, not rejected.
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync("build/_app", { recursive: true });\n' +
+        'writeFileSync("build/200.html", "<h1>spa shell</h1>");\n' +
+        'writeFileSync("build/_app/app.js", "console.log(1);");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("published SPA fallback 200.html as index.html");
+    expect(await readFile(join(fixture.output, "public", "index.html"), "utf8")).toBe(
+      "<h1>spa shell</h1>",
+    );
+    expect(await exists(join(fixture.output, "public", "200.html"))).toBe(true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("auto mode failure inventories the workspace and names SvelteKit misconfigs", async () => {
+  // adapter-static with prerendering disabled and no fallback writes only
+  // assets (_app/, fonts, robots.txt) — unservable anywhere. The failure
+  // must show what the build produced and name the fix.
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync("build/_app/immutable", { recursive: true });\n' +
+        'mkdirSync(".svelte-kit/output", { recursive: true });\n' +
+        'writeFileSync("build/robots.txt", "User-agent: *");\n' +
+        'writeFileSync("build/_app/version.json", "{}");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("workspace after build:");
+    expect(result.stderr).toContain("build/ contains: _app/, robots.txt");
+    expect(result.stderr).toContain("SvelteKit assets but no HTML pages");
+    expect(result.stderr).toContain("export const prerender = true");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("auto mode fails clearly for a dev-server start with no static output", async () => {
   const fixture = await staticFixture("noop.ts");
   try {

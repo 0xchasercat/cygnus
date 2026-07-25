@@ -307,12 +307,17 @@ if (( uninstall )); then
   fi
 
   echo "Remove Cygnus files" >&2
+  # Sealed artifact trees are stored without write permission (immutability
+  # by mode bits). Root removal ignores that; the rootless macOS install
+  # does not — restore owner write on everything we are about to delete.
+  chmod -R u+w -- "$config_dir" "$state_dir" "$runtime_dir" 2>/dev/null || true
   # Shared system/user locations (prefix, systemd/launchd dirs) only lose the
   # specific Cygnus entries; installer-exclusive roots (config/state/runtime,
   # and on macOS the console/log roots) are removed entirely.
   rm -f -- "$prefix/cygnus-daemon" "$prefix/cygnus" "$prefix/cygnusctl" "$prefix/cygnus-init" "$prefix/bun" "$service_file"
   rm -rf -- "$config_dir" "$state_dir" "$runtime_dir"
   if [[ $OS == Darwin ]]; then
+    chmod -R u+w -- "$console_root" "$log_dir" 2>/dev/null || true
     rm -rf -- "$console_root" "$log_dir"
     # The default macOS prefix (~/.cygnus/bin) is installer-exclusive; a
     # custom --prefix may be a shared system directory and must not be
