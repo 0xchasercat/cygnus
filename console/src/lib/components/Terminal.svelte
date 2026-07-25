@@ -64,7 +64,14 @@
     font-size: 11px;
     user-select: none;
   }
-  .txt { color: var(--ink-2); }
+  .txt {
+    color: var(--ink-2);
+    /* Build tools emit arbitrarily long unbroken tokens (minified output,
+       stack traces, stray escape sequences). Break anywhere rather than
+       letting one line blow the card out past the viewport. */
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
   .head .txt {
     color: var(--ink);
     font-weight: 600;
