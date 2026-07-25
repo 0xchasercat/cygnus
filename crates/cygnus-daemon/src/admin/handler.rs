@@ -53,6 +53,10 @@ pub enum AdminMutation {
         mode: SslMode,
         email: Option<String>,
     },
+    SetDnsProvider {
+        provider: Option<String>,
+        api_token: Option<String>,
+    },
     AddAppDomain {
         app: String,
         host: String,
@@ -279,6 +283,19 @@ impl StateAdminHandler {
                 request,
                 AdminMutation::SetDashboardTls { mode, email },
                 "set_dashboard_tls",
+            ),
+            AdminCommand::SetDnsProvider {
+                provider,
+                api_token,
+            } => self.mutate(
+                role,
+                peer,
+                request,
+                AdminMutation::SetDnsProvider {
+                    provider,
+                    api_token,
+                },
+                "set_dns_provider",
             ),
             AdminCommand::ListAppDomains { app } => {
                 let domains = self
@@ -964,6 +981,7 @@ impl StateAdminHandler {
                 apex_domain: snapshot.edge.apex_domain,
                 ssl_mode: snapshot.edge.ssl_mode,
                 acme_email: acme.map(|config| config.email.clone()),
+                dns_provider: acme.and_then(|config| config.dns_provider.clone()),
                 app_count: snapshot.apps.len(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 uptime_seconds: self.started_at.elapsed().as_secs(),

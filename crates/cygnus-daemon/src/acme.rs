@@ -91,14 +91,46 @@ impl CloudflareDnsProvider {
     pub fn from_environment() -> Result<Self, AcmeError> {
         let token = std::env::var("CYGNUS_CLOUDFLARE_API_TOKEN")
             .map_err(|_| AcmeError::Dns("CYGNUS_CLOUDFLARE_API_TOKEN is not set".into()))?;
+        Self::from_token(&token)
+    }
+
+    /// Build a provider from the credential stored in the ACME configuration,
+    /// falling back to the CYGNUS_CLOUDFLARE_API_TOKEN environment variable
+    /// for installs configured before the dashboard flow existed.
+    pub fn from_acme_config(config: &AcmeConfig) -> Result<Self, AcmeError> {
+        match config.dns_api_token.as_deref() {
+            Some(token) => Self::from_token(token),
+            None => Self::from_environment(),
+        }
+    }
+
+    pub fn from_token(token: &str) -> Result<Self, AcmeError> {
         if token.trim().is_empty() {
             return Err(AcmeError::Dns("Cloudflare API token is empty".into()));
         }
         Ok(Self {
-            token,
+            token: token.trim().to_owned(),
             api_base: "https://api.cloudflare.com/client/v4".into(),
             dns_query_base: "https://cloudflare-dns.com/dns-query".into(),
         })
+    }
+
+    /// Validate the token against Cloudflare and report how many zones it can
+    /// see — proving both authentication and the Zone:Read permission the
+    /// DNS-01 flow depends on before anything is persisted.
+    pub fn verify(&self) -> Result<u32, AcmeError> {
+        let url = format!("{}/zones?per_page=50&status=active", self.api_base);
+        let mut response = ureq::get(&url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("Accept", "application/json")
+            .call()
+            .map_err(|error| AcmeError::Dns(format!("Cloudflare rejected the token: {error}")))?;
+        let envelope: CloudflareEnvelope<Vec<CloudflareZone>> = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| AcmeError::Dns(format!("decode Cloudflare zone response: {error}")))?;
+        envelope.ensure_success()?;
+        Ok(envelope.result.len() as u32)
     }
 
     #[cfg(test)]
@@ -790,6 +822,7 @@ mod tests {
                 email: "operator@example.com".into(),
                 directory_url,
                 dns_provider: None,
+                dns_api_token: None,
             },
             &directory.join("state.db"),
             challenges.clone(),

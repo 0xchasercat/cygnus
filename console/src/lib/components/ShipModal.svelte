@@ -196,7 +196,7 @@
   }
 
   async function startUpload(e) {
-    e.preventDefault();
+    e?.preventDefault?.();
     if (uploading || !picked || !appName) return;
     uploading = true;
     uploadError = '';
@@ -228,6 +228,7 @@
       uploading = false;
       if (!r.ok) {
         uploadError = r.error ?? 'Upload failed';
+        progress = 0;
         return;
       }
       ui.shipOpen = false;
@@ -237,6 +238,7 @@
     } catch (cause) {
       uploading = false;
       uploadError = cause instanceof Error ? cause.message : 'Upload failed';
+      progress = 0;
     }
   }
 
@@ -457,7 +459,14 @@
                       : 'Queued — opening build…'}
                   </span>
                 {/if}
-                {#if uploadError}<p class="inline-error" role="alert">{uploadError}</p>{/if}
+                {#if uploadError}
+                  <div class="upload-error-row">
+                    <p class="inline-error" role="alert">{uploadError}</p>
+                    {#if picked}
+                      <button class="btn sm" type="button" onclick={() => startUpload()}>Try again</button>
+                    {/if}
+                  </div>
+                {/if}
                 <div class="uactions">
                   <button class="btn" type="button" onclick={resetUpload} disabled={uploading}>Clear</button>
                   <button class="btn cobalt" type="submit" disabled={uploading || !appName}>
@@ -578,7 +587,7 @@
       {/if}
 
       <footer>
-        <span class="fcli num"><i>$</i> {live ? 'live · operator' : 'tenant 0 · preview'}</span>
+        <span class="fcli num"><i>$</i> {live ? 'live · operator' : 'preview mode'}</span>
         <span class="fnote">{live ? 'uploads run server-side builds' : 'shipping disabled · daemon bridge offline'}</span>
       </footer>
     </div>
@@ -724,6 +733,13 @@
     margin-top: 4px;
   }
   .inline-error { grid-column: 1 / -1; color: var(--red); font-size: 11.5px; margin: 2px 0 0; }
+  .upload-error-row {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .upload-error-row .inline-error { grid-column: unset; flex: 1; margin: 0; }
 
   .preview-toggle {
     grid-column: 1 / -1;

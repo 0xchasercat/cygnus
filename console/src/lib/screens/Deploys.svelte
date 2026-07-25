@@ -19,7 +19,7 @@
   );
 
   const LED = { active: 'live', building: 'build', failed: 'fail', sealed: 'cold' };
-  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'sealed' };
+  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'built' };
 
   // Derive a "branch · sha7" source label when a github job references this deploy.
   function sourceLabel(d) {

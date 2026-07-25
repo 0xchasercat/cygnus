@@ -16,8 +16,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand};
 use cygnus_daemon::admin::{
     ADMIN_PROTOCOL_VERSION, ActiveDeploymentView, AdminClient, AdminCommand, AdminData,
-    AdminRequest, AdminResponse, AppView, DEFAULT_HOST_ADMIN_SOCKET, DeploymentView, LogStream,
-    MAX_LOG_CHUNK_BYTES, NodeView,
+    AdminErrorCode, AdminRequest, AdminResponse, AppView, DEFAULT_HOST_ADMIN_SOCKET,
+    DeploymentView, LogStream, MAX_LOG_CHUNK_BYTES, NodeView,
 };
 use cygnus_daemon::deploy::DeployRequest;
 use cygnus_daemon::edge::SslMode;
@@ -90,8 +90,8 @@ enum Command {
         /// Environment variable to set, as KEY=VALUE. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// Per-app memory ceiling in bytes.
-        #[arg(long)]
+        /// Per-app memory ceiling — bytes, or with a suffix: 512M, 2G.
+        #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
         memory_max_bytes: Option<u64>,
         /// Deploy as an isolated preview under `<app>-<slug>` instead of
         /// touching the production app/domain.
@@ -123,16 +123,19 @@ enum Command {
     /// Configure an application's memory ceiling. Takes effect on redeploy.
     AppResources {
         app: String,
-        #[arg(long, value_name = "BYTES")]
+        /// Memory ceiling — bytes, or with a suffix: 512M, 2G.
+        #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
         memory_max_bytes: u64,
     },
     /// Restart the active artifact with the latest environment and resources.
     Redeploy { app: String },
     /// Configure node-wide workload memory policy.
     NodeResources {
-        #[arg(long, value_name = "BYTES")]
+        /// Aggregate workload memory budget — bytes, or with a suffix: 4G.
+        #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
         node_memory_budget_bytes: Option<u64>,
-        #[arg(long, value_name = "BYTES")]
+        /// Default for apps without their own limit — bytes, or e.g. 256M.
+        #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
         app_memory_default_bytes: Option<u64>,
     },
     /// Configure application ingress. The supervised daemon must restart.
@@ -182,6 +185,15 @@ enum Command {
         #[arg(long)]
         email: Option<String>,
     },
+    /// Connect a DNS provider for DNS-01 certificate issuance (wildcards).
+    /// The token is verified against the provider before it is stored.
+    DnsProvider {
+        /// "cloudflare" to connect or update, "none" to disconnect.
+        provider: String,
+        /// API token with Zone:Read + DNS:Edit. Omit to keep the stored one.
+        #[arg(long)]
+        api_token: Option<String>,
+    },
     /// Manage persisted application environment variables.
     Env {
         #[command(subcommand)]
@@ -210,13 +222,19 @@ enum Command {
     Rollback {
         app: String,
         deployment: String,
+        /// Expected current artifact hash (compare-and-swap guard). When
+        /// omitted, the CLI reads the app's active artifact and guards
+        /// against that automatically.
         #[arg(long)]
-        expected_active_artifact: String,
+        expected_active_artifact: Option<String>,
     },
     /// Write a deployment build log to stdout. With no <DEPLOYMENT>, shows the
     /// most recent deployment's log (run `cygnus deployments` for ids).
     Logs {
         deployment: Option<String>,
+        /// Scope the default "most recent deployment" lookup to one app.
+        #[arg(long)]
+        app: Option<String>,
         #[arg(long, value_enum, default_value_t = StreamArg::Stdout)]
         stream: StreamArg,
         #[arg(long, default_value_t = 0)]
@@ -258,15 +276,16 @@ enum EngineCommand {
 
 #[derive(Debug, Subcommand)]
 enum EnvCommand {
+    /// Set an environment variable for an app. Applies on the next deploy —
+    /// run `cygnus redeploy <app>` to restart with the new value now.
     Set {
         app: String,
         key: String,
         value: String,
     },
-    Remove {
-        app: String,
-        key: String,
-    },
+    /// Remove an environment variable from an app. Applies on the next
+    /// deploy — run `cygnus redeploy <app>` to restart without it now.
+    Remove { app: String, key: String },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -586,6 +605,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     "saved"
                 },
             );
+            if restart_required {
+                theme.line_kv("hint", restart_hint());
+            }
         }
         Command::DashboardDomain { domain, apex } => {
             let data = call(&client, AdminCommand::SetDashboardDomain { domain, apex })?;
@@ -625,6 +647,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     "saved"
                 },
             );
+            if restart_required {
+                theme.line_kv("hint", restart_hint());
+            }
         }
         Command::DashboardTls { mode, email } => {
             let mode = match mode {
@@ -636,6 +661,35 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 return Err("daemon returned an unexpected dashboard TLS response".into());
             };
             theme.line_kv("tls", "dashboard TLS policy updated");
+        }
+        Command::DnsProvider {
+            provider,
+            api_token,
+        } => {
+            let provider = match provider.as_str() {
+                "none" | "off" | "disabled" => None,
+                other => Some(other.to_owned()),
+            };
+            let data = call(
+                &client,
+                AdminCommand::SetDnsProvider {
+                    provider,
+                    api_token,
+                },
+            )?;
+            let AdminData::DnsProviderSet { provider, zones } = data else {
+                return Err("daemon returned an unexpected DNS provider response".into());
+            };
+            match provider {
+                Some(name) => theme.line_kv(
+                    "dns",
+                    &format!(
+                        "{name} connected · {zones} zone{} accessible",
+                        if zones == 1 { "" } else { "s" }
+                    ),
+                ),
+                None => theme.line_kv("dns", "provider disconnected"),
+            }
         }
         Command::Env { command } => {
             let (data, action) = match command {
@@ -699,6 +753,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             deployment,
             expected_active_artifact,
         } => {
+            // The compare-and-swap guard is essential for correctness but a
+            // 64-char hash is unreasonable to demand interactively — resolve
+            // it from the app's active deployment when not supplied.
+            let expected_active_artifact = match expected_active_artifact {
+                Some(value) => value,
+                None => {
+                    let data = call(&client, AdminCommand::GetApp { app: app.clone() })?;
+                    let AdminData::App { app: view } = data else {
+                        return Err("daemon returned an unexpected response to GetApp".into());
+                    };
+                    let active = view.active.ok_or(
+                        "app has no active deployment to roll back from — \
+                         pass --expected-active-artifact explicitly to override",
+                    )?;
+                    theme.line_kv("rolling back from", &short_hash(&active.artifact_hash));
+                    active.artifact_hash
+                }
+            };
             let data = call(
                 &client,
                 AdminCommand::Rollback {
@@ -714,10 +786,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Command::Logs {
             deployment,
+            app,
             stream,
             offset,
             follow,
-        } => stream_log(&client, deployment, stream.into(), offset, follow)?,
+        } => stream_log(&client, deployment, app, stream.into(), offset, follow)?,
         Command::DaemonLogs {
             error,
             follow,
@@ -881,8 +954,22 @@ fn call(client: &AdminClient, command: AdminCommand) -> Result<AdminData, Box<dy
     match response {
         AdminResponse::Ok { data, .. } => Ok(*data),
         AdminResponse::Error { error, .. } => {
-            Err(format!("{:?}: {}", error.code, error.message).into())
+            Err(format!("{}: {}", admin_error_label(error.code), error.message).into())
         }
+    }
+}
+
+/// Human labels for daemon error codes — the wire enum's Debug names are
+/// implementation noise in terminal output.
+fn admin_error_label(code: AdminErrorCode) -> &'static str {
+    match code {
+        AdminErrorCode::InvalidRequest => "invalid request",
+        AdminErrorCode::UnsupportedVersion => "unsupported protocol version",
+        AdminErrorCode::Unauthorized => "unauthorized",
+        AdminErrorCode::NotFound => "not found",
+        AdminErrorCode::Conflict => "conflict",
+        AdminErrorCode::Validation => "invalid input",
+        AdminErrorCode::Internal => "daemon error",
     }
 }
 
@@ -894,12 +981,13 @@ fn print_json(data: AdminData) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 /// Pick the most recent deployment so `cygnus logs` (no id) does the obvious
-/// thing instead of erroring. If nothing has shipped yet, print a hint.
-fn latest_deployment_id(client: &AdminClient) -> Result<String, Box<dyn Error>> {
+/// thing instead of erroring, optionally scoped to one app via `--app`.
+/// If nothing has shipped yet, print a hint.
+fn latest_deployment_id(client: &AdminClient, app: Option<&str>) -> Result<String, Box<dyn Error>> {
     let data = call(
         client,
         AdminCommand::ListDeployments {
-            app: None,
+            app: app.map(str::to_owned),
             cursor: None,
             limit: 1,
         },
@@ -909,22 +997,30 @@ fn latest_deployment_id(client: &AdminClient) -> Result<String, Box<dyn Error>> 
     };
     match deployments.into_iter().next() {
         Some(d) => Ok(d.id),
-        None => Err(
-            "no deployments yet — run `cygnus deploy` or pass an explicit <DEPLOYMENT> id".into(),
-        ),
+        None => match app {
+            Some(app) => Err(format!(
+                "no deployments for app {app:?} yet — run `cygnus deploy` or pass an explicit <DEPLOYMENT> id"
+            )
+            .into()),
+            None => Err(
+                "no deployments yet — run `cygnus deploy` or pass an explicit <DEPLOYMENT> id"
+                    .into(),
+            ),
+        },
     }
 }
 
 fn stream_log(
     client: &AdminClient,
     deployment: Option<String>,
+    app: Option<String>,
     stream: LogStream,
     mut offset: u64,
     follow: bool,
 ) -> Result<(), Box<dyn Error>> {
     let deployment = match deployment {
         Some(id) => id,
-        None => latest_deployment_id(client)?,
+        None => latest_deployment_id(client, app.as_deref())?,
     };
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -1382,6 +1478,9 @@ impl Theme {
             "pinned",
             if app.pinned { "yes" } else { "no" },
         );
+        if !app.env_keys.is_empty() {
+            write_kv(&mut out, self, "env", &app.env_keys.join(" "));
+        }
         if let Some(active) = app.active.as_ref() {
             write_kv(&mut out, self, "deployment", &active.deployment_id);
             write_kv(
@@ -1399,9 +1498,14 @@ impl Theme {
             self.line_kv("deployments", "none");
             return;
         }
-        let rows: Vec<[String; 5]> = deployments
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let rows: Vec<[String; 6]> = deployments
             .iter()
             .map(|deployment| {
+                let age_seconds = (now_ms - deployment.created_ms).max(0) / 1000;
                 [
                     deployment.id.clone(),
                     deployment.app.clone(),
@@ -1412,10 +1516,11 @@ impl Theme {
                         .as_deref()
                         .map(short_hash)
                         .unwrap_or_else(|| "—".to_owned()),
+                    format_uptime(age_seconds as u64),
                 ]
             })
             .collect();
-        let headers = ["ID", "APP", "STATUS", "ENGINE", "ARTIFACT"];
+        let headers = ["ID", "APP", "STATUS", "ENGINE", "ARTIFACT", "AGE"];
         print_table(self, &headers, &rows);
         if let Some(cursor) = next_cursor {
             let stdout = io::stdout();
@@ -1600,6 +1705,52 @@ fn visible_len(value: &str) -> usize {
         }
     }
     len
+}
+
+/// The command that restarts the supervised daemon on this platform, so a
+/// "restart required" line is always paired with the action that performs it.
+fn restart_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "restart via: sudo launchctl kickstart -k system/com.cygnus.daemon"
+    } else {
+        "restart via: sudo systemctl restart cygnus"
+    }
+}
+
+/// Parse a byte size that may carry a binary suffix — `512M`, `2G`, `64K`
+/// (case-insensitive; `MB`/`MiB` spellings accepted, all binary multiples).
+/// Raw byte counts remain valid, so scripts keep working.
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(rest) = lower
+        .strip_suffix("gib")
+        .or_else(|| lower.strip_suffix("gb"))
+        .or_else(|| lower.strip_suffix('g'))
+    {
+        (rest, 1024 * 1024 * 1024)
+    } else if let Some(rest) = lower
+        .strip_suffix("mib")
+        .or_else(|| lower.strip_suffix("mb"))
+        .or_else(|| lower.strip_suffix('m'))
+    {
+        (rest, 1024 * 1024)
+    } else if let Some(rest) = lower
+        .strip_suffix("kib")
+        .or_else(|| lower.strip_suffix("kb"))
+        .or_else(|| lower.strip_suffix('k'))
+    {
+        (rest, 1024)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let number: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size {trimmed:?} — use bytes or a suffix like 512M or 2G"))?;
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size {trimmed:?} does not fit in 64 bits"))
 }
 
 fn format_uptime(seconds: u64) -> String {
@@ -1934,6 +2085,27 @@ mod tests {
             .command,
             Command::Rollback { .. }
         ));
+        // Without the guard flag, the CLI resolves the active artifact itself.
+        assert!(matches!(
+            Cli::try_parse_from(["cygnus", "rollback", "api", "dep-1"])
+                .unwrap()
+                .command,
+            Command::Rollback {
+                expected_active_artifact: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn byte_sizes_accept_binary_suffixes() {
+        assert_eq!(parse_byte_size("512").unwrap(), 512);
+        assert_eq!(parse_byte_size("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_byte_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("64KiB").unwrap(), 65_536);
+        assert_eq!(parse_byte_size(" 1 GB ").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_byte_size("12x").is_err());
+        assert!(parse_byte_size("").is_err());
     }
 
     #[test]

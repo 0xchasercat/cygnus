@@ -43,6 +43,11 @@ pub struct AcmeConfig {
     pub directory_url: String,
     #[serde(default)]
     pub dns_provider: Option<String>,
+    /// DNS provider API credential for DNS-01 challenges. Lives only in the
+    /// root-owned state database and the daemon's memory — it is never
+    /// surfaced through the admin status API or the console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_api_token: Option<String>,
 }
 
 fn default_acme_directory() -> String {

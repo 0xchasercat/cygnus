@@ -40,18 +40,23 @@ macOS runs cages as plain processes — no namespaces, no cgroups, no seccomp.
 It's fine for local development; it isn't the isolation story on Linux.
 
 The installer downloads the latest release, verifies checksums, starts the
-daemon, and prints your console URL plus a one-time **recovery token**. Save
-that token somewhere safe — it's shown exactly once and it's your only way
-back in if you ever lose the admin password. Open the console URL and the
-setup wizard walks you through creating the admin account (email +
-password) on first visit; you won't need the token unless you get locked
-out later, at which point you can regenerate it with
-`install.sh --rotate-secrets`.
+daemon, and prints the listener URL (default `http://<server-ip>:3000`) plus a
+one-time **recovery token**. Save that token somewhere safe — it's shown
+exactly once and it's your only way back in if you ever lose the admin
+password. Open the console URL and the setup wizard walks you through four
+steps: create the admin account → choose listener mode (`integrated` is
+the default) → set an optional dashboard domain → toggle automatic HTTPS.
+You won't need the recovery token unless you get locked out later, at
+which point you can regenerate it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash -s -- --rotate-secrets
+```
 
 Everything after install is configured from the dashboard: listen address,
 custom domains, ACME/HTTPS, DNS provider. Flags exist to set them at install
-time too (`--apps-domain`, `--https-listen`, `--acme-email`, ...); run
-`install.sh --help` for the full list.
+time too (`--apps-domain`, `--https-listen`, `--acme-email`, ...); pass
+`--help` to the install command for the full list.
 
 Re-running the installer upgrades in place — binaries, engine, and console
 always track the release you point it at; config and the systemd/launchd
@@ -61,7 +66,7 @@ binaries, config, state, and runtime sockets — this is destructive and does
 not touch anything outside its own directories):
 
 ```sh
-install.sh --uninstall
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash -s -- --uninstall
 ```
 
 ## Deploy
@@ -125,14 +130,30 @@ straight from the page cache on revival, skipping the parse phase entirely.
 ## DNS
 
 Apps get subdomains of your configured apps domain. Point a wildcard record
-at the host:
+at the host, and a separate A record for the dashboard domain itself:
 
 ```
-*.apps.example.com  A  <host-ip>
+*.apps.example.com      A  <host-ip>
+dashboard.example.com   A  <host-ip>
 ```
+
+A low TTL (300 seconds) during initial setup makes certificate issuance
+and propagation faster.
 
 `apps.localhost` works out of the box for local use — browsers resolve
 `*.localhost` to loopback without any DNS setup.
+
+**Wildcard certificates** require DNS-01 challenge validation and a
+supported DNS provider (currently Cloudflare). Connect it from
+**Settings → Automatic HTTPS → Wildcard certificates**: the dashboard links
+straight to Cloudflare's token page with the exact permissions pre-filled
+(Zone : Read, DNS : Edit) — create, copy, paste, and Cygnus verifies the
+token against Cloudflare before storing it. `cygnus dns-provider cloudflare
+--api-token <token>` does the same from the CLI, and the
+`CYGNUS_CLOUDFLARE_API_TOKEN` environment variable remains a fallback for
+unattended installs. Without a provider, Cygnus falls back to per-domain
+HTTP-01 issuance, which works for exact domains once DNS points at the node
+but cannot issue wildcard certificates.
 
 ## The console
 
@@ -146,10 +167,12 @@ repositories, and rollbacks. It's served by the platform itself as app
 
 ```
 cygnus status                 node, engines, certificates
-cygnus apps                   registered apps and their cages
+cygnus apps                   registered apps, their state and endpoints
 cygnus deploy                 server-side build, streamed, infers app from cwd
-cygnus logs <deployment>      build output
-cygnus rollback <app> <dep>   instant blue-green rollback
+cygnus logs [deployment]      build output (most recent by default; --app <name> to scope)
+cygnus rollback <app> <dep>   instant blue-green rollback (resolves the active artifact
+                              automatically; pass --expected-active-artifact <hash>
+                              for strict compare-and-swap)
 ```
 
 Run `cygnus <command> --help` for the full flag list on any subcommand.
@@ -175,7 +198,8 @@ Run `cygnus <command> --help` for the full flag list on any subcommand.
   - App returning 502/503: the daemon's log line explains why the cage
     failed to boot; `cygnus logs <deployment>` shows the build output.
   - Locked out (lost the admin password): sign in with the recovery token
-    from install, or regenerate it with `install.sh --rotate-secrets`.
+    from install, or regenerate it:
+    `curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash -s -- --rotate-secrets`
 
 ## Building from source
 
@@ -192,6 +216,15 @@ seccomp, cgroups v2) needs Linux 5.15+.
 
 - [Getting started](docs/getting-started.md) — a longer walkthrough of the
   same install → deploy → operate flow above.
+
+## Contributing & Security
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for build
+instructions, test guidance, and PR expectations.
+
+To report a security vulnerability, use GitHub Security Advisories — do not
+open a public issue. See [SECURITY.md](SECURITY.md) for the full policy and
+the isolation model summary.
 
 ## License
 

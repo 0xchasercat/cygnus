@@ -69,34 +69,94 @@ pub enum Status {
     Unavailable,
 }
 
+/// Compose a complete front-generated error response at compile time: status
+/// line, headers, and a small self-contained HTML page a human can act on. The
+/// body is delimited by connection close (every front error reply closes the
+/// connection), so no content-length bookkeeping is needed.
+macro_rules! error_page {
+    ($status_line:literal, $extra_headers:literal, $title:literal, $detail:literal) => {
+        concat!(
+            "HTTP/1.1 ",
+            $status_line,
+            "\r\nconnection: close\r\n",
+            $extra_headers,
+            "content-type: text/html; charset=utf-8\r\n\r\n",
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+            "<title>",
+            $title,
+            "</title><style>",
+            "body{margin:0;min-height:100vh;display:grid;place-items:center;",
+            "background:#0d121c;color:#e8ebf2;",
+            "font:14px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}",
+            "main{max-width:30rem;padding:2.5rem 2rem;text-align:center}",
+            "h1{font-size:14px;font-weight:600;letter-spacing:.3em;margin:0 0 1rem}",
+            "p{margin:0;color:#98a0b3;font-size:13px}",
+            "footer{margin-top:2.2rem;color:#4a5164;font-size:10px;letter-spacing:.34em}",
+            "</style></head><body><main><h1>",
+            $title,
+            "</h1><p>",
+            $detail,
+            "</p><footer>CYGNUS</footer></main></body></html>"
+        )
+        .as_bytes()
+    };
+}
+
 /// The canned response bytes for a front-generated status. Each closes the
 /// connection, since the front does not keep-alive its own error replies.
+/// Bodies are deliberately generic for visitors while giving an operator
+/// enough to know which condition fired.
 pub fn error_response(status: Status) -> &'static [u8] {
     match status {
-        Status::BadRequest => {
-            b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::RequestTimeout => {
-            b"HTTP/1.1 408 Request Timeout\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::PayloadTooLarge => {
-            b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::NotFound => {
-            b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::MisdirectedRequest => {
-            b"HTTP/1.1 421 Misdirected Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::TooManyRequests => {
-            b"HTTP/1.1 429 Too Many Requests\r\nconnection: close\r\nretry-after: 1\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::BadGateway => {
-            b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
-        Status::Unavailable => {
-            b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
-        }
+        Status::BadRequest => error_page!(
+            "400 Bad Request",
+            "",
+            "BAD REQUEST",
+            "The request could not be understood by this server."
+        ),
+        Status::RequestTimeout => error_page!(
+            "408 Request Timeout",
+            "",
+            "REQUEST TIMEOUT",
+            "The request took too long to arrive. Check your connection and try again."
+        ),
+        Status::PayloadTooLarge => error_page!(
+            "413 Payload Too Large",
+            "",
+            "PAYLOAD TOO LARGE",
+            "The request body exceeds what this server accepts."
+        ),
+        Status::NotFound => error_page!(
+            "404 Not Found",
+            "",
+            "NOT FOUND",
+            "No application is configured for this address. If you just pointed DNS here, the app may not be mapped to this domain yet."
+        ),
+        Status::MisdirectedRequest => error_page!(
+            "421 Misdirected Request",
+            "",
+            "MISDIRECTED REQUEST",
+            "This connection was negotiated for a different hostname. Retry with a fresh connection."
+        ),
+        Status::TooManyRequests => error_page!(
+            "429 Too Many Requests",
+            "retry-after: 1\r\n",
+            "TOO MANY REQUESTS",
+            "This application is at capacity right now. Retry in a moment."
+        ),
+        Status::BadGateway => error_page!(
+            "502 Bad Gateway",
+            "retry-after: 5\r\n",
+            "APP NOT ANSWERING",
+            "The application started but is not answering yet. Refresh in a few seconds."
+        ),
+        Status::Unavailable => error_page!(
+            "503 Service Unavailable",
+            "retry-after: 30\r\n",
+            "APP UNAVAILABLE",
+            "The application is recovering after repeated failures and will return automatically. Retry shortly."
+        ),
     }
 }
 

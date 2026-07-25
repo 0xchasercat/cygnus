@@ -22,9 +22,9 @@
         : mode === 'tcp'
           ? (store.node?.listener?.advertise_host ?? 'TCP endpoints')
           : (store.node?.listener?.socket_dir ?? '/run/cygnus/apps');
-      return { id: 'tenant zero', mid: 'live', tail: host, live: true };
+      return { id: 'cygnus node', mid: 'live', tail: host, live: true };
     }
-    return { id: 'tenant zero', mid: 'preview', tail: 'cygnus 0.9.2', live: false };
+    return { id: 'cygnus node', mid: 'preview', tail: 'cygnus 0.9.2', live: false };
   });
 
   let menuOpen = $state(false);

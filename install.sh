@@ -183,6 +183,11 @@ if (( ! uninstall )) && [[ -z $bundle_dir ]]; then
     aarch64|arm64) ARCH_LOWER="aarch64" ;;
     *) fail "Unsupported architecture: $ARCH" ;;
   esac
+  # No x86_64-apple-darwin release exists — fail here with a clear message
+  # instead of a confusing download 404 halfway through the install.
+  if [[ $OS == Darwin && $ARCH_LOWER == x86_64 ]]; then
+    fail "Intel Macs are not supported yet. Use an Apple Silicon Mac or a Linux server."
+  fi
   TARGET="${ARCH_LOWER}-${OS_LOWER}"
 
   if (( TEST_MODE )); then

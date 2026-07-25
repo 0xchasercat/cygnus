@@ -15,6 +15,7 @@
   import Observe from './lib/screens/Observe.svelte';
   import NodeScreen from './lib/screens/NodeScreen.svelte';
   import SettingsScreen from './lib/screens/SettingsScreen.svelte';
+  import Icon from './lib/components/Icon.svelte';
 
   const SCREENS = {
     overview: Overview,
@@ -48,6 +49,17 @@
 
   onMount(() => store.boot());
 
+  // Global toast — auto-dismisses after 4.5s, cleared on change/unmount.
+  let _toastTimer = null;
+  $effect(() => {
+    const msg = store.notice;
+    if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+    if (msg) {
+      _toastTimer = setTimeout(() => { store.notice = ''; }, 4500);
+    }
+    return () => { if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; } };
+  });
+
   function onKeydown(e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
@@ -64,7 +76,7 @@
 <svelte:window onkeydown={onKeydown} />
 
 {#if store.mode === 'loading'}
-  <div class="loading num">LOCATING TENANT ZERO…</div>
+  <div class="loading num">CONNECTING TO NODE…</div>
 {:else if needsSetup}
   <Setup />
 {:else if store.mode === 'live' && !ready}
@@ -88,6 +100,14 @@
 
   <Palette />
   <ShipModal />
+
+  {#if store.notice}
+    <div class="global-toast" role="status" aria-live="polite">
+      <Icon name="check" size={13} />
+      <span class="toast-msg">{store.notice}</span>
+      <button class="toast-dismiss" onclick={() => (store.notice = '')} aria-label="Dismiss">✕</button>
+    </div>
+  {/if}
 {/if}
 
 <style>
@@ -119,4 +139,37 @@
     font-size: 11px;
     letter-spacing: 0.18em;
   }
+
+  .global-toast {
+    position: fixed;
+    bottom: 28px;
+    right: 28px;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border: 1px solid color-mix(in srgb, var(--live) 35%, var(--line));
+    border-radius: 11px;
+    background: var(--live-soft);
+    color: #087a45;
+    font-size: 12px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    animation: toast-in 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+  }
+  .toast-msg { flex: 1; }
+  .toast-dismiss {
+    background: none;
+    border: 0;
+    padding: 0 0 0 6px;
+    color: #087a45;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    opacity: 0.7;
+  }
+  .toast-dismiss:hover { opacity: 1; }
 </style>

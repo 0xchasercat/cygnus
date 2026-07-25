@@ -16,17 +16,29 @@ curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh 
 The installer downloads the latest release, verifies checksums, starts the
 daemon under systemd, and prints:
 
-- your **console URL** (`https://cygnus.<apps-domain>`)
+- your **console URL** — `http://<server-ip>:3000` by default (the listener
+  address, not a subdomain of your apps domain)
 - your **recovery token** — save it now, it's shown only this once. You
   won't need it for first login (the setup wizard creates the admin
   account); it's your way back in if you ever lose that password.
+
+On first visit the setup wizard walks you through four steps: create the
+admin account (email + password) → choose listener mode (`integrated` is
+the default, which handles HTTP and TLS) → set an optional dashboard
+domain → toggle automatic HTTPS.
 
 Non-interactive installs: pass `--noninteractive` plus flags like
 `--apps-domain apps.example.com --https-listen 0.0.0.0:443 --acme-email you@example.com`.
 
 To remove Cygnus entirely — service, binaries, config, state, and runtime
-sockets — run `install.sh --uninstall`. Re-running the installer afterward
-is a clean reinstall; nothing needs manual deletion first.
+sockets — run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash -s -- --uninstall
+```
+
+Re-running the installer afterward is a clean reinstall; nothing needs
+manual deletion first.
 
 ### macOS (development)
 
@@ -40,22 +52,55 @@ curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh 
 
 ## 2. DNS
 
-Apps get subdomains of your apps domain. Point a wildcard record at the host:
+Apps get subdomains of your apps domain. Point a wildcard record at the host,
+and a separate A record for the dashboard domain:
 
 ```
-*.apps.example.com  A  <host-ip>
+*.apps.example.com      A  <host-ip>
+dashboard.example.com   A  <host-ip>
 ```
+
+A low TTL (300 seconds) during initial setup speeds up certificate issuance
+and propagation.
 
 For local use the default `apps.localhost` works out of the box — browsers
 resolve `*.localhost` to loopback.
+
+**Wildcard certificates** require DNS-01 challenge validation. Cloudflare is
+the currently supported provider, and connecting it takes under a minute from
+the dashboard:
+
+1. Open **Settings → Automatic HTTPS → Wildcard certificates → Connect**.
+2. Click **Create token on Cloudflare** — the link opens Cloudflare's token
+   page with the exact permissions pre-filled (Zone : Read, DNS : Edit).
+   Create the token and copy it.
+3. Paste it into the field and hit **Verify & connect**. Cygnus validates the
+   token against Cloudflare (and tells you how many zones it can see) before
+   storing it in the root-owned state database. Pending wildcard certificates
+   begin issuing immediately.
+
+The same flow works from the CLI:
+
+```
+cygnus dns-provider cloudflare --api-token <token>   # verifies, then stores
+cygnus dns-provider none                             # disconnect
+```
+
+The `CYGNUS_CLOUDFLARE_API_TOKEN` environment variable still works as a
+fallback for unattended installs. Without a connected provider, Cygnus uses
+per-domain HTTP-01, which works for exact domains once DNS resolves to the
+node but cannot issue wildcard certs.
 
 ## 3. Open the console
 
 Visit the console URL. On first visit the setup wizard walks you through
 creating the admin account (email + password) — that's your login going
 forward. The recovery token from install isn't needed here; keep it for if
-you ever lose the password, and rotate it any time with
-`install.sh --rotate-secrets`.
+you ever lose the password, and rotate it any time with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash -s -- --rotate-secrets
+```
 
 ## 4. Ship an app
 
@@ -100,8 +145,8 @@ The same settings are accepted in `node.json`:
     "http_listen": "0.0.0.0:80"
   },
   "resources": {
-    "node_memory_budget_bytes": 4294967296,
-    "app_memory_default_bytes": 536870912
+    "node_memory_budget_bytes": "4G",
+    "app_memory_default_bytes": "512M"
   },
   "edge": {
     "https_listen": "0.0.0.0:443"
@@ -121,9 +166,9 @@ Useful node-only CLI updates—none replace the app list—include:
 ```sh
 cygnus listener --mode tcp --advertise-host node.example.com
 cygnus dashboard-listen --listen 0.0.0.0:3000
-cygnus node-resources --node-memory-budget-bytes 4294967296 \
-  --app-memory-default-bytes 536870912
-cygnus app-resources my-app --memory-max-bytes 1073741824
+cygnus node-resources --node-memory-budget-bytes 4G \
+  --app-memory-default-bytes 512M
+cygnus app-resources my-app --memory-max-bytes 1G
 cygnus env set my-app API_URL https://api.example.com
 ```
 
@@ -135,7 +180,8 @@ applied configuration revisions.
 
 - **Dashboard** — latency charts, cold-start anatomy, live request stream,
   events, build and runtime logs, domains, rollbacks.
-- **CLI** — `cygnus status`, `cygnus apps`, `cygnus logs <deployment>`,
+- **CLI** — `cygnus status`, `cygnus apps`, `cygnus logs [deployment]`
+  (omit the id to show the most recent),
   `cygnus rollback` (compare-and-swap on the active artifact). The CLI talks
   to the daemon's root-only admin socket, so it keeps working even if you
   break the dashboard with a bad deploy of the dashboard itself.
@@ -159,19 +205,41 @@ Pin an app always-warm with `min_instances: 1` (the dashboard's own app,
 
 macOS uses `~/.cygnus/{state,run,etc}` for the same roles.
 
+## Upgrading
+
+Re-run the same install command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash
+```
+
+The installer detects the existing install, snapshots the current binaries
+and state, then upgrades transactionally. The daemon restarts with the new
+binaries; running apps come back on their next request (scale-to-zero
+revival). If the new daemon fails its health check, the installer
+automatically restores the previous binaries and restarts the old release —
+no manual intervention required. Config and the service file are preserved
+unless you pass `--reconfigure`; secrets are preserved unless you pass
+`--rotate-secrets`.
+
 ## Troubleshooting
 
 - **Console unreachable** — `systemctl status cygnus`, then
   `journalctl -u cygnus -n 100`. The daemon logs every request and every
   boot failure with the reason.
 - **App 502/503** — the daemon's log line says why the cage failed to boot;
-  `cygnus logs <deployment>` shows the build output.
+  `cygnus logs` shows the most recent build output (pass a deployment id to
+  select a specific one).
 - **Locked out of the console** — sign in with the recovery token from
-  install, or regenerate it with `install.sh --rotate-secrets` if you lost
-  it too.
+  install, or regenerate it with:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | sudo bash -s -- --rotate-secrets
+  ```
 - **macOS: sockets never become ready after an accidental `sudo` install** —
   a root copy of the service may still be registered with launchd (it
   survives deleting the plist). Remove it and start clean:
   `sudo launchctl bootout system/com.cygnus.daemon`, then
   `sudo rm -rf ~/.cygnus ~/Library/LaunchAgents/com.cygnus.daemon.plist`,
-  then rerun the installer without sudo.
+  then rerun `curl -fsSL https://raw.githubusercontent.com/0xchasercat/cygnus/main/install.sh | bash`
+  without sudo.

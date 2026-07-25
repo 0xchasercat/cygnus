@@ -635,6 +635,26 @@ class Store {
     }
   }
 
+  // Connect ("cloudflare" + apiToken), replace, or disconnect (provider null)
+  // the DNS provider used for DNS-01 issuance. The daemon verifies the token
+  // against Cloudflare before storing it and reports the zone count it saw.
+  async setDnsProvider({ provider, apiToken }) {
+    try {
+      const data = await post('/api/v1/settings/dns-provider', {
+        provider,
+        ...(apiToken ? { api_token: apiToken } : {}),
+      });
+      const zones = data?.zones ?? 0;
+      this.notice = provider
+        ? `Cloudflare connected — ${zones} zone${zones === 1 ? '' : 's'} accessible.`
+        : 'DNS provider disconnected.';
+      await this.#safeGet('/api/v1/status', (d) => (this.node = d?.node ?? this.node));
+      return { ok: true, zones };
+    } catch (cause) {
+      return { ok: false, error: cause instanceof Error ? cause.message : 'Could not update DNS provider' };
+    }
+  }
+
   async retryDashboardAcme() {
     try {
       // Re-applying automatic TLS is intentionally idempotent and asks the
@@ -838,7 +858,7 @@ class Store {
   async configureRepository(cfg) {
     try {
       await post('/api/v1/github/repositories', cfg);
-      this.notice = `Mapped ${cfg.owner}/${cfg.name} to Tenant Zero.`;
+      this.notice = `Repository connected — first build queued.`;
       await this.#poll();
       return { ok: true };
     } catch (cause) {

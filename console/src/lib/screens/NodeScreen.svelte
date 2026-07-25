@@ -184,7 +184,7 @@
     <!-- ————— revival anatomy ————— -->
     <section class="card">
       <div class="cardhead">
-        <span class="label">Revival budget</span>
+        <span class="label">Cold start budget</span>
         {#if store.metrics?.totals}
           <span class="hint num">p50 <b>{millis(store.metrics.totals.boot_p50_ms)}</b> · p99 <b>{millis(store.metrics.totals.boot_p99_ms)}</b></span>
         {/if}
