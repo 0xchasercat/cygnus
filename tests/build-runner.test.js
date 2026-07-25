@@ -301,6 +301,87 @@ test("auto mode serves static output when the start script is a dev server", asy
   }
 });
 
+test("auto mode serves the assets directory from wrangler config", async () => {
+  // Cloudflare Workers project: assets live in a non-conventional directory
+  // named only in wrangler.jsonc, alongside a worker script Cygnus cannot
+  // run. The assets are the servable site; the log must say what happens to
+  // the worker.
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "wrangler.jsonc"),
+      '{\n  // deployed on the edge\n  "name": "site",\n  "main": "src/worker.ts",\n  "assets": { "directory": "./site-assets" }\n}\n',
+    );
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync("site-assets", { recursive: true });\n' +
+        'writeFileSync("site-assets/index.html", "<h1>edge assets ok</h1>");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("Cloudflare Workers config found (wrangler.jsonc)");
+    expect(result.stderr).toContain("worker script (src/worker.ts) does not run on Cygnus");
+    expect(await exists(join(fixture.output, "public", "index.html"))).toBe(true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("auto mode explains adapter options for worker-only wrangler projects", async () => {
+  const fixture = await staticFixture("noop.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "wrangler.toml"),
+      'name = "api"\nmain = "src/worker.ts"\ncompatibility_date = "2026-01-01"\n',
+    );
+    await writeFile(join(fixture.workspace, "noop.ts"), 'console.error("worker build");\n');
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("targets the Cloudflare Workers runtime (wrangler.toml, main: src/worker.ts)");
+    expect(result.stderr).toContain("@sveltejs/adapter-node");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("auto mode finds Angular's dist/<project>/browser output", async () => {
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync("dist/myapp/browser", { recursive: true });\n' +
+        'writeFileSync("dist/myapp/browser/index.html", "<h1>ng ok</h1>");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("static output found: dist/myapp/browser");
+    expect(await exists(join(fixture.output, "public", "index.html"))).toBe(true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("auto mode serves prerendered SvelteKit cloudflare output", async () => {
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync(".svelte-kit/cloudflare", { recursive: true });\n' +
+        'writeFileSync(".svelte-kit/cloudflare/index.html", "<h1>prerendered ok</h1>");\n' +
+        'writeFileSync(".svelte-kit/cloudflare/_worker.js", "export default {};");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("static output found: .svelte-kit/cloudflare");
+    expect(await exists(join(fixture.output, "public", "index.html"))).toBe(true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("auto mode fails clearly for a dev-server start with no static output", async () => {
   const fixture = await staticFixture("noop.ts");
   try {
