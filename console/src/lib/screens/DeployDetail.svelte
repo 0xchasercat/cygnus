@@ -518,12 +518,11 @@
               <div class="kvrow"><span>Duration</span><b class="num">{formatElapsed(elapsedMs)}</b></div>
             {/if}
           </div>
-          <div class="foot num">content-addressed · RO-mounted · runtime writes are noexec</div>
         </section>
 
         <section class="card">
           <div class="cardhead">
-            <span class="label">Cold start anatomy</span>
+            <span class="label">Cold start breakdown</span>
             {#if store.metrics?.boot_phases}
               <span class="p num">p50 {millis(store.metrics.totals.boot_p50_ms)}</span>
             {/if}

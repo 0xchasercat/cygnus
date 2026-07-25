@@ -247,9 +247,12 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
     }
 
     fn install_after_commit(&self, snapshot: &Snapshot, logical_app: &str, new_runtime_key: &str) {
+        // resolve_exact: a first deploy has no internal route yet, and a
+        // plain resolve would fall through to the default route — Tenant
+        // Zero — and retire the console's own runtime below.
         let previous_runtime_key = self
             .router
-            .resolve(&internal_app_route_key(logical_app))
+            .resolve_exact(&internal_app_route_key(logical_app))
             .map(|route| route.app.clone());
         let retired = self.router.install(route_table(snapshot));
         if let Some(previous) = previous_runtime_key
@@ -270,7 +273,7 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
         let result: Result<DeployResult, DeployError> = (|| {
             let previous_runtime_key = self
                 .router
-                .resolve(&internal_app_route_key(&app))
+                .resolve_exact(&internal_app_route_key(&app))
                 .map(|route| route.app.clone())
                 .or_else(|| {
                     state
@@ -1301,7 +1304,7 @@ impl LiveAdminMutations {
         })?;
         let previous_route = self
             .router
-            .resolve(&internal_app_route_key(app))
+            .resolve_exact(&internal_app_route_key(app))
             .ok_or_else(|| {
                 AdminMutationError::new(
                     AdminErrorCode::Conflict,
@@ -1527,7 +1530,7 @@ impl LiveAdminMutations {
         let routes = route_table(&snapshot);
         let actual_previous_runtime_key = self
             .router
-            .resolve(&internal_app_route_key(app))
+            .resolve_exact(&internal_app_route_key(app))
             .map(|route| route.app.clone());
         let runtime_changed =
             actual_previous_runtime_key.as_deref() != Some(plan.runtime_key.as_str());
@@ -1692,7 +1695,9 @@ impl AppListenerWorker {
 }
 
 fn active_app_route(router: &Router, app: &str) -> Option<Arc<Route>> {
-    router.resolve(&internal_app_route_key(app))
+    // Exact only: an app listener must go dark when its app is gone, not
+    // fall through to the default route and expose the console on its port.
+    router.resolve_exact(&internal_app_route_key(app))
 }
 
 fn spawn_tcp_app_worker(

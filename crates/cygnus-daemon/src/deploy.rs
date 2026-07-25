@@ -1202,9 +1202,14 @@ fn preflight_workspace(
     workspace: &Path,
     explicit_entry: Option<&Path>,
 ) -> Result<BuildPlan, DeployError> {
+    // .npmrc and bunfig.toml can redirect the package registry or inject
+    // preload scripts into the server-side build, so they stay rejected.
+    // Lockfiles are different: bun.lockb (and the newer bun.lock) are present
+    // in most real Bun repositories and only pin dependency versions — they
+    // make installs MORE deterministic. Rejecting them failed the majority
+    // of real-world deploys for no security win.
     reject_workspace_path(workspace, ".npmrc", false)?;
     reject_workspace_path(workspace, "bunfig.toml", false)?;
-    reject_workspace_path(workspace, "bun.lockb", false)?;
 
     let package_path = workspace.join("package.json");
     let (has_dependencies, build_script, has_start_script) =
@@ -2830,6 +2835,12 @@ mod tests {
         fs::remove_file(workspace.join("package.json")).unwrap();
         fs::write(workspace.join(".npmrc"), b"registry=https://evil.invalid\n").unwrap();
         assert!(preflight_workspace(&workspace, None).is_err());
+        fs::remove_file(workspace.join(".npmrc")).unwrap();
+        // Lockfiles are not control files — most real Bun repositories ship
+        // bun.lockb, and rejecting it failed their deploys outright.
+        fs::write(workspace.join("bun.lockb"), b"binary-lockfile").unwrap();
+        fs::write(workspace.join("index.ts"), b"export default {};\n").unwrap();
+        assert!(preflight_workspace(&workspace, None).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 

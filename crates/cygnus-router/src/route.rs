@@ -80,6 +80,16 @@ impl RouteTable {
         self.default.as_ref().map(Arc::clone)
     }
 
+    /// Resolve an exact pattern only — no wildcard matching and, critically,
+    /// no default-route fallback. Internal bookkeeping keys (the per-app
+    /// `__cygnus_app__.<name>` routes) must use this: falling through to the
+    /// default made "look up app X's previous runtime" answer with Tenant
+    /// Zero's runtime whenever X had no route yet, and the first deploy of a
+    /// new app then retired the console's own cage.
+    pub fn resolve_exact(&self, pattern: &str) -> Option<Arc<Route>> {
+        self.exact.get(&normalize_host(pattern)).map(Arc::clone)
+    }
+
     /// Whether no request still holds a route cloned from this table.
     pub fn is_quiescent(&self) -> bool {
         self.exact
@@ -106,6 +116,12 @@ impl Router {
     /// Resolve a host to its route without blocking writers or readers.
     pub fn resolve(&self, host: &str) -> Option<Arc<Route>> {
         self.table.load().resolve(host)
+    }
+
+    /// Resolve an exact pattern only — never the wildcard or default routes.
+    /// Use for internal bookkeeping keys; see [`RouteTable::resolve_exact`].
+    pub fn resolve_exact(&self, pattern: &str) -> Option<Arc<Route>> {
+        self.table.load().resolve_exact(pattern)
     }
 
     /// Atomically replace the routing table and return the retired table.
@@ -200,6 +216,36 @@ mod tests {
         // Clearing the default restores 404 behavior.
         table.set_default(None);
         assert!(table.resolve("nope.example.com").is_none());
+    }
+
+    #[test]
+    fn resolve_exact_never_falls_through_to_wildcard_or_default() {
+        let mut table = table();
+        table.set_default(Some(route("console")));
+        // Exact patterns still resolve.
+        assert_eq!(table.resolve_exact("api.example.com").unwrap().app, "api");
+        assert_eq!(
+            table
+                .resolve_exact("__cygnus_app__.api")
+                .map(|r| r.app.clone()),
+            None,
+            "internal key was never inserted"
+        );
+        table.insert("__cygnus_app__.api", route("r-api"));
+        assert_eq!(
+            table.resolve_exact("__cygnus_app__.api").unwrap().app,
+            "r-api"
+        );
+        // A missing internal key must answer None — NOT the default route.
+        // Falling through here made "find app X's previous runtime" return
+        // Tenant Zero, and the first deploy of a new app retired the console.
+        assert!(
+            table
+                .resolve_exact("__cygnus_app__.brand-new-app")
+                .is_none()
+        );
+        // Wildcards don't apply to exact-only resolution either.
+        assert!(table.resolve_exact("blog.apps.example.com").is_none());
     }
 
     #[test]

@@ -674,7 +674,7 @@
             </div>
           </div>
         {/if}
-        <div class="foot num">builds run server-side · lifecycle scripts disabled by default</div>
+        <div class="foot num">dependency lifecycle scripts don't run during builds</div>
       </section>
     </div>
 

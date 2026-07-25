@@ -154,7 +154,7 @@
     <!-- ————— memory density ————— -->
     <section class="card">
       <div class="cardhead">
-        <span class="label">Memory · density</span>
+        <span class="label">Memory</span>
         {#if hasMemory}<span class="hint num">{bytes(usedBytes)} / {bytes(node.memory.total_bytes)}</span>{/if}
       </div>
       <div class="pad">
@@ -184,7 +184,7 @@
     <!-- ————— revival anatomy ————— -->
     <section class="card">
       <div class="cardhead">
-        <span class="label">Cold start budget</span>
+        <span class="label">Cold starts</span>
         {#if store.metrics?.totals}
           <span class="hint num">p50 <b>{millis(store.metrics.totals.boot_p50_ms)}</b> · p99 <b>{millis(store.metrics.totals.boot_p99_ms)}</b></span>
         {/if}
@@ -200,7 +200,7 @@
 
     <!-- ————— engines ————— -->
     <section class="card">
-      <div class="cardhead"><span class="label">Engines · page-cache shared</span></div>
+      <div class="cardhead"><span class="label">Engines</span></div>
       {#if node?.engines?.length}
         <div class="rows pad0">
           {#each node.engines as e (e.version)}
@@ -212,7 +212,6 @@
             </div>
           {/each}
         </div>
-        <div class="foot num">one text copy per resident version · unreferenced engines are GC'd</div>
       {:else}
         <div class="empty mono">no engines reported</div>
       {/if}
@@ -220,7 +219,7 @@
 
     <!-- ————— certificates ————— -->
     <section class="card">
-      <div class="cardhead"><span class="label">Certificates · ACME</span></div>
+      <div class="cardhead"><span class="label">Certificates</span></div>
       {#if node?.certificates?.length}
         <div class="rows pad0">
           {#each node.certificates as c (c.domain)}
@@ -233,7 +232,6 @@
             </div>
           {/each}
         </div>
-        <div class="foot num">keys never enter a cage · hot-loaded into rustls</div>
       {:else}
         <div class="empty mono">no certificates reported</div>
       {/if}
@@ -243,7 +241,7 @@
     {#if egress}
       <section class="card">
         <div class="cardhead">
-          <span class="label">Egress · nftables per cage</span>
+          <span class="label">Egress</span>
           <span class="hint num">{egress.today} today · {egress.conns} conns</span>
         </div>
         <div class="pad">
