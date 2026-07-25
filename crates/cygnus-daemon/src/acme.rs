@@ -124,13 +124,11 @@ impl CloudflareDnsProvider {
             .header("Authorization", &format!("Bearer {}", self.token))
             .header("Accept", "application/json")
             .call()
-            .map_err(|error| {
-                AcmeError::Dns(format!("Cloudflare rejected the token: {error}"))
-            })?;
-        let envelope: CloudflareEnvelope<Vec<CloudflareZone>> =
-            response.body_mut().read_json().map_err(|error| {
-                AcmeError::Dns(format!("decode Cloudflare zone response: {error}"))
-            })?;
+            .map_err(|error| AcmeError::Dns(format!("Cloudflare rejected the token: {error}")))?;
+        let envelope: CloudflareEnvelope<Vec<CloudflareZone>> = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| AcmeError::Dns(format!("decode Cloudflare zone response: {error}")))?;
         envelope.ensure_success()?;
         Ok(envelope.result.len() as u32)
     }
