@@ -18,7 +18,7 @@
   const endpoint = $derived(appEndpoint(store.node, app));
 
   const LED = { active: 'live', building: 'build', failed: 'fail', sealed: 'cold' };
-  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'sealed' };
+  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'built' };
 
   const stateLed = $derived(
     app
@@ -495,6 +495,7 @@
               <button class="btn cobalt sm" type="submit" disabled={domainBusy || !newHost.trim()}>
                 {domainBusy ? 'Adding…' : 'Add'}
               </button>
+              <p class="dom-hint mono">Point an A record for your domain at this node's IP — exact DNS details appear after adding.</p>
               {#if domainError}<p class="dom-err" role="alert">{domainError}</p>{/if}
             </form>
           {/if}
@@ -610,10 +611,10 @@
           </section>
         {/if}
 
-        <!-- ————— the cage ————— -->
+        <!-- ————— the runtime ————— -->
         <section class="card">
           <div class="cardhead">
-            <span class="label">Cage</span>
+            <span class="label">Runtime</span>
             {#if app.lifecycle_state === 'ready'}
               <span class="pill live">ready</span>
             {:else if app.lifecycle_state === 'building'}
@@ -625,7 +626,7 @@
           {#if app.lifecycle_state === 'cold'}
             <div class="coldbox">
               <p>No process. The artifact sleeps on disk — {app.env_keys?.length ?? 0} env keys sealed, route armed.</p>
-              <div class="coldstat num">next request revives the cage</div>
+              <div class="coldstat num">next request revives the process</div>
             </div>
           {:else}
             <div class="kv">
@@ -635,8 +636,8 @@
             </div>
             {#if store.metrics?.totals?.boot_p50_ms}
               <div class="kv" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line-2)">
-                <div class="kvrow"><span>Revival p50</span><b class="num">{millis(store.metrics.totals.boot_p50_ms)}</b></div>
-                <div class="kvrow"><span>Revival p99</span><b class="num">{millis(store.metrics.totals.boot_p99_ms)}</b></div>
+                <div class="kvrow"><span>Cold start p50</span><b class="num">{millis(store.metrics.totals.boot_p50_ms)}</b></div>
+                <div class="kvrow"><span>Cold start p99</span><b class="num">{millis(store.metrics.totals.boot_p99_ms)}</b></div>
               </div>
             {/if}
           {/if}
@@ -659,7 +660,7 @@
             <button class="btn sm" type="submit" disabled={memoryBusy || !memoryMiB}>
               {memoryBusy ? 'Saving…' : 'Save'}
             </button>
-            <p>Applied the next time this app starts. Redeploy now to replace the running cage immediately.</p>
+            <p>Applied the next time this app starts. Redeploy now to replace the running process immediately.</p>
             {#if memoryError}<span class="dom-err" role="alert">{memoryError}</span>{/if}
           </form>
         </section>
@@ -754,7 +755,10 @@
   {/if}
 {:else}
   <div class="page screen-enter">
-    <div class="empty mono">no app selected</div>
+    <div class="empty-state">
+      <p class="empty-copy">This app may still be loading, or it was removed.</p>
+      <button class="btn" onclick={() => go('overview')}>Back to overview</button>
+    </div>
   </div>
 {/if}
 
@@ -1071,6 +1075,7 @@
   }
   .dom-add input:focus-visible { outline: 2px solid var(--cobalt); outline-offset: 1px; }
   .dom-add .dom-err { grid-column: 1 / -1; color: var(--red); font-size: 11px; margin: 0; }
+  .dom-hint { grid-column: 1 / -1; font-size: 10.5px; color: var(--ink-4); margin: 0; line-height: 1.55; }
   .linklike {
     background: none;
     border: 0;
@@ -1234,4 +1239,18 @@
   .dactions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
   .btn.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--line)); }
   .btn.danger:hover { background: var(--red-soft); }
+  .empty-state {
+    padding: 80px 0;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  .empty-copy {
+    color: var(--ink-3);
+    font-size: 13px;
+    line-height: 1.55;
+    max-width: 360px;
+  }
 </style>

@@ -838,7 +838,7 @@ class Store {
   async configureRepository(cfg) {
     try {
       await post('/api/v1/github/repositories', cfg);
-      this.notice = `Mapped ${cfg.owner}/${cfg.name} to Tenant Zero.`;
+      this.notice = `Repository connected — first build queued.`;
       await this.#poll();
       return { ok: true };
     } catch (cause) {

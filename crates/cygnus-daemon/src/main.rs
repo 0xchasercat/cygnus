@@ -311,7 +311,10 @@ impl<I: Instance + 'static> LiveDeployRuntime<I> {
                     &self.metrics,
                     "deploy_failed",
                     Some(&app),
-                    "deployment failed",
+                    // Carry the actual reason into the live event feed — a
+                    // bare "deployment failed" gives the dashboard nothing
+                    // actionable to show.
+                    format!("deployment failed: {error}"),
                 );
                 Err(error)
             }
@@ -2643,11 +2646,34 @@ fn acme_manager(
         None => None,
         Some("cloudflare") => match CloudflareDnsProvider::from_environment() {
             Ok(provider) => Some(Arc::new(provider)),
-            Err(_) => return Ok(None),
+            Err(error) => {
+                // A broken provider must not silently disable ALL issuance —
+                // fall back to HTTP-01 so exact-domain certificates keep
+                // working, and say why wildcards won't.
+                warn_acme_provider_once(&format!(
+                    "cygnus-daemon: dns_provider \"cloudflare\" is configured but unusable ({error}); \
+                     continuing with HTTP-01 only — wildcard certificates will fail until \
+                     CYGNUS_CLOUDFLARE_API_TOKEN is set"
+                ));
+                None
+            }
         },
-        Some(_) => return Ok(None),
+        Some(other) => {
+            warn_acme_provider_once(&format!(
+                "cygnus-daemon: unsupported dns_provider {other:?} (supported: cloudflare); \
+                 continuing with HTTP-01 only — wildcard certificates will fail"
+            ));
+            None
+        }
     };
     Ok(Some(AcmeManager::new(config, state_path, challenges, dns)?))
+}
+
+/// ACME provider misconfiguration is chronic (re-checked every reconcile
+/// tick) — warn once per process instead of every two minutes.
+fn warn_acme_provider_once(message: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| eprintln!("{message}"));
 }
 
 fn reconcile_acme_domains(
@@ -2680,6 +2706,41 @@ fn reconcile_acme_domains(
         }
         let precheck = dns_precheck(&StdDnsResolver, &domain.host, expected_ip);
         if !precheck.ok {
+            // Surface WHY issuance is on hold instead of silently skipping —
+            // an unpointed DNS record otherwise looks like Cygnus doing
+            // nothing. Keep the domain's status and retry cadence untouched,
+            // and only write when the message changes so the reconcile loop
+            // doesn't churn the database or audit log every two minutes.
+            let detail = match (precheck.expected_ip, precheck.resolves_to.is_empty()) {
+                (Some(expected), true) => format!(
+                    "waiting for DNS: {} does not resolve yet — point an A record at {expected}",
+                    domain.host
+                ),
+                (Some(expected), false) => format!(
+                    "waiting for DNS: {} resolves to {} — expected {expected}",
+                    domain.host,
+                    precheck
+                        .resolves_to
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                (None, _) => format!(
+                    "waiting for DNS: cannot determine this node's public IP to verify {} — set CYGNUS_PUBLIC_IP",
+                    domain.host
+                ),
+            };
+            if domain.error.as_deref() != Some(detail.as_str()) {
+                state.update_domain_acme_outcome(
+                    &domain.host,
+                    domain.status,
+                    domain.expires_unix,
+                    Some(&detail),
+                    domain.next_retry_unix,
+                    &system_domain_audit(&domain.host, "domain_acme_waiting_dns"),
+                )?;
+            }
             continue;
         }
         state.update_domain_status(

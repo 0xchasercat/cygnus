@@ -63,12 +63,39 @@
 
 <main class="login">
   <section class="card" aria-labelledby="login-title">
-    {#if store.auth === 'locked'}
+    {#if store.auth === 'locked' && !recovering}
       <div class="mark"><SwanMark size={28} /></div>
       <h1 id="login-title" class="word">CYGNUS</h1>
-      <p class="line">Tenant zero console</p>
+      <p class="line">Node console</p>
       <p class="locked">Console credentials are not configured on this host.</p>
       <p class="env mono">Set <code>CYGNUS_CONSOLE_BOOTSTRAP_TOKEN</code> and <code>CYGNUS_CONSOLE_SESSION_KEY</code> on the host, then reload.</p>
+      <button class="recover" onclick={toggleRecover}>Use bootstrap token to recover access</button>
+    {:else if store.auth === 'locked' && recovering}
+      <div class="mark"><SwanMark size={28} /></div>
+      <h1 id="login-title" class="word">CYGNUS</h1>
+      <p class="line">Recover access with the bootstrap token</p>
+
+      <form onsubmit={submitToken} class="form">
+        <label for="bootstrap-token-locked">Bootstrap token</label>
+        <input
+          id="bootstrap-token-locked"
+          bind:this={tokenEl}
+          bind:value={token}
+          type="password"
+          autocomplete="current-password"
+          autocapitalize="off"
+          spellcheck="false"
+          maxlength="1024"
+          required
+        />
+        {#if error}<p class="err" role="alert">{error}</p>{/if}
+        <button class="btn cobalt primary" type="submit" disabled={submitting || !token}>
+          {submitting ? 'Unlocking…' : 'Unlock with token'}
+        </button>
+      </form>
+
+      <button class="back-link" onclick={toggleRecover}>← Back</button>
+      <p class="hint mono">Token printed by the installer · rotate with install.sh --rotate-secrets</p>
     {:else if recovering}
       <div class="mark"><SwanMark size={28} /></div>
       <h1 id="login-title" class="word">CYGNUS</h1>
@@ -98,7 +125,7 @@
     {:else}
       <div class="mark"><SwanMark size={28} /></div>
       <h1 id="login-title" class="word">CYGNUS</h1>
-      <p class="line">Tenant zero console</p>
+      <p class="line">Node console</p>
 
       <form onsubmit={submit} class="form">
         <label for="login-email">Admin email</label>

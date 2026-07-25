@@ -865,7 +865,14 @@ where
 
     match result {
         Ok(result) => Ok(result),
-        Err(error @ DeployError::ActivationFailed { .. }) => Err(error),
+        Err(DeployError::ActivationFailed { id, detail }) => {
+            // The artifact sealed but the runtime never became ready. Without
+            // a terminal status the row lingers as sealed-but-dead — the
+            // dashboard can neither explain it nor offer a retry. Record the
+            // failure (best effort; the original error is what matters).
+            let _ = state.mark_deployment_failed(&id, &detail);
+            Err(DeployError::ActivationFailed { id, detail })
+        }
         Err(DeployError::BuildFailed { id, detail, logs }) => Err(fail_build(
             state,
             &artifact_root,
@@ -1176,6 +1183,11 @@ fn runtime_config(
         init: linux.then(|| PathBuf::from(INIT_CAGE_PATH)),
         seccomp: Some(SeccompMode::Enforce),
         egress: crate::state::EgressConfig::None,
+        // Real applications routinely take longer than the 10s cage default
+        // to bind on a cold boot (framework route compilation, migrations,
+        // first-run caches). A too-tight gate reads as "Cygnus can't run my
+        // app" — give deployed apps 30s before declaring the boot dead.
+        readiness_timeout_ms: 30_000,
         ..AppConfig::default()
     })
 }
@@ -2073,7 +2085,8 @@ fn fail_build(
         });
     let _ = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
         .open(logs.join("pipeline.error.log"))
         .and_then(|mut file| {

@@ -59,15 +59,15 @@
         <span class="readout big">{rpsText}<span class="unit">rps</span></span>
         {#if sparkData.length}<Spark data={sparkData} w={92} h={30} />{/if}
       </div>
-      <span class="sub num">{m ? `proxy overhead · ${rate(m.totals.p50_ms)} ms p50` : 'collecting…'}</span>
+      <span class="sub num">{m ? `proxy overhead · ${rate(m.totals.p50_ms)} ms p50` : 'no traffic yet'}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
-      <span class="label">Revival · p99</span>
+      <span class="label">Cold start · p99</span>
       <div class="row">
         <span class="readout big">{bootP99 == null ? '—' : `${Math.round(bootP99)}`}<span class="unit">ms</span></span>
       </div>
-      <span class="sub num">{bootP50 == null ? 'collecting…' : `p50 ${Math.round(bootP50)} ms · budget ≤ 150`}</span>
+      <span class="sub num">{bootP50 == null ? 'no traffic yet' : `p50 ${Math.round(bootP50)} ms · budget ≤ 150`}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
@@ -75,11 +75,11 @@
       <div class="row">
         <span class="readout big">{errRate == null ? '—' : percent(errRate, 2).replace('%', '')}<span class="unit">%</span></span>
       </div>
-      <span class="sub num">{m ? `${m.totals.requests_1m.toLocaleString()} req · 1m` : 'collecting…'}</span>
+      <span class="sub num">{m ? `${m.totals.requests_1m.toLocaleString()} req · 1m` : 'no traffic yet'}</span>
     </div>
     <div class="hairline-v"></div>
     <div class="cell">
-      <span class="label">Cages</span>
+      <span class="label">Warm</span>
       <div class="row">
         <span class="readout big"
           >{warm}<span class="unit">warm</span><span class="dim num">&nbsp;/ {total}</span></span
@@ -183,7 +183,7 @@
           </div>
           <div class="ramlegend num">
             <span>{(usedBytes / (1024 ** 3)).toFixed(1)} / {(store.node.memory.total_bytes / (1024 ** 3)).toFixed(0)} GB</span>
-            <span class="dim">{warm} cages warm</span>
+            <span class="dim">{warm} warm</span>
           </div>
         {/if}
         <div class="nstats">

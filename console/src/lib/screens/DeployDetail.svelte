@@ -1,5 +1,5 @@
 <script>
-  import { ui } from '../stores.svelte.js';
+  import { ui, go, openApp } from '../stores.svelte.js';
   import { store } from '../live.svelte.js';
   import { relativeTime } from '../time.js';
   import { shortHash, millis, phaseLabel } from '../fmt.js';
@@ -23,7 +23,7 @@
   );
 
   const LED = { active: 'live', building: 'build', failed: 'fail', sealed: 'cold' };
-  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'sealed' };
+  const STATUS = { active: 'live', building: 'building', failed: 'failed', sealed: 'built' };
 
   // Vercel-like pipeline: source intake → install → compile → activate.
   const STEPS = [
@@ -362,10 +362,6 @@
       </div>
     </header>
 
-    {#if deploy.error}
-      <div class="failbox"><Icon name="x" size={13} /> {deploy.error}</div>
-    {/if}
-
     <!-- pipeline stepper -->
     <section class="card stepper">
       {#each STEPS as s, i}
@@ -399,7 +395,7 @@
             · {formatElapsed(elapsedMs)}
           {/if}
         {:else}
-          Sealed · pending activation
+          Built · pending activation
         {/if}
       </span>
     </section>
@@ -412,6 +408,20 @@
           <p class="mono">{deploy.error}</p>
         </div>
       </section>
+    {/if}
+
+    {#if deploy.status === 'failed'}
+      <div class="failed-actions">
+        {#if app?.active}
+          <span class="failed-prev num">The previous deployment remains active.</span>
+        {/if}
+        <div class="failed-btns">
+          <button class="btn" onclick={() => { ui.shipOpen = true; }}>Ship again</button>
+          {#if app}
+            <button class="btn" onclick={() => openApp(app.name)}>View app</button>
+          {/if}
+        </div>
+      </div>
     {/if}
 
     <div class="grid">
@@ -513,7 +523,7 @@
 
         <section class="card">
           <div class="cardhead">
-            <span class="label">Revival anatomy</span>
+            <span class="label">Cold start anatomy</span>
             {#if store.metrics?.boot_phases}
               <span class="p num">p50 {millis(store.metrics.totals.boot_p50_ms)}</span>
             {/if}
@@ -582,7 +592,13 @@
   {/if}
 {:else}
   <div class="page screen-enter">
-    <div class="empty mono">no deployment selected</div>
+    <div class="empty-state">
+      <p class="empty-copy">No deployment selected. If you just created a deployment it may still be initializing.</p>
+      <div class="empty-actions">
+        <button class="btn" onclick={() => go('deploys')}>View deploys</button>
+        <button class="btn" onclick={() => go('overview')}>Back to overview</button>
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -956,6 +972,44 @@
     padding: 80px 0;
     text-align: center;
     color: var(--ink-4);
+  }
+  .failed-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: -4px 0 14px;
+    padding: 12px 16px;
+    border: 1px solid var(--line-2);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+  }
+  .failed-prev {
+    font-size: 11.5px;
+    color: var(--ink-3);
+    flex: 1;
+  }
+  .failed-btns {
+    display: flex;
+    gap: 8px;
+  }
+  .empty-state {
+    padding: 80px 0;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  .empty-copy {
+    color: var(--ink-3);
+    font-size: 13px;
+    line-height: 1.55;
+    max-width: 360px;
+  }
+  .empty-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
   }
 
   @media (max-width: 980px) {

@@ -98,6 +98,7 @@
   let listenerRestartUrl = $state('');
   let listenerRestartReady = $state(false);
   let listenerDraft = $state({});
+  let listenerConfirm = $state(false);
   const listenerMode = $derived(store.node?.listener?.mode ?? store.node?.listener_mode ?? 'integrated');
   const socketExample = $derived(`${listenerDraft.socket_dir || '/run/cygnus/apps'}/my-app.sock`);
 
@@ -142,6 +143,7 @@
       socket_mode: typeof l.socket_mode === 'number' ? `0${l.socket_mode.toString(8).padStart(3, '0')}` : (l.socket_mode ?? '0660'),
     };
     listenerError = '';
+    listenerConfirm = false;
     listenerEditOpen = !listenerEditOpen;
   }
 
@@ -149,7 +151,11 @@
     e.preventDefault();
     if (listenerBusy) return;
     const d = listenerDraft;
-    if (!window.confirm('Apply this listener configuration? Active app endpoints may change and the dashboard may reconnect on a new port.')) return;
+    if (!listenerConfirm) {
+      listenerConfirm = true;
+      return;
+    }
+    listenerConfirm = false;
     const dashboardCurrent = splitAddress(store.node?.listen, '0.0.0.0', 3000);
     const dashboardChanged = Number(d.dashboard_port) !== dashboardCurrent.port;
     // Null means "keep the current bind" — an untouched dashboard port must
@@ -436,10 +442,6 @@
     <h1>Settings</h1>
   </div>
 
-  {#if store.notice}
-    <div class="notice" role="status"><Icon name="check" size={13} /> {store.notice}</div>
-  {/if}
-
   <div class="grid">
     <div class="col">
       <!-- domains -->
@@ -660,7 +662,7 @@
             <button class="btn sm" type="button" onclick={editListener}>{listenerEditOpen ? 'Cancel' : 'Configure'}</button>
           </div>
           {#if listenerEditOpen}
-            <form class="listener-form" onsubmit={saveListener}>
+            <form class="listener-form" onsubmit={saveListener} oninput={() => (listenerConfirm = false)}>
               <fieldset class="listener-modes">
                 <legend>Mode</legend>
                 {#each ['integrated', 'tcp', 'uds'] as mode}
@@ -693,7 +695,14 @@
                 {/if}
               </div>
               {#if listenerError}<p class="inline-error" role="alert">{listenerError}</p>{/if}
-              <div class="map-actions"><button class="btn cobalt sm" type="submit" disabled={listenerBusy}>{listenerBusy ? 'Applying…' : 'Apply listener'}</button></div>
+              <div class="map-actions">
+                {#if listenerConfirm}
+                  <button class="btn sm" type="button" onclick={() => (listenerConfirm = false)}>Cancel</button>
+                {/if}
+                <button class="btn {listenerConfirm ? 'danger' : 'cobalt'} sm" type="submit" disabled={listenerBusy}>
+                  {listenerBusy ? 'Applying…' : listenerConfirm ? 'Confirm — endpoints may change' : 'Apply listener'}
+                </button>
+              </div>
             </form>
           {/if}
         </div>
