@@ -274,6 +274,50 @@ test("static build fails when no conventional output directory exists", async ()
   }
 });
 
+test("auto mode serves static output when the start script is a dev server", async () => {
+  // CRA-style repository: `start` launches a webpack dev server (never a
+  // production contract) while the build script emits build/index.html.
+  // The runner must serve the static output instead of packaging the dev
+  // server as a Bun runtime app that dies at boot.
+  const fixture = await staticFixture("build.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "package.json"),
+      JSON.stringify({ scripts: { start: "craco start", build: "craco build" } }),
+    );
+    await writeFile(
+      join(fixture.workspace, "build.ts"),
+      'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+        'mkdirSync("build", { recursive: true });\n' +
+        'writeFileSync("build/index.html", "<h1>static ok</h1>");\n',
+    );
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("start script launches a dev server (craco start)");
+    expect(result.stderr).toContain("serving static output build instead");
+    expect(await exists(join(fixture.output, "public", "index.html"))).toBe(true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("auto mode fails clearly for a dev-server start with no static output", async () => {
+  const fixture = await staticFixture("noop.ts");
+  try {
+    await writeFile(
+      join(fixture.workspace, "package.json"),
+      JSON.stringify({ scripts: { start: "react-scripts start" } }),
+    );
+    await writeFile(join(fixture.workspace, "noop.ts"), 'console.error("built nothing");\n');
+    const result = await run(["--auto"], fixture.env);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("launches a development server (react-scripts start)");
+    expect(result.stderr).toContain("add a build script");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("auto mode packages and runs a start-only Bun application", async () => {
   const fixture = await staticFixture();
   try {

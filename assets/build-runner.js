@@ -252,14 +252,56 @@ async function firstStaticOutputDirectory() {
   throw error;
 }
 
-async function packageHasStartScript() {
+async function packageStartScript() {
   try {
     const packageJson = JSON.parse(await readFile(join(WORKSPACE, "package.json"), "utf8"));
-    return typeof packageJson?.scripts?.start === "string" && packageJson.scripts.start.trim().length > 0;
+    const script = packageJson?.scripts?.start;
+    if (typeof script !== "string" || script.trim().length === 0) return null;
+    return script.trim();
   } catch (error) {
-    if (error?.code === "ENOENT") return false;
+    if (error?.code === "ENOENT") return null;
     throw error;
   }
+}
+
+// Start scripts that launch a development server rather than a production
+// one. The list is deliberately conservative: every entry either watches
+// source files, serves unbuilt sources, or refuses to run outside a TTY —
+// none of them is ever the right thing to execute in a production cage.
+const DEV_SERVER_PATTERNS = Object.freeze([
+  /(?:^|[\s;&(])react-scripts start(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])craco start(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])react-app-rewired start(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])vue-cli-service serve(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])ng serve(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])gatsby develop(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])next dev(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])nuxt dev(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])remix dev(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])astro dev(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])webpack-dev-server(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])webpack serve(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])rsbuild dev(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])expo start(?=$|[\s;&)])/,
+  // Bare `vite` (plus dev/serve/preview and flags) is the dev/preview
+  // server; `vite build` is not and must not match.
+  /(?:^|[\s;&(])vite(?:\s+(?:dev|serve|preview))?(?=$|\s+-)/,
+]);
+
+function devServerCommand(script) {
+  for (const pattern of DEV_SERVER_PATTERNS) {
+    const match = script.match(pattern);
+    if (match) return match[0].trim().replace(/^[;&(]\s*/, "");
+  }
+  return null;
+}
+
+async function publishStaticOutput(output) {
+  const publicOutput = join(OUTPUT, "public");
+  await rm(publicOutput, { recursive: true, force: true });
+  await copyStaticTree(output.path, publicOutput, true);
+  phaseLog("build", "static output copy completed");
+  return buildStaticServer();
 }
 
 let canonicalWorkspace;
@@ -496,9 +538,35 @@ async function buildAuto() {
     phaseLog("detect", "no build script configured; inspecting runtime package");
   }
 
-  // A start script is the repository's own Bun runtime contract. Preserve the
-  // built workspace and execute that contract with the Cygnus socket shim.
-  if (await packageHasStartScript()) return buildStartLauncher();
+  // A start script is usually the repository's own Bun runtime contract —
+  // but not when it launches a DEVELOPMENT server (react-scripts, craco,
+  // vite, webpack-dev-server, ...). Those watch source files and bind their
+  // own ports; running one in a production cage either crashes at boot or
+  // serves an unbuilt app. For dev-server starts the deployable thing is the
+  // static output the build script just produced.
+  const startScript = await packageStartScript();
+  if (startScript !== null) {
+    const devServer = devServerCommand(startScript);
+    if (devServer === null) return buildStartLauncher();
+    let output = null;
+    try {
+      output = await firstStaticOutputDirectory();
+    } catch (error) {
+      if (error?.code !== "CYGNUS_NO_STATIC_OUTPUT") throw error;
+    }
+    if (output === null) {
+      fail(
+        `the start script launches a development server (${devServer}) and the build ` +
+          `produced no static output directory with index.html — add a build script that ` +
+          `emits one, or point the start script at a production server entry`,
+      );
+    }
+    phaseLog(
+      "detect",
+      `start script launches a dev server (${devServer}); serving static output ${output.relativePath} instead`,
+    );
+    return publishStaticOutput(output);
+  }
 
   // Check if static output was produced (Vite, Gatsby, plain HTML, etc.). An
   // output directory only counts as static when it actually has index.html;
@@ -506,11 +574,7 @@ async function buildAuto() {
   try {
     const output = await firstStaticOutputDirectory();
     phaseLog("detect", `static output found: ${output.relativePath} → static mode`);
-    const publicOutput = join(OUTPUT, "public");
-    await rm(publicOutput, { recursive: true, force: true });
-    await copyStaticTree(output.path, publicOutput, true);
-    phaseLog("build", "static output copy completed");
-    return buildStaticServer();
+    return publishStaticOutput(output);
   } catch (error) {
     if (error?.code !== "CYGNUS_NO_STATIC_OUTPUT") throw error;
     // No standard static output dir — continue to server checks.
