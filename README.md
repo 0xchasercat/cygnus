@@ -33,6 +33,10 @@ concurrent requests, holds WebSocket/SSE connections open, and keeps
 in-memory state between requests. Idle apps scale to zero and cost disk
 only; the next request revives them.
 
+<img width="1920" height="1080" alt="demo" src="https://github.com/user-attachments/assets/3b121751-6605-4ffb-a7e8-515e37b7a63f" />
+
+
+
 ## Install
 
 **Linux** (kernel 5.15+, systemd, root):
