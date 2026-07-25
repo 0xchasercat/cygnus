@@ -657,6 +657,10 @@ impl AdminMutationHandler for LiveAdminMutations {
             AdminMutation::SetDashboardTls { mode, email } => {
                 self.set_dashboard_tls(mode, email.as_deref(), audit)
             }
+            AdminMutation::SetDnsProvider {
+                provider,
+                api_token,
+            } => self.set_dns_provider(provider.as_deref(), api_token.as_deref(), audit),
             AdminMutation::AddAppDomain { app, host } => self.add_app_domain(&app, &host, audit),
             AdminMutation::RemoveAppDomain { app, host } => {
                 self.remove_app_domain(&app, &host, audit)
@@ -941,6 +945,85 @@ impl LiveAdminMutations {
             }
         }
         Ok(AdminData::DashboardTlsSet { mode })
+    }
+
+    fn set_dns_provider(
+        &self,
+        provider: Option<&str>,
+        api_token: Option<&str>,
+        audit: &AuditContext,
+    ) -> Result<AdminData, AdminMutationError> {
+        let mut state = State::open(&self.state_path).map_err(map_admin_state_error)?;
+        // Verify the credential against the provider BEFORE persisting, so a
+        // token that is wrong, expired, or scoped to zero zones is rejected
+        // here with the provider's own explanation instead of failing
+        // silently at the next issuance attempt.
+        let zones = match provider {
+            None => 0,
+            Some("cloudflare") => {
+                let snapshot = state.load().map_err(map_admin_state_error)?;
+                let stored = snapshot
+                    .edge
+                    .acme
+                    .as_ref()
+                    .and_then(|config| config.dns_api_token.clone());
+                let token = api_token
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .or(stored)
+                    .ok_or_else(|| {
+                        AdminMutationError::new(
+                            AdminErrorCode::Validation,
+                            "connecting Cloudflare requires an api_token",
+                        )
+                    })?;
+                let client = CloudflareDnsProvider::from_token(&token).map_err(|error| {
+                    AdminMutationError::new(AdminErrorCode::Validation, error.to_string())
+                })?;
+                let zones = client.verify().map_err(|error| {
+                    AdminMutationError::new(AdminErrorCode::Validation, error.to_string())
+                })?;
+                if zones == 0 {
+                    return Err(AdminMutationError::new(
+                        AdminErrorCode::Validation,
+                        "the token is valid but can see no zones — create it on the Cloudflare \
+                         account that owns your domains, with Zone:Read and DNS:Edit",
+                    ));
+                }
+                zones
+            }
+            Some(other) => {
+                return Err(AdminMutationError::new(
+                    AdminErrorCode::Validation,
+                    format!("unsupported DNS provider {other:?} (supported: cloudflare)"),
+                ));
+            }
+        };
+        state
+            .set_dns_provider(provider, api_token, audit)
+            .map_err(map_admin_state_error)?;
+        if provider.is_some() {
+            // Newly unblocked wildcard domains should not wait for the next
+            // reconcile tick — kick one now, best effort.
+            if let Err(error) = reconcile_acme_domains(
+                &self.state_path,
+                self.http01_challenges.clone(),
+                self.tls.as_ref(),
+                &self.metrics,
+            ) {
+                record_event(
+                    &self.metrics,
+                    "cert_failed",
+                    None,
+                    format!("ACME reconcile error: {error}"),
+                );
+            }
+        }
+        Ok(AdminData::DnsProviderSet {
+            provider: provider.map(str::to_owned),
+            zones,
+        })
     }
 
     fn add_app_domain(
@@ -2644,7 +2727,7 @@ fn acme_manager(
     };
     let dns: Option<Arc<dyn Dns01Provider>> = match config.dns_provider.as_deref() {
         None => None,
-        Some("cloudflare") => match CloudflareDnsProvider::from_environment() {
+        Some("cloudflare") => match CloudflareDnsProvider::from_acme_config(&config) {
             Ok(provider) => Some(Arc::new(provider)),
             Err(error) => {
                 // A broken provider must not silently disable ALL issuance —
@@ -2652,8 +2735,8 @@ fn acme_manager(
                 // working, and say why wildcards won't.
                 warn_acme_provider_once(&format!(
                     "cygnus-daemon: dns_provider \"cloudflare\" is configured but unusable ({error}); \
-                     continuing with HTTP-01 only — wildcard certificates will fail until \
-                     CYGNUS_CLOUDFLARE_API_TOKEN is set"
+                     continuing with HTTP-01 only — wildcard certificates will fail until a token \
+                     is connected in Settings or CYGNUS_CLOUDFLARE_API_TOKEN is set"
                 ));
                 None
             }

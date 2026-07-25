@@ -158,6 +158,7 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   ].includes(path);
   const dashboardDomainRoute = path === "/api/v1/settings/dashboard-domain";
   const dashboardTlsRoute = path === "/api/v1/settings/dashboard-tls";
+  const dnsProviderRoute = path === "/api/v1/settings/dns-provider";
   const passwordRoute = path === "/api/v1/settings/password";
   const listenerRoute = path === "/api/v1/settings/listener";
   const nodeResourcesRoute = path === "/api/v1/settings/node-resources";
@@ -172,7 +173,7 @@ export async function handleApi(request, url, requestAdmin = adminRequest, socke
   const appEnvKeyRoute = /^\/api\/v1\/apps\/[^/]+\/env\/[^/]+$/u.test(path);
   const githubReposRoute = path === "/api/v1/github/repositories";
   const githubTriggerRoute = /^\/api\/v1\/github\/trigger-deploy$/u.test(path);
-  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || passwordRoute || listenerRoute || nodeResourcesRoute || appResourcesRoute || appRedeployRoute || [
+  const mutationRoute = deployUploadRoute || dashboardDomainRoute || dashboardTlsRoute || dnsProviderRoute || passwordRoute || listenerRoute || nodeResourcesRoute || appResourcesRoute || appRedeployRoute || [
     "/api/v1/map-domain",
     "/api/v1/rollback",
     "/api/v1/github/manifest",
@@ -615,6 +616,10 @@ export async function commandForRequest(request, url) {
     assertQueryKeys(url, []);
     return dashboardTlsCommand(await readJsonBody(request));
   }
+  if (parts.length === 4 && parts[2] === "settings" && parts[3] === "dns-provider") {
+    assertQueryKeys(url, []);
+    return dnsProviderCommand(await readJsonBody(request));
+  }
   if (parts.length === 4 && parts[2] === "settings" && parts[3] === "password") {
     assertQueryKeys(url, []);
     return changePasswordCommand(await readJsonBody(request));
@@ -863,6 +868,22 @@ export function dashboardTlsCommand(body) {
   const command = { type: "set_dashboard_tls", mode: safeTlsMode(body.mode) };
   if (body.email !== undefined && body.email !== null && String(body.email).trim() !== "") {
     command.email = safeEmail(body.email);
+  }
+  return command;
+}
+
+export function dnsProviderCommand(body) {
+  assertObjectKeys(body, ["provider"], ["api_token"]);
+  if (body.provider !== null && body.provider !== "cloudflare") {
+    throw new HttpInputError(422, "validation", "provider must be \"cloudflare\" or null");
+  }
+  const command = { type: "set_dns_provider", provider: body.provider };
+  if (body.api_token !== undefined && body.api_token !== null) {
+    const token = String(body.api_token).trim();
+    if (!token || token.length > 256 || /\s/u.test(token)) {
+      throw new HttpInputError(422, "validation", "api_token must be a single token of at most 256 characters");
+    }
+    command.api_token = token;
   }
   return command;
 }

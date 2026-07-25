@@ -297,6 +297,51 @@
     if (!r.ok) dashError = r.error ?? 'Could not retry dashboard certificate issuance';
   }
 
+  // ——— DNS provider (DNS-01 · wildcard certificates) ———
+  let dnsEditOpen = $state(false);
+  let dnsToken = $state('');
+  let dnsBusy = $state(false);
+  let dnsError = $state('');
+  const dnsConnected = $derived(Boolean(store.node?.dns_provider));
+  // Cloudflare's documented token-template URL: pre-fills the exact
+  // permissions (Zone:Read + DNS:Edit, all zones) so creating the token is
+  // one click plus a copy — the closest thing to OAuth Cloudflare offers.
+  const cloudflareTokenUrl = $derived(
+    'https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys='
+    + encodeURIComponent('[{"key":"zone","type":"read"},{"key":"dns","type":"edit"}]')
+    + '&accountId=%2A&zoneId=all&name='
+    + encodeURIComponent(`Cygnus DNS${dashboardDomain ? ` (${dashboardDomain})` : ''}`)
+  );
+
+  async function saveDnsProvider(e) {
+    e.preventDefault();
+    if (dnsBusy || !dnsToken.trim()) return;
+    dnsBusy = true;
+    dnsError = '';
+    const r = await store.setDnsProvider({ provider: 'cloudflare', apiToken: dnsToken.trim() });
+    dnsBusy = false;
+    if (!r.ok) {
+      dnsError = r.error ?? 'Could not connect Cloudflare';
+      return;
+    }
+    dnsToken = '';
+    dnsEditOpen = false;
+  }
+
+  async function disconnectDns() {
+    if (dnsBusy) return;
+    dnsBusy = true;
+    dnsError = '';
+    const r = await store.setDnsProvider({ provider: null });
+    dnsBusy = false;
+    if (!r.ok) {
+      dnsError = r.error ?? 'Could not disconnect DNS provider';
+      return;
+    }
+    dnsToken = '';
+    dnsEditOpen = false;
+  }
+
   async function connectGithub(e) {
     e.preventDefault();
     if (githubBusy) return;
@@ -781,6 +826,52 @@
               />
             </label>
           {/if}
+          {#if sslAuto}
+            <div class="tls-row">
+              <div class="tls-meta">
+                <span class="tls-title">
+                  Wildcard certificates
+                  <span class="pill {dnsConnected ? 'live' : 'ghost'}">{dnsConnected ? 'Cloudflare' : 'off'}</span>
+                </span>
+                <span class="tmeta num">
+                  {dnsConnected
+                    ? 'certificates issue through Cloudflare DNS — wildcards and proxied domains work'
+                    : `issue through Cloudflare DNS — required for *.${apexDomain || 'your-apps-domain'}`}
+                </span>
+              </div>
+              <button class="btn sm" type="button" onclick={() => { dnsEditOpen = !dnsEditOpen; dnsError = ''; }}>
+                {dnsEditOpen ? 'Cancel' : dnsConnected ? 'Manage' : 'Connect'}
+              </button>
+            </div>
+            {#if dnsEditOpen}
+              <form class="dns-form" onsubmit={saveDnsProvider}>
+                <p class="dns-step mono">1 · Create the token — this link pre-fills the exact permissions (Zone : Read, DNS : Edit).</p>
+                <a class="btn sm dns-create" href={cloudflareTokenUrl} target="_blank" rel="noopener noreferrer">
+                  Create token on Cloudflare <Icon name="arrowR" size={12} />
+                </a>
+                <p class="dns-step mono">2 · Paste it here. Cygnus verifies it with Cloudflare, then stores it only on this node.</p>
+                <label class="dns-token">API token
+                  <input
+                    bind:value={dnsToken}
+                    type="password"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder={dnsConnected ? 'paste a new token to replace the stored one' : 'paste token'}
+                    maxlength="256"
+                  />
+                </label>
+                {#if dnsError}<p class="inline-error" role="alert">{dnsError}</p>{/if}
+                <div class="map-actions">
+                  {#if dnsConnected}
+                    <button type="button" class="btn sm danger" onclick={disconnectDns} disabled={dnsBusy}>Disconnect</button>
+                  {/if}
+                  <button class="btn cobalt sm" type="submit" disabled={dnsBusy || !dnsToken.trim()}>
+                    {dnsBusy ? 'Verifying with Cloudflare…' : 'Verify & connect'}
+                  </button>
+                </div>
+              </form>
+            {/if}
+          {/if}
           {#if dashError && !dashEditOpen}<p class="inline-error" role="alert">{dashError}</p>{/if}
           {#if sslMode}
             <p class="dash-note mono">
@@ -1250,6 +1341,36 @@
     font-size: 11px;
   }
   .listener-restart code { overflow-wrap: anywhere; font-family: var(--mono); }
+  .dns-form {
+    display: grid;
+    gap: 10px;
+    padding: 12px 0 6px;
+    border-top: 1px solid var(--line-2);
+    margin-top: 2px;
+  }
+  .dns-step { margin: 0; font-size: 10.5px; color: var(--ink-3); letter-spacing: 0.02em; line-height: 1.55; }
+  .dns-create { justify-self: start; text-decoration: none; }
+  .dns-token {
+    display: grid;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .dns-token input {
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 9px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
   .proxy-examples { grid-column: 1 / -1; display: grid; gap: 6px; }
   .proxy-examples div { display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 8px; background: var(--surface-3); border-radius: 7px; }
   .proxy-examples span { font-size: 10px; color: var(--ink-3); }

@@ -67,11 +67,29 @@ For local use the default `apps.localhost` works out of the box — browsers
 resolve `*.localhost` to loopback.
 
 **Wildcard certificates** require DNS-01 challenge validation. Cloudflare is
-the currently supported provider; use `--dns-provider cloudflare` at install
-time or configure it via the dashboard, and set the
-`CYGNUS_CLOUDFLARE_API_TOKEN` environment variable. Without a configured
-provider, Cygnus uses per-domain HTTP-01, which works for exact domains once
-DNS resolves to the node but cannot issue wildcard certs.
+the currently supported provider, and connecting it takes under a minute from
+the dashboard:
+
+1. Open **Settings → Automatic HTTPS → Wildcard certificates → Connect**.
+2. Click **Create token on Cloudflare** — the link opens Cloudflare's token
+   page with the exact permissions pre-filled (Zone : Read, DNS : Edit).
+   Create the token and copy it.
+3. Paste it into the field and hit **Verify & connect**. Cygnus validates the
+   token against Cloudflare (and tells you how many zones it can see) before
+   storing it in the root-owned state database. Pending wildcard certificates
+   begin issuing immediately.
+
+The same flow works from the CLI:
+
+```
+cygnus dns-provider cloudflare --api-token <token>   # verifies, then stores
+cygnus dns-provider none                             # disconnect
+```
+
+The `CYGNUS_CLOUDFLARE_API_TOKEN` environment variable still works as a
+fallback for unattended installs. Without a connected provider, Cygnus uses
+per-domain HTTP-01, which works for exact domains once DNS resolves to the
+node but cannot issue wildcard certs.
 
 ## 3. Open the console
 

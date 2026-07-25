@@ -25,6 +25,7 @@ import {
   consumeManifestState,
   dashboardDomainCommand,
   dashboardTlsCommand,
+  dnsProviderCommand,
   deployUploadBeginCommand,
   deployUploadChunk,
   deployUploadFinishCommand,
@@ -441,6 +442,18 @@ describe("console request validation", () => {
 
     expect(await command("/api/v1/settings/dashboard-domain", "POST", { domain: "dashboard.cygnus.run", apex: "cygnus.run" })).toEqual({ type: "set_dashboard_domain", domain: "dashboard.cygnus.run", apex: "cygnus.run" });
     expect(await command("/api/v1/settings/dashboard-tls", "POST", { mode: "acme" })).toEqual({ type: "set_dashboard_tls", mode: "acme" });
+    // DNS provider: token trimmed and forwarded; null disconnects; junk rejected.
+    expect(await command("/api/v1/settings/dns-provider", "POST", {
+      provider: "cloudflare",
+      api_token: " cf-token-abc123 ",
+    })).toEqual({ type: "set_dns_provider", provider: "cloudflare", api_token: "cf-token-abc123" });
+    expect(await command("/api/v1/settings/dns-provider", "POST", { provider: null })).toEqual({
+      type: "set_dns_provider",
+      provider: null,
+    });
+    expect(() => dnsProviderCommand({ provider: "route53" })).toThrow("provider must be");
+    expect(() => dnsProviderCommand({ provider: "cloudflare", api_token: "has spaces" })).toThrow("api_token must be");
+    expect(() => dnsProviderCommand({ provider: "cloudflare", api_token: "" })).toThrow("api_token must be");
     expect(await command("/api/v1/settings/listener", "POST", {
       listener: { mode: "tcp", host: "0.0.0.0", port_start: 10000, port_end: 19999, advertise_host: "node.example.com" },
       dashboard_listen: "0.0.0.0:3000",

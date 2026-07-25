@@ -468,6 +468,17 @@ fn validate_request(request: &AdminRequest) -> Result<(), String> {
             }
         }
         AdminCommand::SetDashboardTls { .. } => {}
+        AdminCommand::SetDnsProvider {
+            provider,
+            api_token,
+        } => {
+            if let Some(provider) = provider {
+                validate_text(provider, 64, "dns provider")?;
+            }
+            if let Some(token) = api_token {
+                validate_text(token, 256, "dns api token")?;
+            }
+        }
         AdminCommand::ListAppDomains { app } => validate_app_name(app)?,
         AdminCommand::AddAppDomain { app, host }
         | AdminCommand::RemoveAppDomain { app, host }

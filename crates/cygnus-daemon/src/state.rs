@@ -33,7 +33,7 @@ use thiserror::Error;
 
 /// Default on-disk database used by the daemon binary.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/cygnus/state.db";
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_ACCOUNT_EMAIL_BYTES: usize = 254;
 pub const MIN_ACCOUNT_PASSWORD_BYTES: usize = 12;
@@ -1111,6 +1111,7 @@ impl State {
                 9 => migrate_v9_to_v10(&transaction)?,
                 10 => migrate_v10_to_v11(&transaction)?,
                 11 => migrate_v11_to_v12(&transaction)?,
+                12 => migrate_v12_to_v13(&transaction)?,
                 _ => unreachable!("validated schema version"),
             }
             let next = version + 1;
@@ -1458,7 +1459,7 @@ impl State {
             .connection
             .query_row(
                 "SELECT https_listen, apps_domain, acme_email, acme_directory_url, dns_provider,
-                        dashboard_domain, apex_domain, ssl_mode
+                        dashboard_domain, apex_domain, ssl_mode, dns_api_token
                  FROM edge_config WHERE id = 1",
                 [],
                 |row| {
@@ -1471,6 +1472,7 @@ impl State {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1495,6 +1497,7 @@ impl State {
                 email,
                 directory_url,
                 dns_provider: edge.4,
+                dns_api_token: edge.8,
             }),
             _ => {
                 return Err(StateError::IncompleteState(
@@ -3114,6 +3117,7 @@ impl State {
                 edge.https_listen = Some(SocketAddr::from(([0, 0, 0, 0], 443)));
             }
             let dns_provider = edge.acme.as_ref().and_then(|c| c.dns_provider.clone());
+            let dns_api_token = edge.acme.as_ref().and_then(|c| c.dns_api_token.clone());
             let directory_url = edge
                 .acme
                 .as_ref()
@@ -3123,6 +3127,7 @@ impl State {
                 email: contact,
                 directory_url,
                 dns_provider,
+                dns_api_token,
             });
         }
         let transaction = self.connection.transaction()?;
@@ -3132,6 +3137,63 @@ impl State {
              WHERE kind = 'native'",
             [ssl_mode_name(mode)],
         )?;
+        append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
+        transaction.commit()?;
+        Ok(edge)
+    }
+
+    /// Connect, replace, or disconnect the DNS provider used for DNS-01
+    /// certificate issuance. Requires automatic HTTPS (an ACME configuration)
+    /// to exist — the provider is meaningless without it. Passing `None`
+    /// clears both the provider and its stored credential; a `Some` provider
+    /// without a token keeps the token already on file.
+    pub fn set_dns_provider(
+        &mut self,
+        provider: Option<&str>,
+        api_token: Option<&str>,
+        audit: &AuditContext,
+    ) -> Result<EdgeConfig, StateError> {
+        validate_audit_context(audit)?;
+        let snapshot = self.load()?;
+        let mut edge = snapshot.edge;
+        let Some(mut acme) = edge.acme.take() else {
+            return Err(StateError::InvalidConfig(
+                "enable automatic HTTPS before configuring a DNS provider".into(),
+            ));
+        };
+        match provider {
+            None => {
+                acme.dns_provider = None;
+                acme.dns_api_token = None;
+            }
+            Some("cloudflare") => {
+                let token = api_token
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .or(acme.dns_api_token);
+                let Some(token) = token else {
+                    return Err(StateError::InvalidConfig(
+                        "connecting Cloudflare requires an api_token".into(),
+                    ));
+                };
+                if token.len() > 256 || token.chars().any(char::is_whitespace) {
+                    return Err(StateError::InvalidConfig(
+                        "api_token must be a single token of at most 256 characters".into(),
+                    ));
+                }
+                acme.dns_provider = Some("cloudflare".into());
+                acme.dns_api_token = Some(token);
+            }
+            Some(other) => {
+                return Err(StateError::InvalidConfig(format!(
+                    "unsupported DNS provider {other:?} (supported: cloudflare)"
+                )));
+            }
+        }
+        edge.acme = Some(acme);
+        let transaction = self.connection.transaction()?;
+        store_edge_config_tx(&transaction, &edge)?;
         append_audit_tx(&transaction, audit, AuditOutcome::Success, None)?;
         transaction.commit()?;
         Ok(edge)
@@ -5055,6 +5117,13 @@ fn migrate_v11_to_v12(connection: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn migrate_v12_to_v13(connection: &Connection) -> Result<(), StateError> {
+    // DNS provider API credential for DNS-01 issuance. Stored alongside the
+    // rest of the edge configuration in the root-owned state database.
+    connection.execute_batch("ALTER TABLE edge_config ADD COLUMN dns_api_token TEXT;")?;
+    Ok(())
+}
+
 fn normalize_and_validate_account_email(email: &str) -> Result<String, StateError> {
     let normalized = email.trim().to_lowercase();
     if normalized.is_empty() || normalized.len() > MAX_ACCOUNT_EMAIL_BYTES {
@@ -6209,7 +6278,7 @@ fn store_edge_config_tx(
     edge: &EdgeConfig,
 ) -> Result<(), StateError> {
     let https_listen = edge.https_listen.map(|address| address.to_string());
-    let (acme_email, acme_directory_url, dns_provider) = edge
+    let (acme_email, acme_directory_url, dns_provider, dns_api_token) = edge
         .acme
         .as_ref()
         .map(|acme| {
@@ -6217,21 +6286,23 @@ fn store_edge_config_tx(
                 Some(acme.email.as_str()),
                 Some(acme.directory_url.as_str()),
                 acme.dns_provider.as_deref(),
+                acme.dns_api_token.as_deref(),
             )
         })
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
     transaction.execute(
         "INSERT INTO edge_config
          (id, https_listen, apps_domain, acme_email, acme_directory_url, dns_provider,
-          dashboard_domain, apex_domain, ssl_mode)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          dashboard_domain, apex_domain, ssl_mode, dns_api_token)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET https_listen = excluded.https_listen,
              apps_domain = excluded.apps_domain, acme_email = excluded.acme_email,
              acme_directory_url = excluded.acme_directory_url,
              dns_provider = excluded.dns_provider,
              dashboard_domain = excluded.dashboard_domain,
              apex_domain = excluded.apex_domain,
-             ssl_mode = excluded.ssl_mode",
+             ssl_mode = excluded.ssl_mode,
+             dns_api_token = excluded.dns_api_token",
         params![
             https_listen,
             edge.apps_domain,
@@ -6244,6 +6315,7 @@ fn store_edge_config_tx(
                 SslMode::Acme => "acme",
                 SslMode::SelfSigned => "self_signed",
             },
+            dns_api_token,
         ],
     )?;
     Ok(())
@@ -6796,6 +6868,7 @@ fn canonical_edge_config(listen: SocketAddr, edge: &EdgeConfig) -> Result<EdgeCo
                 email: email.to_owned(),
                 directory_url: directory_url.to_owned(),
                 dns_provider: acme.dns_provider.clone(),
+                dns_api_token: acme.dns_api_token.clone(),
             })
         })
         .transpose()?;
@@ -8406,6 +8479,7 @@ mod tests {
                 email: "ops@example.com".into(),
                 directory_url: crate::edge::DEFAULT_ACME_DIRECTORY.into(),
                 dns_provider: Some("cloudflare".into()),
+                dns_api_token: None,
             }),
         };
         state.apply(&input).unwrap();
@@ -8424,6 +8498,7 @@ mod tests {
                 email: "admin@example.com".into(),
                 directory_url: "https://acme.test/directory".into(),
                 dns_provider: None,
+                dns_api_token: None,
             }),
         };
         state

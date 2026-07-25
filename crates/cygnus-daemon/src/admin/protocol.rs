@@ -60,6 +60,17 @@ pub enum AdminCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         email: Option<String>,
     },
+    /// Connect, replace, or disconnect the DNS provider used for DNS-01
+    /// certificate issuance (wildcards). `provider: None` disconnects and
+    /// clears the stored credential; omitting `api_token` while connecting
+    /// keeps the credential already on file. The daemon verifies the token
+    /// against the provider before persisting anything.
+    SetDnsProvider {
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_token: Option<String>,
+    },
     ListAppDomains {
         app: String,
     },
@@ -388,6 +399,11 @@ pub enum AdminData {
     DashboardTlsSet {
         mode: SslMode,
     },
+    DnsProviderSet {
+        provider: Option<String>,
+        /// Zones the verified credential can see (0 when disconnecting).
+        zones: u32,
+    },
     AppDomains {
         domains: Vec<AppDomainView>,
     },
@@ -581,6 +597,9 @@ pub struct NodeView {
     /// Let's Encrypt contact email when ACME is configured (no secrets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme_email: Option<String>,
+    /// Connected DNS-01 provider name, e.g. "cloudflare" (never the token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_provider: Option<String>,
     pub app_count: usize,
     pub version: String,
     pub uptime_seconds: u64,
@@ -820,6 +839,44 @@ mod tests {
                 "mode":"acme",
                 "email":"ops@example.com"
             })
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetDnsProvider {
+                provider: Some("cloudflare".into()),
+                api_token: Some("token-123".into()),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type":"set_dns_provider",
+                "provider":"cloudflare",
+                "api_token":"token-123"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AdminCommand::SetDnsProvider {
+                provider: None,
+                api_token: None,
+            })
+            .unwrap(),
+            serde_json::json!({"type":"set_dns_provider","provider":null})
+        );
+        assert_eq!(
+            serde_json::from_value::<AdminCommand>(
+                serde_json::json!({"type":"set_dns_provider","provider":null})
+            )
+            .unwrap(),
+            AdminCommand::SetDnsProvider {
+                provider: None,
+                api_token: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(AdminData::DnsProviderSet {
+                provider: Some("cloudflare".into()),
+                zones: 3,
+            })
+            .unwrap(),
+            serde_json::json!({"kind":"dns_provider_set","provider":"cloudflare","zones":3})
         );
         assert_eq!(
             serde_json::to_value(AdminCommand::SetAppDomainTls {

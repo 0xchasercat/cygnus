@@ -185,6 +185,15 @@ enum Command {
         #[arg(long)]
         email: Option<String>,
     },
+    /// Connect a DNS provider for DNS-01 certificate issuance (wildcards).
+    /// The token is verified against the provider before it is stored.
+    DnsProvider {
+        /// "cloudflare" to connect or update, "none" to disconnect.
+        provider: String,
+        /// API token with Zone:Read + DNS:Edit. Omit to keep the stored one.
+        #[arg(long)]
+        api_token: Option<String>,
+    },
     /// Manage persisted application environment variables.
     Env {
         #[command(subcommand)]
@@ -652,6 +661,35 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 return Err("daemon returned an unexpected dashboard TLS response".into());
             };
             theme.line_kv("tls", "dashboard TLS policy updated");
+        }
+        Command::DnsProvider {
+            provider,
+            api_token,
+        } => {
+            let provider = match provider.as_str() {
+                "none" | "off" | "disabled" => None,
+                other => Some(other.to_owned()),
+            };
+            let data = call(
+                &client,
+                AdminCommand::SetDnsProvider {
+                    provider,
+                    api_token,
+                },
+            )?;
+            let AdminData::DnsProviderSet { provider, zones } = data else {
+                return Err("daemon returned an unexpected DNS provider response".into());
+            };
+            match provider {
+                Some(name) => theme.line_kv(
+                    "dns",
+                    &format!(
+                        "{name} connected · {zones} zone{} accessible",
+                        if zones == 1 { "" } else { "s" }
+                    ),
+                ),
+                None => theme.line_kv("dns", "provider disconnected"),
+            }
         }
         Command::Env { command } => {
             let (data, action) = match command {

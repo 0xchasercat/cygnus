@@ -144,12 +144,16 @@ and propagation faster.
 `*.localhost` to loopback without any DNS setup.
 
 **Wildcard certificates** require DNS-01 challenge validation and a
-supported DNS provider. Currently Cloudflare is supported; configure it
-with `--dns-provider cloudflare` (the installer) or via the dashboard, and
-set the `CYGNUS_CLOUDFLARE_API_TOKEN` environment variable to your
-Cloudflare API token. Without a configured provider, Cygnus falls back to
-per-domain HTTP-01 issuance, which works for exact domains once DNS points
-at the node but cannot issue wildcard certificates.
+supported DNS provider (currently Cloudflare). Connect it from
+**Settings → Automatic HTTPS → Wildcard certificates**: the dashboard links
+straight to Cloudflare's token page with the exact permissions pre-filled
+(Zone : Read, DNS : Edit) — create, copy, paste, and Cygnus verifies the
+token against Cloudflare before storing it. `cygnus dns-provider cloudflare
+--api-token <token>` does the same from the CLI, and the
+`CYGNUS_CLOUDFLARE_API_TOKEN` environment variable remains a fallback for
+unattended installs. Without a provider, Cygnus falls back to per-domain
+HTTP-01 issuance, which works for exact domains once DNS points at the node
+but cannot issue wildcard certificates.
 
 ## The console
 
