@@ -50,7 +50,10 @@ const STATIC_OUTPUT_DIRECTORIES = Object.freeze([
   "dist",
   "build",
   "out",
-  ".output/public",
+  "dist/browser", // Angular (single-project layout)
+  ".output/public", // Nuxt generate / Nitro prerender
+  ".svelte-kit/cloudflare", // SvelteKit adapter-cloudflare (prerendered only — the index.html gate keeps SSR builds out)
+  "_site", // Eleventy, Jekyll
   "public",
 ]);
 const ROOT_COPY_EXCLUSIONS = Object.freeze(new Set([
@@ -245,11 +248,132 @@ async function firstStaticOutputDirectory() {
       if (error?.code !== "ENOENT") throw error;
     }
   }
+  // Angular CLI emits dist/<project>/browser/index.html — the project
+  // segment is repo-specific, so probe exactly one level below dist.
+  try {
+    const distPath = join(WORKSPACE, "dist");
+    for (const entry of await readdir(distPath, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const relativePath = join("dist", entry.name, "browser");
+      const candidate = join(distPath, entry.name, "browser");
+      try {
+        const indexMetadata = await lstat(join(candidate, "index.html"));
+        if (indexMetadata.isFile()) return { path: candidate, relativePath };
+      } catch (error) {
+        if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+      }
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+  }
   const error = new Error(
     `static build completed but no output directory with index.html exists (${STATIC_OUTPUT_DIRECTORIES.join(", ")})`,
   );
   error.code = "CYGNUS_NO_STATIC_OUTPUT";
   throw error;
+}
+
+// Cloudflare Workers projects describe their deployment in wrangler
+// config, not package.json. Cygnus cannot run a Workers-runtime script
+// (bindings like env.ASSETS, KV, or D1 only exist on Cloudflare), but the
+// configured static assets directory is often the whole deployable site —
+// and when it isn't, the operator deserves adapter guidance, not a shrug.
+async function wranglerConfigFile() {
+  for (const name of ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]) {
+    try {
+      const raw = await readFile(join(WORKSPACE, name), "utf8");
+      return { name, raw };
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return null;
+}
+
+function wranglerField(config, field) {
+  if (config.name.endsWith(".toml")) {
+    if (field === "assets") {
+      const section = config.raw.match(/\[assets\][^[]*/);
+      const sectional = section?.[0]?.match(/directory\s*=\s*"([^"]+)"/);
+      const inline = config.raw.match(/assets\s*=\s*\{[^}]*directory\s*=\s*"([^"]+)"/);
+      const legacySite = config.raw.match(/\[site\][^[]*/);
+      const legacy = legacySite?.[0]?.match(/bucket\s*=\s*"([^"]+)"/);
+      return sectional?.[1] ?? inline?.[1] ?? legacy?.[1] ?? null;
+    }
+    const main = config.raw.match(/^\s*main\s*=\s*"([^"]+)"/m);
+    return main?.[1] ?? null;
+  }
+  try {
+    const stripped = config.raw
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    const parsed = JSON.parse(stripped);
+    if (field === "assets") {
+      const assets = parsed?.assets;
+      if (typeof assets === "string") return assets;
+      return assets?.directory ?? parsed?.site?.bucket ?? null;
+    }
+    return typeof parsed?.main === "string" ? parsed.main : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the Workers deployment described by wrangler config: the worker
+// entry (`main`) and — when the configured assets directory is a complete
+// site with index.html — a servable static output. Returns null when no
+// wrangler config exists.
+async function wranglerDeployment() {
+  const config = await wranglerConfigFile();
+  if (config === null) return null;
+  const main = wranglerField(config, "main");
+  const assetsDir = safeWorkspaceRelative(wranglerField(config, "assets"));
+  let servable = null;
+  if (assetsDir !== null) {
+    const candidate = join(WORKSPACE, assetsDir);
+    try {
+      const metadata = await lstat(candidate);
+      if (
+        metadata.isDirectory() &&
+        (await lstat(join(candidate, "index.html"))).isFile()
+      ) {
+        servable = { path: candidate, relativePath: assetsDir };
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+  }
+  return { configName: config.name, main, servable };
+}
+
+function workerCaveat(main) {
+  return main
+    ? ` — the worker script (${main}) does not run on Cygnus, so routes it handles will not respond`
+    : "";
+}
+
+function failWorkersRuntime(deployment) {
+  fail(
+    `this project targets the Cloudflare Workers runtime (${deployment.configName}` +
+      (deployment.main ? `, main: ${deployment.main}` : "") +
+      `) and the build produced no servable static output. Cygnus runs Bun/Node servers — ` +
+      `switch the framework adapter (SvelteKit: @sveltejs/adapter-node, Astro: @astrojs/node, ` +
+      `React Router/Remix: the node server build) or prerender the site to static output`,
+  );
+}
+
+function safeWorkspaceRelative(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().replace(/^\.\//, "");
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > 512 ||
+    isAbsolute(trimmed) ||
+    trimmed.split(/[\\/]/).some((part) => part === "..")
+  ) {
+    return null;
+  }
+  return trimmed;
 }
 
 async function packageStartScript() {
@@ -278,11 +402,14 @@ const DEV_SERVER_PATTERNS = Object.freeze([
   /(?:^|[\s;&(])next dev(?=$|[\s;&)])/,
   /(?:^|[\s;&(])nuxt dev(?=$|[\s;&)])/,
   /(?:^|[\s;&(])remix dev(?=$|[\s;&)])/,
-  /(?:^|[\s;&(])astro dev(?=$|[\s;&)])/,
   /(?:^|[\s;&(])webpack-dev-server(?=$|[\s;&)])/,
   /(?:^|[\s;&(])webpack serve(?=$|[\s;&)])/,
   /(?:^|[\s;&(])rsbuild dev(?=$|[\s;&)])/,
   /(?:^|[\s;&(])expo start(?=$|[\s;&)])/,
+  // wrangler dev/deploy target the Cloudflare Workers runtime, never a
+  // production process on this node.
+  /(?:^|[\s;&(])wrangler (?:dev|deploy)(?=$|[\s;&)])/,
+  /(?:^|[\s;&(])astro (?:dev|preview)(?=$|[\s;&)])/,
   // Bare `vite` (plus dev/serve/preview and flags) is the dev/preview
   // server; `vite build` is not and must not match.
   /(?:^|[\s;&(])vite(?:\s+(?:dev|serve|preview))?(?=$|\s+-)/,
@@ -555,6 +682,18 @@ async function buildAuto() {
       if (error?.code !== "CYGNUS_NO_STATIC_OUTPUT") throw error;
     }
     if (output === null) {
+      // Workers projects commonly pair `start: "wrangler dev"` with assets
+      // declared only in wrangler config — consult it before giving up.
+      const workers = await wranglerDeployment();
+      if (workers?.servable) {
+        phaseLog(
+          "detect",
+          `start script launches a dev server (${devServer}); serving Cloudflare Workers assets ` +
+            `from ${workers.servable.relativePath} instead${workerCaveat(workers.main)}`,
+        );
+        return publishStaticOutput(workers.servable);
+      }
+      if (workers !== null) failWorkersRuntime(workers);
       fail(
         `the start script launches a development server (${devServer}) and the build ` +
           `produced no static output directory with index.html — add a build script that ` +
@@ -587,8 +726,10 @@ async function buildAuto() {
     ".output/server/index.mjs",            // Nuxt / Nitro
     ".output/server/index.js",             // Nuxt / Nitro (CJS fallback)
     "dist/server/index.mjs",               // SolidStart
+    "dist/server/entry.mjs",               // Astro (@astrojs/node)
     "build/server/index.mjs",              // SvelteKit
-    "build/index.js",                      // Remix
+    "build/server/index.js",               // React Router 7 / Remix v2
+    "build/index.js",                      // Remix (classic)
   ];
   for (const candidate of STANDALONE_ENTRIES) {
     const fullPath = join(WORKSPACE, candidate);
@@ -616,10 +757,28 @@ async function buildAuto() {
     }
   }
 
-  // 3. Nothing worked — fail with guidance.
+  // 3. Cloudflare Workers projects: the deployment contract lives in
+  // wrangler config. Serve the configured static assets when they are a
+  // complete site; otherwise explain exactly which adapter to switch to.
+  const workers = await wranglerDeployment();
+  if (workers !== null) {
+    if (workers.servable) {
+      phaseLog(
+        "detect",
+        `Cloudflare Workers config found (${workers.configName}); serving its static assets ` +
+          `from ${workers.servable.relativePath}${workerCaveat(workers.main)}`,
+      );
+      return publishStaticOutput(workers.servable);
+    }
+    failWorkersRuntime(workers);
+  }
+
+  // 4. Nothing worked — fail with enough context to act on.
   phaseLog(
     "detect",
-    "build completed but no static output or server entry found; pass --entry <path>",
+    `build completed but no static output or server entry found — looked for index.html under ` +
+      `${STATIC_OUTPUT_DIRECTORIES.join(", ")} and server entries at ${STANDALONE_ENTRIES.join(", ")}; ` +
+      `pass --entry <path> for a custom server entry or add a start script`,
   );
   return 1;
 }
