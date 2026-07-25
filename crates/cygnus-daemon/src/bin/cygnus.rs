@@ -276,10 +276,7 @@ enum EnvCommand {
     },
     /// Remove an environment variable from an app. Applies on the next
     /// deploy — run `cygnus redeploy <app>` to restart without it now.
-    Remove {
-        app: String,
-        key: String,
-    },
+    Remove { app: String, key: String },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -948,10 +945,7 @@ fn print_json(data: AdminData) -> Result<(), Box<dyn Error>> {
 /// Pick the most recent deployment so `cygnus logs` (no id) does the obvious
 /// thing instead of erroring, optionally scoped to one app via `--app`.
 /// If nothing has shipped yet, print a hint.
-fn latest_deployment_id(
-    client: &AdminClient,
-    app: Option<&str>,
-) -> Result<String, Box<dyn Error>> {
+fn latest_deployment_id(client: &AdminClient, app: Option<&str>) -> Result<String, Box<dyn Error>> {
     let data = call(
         client,
         AdminCommand::ListDeployments {
@@ -988,7 +982,7 @@ fn stream_log(
 ) -> Result<(), Box<dyn Error>> {
     let deployment = match deployment {
         Some(id) => id,
-        None => latest_deployment_id(client)?,
+        None => latest_deployment_id(client, app.as_deref())?,
     };
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -1712,9 +1706,10 @@ fn parse_byte_size(value: &str) -> Result<u64, String> {
     } else {
         (lower.as_str(), 1)
     };
-    let number: u64 = digits.trim().parse().map_err(|_| {
-        format!("invalid size {trimmed:?} — use bytes or a suffix like 512M or 2G")
-    })?;
+    let number: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size {trimmed:?} — use bytes or a suffix like 512M or 2G"))?;
     number
         .checked_mul(multiplier)
         .ok_or_else(|| format!("size {trimmed:?} does not fit in 64 bits"))
