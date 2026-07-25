@@ -625,8 +625,8 @@
           </div>
           {#if app.lifecycle_state === 'cold'}
             <div class="coldbox">
-              <p>No process. The artifact sleeps on disk — {app.env_keys?.length ?? 0} env keys sealed, route armed.</p>
-              <div class="coldstat num">next request revives the process</div>
+              <p>Scaled to zero — no process is running. The next request starts one automatically.</p>
+              <div class="coldstat num">routes stay active while cold</div>
             </div>
           {:else}
             <div class="kv">

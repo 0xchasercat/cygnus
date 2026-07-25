@@ -119,9 +119,9 @@
             <div class="foot">
               <span class="meta num">
                 {#if a.lifecycle_state === 'building'}
-                  <em class="bmeta">building · {a.active ? 'sealing' : 'no artifact yet'}</em>
+                  <em class="bmeta">building · {a.active ? 'previous version stays live' : 'first deploy'}</em>
                 {:else if a.lifecycle_state === 'cold'}
-                  cold · revives on next request
+                  cold · starts on next request
                 {:else}
                   {rate(am?.rps_1m ?? 0)} rps · {am ? `${millis(am.p50_ms)} p50` : '—'}
                 {/if}

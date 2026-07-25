@@ -1489,10 +1489,18 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), GitHubError
             || entry_type.is_block_special()
             || entry_type.is_fifo()
         {
-            return Err(GitHubError::UnsafeArchive(format!(
-                "links and special files are not allowed: {}",
+            // Real repositories routinely contain a stray symlink somewhere
+            // (editor config directories, vendored assets). None of it may be
+            // materialized — a link could point outside the extraction root —
+            // but failing the whole deployment over it stranded working apps.
+            // Skip the entry: nothing is created on disk, so nothing unsafe
+            // exists, and a build that genuinely needed the file fails later
+            // with that file's name in its own log.
+            eprintln!(
+                "cygnus-daemon: skipping link/special archive entry {}",
                 path.display()
-            )));
+            );
+            continue;
         }
         // Extract paths verbatim first. GitHub tarballs normally wrap every
         // file in one repository directory, but that directory is not
@@ -2224,7 +2232,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_rejects_traversal_and_symlinks() {
+    fn archive_skips_links_and_special_files() {
         let path = tmp().join("archive");
         let mut bytes = Vec::new();
         {
@@ -2236,11 +2244,20 @@ mod tests {
             header.set_size(0);
             header.set_cksum();
             builder.append(&header, io::empty()).unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_path("kept.txt").unwrap();
+            file.set_entry_type(tar::EntryType::file());
+            file.set_size(4);
+            file.set_cksum();
+            builder.append(&file, "data".as_bytes()).unwrap();
             builder.finish().unwrap();
         }
-        assert!(matches!(
-            safe_extract_archive(&bytes, &path),
-            Err(GitHubError::UnsafeArchive(_))
-        ));
+        // Links and special files are skipped, never materialized — a stray
+        // editor symlink must not fail the whole deployment, and nothing may
+        // be created on disk for it (a link target could escape the root).
+        safe_extract_archive(&bytes, &path).unwrap();
+        assert!(fs::symlink_metadata(path.join("link")).is_err());
+        assert_eq!(fs::read_to_string(path.join("kept.txt")).unwrap(), "data");
+        let _ = fs::remove_dir_all(&path);
     }
 }

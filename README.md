@@ -2,7 +2,18 @@
   <img src="banner.webp" alt="Cygnus — Node compatibility. Serverless efficiency." width="720">
 </p>
 
-# Cygnus
+<h1 align="center">Cygnus</h1>
+
+<p align="center">
+  <em>Self-hosted serverless for Bun and Node apps.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/0xchasercat/cygnus/actions/workflows/ci.yml"><img src="https://github.com/0xchasercat/cygnus/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License"></a>
+  <a href="https://github.com/0xchasercat/cygnus/releases"><img src="https://img.shields.io/github/v/release/0xchasercat/cygnus" alt="Release"></a>
+  <a href="https://github.com/0xchasercat/cygnus/commits/main"><img src="https://img.shields.io/github/last-commit/0xchasercat/cygnus" alt="Last commit"></a>
+</p>
 
 Self-hosted serverless for Bun and Node apps. One binary, no containers, no
 registry, no YAML. Deploy unmodified apps into kernel-sandboxed cages that
