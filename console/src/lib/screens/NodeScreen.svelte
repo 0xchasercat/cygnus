@@ -111,6 +111,7 @@
   </header>
 
   <div class="grid">
+    <div class="col">
     <!-- ————— identity ————— -->
     <section class="card">
       <div class="cardhead"><span class="label">Identity</span></div>
@@ -180,8 +181,10 @@
         {/if}
       </div>
     </section>
+    </div>
 
-    <!-- ————— revival anatomy ————— -->
+    <div class="col">
+    <!-- ————— cold starts ————— -->
     <section class="card">
       <div class="cardhead">
         <span class="label">Cold starts</span>
@@ -277,6 +280,7 @@
         </div>
       </div>
     </section>
+    </div>
   </div>
 </div>
 
@@ -319,6 +323,14 @@
     grid-template-columns: repeat(2, 1fr);
     gap: 18px;
     align-items: start;
+  }
+  /* Cards stack per column (like Settings) instead of row-aligning across
+     the grid, so a tall card never opens a gap beside its neighbor. */
+  .col {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-width: 0;
   }
 
   .cardhead {
